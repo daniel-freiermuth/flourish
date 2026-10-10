@@ -592,3 +592,106 @@ async fn upgrading_sends_pre_blocked_reports_to_triage() {
 
     drop(store);
 }
+
+/// Upgrading moves every failure streak onto its work item.
+///
+/// 023 copies the three streak column pairs (`fix`, `recheck` on the
+/// finding, `harvest` on its `pr_state` row) into `finding_work`, one row
+/// per (finding, kind) that had a streak, and drops the columns. A finding
+/// with no streak gets no row, which reads as no streak.
+///
+/// Seeded at the state just before 023 so that rolling forward executes it.
+#[tokio::test]
+async fn upgrading_moves_failure_streaks_onto_their_work_items() {
+    use hunter::domain::FindingJobKind;
+    use hunter::store::WorkStreak;
+
+    let (_dir, path) = scratch("mig-finding-work");
+
+    let before_023 = sqlx::migrate!("./migrations")
+        .iter()
+        .position(|m| m.version == 23)
+        .expect("migration 023 exists");
+    let pool = seed_state(&path, before_023).await;
+    sqlx::query(
+        "INSERT INTO repos (id, name, url, path, forge, default_branch, added_at) \
+         VALUES (1, 'widget', 'https://e/w.git', '/wr/repos/repo-1', 'github', 'main', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    // 1: a fix streak and a recheck streak. 2: a harvest streak.
+    // 3: no streak at all.
+    for (id, status, fix, fix_key, recheck, recheck_key) in [
+        (
+            1,
+            "queued",
+            2,
+            Some("no commits"),
+            1,
+            Some("no verdict file"),
+        ),
+        (2, "merged", 0, None, 0, None),
+        (3, "new", 0, None, 0, None),
+    ] {
+        sqlx::query(
+            "INSERT INTO findings (id, type, repo_id, fingerprint, severity, confidence, \
+             summary, status, created_at, updated_at, fix_attempts, last_fix_failure, \
+             recheck_attempts, last_recheck_failure) \
+             VALUES (?1, 'bug', 1, 'fp-' || ?1, 'high', 0.9, 's', ?2, 1, 1, ?3, ?4, ?5, ?6)",
+        )
+        .bind(id)
+        .bind(status)
+        .bind(fix)
+        .bind(fix_key)
+        .bind(recheck)
+        .bind(recheck_key)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO pr_state (finding_id, pr_number, state, harvest_attempts, \
+         last_harvest_failure) VALUES (2, 7, 'MERGED', 2, 'pr view failed'), \
+         (3, 8, 'MERGED', 0, NULL)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let store = Store::connect(&path).await.expect("roll forward");
+
+    let streak = |n: i64, key: &str| WorkStreak {
+        streak: n,
+        last_failure: Some(key.to_owned()),
+    };
+    let mut got = Vec::new();
+    for id in 1..=3 {
+        for kind in [
+            FindingJobKind::Fix,
+            FindingJobKind::Recheck,
+            FindingJobKind::Harvest,
+        ] {
+            let s = store.work_streak(id, kind).await.unwrap();
+            if s != WorkStreak::default() {
+                got.push((id, kind, s));
+            }
+        }
+    }
+    assert_eq!(
+        got,
+        vec![
+            (1, FindingJobKind::Fix, streak(2, "no commits")),
+            (1, FindingJobKind::Recheck, streak(1, "no verdict file")),
+            (2, FindingJobKind::Harvest, streak(2, "pr view failed")),
+        ]
+    );
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM finding_work")
+        .fetch_one(&open(&path).await)
+        .await
+        .unwrap();
+    assert_eq!(rows, 3, "no row for work that had no streak");
+
+    drop(store);
+}

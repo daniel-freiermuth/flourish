@@ -246,8 +246,6 @@ fn pr_prompts_keep_bot_reviews_apart_from_maintainer_feedback() {
         addressed_head_sha: None,
         synced_at: None,
         harvested_at: None,
-        harvest_attempts: 0,
-        last_harvest_failure: None,
     };
 
     for (name, prompt) in [

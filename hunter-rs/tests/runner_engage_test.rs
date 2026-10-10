@@ -1114,7 +1114,12 @@ async fn assert_left_for_the_cold_harvest(f: &Fixture, tree: &std::path::Path) {
     let ps = f.store.get_pr_state(f.fid).await.unwrap().unwrap();
     assert_eq!(ps.harvested_at, None);
     assert_eq!(
-        ps.harvest_attempts, 0,
+        f.store
+            .work_streak(f.fid, hunter::domain::FindingJobKind::Harvest)
+            .await
+            .unwrap()
+            .streak,
+        0,
         "a failed handoff is not a harvest failure"
     );
     assert!(!tree.exists(), "the chain's tree must be released");

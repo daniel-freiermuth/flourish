@@ -91,6 +91,14 @@ pub struct ResumeChainStats {
     pub max_single: i64,
 }
 
+/// The identical-failure streak of one work item (`finding_work`): how
+/// many attempts in a row failed, and the key they failed with.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkStreak {
+    pub streak: i64,
+    pub last_failure: Option<String>,
+}
+
 /// A job row just inserted, and the suspensions its insert retired.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatedJob {
@@ -517,8 +525,7 @@ impl Store {
                    severity AS "severity: Severity", confidence, summary, detail, status AS "status: FindingStatus", pr_url,
                    created_at, updated_at, bug_class AS "bug_class: BugClass", evidence_plan,
                    introduced_by, rung_achieved, verdict_reason,
-                   budget_override AS "budget_override: BudgetOverride", fix_attempts, last_fix_failure,
-                   recheck_attempts, last_recheck_failure, ecosystem, package,
+                   budget_override AS "budget_override: BudgetOverride", ecosystem, package,
                    current_version, latest_version, update_type,
                    security_advisory, missing_tests, test_file, smell_type,
                    suggested_refactor, modernization_class, current_approach,
@@ -828,8 +835,7 @@ impl Store {
             return Err(sqlx::Error::RowNotFound);
         }
         let finding = sqlx::query!(
-            "UPDATE findings SET status = ?1, updated_at = ?2, \
-             fix_attempts = 0, last_fix_failure = NULL WHERE id = ?3",
+            "UPDATE findings SET status = ?1, updated_at = ?2 WHERE id = ?3",
             blocked,
             now,
             finding_id
@@ -839,6 +845,15 @@ impl Store {
         if finding.rows_affected() == 0 {
             return Err(sqlx::Error::RowNotFound);
         }
+        let fix_work = FindingJobKind::Fix;
+        sqlx::query!(
+            "UPDATE finding_work SET streak = 0, last_failure = NULL \
+             WHERE finding_id = ?1 AND kind = ?2",
+            finding_id,
+            fix_work
+        )
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await
     }
 
@@ -1412,8 +1427,7 @@ impl Store {
                    severity AS "severity: Severity", confidence, summary, detail, status AS "status: FindingStatus", pr_url,
                    created_at, updated_at, bug_class AS "bug_class: BugClass", evidence_plan,
                    introduced_by, rung_achieved, verdict_reason,
-                   budget_override AS "budget_override: BudgetOverride", fix_attempts, last_fix_failure,
-                   recheck_attempts, last_recheck_failure, ecosystem, package,
+                   budget_override AS "budget_override: BudgetOverride", ecosystem, package,
                    current_version, latest_version, update_type,
                    security_advisory, missing_tests, test_file, smell_type,
                    suggested_refactor, modernization_class, current_approach,
@@ -1526,8 +1540,7 @@ impl Store {
                    last_activity_at, last_engaged_activity_at, needs_attention,
                    attention_since, attention_fingerprint,
                    addressed_fingerprint, head_sha, addressed_head_sha,
-                   synced_at, harvested_at, harvest_attempts,
-                   last_harvest_failure
+                   synced_at, harvested_at
             FROM pr_state
             WHERE finding_id = ?1
             "#,
@@ -2802,8 +2815,7 @@ impl Store {
                    severity AS "severity: Severity", confidence, summary, detail, status AS "status: FindingStatus", pr_url,
                    created_at, updated_at, bug_class AS "bug_class: BugClass", evidence_plan,
                    introduced_by, rung_achieved, verdict_reason,
-                   budget_override AS "budget_override: BudgetOverride", fix_attempts, last_fix_failure,
-                   recheck_attempts, last_recheck_failure, ecosystem, package,
+                   budget_override AS "budget_override: BudgetOverride", ecosystem, package,
                    current_version, latest_version, update_type,
                    security_advisory, missing_tests, test_file, smell_type,
                    suggested_refactor, modernization_class, current_approach,
@@ -2841,8 +2853,7 @@ impl Store {
                    severity AS "severity: Severity", confidence, summary, detail, status AS "status: FindingStatus", pr_url,
                    created_at, updated_at, bug_class AS "bug_class: BugClass", evidence_plan,
                    introduced_by, rung_achieved, verdict_reason,
-                   budget_override AS "budget_override: BudgetOverride", fix_attempts, last_fix_failure,
-                   recheck_attempts, last_recheck_failure, ecosystem, package,
+                   budget_override AS "budget_override: BudgetOverride", ecosystem, package,
                    current_version, latest_version, update_type,
                    security_advisory, missing_tests, test_file, smell_type,
                    suggested_refactor, modernization_class, current_approach,
@@ -3153,15 +3164,16 @@ impl Store {
     /// `pr_state` holds one row per finding, not per PR, and a finding can
     /// ship more than one PR: a closure harvested as `abandoned` sends it
     /// back to `new`, and its next fix opens a fresh PR on the same row.
-    /// The harvest bookkeeping (`harvested_at`, `harvest_attempts`,
-    /// `last_harvest_failure`) describes the PR it was recorded for, so a
-    /// different `pr_number` clears it; otherwise the new PR inherits the
-    /// old one's stamp and `list_pending_harvest` never selects it. The
-    /// same number keeps it, so re-syncing a PR never un-harvests it. A
-    /// stored NULL is an unknown number, not another PR (`set_pr_number`
-    /// fills it in for the PR already being worked), hence `<>` and not
-    /// `IS NOT`. Every `pr_state` upsert repeats these three CASEs:
-    /// `query!` takes one literal, so the SQL cannot be shared.
+    /// The harvest bookkeeping (`harvested_at`, and the harvest streak in
+    /// `finding_work`, which migration 023's trigger resets) describes the
+    /// PR it was recorded for, so a different `pr_number` clears it;
+    /// otherwise the new PR inherits the old one's stamp and
+    /// `list_pending_harvest` never selects it. The same number keeps it,
+    /// so re-syncing a PR never un-harvests it. A stored NULL is an unknown
+    /// number, not another PR (`set_pr_number` fills it in for the PR
+    /// already being worked), hence `<>` and not `IS NOT`. Every `pr_state`
+    /// upsert repeats this CASE: `query!` takes one literal, so the SQL
+    /// cannot be shared.
     pub async fn mark_pr_merged(
         &self,
         finding_id: i64,
@@ -3175,11 +3187,7 @@ impl Store {
              pr_number = excluded.pr_number, state = 'MERGED', \
              needs_attention = NULL, synced_at = excluded.synced_at, \
              harvested_at = CASE WHEN pr_state.pr_number <> excluded.pr_number \
-                 THEN NULL ELSE pr_state.harvested_at END, \
-             harvest_attempts = CASE WHEN pr_state.pr_number <> excluded.pr_number \
-                 THEN 0 ELSE pr_state.harvest_attempts END, \
-             last_harvest_failure = CASE WHEN pr_state.pr_number <> excluded.pr_number \
-                 THEN NULL ELSE pr_state.last_harvest_failure END",
+                 THEN NULL ELSE pr_state.harvested_at END",
             finding_id,
             pr_number,
             synced_at
@@ -3204,11 +3212,7 @@ impl Store {
              pr_number = excluded.pr_number, state = 'CLOSED', \
              needs_attention = NULL, synced_at = excluded.synced_at, \
              harvested_at = CASE WHEN pr_state.pr_number <> excluded.pr_number \
-                 THEN NULL ELSE pr_state.harvested_at END, \
-             harvest_attempts = CASE WHEN pr_state.pr_number <> excluded.pr_number \
-                 THEN 0 ELSE pr_state.harvest_attempts END, \
-             last_harvest_failure = CASE WHEN pr_state.pr_number <> excluded.pr_number \
-                 THEN NULL ELSE pr_state.last_harvest_failure END",
+                 THEN NULL ELSE pr_state.harvested_at END",
             finding_id,
             pr_number,
             synced_at
@@ -3253,11 +3257,7 @@ impl Store {
              attention_fingerprint = excluded.attention_fingerprint, \
              synced_at = excluded.synced_at, \
              harvested_at = CASE WHEN pr_state.pr_number <> excluded.pr_number \
-                 THEN NULL ELSE pr_state.harvested_at END, \
-             harvest_attempts = CASE WHEN pr_state.pr_number <> excluded.pr_number \
-                 THEN 0 ELSE pr_state.harvest_attempts END, \
-             last_harvest_failure = CASE WHEN pr_state.pr_number <> excluded.pr_number \
-                 THEN NULL ELSE pr_state.last_harvest_failure END",
+                 THEN NULL ELSE pr_state.harvested_at END",
             finding_id,
             d.pr_number,
             d.state,
@@ -3419,11 +3419,7 @@ impl Store {
             "INSERT INTO pr_state (finding_id, pr_number) VALUES (?1, ?2) \
              ON CONFLICT(finding_id) DO UPDATE SET pr_number = excluded.pr_number, \
              harvested_at = CASE WHEN pr_state.pr_number <> excluded.pr_number \
-                 THEN NULL ELSE pr_state.harvested_at END, \
-             harvest_attempts = CASE WHEN pr_state.pr_number <> excluded.pr_number \
-                 THEN 0 ELSE pr_state.harvest_attempts END, \
-             last_harvest_failure = CASE WHEN pr_state.pr_number <> excluded.pr_number \
-                 THEN NULL ELSE pr_state.last_harvest_failure END",
+                 THEN NULL ELSE pr_state.harvested_at END",
             finding_id,
             pr_number
         )
@@ -3455,8 +3451,7 @@ impl Store {
                    f.summary, f.detail, f.status AS "status: FindingStatus", f.pr_url,
                    f.created_at, f.updated_at, f.bug_class AS "bug_class: BugClass",
                    f.evidence_plan, f.introduced_by, f.rung_achieved, f.verdict_reason,
-                   f.budget_override AS "budget_override: BudgetOverride", f.fix_attempts, f.last_fix_failure,
-                   f.recheck_attempts, f.last_recheck_failure, f.ecosystem, f.package,
+                   f.budget_override AS "budget_override: BudgetOverride", f.ecosystem, f.package,
                    f.current_version, f.latest_version, f.update_type,
                    f.security_advisory, f.missing_tests, f.test_file, f.smell_type,
                    f.suggested_refactor, f.modernization_class, f.current_approach,
@@ -3533,108 +3528,62 @@ impl Store {
         Ok((stuck_findings, orphaned_jobs))
     }
 
-    /// Record a fix attempt fingerprint for retry-limiting.
-    pub async fn record_fix_attempt(
+    /// The identical-failure streak of `finding_id`'s `kind` work: zero and
+    /// no key while the work item has no row.
+    pub async fn work_streak(
         &self,
         finding_id: i64,
-        failure_fingerprint: &str,
-    ) -> sqlx::Result<i64> {
-        let now = now_ms();
-        // Streak tracking: same failure -> increment; different -> reset to 1
-        let finding = self.get_finding(finding_id).await?;
-        let (prev_failure, prev_attempts) = match &finding {
-            Some(f) => (f.last_fix_failure.as_deref(), f.fix_attempts),
-            None => (None, 0),
-        };
-        let attempts = if Some(failure_fingerprint) == prev_failure {
-            prev_attempts + 1
-        } else {
-            1
-        };
-        sqlx::query!(
-            "UPDATE findings SET fix_attempts = ?1, last_fix_failure = ?2, updated_at = ?3 WHERE id = ?4",
-            attempts, failure_fingerprint, now, finding_id
+        kind: FindingJobKind,
+    ) -> sqlx::Result<WorkStreak> {
+        Ok(sqlx::query_as!(
+            WorkStreak,
+            r#"SELECT streak AS "streak!: i64", last_failure FROM finding_work
+               WHERE finding_id = ?1 AND kind = ?2"#,
+            finding_id,
+            kind
         )
-        .execute(&self.pool)
-        .await?;
-        Ok(attempts)
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or_default())
     }
-    pub async fn clear_fix_attempts(&self, finding_id: i64) -> sqlx::Result<()> {
-        let now = now_ms();
-        sqlx::query!(
-            "UPDATE findings SET fix_attempts = 0, last_fix_failure = NULL, updated_at = ?1 WHERE id = ?2",
-            now, finding_id
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-    pub async fn record_recheck_attempt(
+
+    /// Count one failed attempt of `finding_id`'s `kind` work under `key`
+    /// and return the streak it makes: one more than before when the last
+    /// failure had the same key, else 1. One statement, so two writers
+    /// cannot both read the old streak and lose a count.
+    pub async fn record_work_failure(
         &self,
         finding_id: i64,
-        failure_fingerprint: &str,
+        kind: FindingJobKind,
+        key: &str,
     ) -> sqlx::Result<i64> {
-        let now = now_ms();
-        let finding = self.get_finding(finding_id).await?;
-        let (prev_failure, prev_attempts) = match &finding {
-            Some(f) => (f.last_recheck_failure.as_deref(), f.recheck_attempts),
-            None => (None, 0),
-        };
-        let attempts = if Some(failure_fingerprint) == prev_failure {
-            prev_attempts + 1
-        } else {
-            1
-        };
-        sqlx::query!(
-            "UPDATE findings SET recheck_attempts = ?1, last_recheck_failure = ?2, updated_at = ?3 WHERE id = ?4",
-            attempts, failure_fingerprint, now, finding_id
+        sqlx::query_scalar!(
+            r#"INSERT INTO finding_work (finding_id, kind, streak, last_failure)
+               VALUES (?1, ?2, 1, ?3)
+               ON CONFLICT(finding_id, kind) DO UPDATE SET
+                 streak = CASE WHEN finding_work.last_failure IS excluded.last_failure
+                     THEN finding_work.streak + 1 ELSE 1 END,
+                 last_failure = excluded.last_failure
+               RETURNING streak AS "streak!: i64""#,
+            finding_id,
+            kind,
+            key
         )
-        .execute(&self.pool)
-        .await?;
-        Ok(attempts)
+        .fetch_one(&self.pool)
+        .await
     }
-    pub async fn clear_recheck_attempts(&self, finding_id: i64) -> sqlx::Result<()> {
-        let now = now_ms();
-        sqlx::query!(
-            "UPDATE findings SET recheck_attempts = 0, last_recheck_failure = NULL, updated_at = ?1 WHERE id = ?2",
-            now, finding_id
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-    pub async fn record_harvest_attempt(
+
+    /// End `finding_id`'s `kind` streak: the work concluded or was given up.
+    pub async fn clear_work_streak(
         &self,
         finding_id: i64,
-        failure_fingerprint: &str,
-    ) -> sqlx::Result<i64> {
-        // harvest_attempts are stored in pr_state, not findings
-        let ps = self.get_pr_state(finding_id).await?;
-        let (prev_failure, prev_attempts) = match &ps {
-            Some(p) => (p.last_harvest_failure.as_deref(), p.harvest_attempts),
-            None => (None, 0),
-        };
-        let attempts = if Some(failure_fingerprint) == prev_failure {
-            prev_attempts + 1
-        } else {
-            1
-        };
+        kind: FindingJobKind,
+    ) -> sqlx::Result<()> {
         sqlx::query!(
-            "UPDATE pr_state SET harvest_attempts = ?1, last_harvest_failure = ?2 \
-             WHERE finding_id = ?3",
-            attempts,
-            failure_fingerprint,
-            finding_id
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(attempts)
-    }
-    pub async fn clear_harvest_attempts(&self, finding_id: i64) -> sqlx::Result<()> {
-        sqlx::query!(
-            "UPDATE pr_state SET harvest_attempts = 0, last_harvest_failure = NULL \
-             WHERE finding_id = ?1",
-            finding_id
+            "UPDATE finding_work SET streak = 0, last_failure = NULL \
+             WHERE finding_id = ?1 AND kind = ?2",
+            finding_id,
+            kind
         )
         .execute(&self.pool)
         .await?;

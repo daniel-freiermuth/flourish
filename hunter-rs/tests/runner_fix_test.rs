@@ -13,8 +13,8 @@
 mod support;
 
 use hunter::config::Config;
-use hunter::domain::ForgeName;
-use hunter::store::FindingInsert;
+use hunter::domain::{FindingJobKind, ForgeName};
+use hunter::store::{FindingInsert, WorkStreak};
 use support::{GitRepo, ScriptedBackend, TempDir, fresh_store, git};
 
 const REPO_URL: &str = "https://github.com/acme/widget";
@@ -708,6 +708,14 @@ async fn interrupted_blocked_resume_keeps_the_report_for_the_next_resume() {
         !tree.join("BLOCKED.md").exists(),
         "the restored report lives on the job row"
     );
+}
+
+/// The fixture finding's fix streak.
+async fn fix_streak(f: &Fixture) -> WorkStreak {
+    f.store
+        .work_streak(f.fid, FindingJobKind::Fix)
+        .await
+        .unwrap()
 }
 
 /// The blocker recorded on `job`'s row.
@@ -1442,16 +1450,18 @@ async fn a_shipped_fix_reaches_origin_and_opens_its_pr_from_the_branch() {
     let f = fixture("fix-ship-argv").await;
     route_push(&f, None);
     f.store
-        .record_fix_attempt(f.fid, "no commits")
+        .record_work_failure(f.fid, FindingJobKind::Fix, "no commits")
         .await
         .unwrap();
 
     let summary = fix(&f, &committing(true)).await;
 
     assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
-    let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
-    assert_eq!(after.fix_attempts, 0, "a shipped fix ends the streak");
-    assert_eq!(after.last_fix_failure, None);
+    assert_eq!(
+        fix_streak(&f).await,
+        WorkStreak::default(),
+        "a shipped fix ends the streak"
+    );
     let origin = git(&f.repo_dir, &["remote", "get-url", "origin"]);
     let pushed = git(
         std::path::Path::new(origin.trim()),
@@ -1498,8 +1508,9 @@ async fn a_failed_pr_create_requeues() {
     let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
     assert_eq!(after.status, hunter::domain::FindingStatus::Queued);
     assert_eq!(after.pr_url, None);
-    assert_eq!(after.fix_attempts, 1);
-    assert_eq!(after.last_fix_failure.as_deref(), Some(failure.as_str()));
+    let streak = fix_streak(&f).await;
+    assert_eq!(streak.streak, 1);
+    assert_eq!(streak.last_failure.as_deref(), Some(failure.as_str()));
 }
 
 /// A push that fails requeues the finding, and no PR is attempted for a
@@ -1552,7 +1563,11 @@ async fn unshippable_work_is_requeued_with_the_reason() {
             hunter::domain::FindingStatus::Queued,
             "{label}"
         );
-        assert_eq!(after.last_fix_failure.as_deref(), Some(reason), "{label}");
+        assert_eq!(
+            fix_streak(&f).await.last_failure.as_deref(),
+            Some(reason),
+            "{label}"
+        );
     }
 }
 
@@ -1563,7 +1578,7 @@ async fn a_different_failure_restarts_the_streak() {
     let f = fixture("fix-streak-reset").await;
     for _ in 0..2 {
         f.store
-            .record_fix_attempt(f.fid, "no commits")
+            .record_work_failure(f.fid, FindingJobKind::Fix, "no commits")
             .await
             .unwrap();
     }
@@ -1573,7 +1588,7 @@ async fn a_different_failure_restarts_the_streak() {
     assert_eq!(summary.outcome.as_deref(), Some("requeued"), "{summary:?}");
     let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
     assert_eq!(after.status, hunter::domain::FindingStatus::Queued);
-    assert_eq!(after.fix_attempts, 1);
+    assert_eq!(fix_streak(&f).await.streak, 1);
 }
 
 // ---------------------------------------------------------------------------

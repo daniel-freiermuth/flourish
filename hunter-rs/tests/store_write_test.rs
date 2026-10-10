@@ -1226,20 +1226,29 @@ impl PrUpsert {
 /// two attempts into a failure streak.
 async fn seed_harvested_pr(pool: &SqlitePool, pr_number: Option<i64>) {
     sqlx::query(
-        "INSERT INTO pr_state (finding_id, pr_number, state, harvested_at, \
-         harvest_attempts, last_harvest_failure) VALUES (1, ?1, 'CLOSED', 4000, 2, 'gh: 502')",
+        "INSERT INTO pr_state (finding_id, pr_number, state, harvested_at) \
+         VALUES (1, ?1, 'CLOSED', 4000)",
     )
     .bind(pr_number)
     .execute(pool)
     .await
     .unwrap();
+    sqlx::query(
+        "INSERT INTO finding_work (finding_id, kind, streak, last_failure) \
+         VALUES (1, 'harvest', 2, 'gh: 502')",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
-/// Finding 1's (`harvested_at`, `harvest_attempts`, `last_harvest_failure`).
+/// Finding 1's (`harvested_at`, harvest streak, its failure key).
 async fn harvest_bookkeeping(pool: &SqlitePool) -> (Option<i64>, i64, Option<String>) {
     sqlx::query_as(
-        "SELECT harvested_at, harvest_attempts, last_harvest_failure \
-         FROM pr_state WHERE finding_id = 1",
+        "SELECT p.harvested_at, COALESCE(w.streak, 0), w.last_failure \
+         FROM pr_state p LEFT JOIN finding_work w \
+           ON w.finding_id = p.finding_id AND w.kind = 'harvest' \
+         WHERE p.finding_id = 1",
     )
     .fetch_one(pool)
     .await
@@ -1778,7 +1787,8 @@ async fn blocked_store_fixture() -> (TempDir, hunter::store::Store, String) {
     let (dir, path, pool) = fresh_db().await;
     seed_repo_and_findings(&pool).await;
     sqlx::raw_sql(
-        "UPDATE findings SET fix_attempts = 3, last_fix_failure = 'old failure' WHERE id IN (1, 2); \
+        "INSERT INTO finding_work (finding_id, kind, streak, last_failure) VALUES \
+             (1, 'fix', 3, 'old failure'), (2, 'fix', 3, 'old failure'); \
          INSERT INTO jobs (id, kind, repo_id, finding_id, state, pid, session_file, \
                            tokens_new, calls, usage_delta, cap_tokens, exit_code, killed_reason, \
                            model, started_at, finished_at, pinned_sha) VALUES \
@@ -1824,8 +1834,13 @@ async fn blocked_fix_retains_checkpoint_without_suppressing_the_finding() {
             store.held_fix_blockers().await.unwrap().get(&finding_id),
             Some(&reason)
         );
-        assert_eq!(finding.fix_attempts, 0);
-        assert_eq!(finding.last_fix_failure, None);
+        assert_eq!(
+            store
+                .work_streak(finding_id, hunter::domain::FindingJobKind::Fix)
+                .await
+                .unwrap(),
+            hunter::store::WorkStreak::default()
+        );
         assert!(finding.updated_at > 1000);
         let job = store.jobs_by_finding(finding_id).await.unwrap().remove(0);
         assert_eq!(job.state, JobState::Suspended);

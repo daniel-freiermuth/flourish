@@ -44,12 +44,12 @@ async fn seed_findings(pool: &SqlitePool) {
         r"
         INSERT INTO findings
             (id, type, repo_id, fingerprint, severity, confidence, summary, status,
-             created_at, updated_at, fix_attempts, recheck_attempts)
+             created_at, updated_at)
         VALUES
-            (1, 'bug', 1, 'fp1', 'low',    0.9, 'one',   'new',     1000, 1000, 0, 0),
-            (2, 'bug', 1, 'fp2', 'medium', 0.8, 'two',   'queued',  1000, 1000, 0, 0),
-            (3, 'bug', 1, 'fp3', 'high',   0.7, 'three', 'fixing',  1000, 1000, 0, 0),
-            (4, 'bug', 1, 'fp4', 'low',    0.6, 'four',  'queued',  1000, 1000, 0, 0);
+            (1, 'bug', 1, 'fp1', 'low',    0.9, 'one',   'new',     1000, 1000),
+            (2, 'bug', 1, 'fp2', 'medium', 0.8, 'two',   'queued',  1000, 1000),
+            (3, 'bug', 1, 'fp3', 'high',   0.7, 'three', 'fixing',  1000, 1000),
+            (4, 'bug', 1, 'fp4', 'low',    0.6, 'four',  'queued',  1000, 1000);
         ",
     )
     .execute(pool)
@@ -596,39 +596,68 @@ async fn upsert_finding_and_queries() {
     assert_eq!(suppressed2.len(), 1);
 }
 
-// -- 7. record/clear attempt tracking ----------------------------------------
+// -- 7. record/clear failure streaks -----------------------------------------
 
 #[tokio::test]
-async fn fix_attempt_streak_tracking() {
+async fn work_failure_streak_tracking() {
+    use hunter::domain::FindingJobKind::{Fix, Harvest};
     let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
     seed_findings(&pool).await;
     let store = rw_store(&path).await;
+    let streak = |kind| {
+        let store = store.clone();
+        async move { store.work_streak(1, kind).await.unwrap() }
+    };
 
-    // Record same failure 3 times
-    store.record_fix_attempt(1, "push failed").await.unwrap();
-    let f = store.get_finding(1).await.unwrap().unwrap();
-    assert_eq!(f.fix_attempts, 1);
-    assert_eq!(f.last_fix_failure.as_deref(), Some("push failed"));
+    // Same failure twice
+    assert_eq!(
+        store
+            .record_work_failure(1, Fix, "push failed")
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        streak(Fix).await.last_failure.as_deref(),
+        Some("push failed")
+    );
+    assert_eq!(
+        store
+            .record_work_failure(1, Fix, "push failed")
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(streak(Fix).await.streak, 2);
 
-    store.record_fix_attempt(1, "push failed").await.unwrap();
-    let f = store.get_finding(1).await.unwrap().unwrap();
-    assert_eq!(f.fix_attempts, 2);
+    // Each kind keeps its own streak
+    assert_eq!(
+        store
+            .record_work_failure(1, Harvest, "push failed")
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(streak(Fix).await.streak, 2);
 
     // Different failure resets streak
-    store
-        .record_fix_attempt(1, "PR create failed")
-        .await
-        .unwrap();
-    let f = store.get_finding(1).await.unwrap().unwrap();
-    assert_eq!(f.fix_attempts, 1);
-    assert_eq!(f.last_fix_failure.as_deref(), Some("PR create failed"));
+    assert_eq!(
+        store
+            .record_work_failure(1, Fix, "PR create failed")
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        streak(Fix).await.last_failure.as_deref(),
+        Some("PR create failed")
+    );
 
-    // Clear resets everything
-    store.clear_fix_attempts(1).await.unwrap();
-    let f = store.get_finding(1).await.unwrap().unwrap();
-    assert_eq!(f.fix_attempts, 0);
-    assert!(f.last_fix_failure.is_none());
+    // Clear resets everything, for that kind only
+    store.clear_work_streak(1, Fix).await.unwrap();
+    assert_eq!(streak(Fix).await, hunter::store::WorkStreak::default());
+    assert_eq!(streak(Harvest).await.streak, 1);
 }
 
 // -- 3b. reconcile_and_log: an orphan that did work is kept for resume -------
@@ -851,8 +880,8 @@ async fn repo_with_an_undecodable_finding(
     sqlx::query(
         "INSERT INTO findings
             (type, repo_id, fingerprint, severity, confidence, summary, status,
-             created_at, updated_at, fix_attempts, recheck_attempts)
-         VALUES (?1, ?2, 'fp-bad', 'HIGH', 0.9, 'turned down', 'rejected', 1000, 1000, 0, 0)",
+             created_at, updated_at)
+         VALUES (?1, ?2, 'fp-bad', 'HIGH', 0.9, 'turned down', 'rejected', 1000, 1000)",
     )
     .bind(finding_type)
     .bind(rid)

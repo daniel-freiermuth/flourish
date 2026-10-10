@@ -105,9 +105,10 @@ impl From<&Repo> for RepoBrief {
     }
 }
 
-/// findings row, all 39 columns (38 from migrations/001 + `standard_section`
-/// from migrations/004). `missing_tests` is JSON-encoded TEXT served
-/// as a plain string — do NOT parse it.
+/// findings row, all 35 columns (38 from migrations/001 + `standard_section`
+/// from migrations/004, less the four streak columns migration 023 moved to
+/// `finding_work`). `missing_tests` is JSON-encoded TEXT served as a plain
+/// string — do NOT parse it.
 #[derive(Debug, Clone, Serialize, TS)]
 pub struct Finding {
     pub id: i64,
@@ -132,10 +133,6 @@ pub struct Finding {
     pub rung_achieved: Option<i64>,
     pub verdict_reason: Option<String>,
     pub budget_override: Option<BudgetOverride>,
-    pub fix_attempts: i64,
-    pub last_fix_failure: Option<String>,
-    pub recheck_attempts: i64,
-    pub last_recheck_failure: Option<String>,
     pub ecosystem: Option<String>,
     pub package: Option<String>,
     pub current_version: Option<String>,
@@ -270,7 +267,7 @@ pub struct Event {
     pub username: Option<String>,
 }
 
-/// `pr_state` row, all 18 columns the code creates (the live DB may carry
+/// `pr_state` row, all 16 columns the code creates (the live DB may carry
 /// residual columns — explicit column list excludes them).
 #[derive(Debug, Clone, Serialize, TS)]
 pub struct PrState {
@@ -290,8 +287,6 @@ pub struct PrState {
     pub addressed_head_sha: Option<String>,
     pub synced_at: Option<i64>,
     pub harvested_at: Option<i64>,
-    pub harvest_attempts: i64,
-    pub last_harvest_failure: Option<String>,
 }
 
 /// `scheduler_state` single row (id = 1).
