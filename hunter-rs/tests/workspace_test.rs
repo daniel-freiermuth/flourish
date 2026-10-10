@@ -430,6 +430,33 @@ async fn the_sweep_releases_only_finished_chains_and_ages_out_their_sessions() {
     );
 }
 
+/// A chain that was resumed and then finished is as finished as one that
+/// never was: its tree is released when the last attempt ends, and the
+/// workspace ages out with the rest. The attempt the resume continued
+/// will never be offered again — its successor is the record that it was
+/// picked up — so it must not keep the chain's tree alive.
+#[tokio::test]
+async fn a_resumed_chain_that_finished_releases_its_tree_and_ages_out() {
+    let f = fixture("ws-resumed-release", "main").await;
+
+    let (_, _, cold, _, origin_id) = suspend_then_resume_a_hunt(&f).await;
+
+    assert!(!cold.tree.exists(), "the finished chain's tree is released");
+    assert!(
+        !git(&f.clone, &["worktree", "list", "--porcelain"])
+            .contains(cold.tree.to_string_lossy().as_ref()),
+        "and unregistered from the clone"
+    );
+
+    let root = f.cfg.work_root.join("jobs").join(origin_id.to_string());
+    let later = hunter::util::now_ms() + SESSION_RETENTION_MS + 1;
+    let report = workspace::sweep(&f.store, &f.cfg.work_root, later)
+        .await
+        .unwrap();
+    assert_eq!(report.workspaces_removed, 1);
+    assert!(!root.exists(), "past retention the workspace goes");
+}
+
 /// A daemon killed during `git worktree add` leaves the registration
 /// locked (`initializing`) with its directory gone. Plain prune skips a
 /// locked worktree, so the sweep must unlock it first -- but only one
@@ -543,6 +570,62 @@ async fn a_fresh_fix_superseding_a_suspended_fix_takes_over_its_branch() {
     assert!(
         !old_tree.exists(),
         "the superseded chain's tree was released"
+    );
+}
+
+/// A resumed fix that then fails ends its chain, so its tree — and the
+/// per-finding branch checked out in it — is released, and the next fresh
+/// fix of the finding can check the branch out again. Nothing supersedes
+/// that chain: its suspension already has a successor.
+#[tokio::test]
+async fn a_fresh_fix_after_a_failed_resume_takes_over_its_branch() {
+    let f = fixture("ws-fix-after-resume", "main").await;
+    let fid = queued_finding(&f.store).await;
+    let finding = f.store.get_finding(fid).await.unwrap().unwrap();
+
+    let suspending =
+        ScriptedBackend::new(|tree| suspended_at_cap(&tree.parent().unwrap().join("session")));
+    let first = run_fix(&f.store, &f.cfg, &finding, &suspending, None)
+        .await
+        .unwrap();
+    assert_eq!(first.state, Some(JobState::Suspended), "{first:?}");
+    let old_tree = f
+        .cfg
+        .work_root
+        .join("jobs")
+        .join(first.job_id.unwrap().to_string())
+        .join("tree");
+
+    let plan = match pick_next(&f.store, &f.cfg, None).await.unwrap() {
+        Some(Candidate::Resume { plan, .. }) => *plan,
+        other => panic!("expected the suspended fix to be resumed, got {other:?}"),
+    };
+    let finding = f.store.get_finding(fid).await.unwrap().unwrap();
+    let failing = ScriptedBackend::new(|_| RunResult {
+        exit_code: Some(1),
+        killed_reason: None,
+        tokens_new: 0,
+        calls: 0,
+        session_file: None,
+        duration_s: 1.0,
+        stdout_tail: "crashed".to_owned(),
+        usage_delta: None,
+    });
+    let resumed = run_fix(&f.store, &f.cfg, &finding, &failing, Some(&plan))
+        .await
+        .unwrap();
+    assert_eq!(resumed.state, Some(JobState::Failed), "{resumed:?}");
+    assert!(!old_tree.exists(), "the ended chain's tree was released");
+
+    let finding = f.store.get_finding(fid).await.unwrap().unwrap();
+    let declining = ScriptedBackend::writing("NOT-A-BUG.md", "misread the code");
+    let fresh = run_fix(&f.store, &f.cfg, &finding, &declining, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        fresh.outcome.as_deref(),
+        Some("rejected"),
+        "the fresh fix got a tree on the shared branch and ran: {fresh:?}"
     );
 }
 

@@ -21,9 +21,10 @@
 //!
 //! Every removal here is gated on the job table. [`release_if_idle`] and
 //! [`sweep`] read the chain's state from the database before touching a
-//! tree, and a chain with a `running` or `suspended` attempt is never
-//! touched. The one exception is [`create`] cleaning up a workspace it
-//! made itself a moment earlier for a job that has not run.
+//! tree, and a chain with a `running` attempt, or a `suspended` one
+//! nothing has resumed yet, is never touched. The one exception is
+//! [`create`] cleaning up a workspace it made itself a moment earlier for
+//! a job that has not run.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -295,7 +296,8 @@ fn release_tree(ws: &Workspace) {
 }
 
 /// Release a chain's tree if, according to the job table, no attempt of the
-/// chain is `running` or `suspended`. Returns whether it released.
+/// chain is `running` or awaiting resume ([`Store::chain_status`]'s `live`).
+/// Returns whether it released.
 ///
 /// The executors call this after recording a job's outcome, and for every
 /// chain a fresh job superseded; both are the moment a chain becomes

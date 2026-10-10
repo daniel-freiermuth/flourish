@@ -105,8 +105,9 @@ pub struct CreatedJob {
 pub struct ChainStatus {
     /// Rows found in the chain. 0 means no job owns the workspace at all.
     pub attempts: i64,
-    /// Attempts that are `running` or `suspended`. Nonzero means the tree
-    /// is in use or will be resumed, and must not be touched.
+    /// Attempts that are `running`, or `suspended` with nothing continuing
+    /// them yet. Nonzero means the tree is in use or will be resumed, and
+    /// must not be touched.
     pub live: i64,
     /// When the chain's latest attempt finished, if any has.
     pub last_finished_at: Option<i64>,
@@ -2356,6 +2357,12 @@ impl Store {
     /// Walks successors from the origin, because a workspace is keyed by
     /// its chain's FIRST job and every later attempt links back to it.
     /// Depth-capped for the same reason [`Self::resume_chain_stats`] is.
+    ///
+    /// A `suspended` attempt that a later row continues is not live. It
+    /// stays `suspended` once resumed — the successor is the record that
+    /// it was picked up, see [`Self::list_resumable_jobs`] — and is never
+    /// offered again, so counting it would hold every resumed chain's
+    /// tree, and a fix chain's branch, for good.
     pub async fn chain_status(&self, origin_id: i64) -> sqlx::Result<ChainStatus> {
         let running = JobState::Running;
         let suspended = JobState::Suspended;
@@ -2370,11 +2377,12 @@ impl Store {
                 WHERE c.depth < ?2 AND j.resumed_from = c.id
             )
             SELECT COUNT(*) AS "attempts!: i64",
-                   COALESCE(SUM(state IN (?3, ?4)), 0) AS "live!: i64",
-                   MAX(finished_at) AS "last_finished_at?: i64",
+                   COALESCE(SUM(a.state = ?3 OR (a.state = ?4 AND NOT EXISTS
+                       (SELECT 1 FROM jobs s WHERE s.resumed_from = a.id))), 0) AS "live!: i64",
+                   MAX(a.finished_at) AS "last_finished_at?: i64",
                    (SELECT r.path FROM jobs o JOIN repos r ON r.id = o.repo_id
                     WHERE o.id = ?1) AS "clone?: String"
-            FROM jobs WHERE id IN (SELECT id FROM chain)
+            FROM jobs a WHERE a.id IN (SELECT id FROM chain)
             "#,
             origin_id,
             RESUME_CHAIN_MAX_DEPTH,
