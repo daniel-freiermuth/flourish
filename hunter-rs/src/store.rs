@@ -3023,7 +3023,9 @@ impl Store {
     /// old one behind. Only `new` and `queued` (no worker has started on
     /// it), and a finding [`Self::supersede_unproposed_dep_updates`] retired,
     /// which comes back as `new`: the scan proposing it again means it never
-    /// landed. `true` when anything changed.
+    /// landed. Not a `queued` one whose fix has a checkpoint: a worker is
+    /// part way to the old target, and resuming it against a rewritten one
+    /// would mix the two (WORK-MODEL.md G2). `true` when anything changed.
     pub async fn refresh_dep_update(
         &self,
         finding_id: i64,
@@ -3056,6 +3058,8 @@ impl Store {
              updated_at = ?14 \
              WHERE id = ?15 AND type = 'dep_update' \
                AND (status IN (?13, ?16) OR (status = ?12 AND verdict_reason = ?17)) \
+               AND NOT EXISTS (SELECT 1 FROM finding_work w WHERE w.finding_id = ?15 \
+                   AND w.kind = 'fix' AND w.checkpoint_job_id IS NOT NULL) \
                AND (status = ?12 OR file IS NOT ?1 OR severity IS NOT ?2 \
                     OR confidence IS NOT ?3 OR summary IS NOT ?4 OR detail IS NOT ?5 \
                     OR ecosystem IS NOT ?6 OR package IS NOT ?7 \
@@ -3140,8 +3144,11 @@ impl Store {
     /// before branch grouping keyed on versions, and one whose installed
     /// version moved has a new fingerprint. Without it the queued one and
     /// the proposal would both be worked. A queued finding with no such
-    /// match is left as it is. `moves` is every move of every finding the
-    /// scan produced. Returns how many were handed over.
+    /// match is left as it is, and so is one whose fix has a checkpoint:
+    /// handing it over would drop the work a paused fix has done for a
+    /// fresh fix of the scan's finding (WORK-MODEL.md G2). `moves` is every
+    /// move of every finding the scan produced. Returns how many were
+    /// handed over.
     pub async fn hand_over_queued_dep_updates(
         &self,
         repo_id: i64,
@@ -3168,6 +3175,8 @@ impl Store {
                  ON p.repo_id = q.repo_id AND p.type = 'dep_update' AND p.status = ?3
                 AND p.fingerprint = json_extract(m.value, '$.fingerprint')
                WHERE q.repo_id = ?1 AND q.type = 'dep_update' AND q.status = ?2
+                 AND NOT EXISTS (SELECT 1 FROM finding_work w WHERE w.finding_id = q.id
+                     AND w.kind = 'fix' AND w.checkpoint_job_id IS NOT NULL)
                  AND q.fingerprint NOT IN
                      (SELECT json_extract(value, '$.fingerprint') FROM json_each(?4))
                GROUP BY q.id"#,

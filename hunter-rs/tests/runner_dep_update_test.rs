@@ -786,3 +786,77 @@ async fn a_queued_group_hands_its_queue_to_the_same_branch() {
     );
     assert_eq!(rig.status_of(major).await, "queued", "another unit");
 }
+
+/// A paused fix of a queued update: the update has a checkpoint, so a
+/// worker is part way through it.
+async fn pause_a_fix(rig: &Rig, fingerprint: &str) -> i64 {
+    let fid = rig.id_of(fingerprint).await;
+    let job: i64 = sqlx::query_scalar(
+        "INSERT INTO jobs (kind, repo_id, finding_id, state, session_file, started_at) \
+         VALUES ('fix', ?1, ?2, 'suspended', '/s/fix.jsonl', 1000) RETURNING id",
+    )
+    .bind(rig.repo.id)
+    .bind(fid)
+    .fetch_one(&rig.pool)
+    .await
+    .unwrap();
+    support::point_checkpoint(&rig.pool, fid, "fix", job).await;
+    job
+}
+
+/// The fix checkpoint of the finding `fingerprint`, if any.
+async fn fix_checkpoint(rig: &Rig, fingerprint: &str) -> Option<i64> {
+    rig.store
+        .checkpoint_job(
+            rig.id_of(fingerprint).await,
+            hunter::domain::FindingJobKind::Fix,
+        )
+        .await
+        .unwrap()
+        .map(|j| j.id)
+}
+
+/// A queued update whose fix is paused part way is not handed over: the
+/// scan would supersede it under the checkpoint, and the work done so far
+/// would be dropped for a fresh fix of the scan's finding (WORK-MODEL.md
+/// G2).
+#[tokio::test]
+async fn a_paused_fix_keeps_its_queued_update_from_being_handed_over() {
+    let rig = Rig::new("depupd-paused-handover").await;
+    let fallback = "widget:dep:left-pad-non-major@1.2.0";
+    rig.seed_update(fallback, "left-pad", "minor", rig.repo.id)
+        .await;
+    rig.set_status(fallback, "queued", None).await;
+    let paused = pause_a_fix(&rig, fallback).await;
+
+    rig.scan(&left_pad("1.2.0", Some("1.3.0"))).await.unwrap();
+
+    assert_eq!(rig.state_of(fallback).await, ("queued".into(), None, None));
+    assert_eq!(fix_checkpoint(&rig, fallback).await, Some(paused));
+    assert_eq!(
+        rig.status_of("widget:dep:left-pad-1.x@1.2.0").await,
+        "new",
+        "the scan's own finding is not queued in its place"
+    );
+}
+
+/// A queued update whose fix is paused part way keeps the target the fix
+/// is working towards: a newer release does not rewrite it under the
+/// checkpoint.
+#[tokio::test]
+async fn a_paused_fix_keeps_its_queued_update_from_being_refreshed() {
+    let rig = Rig::new("depupd-paused-refresh").await;
+    let fp = "widget:dep:left-pad-1.x@1.2.0";
+    rig.scan(&left_pad("1.2.0", Some("1.3.0"))).await.unwrap();
+    rig.set_status(fp, "queued", None).await;
+    let paused = pause_a_fix(&rig, fp).await;
+
+    let s = rig.scan(&left_pad("1.2.0", Some("1.4.0"))).await.unwrap();
+
+    assert_eq!(s.ingest.as_ref().map(|i| i.refreshed), Some(0), "{s:?}");
+    assert_eq!(
+        rig.findings().await,
+        vec![(fp.into(), "queued".into(), Some("1.3.0".into()))]
+    );
+    assert_eq!(fix_checkpoint(&rig, fp).await, Some(paused));
+}
