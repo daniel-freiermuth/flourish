@@ -1650,94 +1650,129 @@ async fn resume_chain_stats_terminate_on_a_cyclic_link() {
     );
 }
 
-/// Every suspended finding job ends up in exactly one place: resumable at
-/// its kind's actionable status, held (a fix at `blocked`, or at `fixing`
-/// between `run_fix`'s claim and its job), or retired. Before
-/// retirement existed, a suspension whose finding moved on (a blocked fix
-/// the operator then rejected) was neither listed nor retired, so it stayed
-/// `suspended` forever and the sweep kept its whole tree on disk.
+/// A finding's work item keeps its checkpoint exactly while the finding is
+/// in that kind's tier, whoever moves it out: the pointer is dropped in
+/// the same write, with its streak, and the job row it named stays as it
+/// ended. Before the pointer, such a suspension was retired by a sweep
+/// that had to run first; until then nothing resumed it and nothing freed
+/// its tree.
 #[tokio::test]
-async fn every_finding_suspension_is_resumable_held_or_retired() {
-    for status in FindingStatus::ALL {
-        let (_dir, path, pool) = fresh_db().await;
-        seed_repo_and_findings(&pool).await;
-        for (id, kind) in [
-            (11, "fix"),
-            (12, "recheck"),
-            (13, "engage"),
-            (14, "harvest"),
-        ] {
+async fn leaving_a_tier_drops_the_checkpoint_and_keeps_the_job_row() {
+    use hunter::domain::FindingJobKind;
+    for (kind, at) in [
+        (FindingJobKind::Fix, FindingStatus::Queued),
+        (FindingJobKind::Fix, FindingStatus::Fixing),
+        (FindingJobKind::Fix, FindingStatus::Blocked),
+        (FindingJobKind::Recheck, FindingStatus::Rechecking),
+        (FindingJobKind::Engage, FindingStatus::PrOpen),
+        (FindingJobKind::Harvest, FindingStatus::Merged),
+        (FindingJobKind::Harvest, FindingStatus::Closed),
+    ] {
+        for to in FindingStatus::ALL {
+            let (_dir, path, pool) = fresh_db().await;
+            seed_repo_and_findings(&pool).await;
+            let store = rw_store(&path).await;
+            store.set_finding_status(1, at).await.unwrap();
             sqlx::query(
                 "INSERT INTO jobs (id, kind, repo_id, finding_id, state, session_file, started_at) \
-                 VALUES (?1, ?2, 1, 1, 'suspended', '/s/finding/session.jsonl', 1000)",
+                 VALUES (11, ?1, 1, 1, 'suspended', '/s/11/session.jsonl', 1000)",
             )
-            .bind(id)
-            .bind(kind)
+            .bind(kind.as_str())
             .execute(&pool)
             .await
             .unwrap();
-        }
-        // A repo job and a suspension already continued are not this rule's.
-        insert_suspended_job(&pool, 20, 1, Some("/s/20/session.jsonl")).await;
-        sqlx::query(
-            "INSERT INTO jobs (id, kind, repo_id, finding_id, state, session_file, started_at) \
-             VALUES (21, 'fix', 1, 1, 'suspended', '/s/21/session.jsonl', 1000), \
-                    (22, 'fix', 1, 1, 'running', '/s/21/session.jsonl', 1000)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query("UPDATE jobs SET resumed_from = 21 WHERE id = 22")
+            sqlx::query(
+                "INSERT INTO finding_work (finding_id, kind, streak, last_failure, \
+                 checkpoint_job_id) VALUES (1, ?1, 2, 'no commits', 11)",
+            )
+            .bind(kind.as_str())
             .execute(&pool)
             .await
             .unwrap();
-        let store = rw_store(&path).await;
-        store.set_finding_status(1, status).await.unwrap();
 
-        let resumable: Vec<i64> = store
-            .list_resumable_jobs()
-            .await
-            .unwrap()
-            .iter()
-            .map(|j| j.id)
-            .filter(|id| (11..=14).contains(id))
-            .collect();
-        let mut retired = store.retire_stranded_suspensions().await.unwrap();
-        retired.sort_unstable();
-        let held: Vec<i64> = if matches!(status, FindingStatus::Blocked | FindingStatus::Fixing) {
-            vec![11]
-        } else {
-            Vec::new()
-        };
-        let mut kept = [resumable.clone(), held.clone()].concat();
-        kept.sort_unstable();
-        let all: Vec<i64> = (11..=14).filter(|id| !kept.contains(id)).collect();
-        assert_eq!(retired, all, "finding status {status}");
+            store.set_finding_status(1, to).await.unwrap();
 
-        for id in 11..=22 {
-            let (state, reason): (String, Option<String>) =
-                sqlx::query_as("SELECT state, killed_reason FROM jobs WHERE id = ?1")
-                    .bind(id)
-                    .fetch_optional(&pool)
-                    .await
-                    .unwrap()
-                    .unwrap_or_else(|| ("absent".to_owned(), None));
-            if retired.contains(&id) {
-                assert_eq!(state, "killed", "{status} job {id}");
-                assert_eq!(reason.as_deref(), Some("finding-moved"));
-            } else if [11, 12, 13, 14, 20, 21].contains(&id) {
-                assert_eq!(state, "suspended", "{status} job {id}");
-            }
-        }
-        assert!(
-            store
-                .retire_stranded_suspensions()
+            let stays = to == at
+                || matches!(
+                    (kind, to),
+                    (
+                        FindingJobKind::Fix,
+                        FindingStatus::Queued | FindingStatus::Fixing | FindingStatus::Blocked
+                    ) | (
+                        FindingJobKind::Harvest,
+                        FindingStatus::Merged | FindingStatus::Closed
+                    )
+                );
+            let label = format!("{kind} at {at} -> {to}");
+            let pointer = store.checkpoint_job(1, kind).await.unwrap().map(|j| j.id);
+            let streak = store.work_streak(1, kind).await.unwrap().streak;
+            let dropped_events = store
+                .recent_events(10)
                 .await
                 .unwrap()
-                .is_empty(),
-            "retiring is idempotent"
-        );
+                .iter()
+                .filter(|e| e.kind == "resume" && e.message.contains("checkpoint job 11 dropped"))
+                .count();
+            if stays {
+                assert_eq!(
+                    (pointer, streak, dropped_events),
+                    (Some(11), 2, 0),
+                    "{label}"
+                );
+            } else {
+                assert_eq!((pointer, streak, dropped_events), (None, 0, 1), "{label}");
+            }
+            let (state, reason): (String, Option<String>) =
+                sqlx::query_as("SELECT state, killed_reason FROM jobs WHERE id = 11")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!((state.as_str(), reason), ("suspended", None), "{label}");
+        }
     }
+}
+
+/// A harvest's work item ends when its PR is harvested, whatever the
+/// finding's status says.
+#[tokio::test]
+async fn harvesting_a_pr_drops_its_harvest_checkpoint() {
+    use hunter::domain::FindingJobKind;
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo_and_findings(&pool).await;
+    let store = rw_store(&path).await;
+    store
+        .set_finding_status(1, FindingStatus::Merged)
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        "INSERT INTO pr_state (finding_id, pr_number, state) VALUES (1, 7, 'MERGED'); \
+         INSERT INTO jobs (id, kind, repo_id, finding_id, state, session_file, started_at) \
+         VALUES (11, 'harvest', 1, 1, 'suspended', '/s/11/session.jsonl', 1000); \
+         INSERT INTO finding_work (finding_id, kind, streak, last_failure, checkpoint_job_id) \
+         VALUES (1, 'harvest', 1, 'pr view failed', 11);",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    store.mark_pr_harvested(1, 5000).await.unwrap();
+
+    assert_eq!(
+        store
+            .checkpoint_job(1, FindingJobKind::Harvest)
+            .await
+            .unwrap()
+            .map(|j| j.id),
+        None
+    );
+    assert_eq!(
+        store
+            .work_streak(1, FindingJobKind::Harvest)
+            .await
+            .unwrap()
+            .streak,
+        0
+    );
 }
 
 #[tokio::test]
@@ -1764,6 +1799,15 @@ async fn finding_checkpoints_resume_only_at_their_actionable_status() {
     let store = rw_store(&path).await;
     for status in FindingStatus::ALL {
         store.set_finding_status(1, status).await.unwrap();
+        // Pointed after the move: this is about which status resumes a
+        // checkpoint, not about which statuses keep one.
+        sqlx::query(
+            "INSERT OR REPLACE INTO finding_work (finding_id, kind, checkpoint_job_id) \
+             SELECT 1, kind, id FROM jobs WHERE id BETWEEN 11 AND 14",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         let actual = store
             .list_resumable_jobs()
             .await
@@ -2077,4 +2121,48 @@ async fn a_full_hunt_request_never_reuses_a_value() {
     // A new request after one was attempted and settled.
     assert!(store.request_full_hunt(2).await.unwrap());
     assert_eq!(requested(2).await, ahead + 1);
+}
+
+/// Dropping a checkpoint drops only the one named: when the pointer has
+/// moved on to another attempt since the caller read it, nothing changes,
+/// nothing is logged, and the caller is told so (`false`), rather than the
+/// newer checkpoint being thrown away or a drop logged that never happened.
+#[tokio::test]
+async fn dropping_a_checkpoint_that_moved_on_changes_nothing() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo_and_findings(&pool).await;
+    sqlx::raw_sql(
+        "INSERT INTO jobs (id, kind, repo_id, finding_id, state, session_file, started_at, \
+                           finished_at) VALUES \
+         (10, 'fix', 1, 2, 'suspended', '/s/10/session.jsonl', 1000, 2000), \
+         (11, 'fix', 1, 2, 'failed', NULL, 3000, 3000); \
+         INSERT INTO finding_work (finding_id, kind, checkpoint_job_id) VALUES (2, 'fix', 10);",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let store = rw_store(&path).await;
+    let fix = hunter::domain::FindingJobKind::Fix;
+    let logged = async |msg: &str| {
+        store
+            .recent_events(10)
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| e.message == msg)
+    };
+
+    assert!(!store.drop_checkpoint(2, fix, 11, "drop 11").await.unwrap());
+    assert_eq!(
+        store.checkpoint_job(2, fix).await.unwrap().map(|j| j.id),
+        Some(10)
+    );
+    assert!(!logged("drop 11").await);
+
+    assert!(store.drop_checkpoint(2, fix, 10, "drop 10").await.unwrap());
+    assert_eq!(
+        store.checkpoint_job(2, fix).await.unwrap().map(|j| j.id),
+        None
+    );
+    assert!(logged("drop 10").await);
 }

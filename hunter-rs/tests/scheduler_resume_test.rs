@@ -228,6 +228,7 @@ async fn seed_finding_suspension(
     .execute(pool)
     .await
     .unwrap();
+    support::point_checkpoint(pool, finding_id, kind, id).await;
 }
 
 /// The `resume` events logged against job `id`, oldest first.
@@ -772,7 +773,7 @@ async fn a_suspension_whose_working_directory_is_gone_is_retired() {
     assert_eq!(state, JobState::Killed.as_str());
     assert_eq!(reason.as_deref(), Some("workdir-gone"));
     let msg = format!(
-        "resume hunt alpha: job 10 retired, workspace {} is gone",
+        "resume hunt alpha: job 10 given up, workspace {} is gone",
         workspace.display()
     );
     assert_eq!(notes.as_deref(), Some(msg.as_str()));
@@ -851,11 +852,11 @@ async fn an_overridden_finding_resumes_its_suspended_attempt_under_the_override(
 }
 
 /// The same flagged pull request, but the suspended engage's tree is
-/// gone: that suspension is retired and the tier starts fresh.
+/// gone: the work item gives that checkpoint up and the tier starts fresh.
 ///
 /// This is job 4358 after a fresh engage removed its worktree. It can
-/// never be resumed, so retiring it on the first cycle that sees it is
-/// the only way it leaves `suspended`.
+/// never be resumed, so it is given up on the first cycle that sees it.
+/// The job row stays as it ended; only the pointer goes.
 #[tokio::test]
 async fn a_flagged_pr_whose_suspended_engage_lost_its_worktree_starts_fresh() {
     let (dir, path, pool) = fresh_db().await;
@@ -882,13 +883,14 @@ async fn a_flagged_pr_whose_suspended_engage_lost_its_worktree_starts_fresh() {
         "a suspension that cannot be continued must not block the fresh engage, got {picked:?}"
     );
     let (state, reason, _) = job_row(&pool, 20).await;
-    assert_eq!(state, JobState::Killed.as_str());
-    assert_eq!(reason.as_deref(), Some("workdir-gone"));
+    assert_eq!(state, JobState::Suspended.as_str());
+    assert_eq!(reason.as_deref(), Some("cap"));
+    assert_eq!(checkpoint_of(&store, 5, FindingJobKind::Engage).await, None);
     assert_eq!(
         resume_events(&pool, 20).await,
         vec![(
             format!(
-                "resume engage alpha: job 20 retired, workspace {} is gone",
+                "resume engage alpha: job 20 given up, workspace {} is gone",
                 workspace.display()
             ),
             Some(5)
@@ -898,14 +900,12 @@ async fn a_flagged_pr_whose_suspended_engage_lost_its_worktree_starts_fresh() {
 
 // -- fresh work supersedes a suspension --------------------------------------
 
-/// Starting a finding's work fresh retires that finding's suspended
-/// attempt at the same kind.
+/// Starting a finding's work fresh drops that work item's checkpoint.
 ///
 /// Whatever path started it, the fresh attempt now owns the work, and
 /// its worktree handling reclaims the directory the old transcript
-/// refers to. A suspension left behind is never resumed and never
-/// retired: it stays `suspended` forever. Other findings and other
-/// kinds are different work and are left alone.
+/// refers to. The old job row stays as it ended. Other findings and other
+/// kinds are different work and keep their checkpoints.
 #[tokio::test]
 async fn fresh_work_on_a_finding_supersedes_its_suspended_attempt() {
     let (dir, path, pool) = fresh_db().await;
@@ -938,15 +938,19 @@ async fn fresh_work_on_a_finding_supersedes_its_suspended_attempt() {
     );
 
     let (state, reason, notes) = job_row(&pool, 20).await;
-    assert_eq!(state, JobState::Killed.as_str());
-    assert_eq!(reason.as_deref(), Some("superseded"));
-    let msg = format!("resume engage alpha: job 20 superseded by fresh job {fresh}");
-    assert_eq!(notes.as_deref(), Some(msg.as_str()));
+    assert_eq!(state, JobState::Suspended.as_str());
+    assert_eq!(reason.as_deref(), Some("cap"));
+    assert_eq!(notes, None);
+    assert_eq!(checkpoint_of(&store, 5, FindingJobKind::Engage).await, None);
+    let msg = format!("resume engage alpha: checkpoint job 20 superseded by fresh job {fresh}");
     assert_eq!(resume_events(&pool, 20).await, vec![(msg, Some(5))]);
-    for other in [21, 22] {
+    for (other, fid, kind) in [
+        (21, 6, FindingJobKind::Engage),
+        (22, 5, FindingJobKind::Fix),
+    ] {
         assert_eq!(
-            job_row(&pool, other).await.0,
-            JobState::Suspended.as_str(),
+            checkpoint_of(&store, fid, kind).await,
+            Some(other),
             "job {other} is different work and must stay resumable"
         );
     }
@@ -2047,14 +2051,15 @@ async fn repeated_suspensions_of_a_harvest_are_not_a_stuck_streak() {
     assert!(outcomes.iter().all(|o| o.as_deref() == Some("suspended")));
 }
 
-/// A recheck, engage or harvest suspension is continued only while its
+/// A recheck, engage or harvest checkpoint is continued only while its
 /// finding is at that kind's status. Once the finding moves on — the
 /// operator rejects a finding mid-recheck, the PR an engage was answering
 /// merges, a closed PR awaiting harvest is reopened — the work no longer
-/// applies: selection stops offering it, and the next sweep retires it
-/// `finding-moved` and releases its tree instead of keeping both forever.
+/// applies: the move drops the checkpoint, selection stops offering it,
+/// and the sweep releases its tree instead of keeping both forever. The
+/// job row stays as it ended.
 #[tokio::test]
-async fn a_suspension_whose_finding_moved_on_is_retired_by_the_sweep() {
+async fn a_checkpoint_whose_finding_moved_on_is_dropped_and_its_tree_released() {
     for (kind, at, moved_to) in [
         ("recheck", "rechecking", "rejected"),
         ("engage", "pr_open", "merged"),
@@ -2093,10 +2098,12 @@ async fn a_suspension_whose_finding_moved_on_is_retired_by_the_sweep() {
             .await
             .unwrap();
         let (state, reason, notes) = job_row(&pool, 20).await;
-        assert_eq!(state, JobState::Killed.as_str(), "{kind}");
-        assert_eq!(reason.as_deref(), Some("finding-moved"), "{kind}");
-        let msg = format!("resume {kind} alpha: job 20 retired, finding #5 is {moved_to}");
-        assert_eq!(notes.as_deref(), Some(msg.as_str()));
+        assert_eq!(
+            (state.as_str(), reason.as_deref(), notes),
+            ("suspended", Some("cap"), None),
+            "{kind}"
+        );
+        let msg = format!("resume {kind}: checkpoint job 20 dropped, finding #5 is {moved_to}");
         assert_eq!(resume_events(&pool, 20).await, vec![(msg, Some(5))]);
         assert!(!tree.exists(), "{kind} at {moved_to} releases its tree");
     }
@@ -2249,6 +2256,7 @@ async fn seed_finding_chain(pool: &SqlitePool, dir: &TempDir, kind: &str, fid: i
         .await
         .unwrap();
     }
+    support::point_checkpoint(pool, fid, kind, first + 3).await;
 }
 
 /// Finding 1 on repo 1 in `status`, with a merged pull request.
@@ -2292,13 +2300,18 @@ async fn give_up_three_chains(
         seed_finding_chain(&pool, &dir, kind, 1, first).await;
         let next = pick_next(&store, &cfg, None).await.unwrap();
         let fresh = matches!(next, Some(Candidate::Finding { finding_id: 1, .. }));
-        let (state, reason, _) = job_row(&pool, first + 3).await;
-        assert_eq!(reason.as_deref(), Some("give-up"));
-        let held = match state.as_str() {
-            "failed" => false,
-            "suspended" => store.job_blocker(first + 3).await.unwrap().is_some(),
-            other => panic!("given-up chain left {other}"),
-        };
+        let (state, _, _) = job_row(&pool, first + 3).await;
+        assert_eq!(
+            state, "suspended",
+            "the given-up job row is left as it ended"
+        );
+        let held = store.job_blocker(first + 3).await.unwrap().is_some();
+        let checkpoint = checkpoint_of(&store, 1, kind.parse().unwrap()).await;
+        assert_eq!(
+            checkpoint,
+            held.then_some(first + 3),
+            "a given-up chain keeps its checkpoint only when it is held"
+        );
         let f = store.get_finding(1).await.unwrap().unwrap();
         let ps = store.get_pr_state(1).await.unwrap().unwrap();
         let streak = streak(&store, 1, kind.parse().unwrap()).await;
@@ -2429,7 +2442,8 @@ async fn a_given_up_engage_chain_sets_the_prs_attention_aside() {
         ),
         "the engage tier must let go of the PR, got {next:?}"
     );
-    assert_eq!(job_row(&pool, 13).await.1.as_deref(), Some("give-up"));
+    assert_eq!(job_row(&pool, 13).await.0, "suspended");
+    assert_eq!(checkpoint_of(&store, 1, FindingJobKind::Engage).await, None);
     let ps = store.get_pr_state(1).await.unwrap().unwrap();
     assert_eq!(
         (
@@ -2446,7 +2460,7 @@ async fn a_given_up_engage_chain_sets_the_prs_attention_aside() {
         .unwrap()
         .into_iter()
         .find(|e| e.job_id == Some(13))
-        .expect("the give-up must be logged against the retired job");
+        .expect("the give-up must be logged against the given-up job");
     assert_eq!(event.kind, "error", "{event:?}");
     assert!(
         event.message.contains("resume chain gave up")
@@ -2530,4 +2544,9 @@ async fn a_held_fix_an_operator_requeues_resumes_past_the_ceiling() {
 /// The failure streak of finding `fid`'s `kind` work.
 async fn streak(store: &Store, fid: i64, kind: FindingJobKind) -> i64 {
     store.work_streak(fid, kind).await.unwrap().streak
+}
+
+/// The job finding `fid`'s `kind` work continues from, if any.
+async fn checkpoint_of(store: &Store, fid: i64, kind: FindingJobKind) -> Option<i64> {
+    store.checkpoint_job(fid, kind).await.unwrap().map(|j| j.id)
 }

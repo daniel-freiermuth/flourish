@@ -1907,12 +1907,12 @@ fn suspended_by(tree: &std::path::Path, killed_reason: &str) -> hunter::types::R
 
 /// A wallclock-killed engage that had already withdrawn the PR concluded
 /// its work: the finding is no longer `pr_open`, so no resume could ever
-/// continue it. It is retired `killed` -- keeping `wallclock` as the
-/// record of why it stopped -- rather than left `suspended` for the
-/// resume tier to offer every cycle, and it still hands off into the
-/// closed PR's harvest in its own session before the tree is released.
+/// continue it. Its work item keeps no checkpoint -- the row stays as the
+/// attempt ended, `wallclock` -- rather than one the resume tier offers
+/// every cycle, and it still hands off into the closed PR's harvest in its
+/// own session before the tree is released.
 #[tokio::test]
-async fn a_suspended_engage_that_withdrew_is_retired_and_continues_into_its_harvest() {
+async fn a_suspended_engage_that_withdrew_keeps_no_checkpoint_and_continues_into_its_harvest() {
     let f = fixture("engage-suspended-withdrew").await;
     let bins = FakeBins::acquire("engage-suspended-withdrew");
     gh_for_handoff(&bins);
@@ -1943,16 +1943,11 @@ async fn a_suspended_engage_that_withdrew_is_retired_and_continues_into_its_harv
     assert_eq!(summary.state, Some(hunter::domain::JobState::Suspended));
     assert!(bins.called_with("gh", "close"), "{:?}", bins.calls());
     let engage_job = summary.job_id.unwrap();
-    let (state, killed_reason, notes) = f.job_row(engage_job).await;
-    assert_eq!(state, "killed", "a concluded suspension is retired");
+    let (state, killed_reason, _) = f.job_row(engage_job).await;
     assert_eq!(
-        killed_reason.as_deref(),
-        Some("wallclock"),
-        "the reason the attempt stopped is kept"
-    );
-    assert!(
-        notes.as_deref().is_some_and(|n| n.contains("(withdrawn)")),
-        "{notes:?}"
+        (state.as_str(), killed_reason.as_deref()),
+        ("suspended", Some("wallclock")),
+        "the row says how the attempt ended"
     );
 
     let runs = backend.runs();
@@ -1982,13 +1977,13 @@ async fn a_suspended_engage_that_withdrew_is_retired_and_continues_into_its_harv
     assert!(!runs[0].tree.exists(), "the chain's tree must be released");
 }
 
-/// A cap-killed engage whose withdrawal the forge refused is retired just
-/// the same. `withdraw-failed` marks the attention addressed, so the
-/// finding waits for new PR activity; a suspension left behind would be
-/// resumed every cycle meanwhile, re-running a worker that already
+/// A cap-killed engage whose withdrawal the forge refused keeps no
+/// checkpoint either. `withdraw-failed` marks the attention addressed, so
+/// the finding waits for new PR activity; a checkpoint left behind would
+/// be resumed every cycle meanwhile, re-running a worker that already
 /// decided, and would pin its tree.
 #[tokio::test]
-async fn a_suspended_engage_whose_withdrawal_failed_is_retired_and_released() {
+async fn a_suspended_engage_whose_withdrawal_failed_keeps_no_checkpoint_and_is_released() {
     let f = fixture("engage-suspended-withdraw-failed").await;
     let bins = FakeBins::acquire("engage-suspended-withdraw-failed");
     bins.ok_unless_action("gh", "pr comment", PR_VIEW_JSON);
@@ -2008,14 +2003,17 @@ async fn a_suspended_engage_whose_withdrawal_failed_is_retired_and_released() {
         "{summary:?}"
     );
     let job = summary.job_id.unwrap();
-    let (state, killed_reason, notes) = f.job_row(job).await;
-    assert_eq!(state, "killed", "a concluded suspension is retired");
-    assert_eq!(killed_reason.as_deref(), Some("cap"));
+    let (state, killed_reason, _) = f.job_row(job).await;
+    assert_eq!(
+        (state.as_str(), killed_reason.as_deref()),
+        ("suspended", Some("cap"))
+    );
+    let events = f.store.recent_events(50).await.unwrap();
     assert!(
-        notes
-            .as_deref()
-            .is_some_and(|n| n.contains("(withdraw-failed)")),
-        "{notes:?}"
+        events.iter().any(|e| e.kind == "resume"
+            && e.job_id == Some(job)
+            && e.message.contains("withdrawal failed; nothing to resume")),
+        "{events:?}"
     );
     assert!(f.store.list_resumable_jobs().await.unwrap().is_empty());
     let runs = backend.runs();

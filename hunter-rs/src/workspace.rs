@@ -21,8 +21,9 @@
 //!
 //! Every removal here is gated on the job table. [`release_if_idle`] and
 //! [`sweep`] read the chain's state from the database before touching a
-//! tree, and a chain with a `running` or `suspended` attempt is never
-//! touched. The one exception is [`create`] cleaning up a workspace it
+//! tree, and a chain with a `running` attempt or a checkpoint (a finding
+//! work item's `checkpoint_job_id`, or a repo-level `suspended` attempt) is
+//! never touched. The one exception is [`create`] cleaning up a workspace it
 //! made itself a moment earlier for a job that has not run.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -294,10 +295,9 @@ fn release_tree(ws: &Workspace) {
     }
 }
 
-/// Release a chain's tree if, according to the job table, no attempt of the
-/// chain is `running` or `suspended` awaiting resume (a suspension a later
-/// attempt continues does not count; see [`Store::chain_status`]). Returns
-/// whether it released.
+/// Release a chain's tree if, according to the database, no attempt of the
+/// chain is `running` or a checkpoint awaiting resume (see
+/// [`Store::chain_status`]). Returns whether it released.
 ///
 /// The executors call this after recording a job's outcome, and for every
 /// chain a fresh job superseded; both are the moment a chain becomes
@@ -402,9 +402,9 @@ pub struct SweepReport {
 /// Reclaim what finished chains, and the layouts before this one, left on
 /// disk. Runs at daemon startup and before every cycle, never during one.
 ///
-/// Nothing is removed without first reading from the job table that no
-/// `running` or `suspended` job needs it. First, suspensions whose finding
-/// has moved on are retired ([`Store::retire_stranded_suspensions`]), so a
+/// Nothing is removed without first reading from the database that no
+/// `running` job or checkpoint needs it. A finding's checkpoint goes when
+/// the finding leaves its kind's tier (migration 024's trigger), so a
 /// checkpoint nothing will ever resume does not hold its tree forever:
 ///
 /// (a) `<work_root>/jobs/<id>/`: a chain with no live attempt has its tree
@@ -432,7 +432,6 @@ pub struct SweepReport {
 /// `session/` while its workspace is inside retention.
 pub async fn sweep(store: &Store, work_root: &Path, now_ms: i64) -> anyhow::Result<SweepReport> {
     let mut report = SweepReport::default();
-    store.retire_stranded_suspensions().await?;
     sweep_chains(store, work_root, now_ms, &mut report).await?;
     sweep_legacy_trees(store, work_root, &mut report).await?;
     sweep_legacy_sessions(store, work_root, now_ms, &mut report).await?;

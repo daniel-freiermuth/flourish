@@ -754,3 +754,20 @@ pub async fn seed_session(pool: &SqlitePool) {
     .await
     .unwrap();
 }
+
+/// Make job `job` the checkpoint of finding `fid`'s `kind` work item, as a
+/// finding job that ended paused does (`Store::complete_job`). For tests
+/// that seed suspended job rows by hand: a finding's work continues from
+/// this pointer, not from whichever row reads `suspended`.
+pub async fn point_checkpoint(pool: &SqlitePool, fid: i64, kind: &str, job: i64) {
+    sqlx::query(
+        "INSERT INTO finding_work (finding_id, kind, checkpoint_job_id) VALUES (?1, ?2, ?3) \
+         ON CONFLICT (finding_id, kind) DO UPDATE SET checkpoint_job_id = excluded.checkpoint_job_id",
+    )
+    .bind(fid)
+    .bind(kind)
+    .bind(job)
+    .execute(pool)
+    .await
+    .unwrap();
+}

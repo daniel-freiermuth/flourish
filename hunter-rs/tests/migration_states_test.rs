@@ -695,3 +695,92 @@ async fn upgrading_moves_failure_streaks_onto_their_work_items() {
 
     drop(store);
 }
+
+/// Upgrading points every work item at the checkpoint it had.
+///
+/// Until 024 a finding's checkpoint was its newest `suspended` attempt
+/// that nothing continued, and only while the finding was in that kind's
+/// tier: the sweep retired the others. 024 turns exactly those into
+/// `finding_work.checkpoint_job_id`, and points nothing at a suspension
+/// outside its tier, one already continued, a repo-level one, or a
+/// harvest whose PR is already harvested.
+///
+/// Seeded at the state just before 024 so that rolling forward executes it.
+#[tokio::test]
+async fn upgrading_points_each_work_item_at_its_checkpoint() {
+    use hunter::domain::FindingJobKind;
+
+    let (_dir, path) = scratch("mig-checkpoints");
+
+    let before_024 = sqlx::migrate!("./migrations")
+        .iter()
+        .position(|m| m.version == 24)
+        .expect("migration 024 exists");
+    let pool = seed_state(&path, before_024).await;
+    sqlx::query(
+        "INSERT INTO repos (id, name, url, path, forge, default_branch, added_at) \
+         VALUES (1, 'widget', 'https://e/w.git', '/wr/repos/repo-1', 'github', 'main', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    // 1: queued, a fix chain 10 -> 11. 2: rejected, a recheck left behind.
+    // 3: merged and harvested. 4: pr_open, an engage. 5: blocked, its held fix.
+    for (id, status) in [
+        (1, "queued"),
+        (2, "rejected"),
+        (3, "merged"),
+        (4, "pr_open"),
+        (5, "blocked"),
+    ] {
+        sqlx::query(
+            "INSERT INTO findings (id, type, repo_id, fingerprint, severity, confidence, \
+             summary, status, created_at, updated_at) \
+             VALUES (?1, 'bug', 1, 'fp-' || ?1, 'high', 0.9, 's', ?2, 1, 1)",
+        )
+        .bind(id)
+        .bind(status)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    sqlx::raw_sql(
+        "INSERT INTO pr_state (finding_id, pr_number, state, harvested_at) \
+             VALUES (3, 7, 'MERGED', 5000); \
+         INSERT INTO jobs (id, kind, repo_id, finding_id, state, session_file, resumed_from, \
+                           started_at) VALUES \
+             (10, 'fix', 1, 1, 'suspended', '/s/10.jsonl', NULL, 1), \
+             (11, 'fix', 1, 1, 'suspended', '/s/10.jsonl', 10, 2), \
+             (12, 'recheck', 1, 2, 'suspended', '/s/12.jsonl', NULL, 3), \
+             (13, 'harvest', 1, 3, 'suspended', '/s/13.jsonl', NULL, 4), \
+             (14, 'engage', 1, 4, 'suspended', '/s/14.jsonl', NULL, 5), \
+             (15, 'fix', 1, 5, 'suspended', '/s/15.jsonl', NULL, 6), \
+             (16, 'hunt', 1, NULL, 'suspended', '/s/16.jsonl', NULL, 7), \
+             (17, 'engage', 1, 4, 'done', '/s/17.jsonl', NULL, 4);",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let store = Store::connect(&path).await.expect("roll forward");
+
+    let mut got = Vec::new();
+    for id in 1..=5 {
+        for kind in FindingJobKind::ALL {
+            if let Some(job) = store.checkpoint_job(id, kind).await.unwrap() {
+                got.push((id, kind, job.id));
+            }
+        }
+    }
+    assert_eq!(
+        got,
+        vec![
+            (1, FindingJobKind::Fix, 11),
+            (4, FindingJobKind::Engage, 14),
+            (5, FindingJobKind::Fix, 15),
+        ]
+    );
+
+    drop(store);
+}
