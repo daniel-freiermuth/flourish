@@ -475,6 +475,104 @@ async fn a_forced_repo_is_picked_over_a_staler_one() {
     assert_eq!(forced.job_kind(), RepoJobKind::Hunt.into());
 }
 
+#[tokio::test]
+async fn pick_next_rechecking_beats_queued_fix_oldest_first() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo(&pool, 1, "alpha", 1, "/nonexistent/alpha").await;
+    seed_finding(&pool, 5, 1, "queued", "queued bug").await;
+    // Two rechecks: #6 is the older, and list_findings returns id DESC.
+    seed_finding(&pool, 6, 1, "rechecking", "older recheck").await;
+    seed_finding(&pool, 9, 1, "rechecking", "newer recheck").await;
+    let store = open_store(pool, &path).await;
+    let cfg = test_config(3600.0);
+    let c = pick_next(&store, &cfg, None).await.unwrap().unwrap();
+    assert_eq!(c.job_kind(), FindingJobKind::Recheck.into());
+    assert_eq!(c.target_id(), 6, "oldest recheck first");
+    assert_eq!(c.budget_override(), None);
+}
+
+/// Overrides are scanned in the normal kind order, and the override's
+/// own tier decides the job kind: an overridden recheck runs as a
+/// recheck, ahead of an un-overridden attention row and of an overridden
+/// queued fix.
+#[tokio::test]
+async fn pick_next_budget_override_keeps_its_tier_kind_and_order() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo(&pool, 1, "alpha", 1, "/nonexistent/alpha").await;
+    seed_finding(&pool, 7, 1, "pr_open", "flagged pr").await;
+    sqlx::query(
+        "INSERT INTO pr_state \
+         (finding_id, pr_number, state, needs_attention, attention_since, synced_at) \
+         VALUES (7, 1, 'OPEN', 'review_comments', 1000, 5000)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    seed_finding(&pool, 5, 1, "queued", "urgent fix").await;
+    seed_finding(&pool, 6, 1, "rechecking", "urgent recheck").await;
+    sqlx::query("UPDATE findings SET budget_override = 'once' WHERE id IN (5, 6)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let store = open_store(pool, &path).await;
+    let cfg = test_config(3600.0);
+    let c = pick_next(&store, &cfg, None).await.unwrap().unwrap();
+    assert_eq!(c.job_kind(), FindingJobKind::Recheck.into());
+    assert_eq!(c.target_id(), 6);
+    assert_eq!(c.budget_override(), Some("once"));
+}
+
+/// With no finding work, the enabled repo hunted longest ago is hunted;
+/// a disabled repo is skipped even though it has never been hunted.
+#[tokio::test]
+async fn pick_next_no_finding_work_hunts_least_recently_hunted_enabled_repo() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo(&pool, 1, "alpha", 1, "/nonexistent/alpha").await;
+    seed_repo(&pool, 2, "beta", 1, "/nonexistent/beta").await;
+    seed_repo(&pool, 3, "gamma", 0, "/nonexistent/gamma").await;
+    for (id, at) in [(1_i64, 5000_i64), (2, 1000)] {
+        sqlx::query("UPDATE repos SET last_hunt_at = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(at)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let store = open_store(pool, &path).await;
+    let cfg = test_config(3600.0);
+    let c = pick_next(&store, &cfg, None).await.unwrap().unwrap();
+    assert_eq!(c.job_kind(), RepoJobKind::Hunt.into());
+    assert_eq!(c.repo_id(), 2);
+    assert!(matches!(c, hunter::scheduler::Candidate::Repo { .. }));
+}
+
+#[tokio::test]
+async fn pick_next_never_hunted_repo_beats_hunted_one() {
+    let (_dir, path, pool) = fresh_db().await;
+    // "alpha" sorts first by name; only staleness may put "beta" ahead.
+    seed_repo(&pool, 1, "alpha", 1, "/nonexistent/alpha").await;
+    seed_repo(&pool, 2, "beta", 1, "/nonexistent/beta").await;
+    sqlx::query("UPDATE repos SET last_hunt_at = 1000 WHERE id = 1")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let store = open_store(pool, &path).await;
+    let cfg = test_config(3600.0);
+    let c = pick_next(&store, &cfg, None).await.unwrap().unwrap();
+    assert_eq!(c.job_kind(), RepoJobKind::Hunt.into());
+    assert_eq!(c.repo_id(), 2);
+}
+
+#[tokio::test]
+async fn pick_next_unknown_force_repo_is_an_error() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo(&pool, 1, "alpha", 1, "/nonexistent/alpha").await;
+    let store = open_store(pool, &path).await;
+    let cfg = test_config(3600.0);
+    let err = pick_next(&store, &cfg, Some("nosuch")).await.unwrap_err();
+    assert_eq!(err.to_string(), r#"unknown repo "nosuch""#);
+}
+
 // -- summary integration (oneshot router, NullBackend) -------------------------
 
 /// `/api/summary` over a queued fix finding (id 5) and no running job,
