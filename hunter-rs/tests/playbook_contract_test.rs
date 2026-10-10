@@ -295,8 +295,6 @@ fn sample_pr_state() -> PrState {
         addressed_head_sha: Some("cafebabe".to_owned()),
         synced_at: Some(1),
         harvested_at: None,
-        harvest_attempts: 0,
-        last_harvest_failure: None,
     }
 }
 

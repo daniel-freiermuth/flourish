@@ -2017,7 +2017,10 @@ async fn handle_recheck_failure(
             .await;
     };
     summary.outcome = Some("requeued".into());
-    match store.record_recheck_attempt(fid, failure).await {
+    match store
+        .record_work_failure(fid, FindingJobKind::Recheck, failure)
+        .await
+    {
         Err(e) => {
             log(format!(
                 "#{fid}: job {job} {detail} -- will retry (not counted: {e})"
@@ -2032,7 +2035,7 @@ async fn handle_recheck_failure(
                 log(format!("#{fid} {streak} identical failures ({detail}), but sending it back to the inbox failed: {e}; will retry")).await;
             } else {
                 log_write_failure(
-                    store.clear_recheck_attempts(fid).await,
+                    store.clear_work_streak(fid, FindingJobKind::Recheck).await,
                     format_args!("#{fid}: clearing recheck attempts"),
                 );
                 log(format!("#{fid} gave up after {streak} identical failures ({detail}); back to inbox for human triage")).await;
@@ -2379,7 +2382,7 @@ pub async fn run_recheck(
                 format_args!("#{fid}: status -> new"),
             );
             log_write_failure(
-                store.clear_recheck_attempts(fid).await,
+                store.clear_work_streak(fid, FindingJobKind::Recheck).await,
                 format_args!("#{fid}: clearing recheck attempts"),
             );
             let _ = store
@@ -2409,7 +2412,7 @@ pub async fn run_recheck(
                 format_args!("#{fid}: verdict -> superseded"),
             );
             log_write_failure(
-                store.clear_recheck_attempts(fid).await,
+                store.clear_work_streak(fid, FindingJobKind::Recheck).await,
                 format_args!("#{fid}: clearing recheck attempts"),
             );
             let _ = store
@@ -2443,7 +2446,7 @@ pub async fn run_recheck(
                 format_args!("#{fid}: verdict -> rejected"),
             );
             log_write_failure(
-                store.clear_recheck_attempts(fid).await,
+                store.clear_work_streak(fid, FindingJobKind::Recheck).await,
                 format_args!("#{fid}: clearing recheck attempts"),
             );
             let _ = store
@@ -3554,7 +3557,10 @@ async fn record_fix_failure(
 ) -> anyhow::Result<()> {
     summary.failure = Some(failure.to_owned());
     summary.outcome = Some("requeued".into());
-    let streak = match store.record_fix_attempt(fid, failure).await {
+    let streak = match store
+        .record_work_failure(fid, FindingJobKind::Fix, failure)
+        .await
+    {
         Ok(streak) => streak,
         Err(e) => {
             let message =
@@ -3808,7 +3814,7 @@ async fn record_declined_fix(
         format_args!("#{fid}: verdict -> {status}"),
     );
     log_write_failure(
-        store.clear_fix_attempts(fid).await,
+        store.clear_work_streak(fid, FindingJobKind::Fix).await,
         format_args!("#{fid}: clearing fix attempts"),
     );
     let first_line: String = reason
@@ -3856,7 +3862,7 @@ async fn record_fix_outcome(
                 format_args!("#{fid}: status -> pr_open ({pr_url})"),
             );
             log_write_failure(
-                store.clear_fix_attempts(fid).await,
+                store.clear_work_streak(fid, FindingJobKind::Fix).await,
                 format_args!("#{fid}: clearing fix attempts"),
             );
             let message = if recovered {
@@ -5197,7 +5203,10 @@ async fn record_harvest_failure(
     let log = |message: String| async move {
         let _ = store.log_event("error", &message, job, Some(fid)).await;
     };
-    let streak = match store.record_harvest_attempt(fid, key).await {
+    let streak = match store
+        .record_work_failure(fid, FindingJobKind::Harvest, key)
+        .await
+    {
         Ok(streak) => streak,
         Err(e) => {
             log(format!(
@@ -5219,7 +5228,7 @@ async fn record_harvest_failure(
         return false;
     }
     log_write_failure(
-        store.clear_harvest_attempts(fid).await,
+        store.clear_work_streak(fid, FindingJobKind::Harvest).await,
         format_args!("#{fid}: clearing harvest attempts"),
     );
     log(format!(
@@ -5684,7 +5693,7 @@ pub async fn run_harvest(
         "reviewed for follow-ups".to_owned()
     };
     log_write_failure(
-        store.clear_harvest_attempts(fid).await,
+        store.clear_work_streak(fid, FindingJobKind::Harvest).await,
         format_args!("#{fid}: clearing harvest attempts"),
     );
     let _ = store

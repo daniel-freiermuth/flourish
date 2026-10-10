@@ -458,7 +458,9 @@ impl std::str::FromStr for RepoJobKind {
 // Finding job kinds (fix + PR lifecycle).
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type, TS)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(rename_all = "snake_case")]
 #[ts(rename_all = "snake_case")]
 pub enum FindingJobKind {
     Fix,

@@ -20,9 +20,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use hunter::config::Config;
-use hunter::domain::{BudgetOverride, FindingStatus};
+use hunter::domain::{BudgetOverride, FindingJobKind, FindingStatus};
 use hunter::scheduler::{CycleSummary, run_recheck};
-use hunter::store::{FindingInsert, Store};
+use hunter::store::{FindingInsert, Store, WorkStreak};
 use hunter::types::{Finding, RunResult};
 use sqlx::SqlitePool;
 use support::{GitRepo, ScriptedBackend, TempDir};
@@ -53,6 +53,13 @@ impl Fixture {
     async fn recheck(&self, backend: &ScriptedBackend) -> CycleSummary {
         let finding = self.finding().await;
         run_recheck(&self.store, &self.cfg, &finding, backend, None)
+            .await
+            .unwrap()
+    }
+
+    async fn streak(&self) -> WorkStreak {
+        self.store
+            .work_streak(self.fid, FindingJobKind::Recheck)
             .await
             .unwrap()
     }
@@ -192,9 +199,9 @@ async fn each_failure_is_a_retry_recorded_under_its_own_name() {
         assert_eq!(summary.verdict, None, "{label}");
         let after = f.finding().await;
         assert_eq!(after.status, FindingStatus::Rechecking, "{label}");
-        assert_eq!(after.recheck_attempts, 1, "{label}");
+        assert_eq!(f.streak().await.streak, 1, "{label}");
         assert_eq!(
-            after.last_recheck_failure.as_deref(),
+            f.streak().await.last_failure.as_deref(),
             Some(failure),
             "{label}"
         );
@@ -228,8 +235,8 @@ async fn the_third_identical_failure_returns_the_finding_to_the_inbox() {
     );
     let after = f.finding().await;
     assert_eq!(after.status, FindingStatus::New);
-    assert_eq!(after.recheck_attempts, 0);
-    assert_eq!(after.last_recheck_failure, None);
+    assert_eq!(f.streak().await.streak, 0);
+    assert_eq!(f.streak().await.last_failure, None);
 }
 
 /// Only IDENTICAL failures make a streak: two kinds alternating never
@@ -253,9 +260,9 @@ async fn alternating_failures_never_accumulate_a_streak() {
 
     let after = f.finding().await;
     assert_eq!(after.status, FindingStatus::Rechecking);
-    assert_eq!(after.recheck_attempts, 1);
+    assert_eq!(f.streak().await.streak, 1);
     assert_eq!(
-        after.last_recheck_failure.as_deref(),
+        f.streak().await.last_failure.as_deref(),
         Some("unparseable verdict file")
     );
 }
@@ -291,7 +298,7 @@ async fn a_verdict_left_by_an_earlier_attempt_is_never_read() {
     let after = f.finding().await;
     assert_eq!(after.status, FindingStatus::Rechecking);
     assert_eq!(
-        after.last_recheck_failure.as_deref(),
+        f.streak().await.last_failure.as_deref(),
         Some("no verdict file")
     );
 }
@@ -310,7 +317,10 @@ async fn a_killed_workers_verdict_is_ignored() {
     assert_eq!(summary.outcome.as_deref(), Some("requeued"), "{summary:?}");
     let after = f.finding().await;
     assert_eq!(after.status, FindingStatus::Rechecking);
-    assert_eq!(after.last_recheck_failure.as_deref(), Some("worker killed"));
+    assert_eq!(
+        f.streak().await.last_failure.as_deref(),
+        Some("worker killed")
+    );
     assert_eq!(after.verdict_reason, None);
 }
 
@@ -321,7 +331,7 @@ async fn a_killed_workers_verdict_is_ignored() {
 async fn a_confirmation_rewrites_the_analysis_and_clears_the_streak() {
     let f = fixture("recheck-confirmed", FindingStatus::Rechecking).await;
     f.recheck(&ScriptedBackend::noop()).await;
-    assert_eq!(f.finding().await.recheck_attempts, 1);
+    assert_eq!(f.streak().await.streak, 1);
 
     let backend = replying(
         f.out(),
@@ -351,8 +361,8 @@ async fn a_confirmation_rewrites_the_analysis_and_clears_the_streak() {
         after.confidence
     );
     assert_eq!(after.severity, hunter::domain::Severity::Medium);
-    assert_eq!(after.recheck_attempts, 0);
-    assert_eq!(after.last_recheck_failure, None);
+    assert_eq!(f.streak().await.streak, 0);
+    assert_eq!(f.streak().await.last_failure, None);
 }
 
 /// A confirmation that names no updates keeps the analysis the finding had.

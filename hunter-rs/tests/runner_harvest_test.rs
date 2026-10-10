@@ -501,7 +501,7 @@ async fn an_invalid_close_reason_counts_toward_the_streak() {
         .unwrap();
         let ps = f.store.get_pr_state(f.fid).await.unwrap().unwrap();
         if attempt < 3 {
-            assert_eq!(ps.harvest_attempts, attempt, "{summary:?}");
+            assert_eq!(harvest_streak(&f).await, attempt, "{summary:?}");
             assert_eq!(ps.harvested_at, None, "retried, not given up: {summary:?}");
         } else {
             assert!(
@@ -529,6 +529,15 @@ async fn an_invalid_close_reason_counts_toward_the_streak() {
             .any(|e| e.kind == "error" && e.message.contains("gave up after 3")),
         "{events:?}"
     );
+}
+
+/// The fixture finding's harvest streak.
+async fn harvest_streak(f: &Fixture) -> i64 {
+    f.store
+        .work_streak(f.fid, FindingJobKind::Harvest)
+        .await
+        .unwrap()
+        .streak
 }
 
 /// How many findings carry `fingerprint`.
@@ -785,7 +794,7 @@ async fn a_classification_that_cannot_be_recorded_is_retried() {
         Some("PR closed without merge")
     );
     assert_eq!(summary.outcome.as_deref(), Some("retry"), "{summary:?}");
-    assert_eq!(ps.harvest_attempts, 0, "not counted toward the streak");
+    assert_eq!(harvest_streak(&f).await, 0, "not counted toward the streak");
     let events = f.store.recent_events(50).await.unwrap();
     assert!(
         events.iter().any(|e| e.kind == "error"
@@ -984,7 +993,7 @@ async fn a_failing_pr_diff_counts_toward_the_streak() {
             }) if finding_id == f.fid
         );
         if attempt < 3 {
-            assert_eq!(ps.harvest_attempts, attempt, "attempt {attempt}");
+            assert_eq!(harvest_streak(&f).await, attempt, "attempt {attempt}");
             assert_eq!(ps.harvested_at, None, "retried, not given up");
             assert!(still_pending, "attempt {attempt}: {picked:?}");
         } else {
@@ -1036,7 +1045,7 @@ async fn a_failing_pr_view_counts_toward_the_streak() {
             }) if finding_id == f.fid
         );
         if attempt < 3 {
-            assert_eq!(ps.harvest_attempts, attempt, "attempt {attempt}");
+            assert_eq!(harvest_streak(&f).await, attempt, "attempt {attempt}");
             assert_eq!(ps.harvested_at, None, "retried, not given up");
             assert!(still_pending, "attempt {attempt}: {picked:?}");
         } else {

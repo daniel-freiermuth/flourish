@@ -1712,7 +1712,7 @@ async fn repeated_suspensions_of_a_fix_are_not_a_stuck_streak() {
 
     let finding = store.get_finding(fid).await.unwrap().unwrap();
     assert_eq!(finding.status, FindingStatus::Queued, "{outcomes:?}");
-    assert_eq!(finding.fix_attempts, 0);
+    assert_eq!(streak(&store, fid, FindingJobKind::Fix).await, 0);
     assert!(outcomes.iter().all(|o| o.as_deref() == Some("suspended")));
 }
 
@@ -1742,7 +1742,7 @@ async fn repeated_suspensions_of_a_recheck_are_not_a_stuck_streak() {
 
     let finding = store.get_finding(fid).await.unwrap().unwrap();
     assert_eq!(finding.status, FindingStatus::Rechecking, "{outcomes:?}");
-    assert_eq!(finding.recheck_attempts, 0);
+    assert_eq!(streak(&store, fid, FindingJobKind::Recheck).await, 0);
     assert!(outcomes.iter().all(|o| o.as_deref() == Some("suspended")));
 }
 
@@ -1889,7 +1889,11 @@ async fn a_recheck_without_a_verdict_retries_then_returns_to_the_inbox() {
             .await
             .unwrap();
         let after = store.get_finding(fid).await.unwrap().unwrap();
-        seen.push((summary.outcome, after.status, after.recheck_attempts));
+        seen.push((
+            summary.outcome,
+            after.status,
+            streak(&store, fid, FindingJobKind::Recheck).await,
+        ));
     }
 
     assert_eq!(
@@ -1934,7 +1938,11 @@ async fn a_recheck_whose_tree_can_never_be_made_returns_to_the_inbox() {
             "{summary:?}"
         );
         let after = store.get_finding(fid).await.unwrap().unwrap();
-        seen.push((summary.outcome, after.status, after.recheck_attempts));
+        seen.push((
+            summary.outcome,
+            after.status,
+            streak(&store, fid, FindingJobKind::Recheck).await,
+        ));
     }
 
     assert_eq!(
@@ -2035,7 +2043,7 @@ async fn repeated_suspensions_of_a_harvest_are_not_a_stuck_streak() {
 
     let ps = store.get_pr_state(fid).await.unwrap().unwrap();
     assert_eq!(ps.harvested_at, None, "still pending harvest: {outcomes:?}");
-    assert_eq!(ps.harvest_attempts, 0);
+    assert_eq!(streak(&store, fid, FindingJobKind::Harvest).await, 0);
     assert!(outcomes.iter().all(|o| o.as_deref() == Some("suspended")));
 }
 
@@ -2293,11 +2301,7 @@ async fn give_up_three_chains(
         };
         let f = store.get_finding(1).await.unwrap().unwrap();
         let ps = store.get_pr_state(1).await.unwrap().unwrap();
-        let streak = match kind {
-            "fix" => f.fix_attempts,
-            "recheck" => f.recheck_attempts,
-            _ => ps.harvest_attempts,
-        };
+        let streak = streak(&store, 1, kind.parse().unwrap()).await;
         seen.push((streak, f.status, ps.harvested_at.is_some(), held, fresh));
     }
     seen
@@ -2460,8 +2464,8 @@ async fn fix_one_give_up_from_blocked() -> (TempDir, PathBuf, SqlitePool) {
     seed_history(&pool).await;
     seed_finding_in(&pool, "queued").await;
     sqlx::query(
-        "UPDATE findings SET fix_attempts = 2, last_fix_failure = 'resume chain gave up' \
-         WHERE id = 1",
+        "INSERT INTO finding_work (finding_id, kind, streak, last_failure) \
+         VALUES (1, 'fix', 2, 'resume chain gave up')",
     )
     .execute(&pool)
     .await
@@ -2482,7 +2486,7 @@ async fn the_summary_preview_neither_retires_nor_counts_a_given_up_chain() {
     let previewed = preview_next(&store, &cfg).await.unwrap();
     let after_preview = (
         job_row(&pool, 33).await.0,
-        store.get_finding(1).await.unwrap().unwrap().fix_attempts,
+        streak(&store, 1, FindingJobKind::Fix).await,
     );
     pick_next(&store, &cfg, None).await.unwrap();
     let after_pick = (
@@ -2521,4 +2525,9 @@ async fn a_held_fix_an_operator_requeues_resumes_past_the_ceiling() {
 
     assert_eq!(plan.predecessor_id, 33);
     assert_eq!(job_row(&pool, 33).await.0, "suspended");
+}
+
+/// The failure streak of finding `fid`'s `kind` work.
+async fn streak(store: &Store, fid: i64, kind: FindingJobKind) -> i64 {
+    store.work_streak(fid, kind).await.unwrap().streak
 }
