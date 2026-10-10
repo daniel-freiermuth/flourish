@@ -289,35 +289,35 @@ The initial attempt and every cap-killed attempt always count; any other
 resumed handoff with zero or unknown metered spend (e.g. a provider failure
 before the first response) does not use this allowance.
 
-Two more things end a suspension, because after either one it can never
-usefully be continued, and a suspension nobody ends stays `suspended`
-forever:
+A finding's work continues from its work item's checkpoint, a pointer to
+the attempt it resumes; job rows are records of attempts and are never
+rewritten once they finish. Three more things end a checkpoint, because
+after any of them it can never usefully be continued:
 
 - **Superseded.** Starting the same work fresh — same finding and kind
   for engage/harvest/recheck/fix, same repo and kind for hunt and the
-  analysis scans — marks the suspended attempt `killed` (reason
-  `superseded`) in the same transaction that creates the fresh job,
-  whichever path started it.
+  analysis scans — ends the checkpoint in the same transaction that
+  creates the fresh job, whichever path started it: a finding's work
+  item drops its pointer, a repo scan's suspended attempt is marked
+  `killed` (reason `superseded`).
 - **Working directory gone.** Every kind runs in its chain's own
   workspace, `<work_root>/jobs/<origin_id>/`, and the transcript is full
   of absolute paths into it — `tree/`, the git worktree of the repo's
-  clone, and `session/`, the transcript itself. A suspension is only
+  clone, and `session/`, the transcript itself. A checkpoint is only
   resumable while all three of these still hold: `tree/` is there, its
   session file lies inside the chain's `session/`, and the row records
   the commit the tree was pinned to. Failing any of them is permanent —
   a row from before per-chain workspaces fails by construction, its
   transcript and tree being in the old layout and its row carrying no
-  pinned commit — so the suspension is marked `killed` (reason
-  `workdir-gone`) when selection reaches it, and selection moves on to
-  the next candidate the same cycle.
-- **Finding moved on.** A finding suspension resumes only at its kind's
-  actionable status (fix: `queued`, recheck: `rechecking`, engage:
-  `pr_open`, harvest: `merged`/`closed`). One whose finding is anywhere
-  else — a blocked fix the operator rejected, a fix unqueued back to
-  `new` — is marked `killed` (reason `finding-moved`) by the sweep before
-  each cycle, so its tree is released. A fix at `blocked` is the
-  exception, held until the operator resumes or discards it, as is one at
-  `fixing`, which `run_fix` is about to continue.
+  pinned commit — so selection gives the checkpoint up when it reaches
+  it (a repo scan's attempt is marked `killed`, reason `workdir-gone`)
+  and moves on to the next candidate the same cycle.
+- **Finding moved on.** A finding's work exists only while the finding
+  is in that kind's tier (fix: `queued`/`fixing`, recheck: `rechecking`,
+  engage: `pr_open`, harvest: `merged`/`closed` and not yet harvested).
+  Whatever moves it out — a verdict, an unqueue, the PR merging — ends
+  the work item in the same write: its checkpoint and its failure streak
+  go, and the next sweep releases the tree.
 
 ### Budget policy
 

@@ -228,12 +228,12 @@ async fn list_attention(store: &Store) -> sqlx::Result<Vec<Finding>> {
 /// (finding, kind) instead of starting that work over
 /// ([`finding_pick`]).
 ///
-/// The scheduler's own selection. On the way it retires suspensions that
+/// The scheduler's own selection. On the way it ends checkpoints that
 /// can never be continued — a chain past the give-up ceiling, or one
 /// whose working directory is gone — which [`resume_plan`] does as it
-/// skips over them, and counts a finding tier's given-up chain as a
-/// failed attempt ([`count_given_up_chain`]). [`preview_next`] makes the
-/// same selection and writes nothing.
+/// skips over them ([`end_checkpoint`]), and counts a finding tier's
+/// given-up chain as a failed attempt ([`count_given_up_chain`]).
+/// [`preview_next`] makes the same selection and writes nothing.
 pub async fn pick_next(
     store: &Store,
     cfg: &Config,
@@ -246,10 +246,10 @@ pub async fn pick_next(
 /// without any of its writes.
 ///
 /// The dashboard polls this, scheduler paused or not, and a poll must not
-/// do the scheduler's work: retiring a chain, bumping a rotation
+/// do the scheduler's work: ending a chain, bumping a rotation
 /// timestamp, or counting a given-up chain against its finding, which can
 /// send the finding to the inbox, hold it blocked or give its PR up. A
-/// suspension the scheduler would retire is only skipped here, so the
+/// checkpoint the scheduler would end is only skipped here, so the
 /// preview names the fresh start a given-up chain makes way for, even
 /// where the scheduler's count ends that work instead.
 pub async fn preview_next(store: &Store, cfg: &Config) -> anyhow::Result<Option<Candidate>> {
@@ -584,9 +584,9 @@ pub async fn candidate_reservation(
 /// worth continuing, or `None`.
 ///
 /// Candidates are walked newest-first; [`resume_plan`] decides each one
-/// and retires those that can never be continued, so the walk moves on
-/// to the next in the same cycle — which is what "fall through to
-/// normal selection" means.
+/// and ends those that can never be continued, so the walk moves on to
+/// the next in the same cycle — which is what "fall through to normal
+/// selection" means.
 async fn pick_resume(
     store: &Store,
     cfg: &Config,
@@ -608,12 +608,12 @@ async fn pick_resume(
     Ok(None)
 }
 
-/// A finding tier's pick: continue the suspended attempt at this same
-/// (finding, kind) when one is resumable, otherwise start the work.
+/// A finding tier's pick: continue the work item's checkpoint when it has
+/// one that is resumable, otherwise start the work.
 ///
 /// Without this the finding tiers, which outrank the resume tier, never
-/// see the suspension: they start the work fresh — paying the session
-/// floor plus everything the suspended attempt already spent. The
+/// see the checkpoint: they start the work fresh — paying the session
+/// floor plus everything the paused attempt already spent. The
 /// replacement keeps the tier's position, label and budget override;
 /// only the plan differs.
 ///
@@ -627,36 +627,32 @@ async fn finding_pick(
     mode: Pick,
 ) -> anyhow::Result<Option<Candidate>> {
     let fresh = finding_candidate(kind, f);
-    let job_kind = JobKind::from(kind);
-    for job in store.list_resumable_jobs().await? {
-        if job.finding_id != Some(f.id) || job.kind != job_kind {
-            continue;
-        }
-        let job_id = job.id;
-        match resume_plan(store, cfg, job, mode).await? {
-            Resumable::Yes(plan) => {
-                return Ok(Some(Candidate::Resume {
-                    label: fresh.label().map(str::to_owned),
-                    budget_override: fresh.budget_override(),
-                    plan,
-                }));
+    let Some(job) = store.checkpoint_job(f.id, kind).await? else {
+        return Ok(Some(fresh));
+    };
+    let job_id = job.id;
+    match resume_plan(store, cfg, job, mode).await? {
+        Resumable::Yes(plan) => Ok(Some(Candidate::Resume {
+            label: fresh.label().map(str::to_owned),
+            budget_override: fresh.budget_override(),
+            plan,
+        })),
+        Resumable::GaveUp(why) => {
+            if count_given_up_chain(store, kind, f.id, job_id, &why).await {
+                Ok(None)
+            } else {
+                Ok(Some(fresh))
             }
-            Resumable::GaveUp(why) => {
-                if count_given_up_chain(store, kind, f.id, job_id, &why).await {
-                    return Ok(None);
-                }
-            }
-            Resumable::No => {}
         }
+        Resumable::No => Ok(Some(fresh)),
     }
-    Ok(Some(fresh))
 }
 
 /// The failure a given-up chain records in its finding's streak.
 const CHAIN_GAVE_UP: &str = "resume chain gave up";
 
 /// Count a chain of this finding tier's work that the give-up ceiling
-/// retired (`why`) as one failed attempt at that work.
+/// ended (`why`) as one failed attempt at that work.
 ///
 /// Every attempt in the chain was a suspension, and a suspension never
 /// counts toward the streak, so without this the finding is still in its
@@ -666,8 +662,8 @@ const CHAIN_GAVE_UP: &str = "resume chain gave up";
 /// ([`handle_recheck_failure`], [`record_fix_failure`],
 /// [`record_harvest_failure`]), three given-up chains in a row end the
 /// work exactly as three identical failures do. Only here, where `f` is
-/// known to still be in this tier: the resume tier also retires chains,
-/// for findings a human may since have moved on.
+/// known to still be in this tier: the resume tier also ends chains, for
+/// findings a human may since have moved on.
 ///
 /// Engage has no failure streak: its tier is a flag that the PR's next
 /// change raises again, so a given-up engage chain sets the flag aside
@@ -727,7 +723,8 @@ async fn count_given_up_chain(
 enum Resumable {
     /// Continue it with this plan.
     Yes(Box<ResumePlan>),
-    /// The chain was past the give-up ceiling, and is now retired: why.
+    /// The chain was past the give-up ceiling, and its checkpoint is now
+    /// ended: why.
     GaveUp(String),
     /// Not resumable for any other reason.
     No,
@@ -744,14 +741,14 @@ enum Resumable {
 /// layout, and its row has no pinned commit. And the chain must be under
 /// the give-up ceiling, unless it is a held fix an operator requeued.
 ///
-/// Failing either is permanent, so the job is retired here rather than
-/// skipped. A skip leaves the row `suspended`: it is offered again every
-/// cycle and never leaves the table. Refusing from inside the executor
-/// would be worse — this tier outranks repo rotation, so the same
+/// Failing either is permanent, so the checkpoint is ended here rather
+/// than skipped ([`end_checkpoint`]). A skip leaves it in place: it is
+/// offered again every cycle and never goes away. Refusing from inside the
+/// executor would be worse — this tier outranks repo rotation, so the same
 /// hopeless job would be picked every cycle, starving every rotation
-/// kind. Retiring it takes it out of the walk in this same cycle. A
-/// [`Pick::Preview`] only skips it, and leaves the retirement to the
-/// scheduler's own next selection.
+/// kind. Ending it takes it out of the walk in this same cycle. A
+/// [`Pick::Preview`] only skips it, and leaves that to the scheduler's own
+/// next selection.
 async fn resume_plan(
     store: &Store,
     cfg: &Config,
@@ -779,19 +776,14 @@ async fn resume_plan(
             // The transcript names files in that tree, so no later cycle
             // can resume it either.
             let msg = format!(
-                "resume {} {}: job {} retired, workspace {} is gone",
+                "resume {} {}: job {} given up, workspace {} is gone",
                 job.kind,
                 repo.name,
                 job.id,
                 workspace.root.display()
             );
             if mode == Pick::Run {
-                let _ = store
-                    .retire_suspended_job(job.id, JobState::Killed, Some("workdir-gone"), &msg)
-                    .await;
-                let _ = store
-                    .log_event("resume", &msg, Some(job.id), job.finding_id)
-                    .await;
+                end_checkpoint(store, &job, JobState::Killed, "workdir-gone", &msg).await;
             }
             return Ok(Resumable::No);
         }
@@ -865,15 +857,9 @@ async fn resume_plan(
             let _ = store.set_last_kind_at(job.repo_id, kind).await;
         }
         // Best-effort: the candidate is skipped either way, so a failed
-        // write only defers the record — and only a landed retirement is
-        // reported as a give-up, so the chain is counted once.
-        let retired = store
-            .retire_suspended_job(job.id, JobState::Failed, Some("give-up"), &msg)
-            .await
-            .is_ok();
-        let _ = store
-            .log_event("resume", &msg, Some(job.id), job.finding_id)
-            .await;
+        // write only defers the record — and only a landed give-up is
+        // reported as one, so the chain is counted once.
+        let retired = end_checkpoint(store, &job, JobState::Failed, "give-up", &msg).await;
         return Ok(if retired {
             Resumable::GaveUp(msg)
         } else {
@@ -910,6 +896,36 @@ async fn resume_plan(
         chain_spent,
         handoff: false,
     })))
+}
+
+/// End the checkpoint `job` for good, logging `msg` as a `resume` event.
+///
+/// A finding's work drops its checkpoint pointer and leaves the job row as
+/// it ended (WORK-MODEL.md §4). A repo-level job's suspended row is its
+/// checkpoint, so that row is retired `state` / `reason` instead. True when
+/// the write landed; a failed one leaves the checkpoint for the next
+/// selection to try again.
+async fn end_checkpoint(
+    store: &Store,
+    job: &Job,
+    state: JobState,
+    reason: &str,
+    msg: &str,
+) -> bool {
+    if let (JobKind::Finding(kind), Some(fid)) = (job.kind, job.finding_id) {
+        return store
+            .drop_checkpoint(fid, kind, job.id, msg)
+            .await
+            .unwrap_or(false);
+    }
+    let retired = store
+        .retire_suspended_job(job.id, state, Some(reason), msg)
+        .await
+        .is_ok();
+    let _ = store
+        .log_event("resume", msg, Some(job.id), job.finding_id)
+        .await;
+    retired
 }
 
 /// Historical cost estimate for one (repo, kind): warm (finished a
@@ -1154,17 +1170,29 @@ pub async fn record_job(
     //
     // Not for a handoff: its predecessor was never suspended. It finished,
     // and retiring it `killed` would rewrite a completed engage.
+    //
+    // A finding's work needs no retirement: this attempt ended without
+    // pausing, so `complete_job` has already moved its work item off the
+    // checkpoint, and the predecessor's row stays as it ended.
     if let Some(plan) = resume
         && !plan.handoff
         && rr.killed_reason.as_deref() == Some("resume-unavailable")
     {
-        let msg = format!(
-            "resume {} {}: session gone, predecessor job {} marked killed",
-            plan.kind, plan.repo, plan.predecessor_id
-        );
-        store
-            .retire_suspended_job(plan.predecessor_id, JobState::Killed, None, &msg)
-            .await?;
+        let msg = if plan.kind.is_finding() {
+            format!(
+                "resume {} {}: session gone, checkpoint job {} given up",
+                plan.kind, plan.repo, plan.predecessor_id
+            )
+        } else {
+            let msg = format!(
+                "resume {} {}: session gone, predecessor job {} marked killed",
+                plan.kind, plan.repo, plan.predecessor_id
+            );
+            store
+                .retire_suspended_job(plan.predecessor_id, JobState::Killed, None, &msg)
+                .await?;
+            msg
+        };
         let _ = store
             .log_event("error", &msg, Some(job_id), plan.finding_id)
             .await;
@@ -1498,27 +1526,6 @@ fn log_write_failure<T, E: std::fmt::Display>(
             |e| tracing::error!(error = %format_args!("{e:#}"), "store write failed: {what}"),
         )
         .ok()
-}
-
-/// Retire a suspended attempt whose work concluded anyway.
-///
-/// A worker can finish the finding's business before the cap stops it —
-/// leave a verdict file, or commit enough for the scheduler to open the
-/// pull request. The finding then leaves the status the kind acts on, so
-/// no resume could ever continue the chain, yet it would stay `suspended`
-/// and be offered by the resume tier every cycle. Retiring it here makes
-/// the chain terminal, so its tree is released with the job instead of
-/// kept for a resume that cannot come. `killed_reason` is left alone: the
-/// attempt really did stop on `cap`.
-async fn retire_concluded(store: &Store, job: i64, outcome: &str) {
-    let msg =
-        format!("job {job} suspended after its work concluded ({outcome}); nothing to resume");
-    log_write_failure(
-        store
-            .retire_suspended_job(job, JobState::Killed, None, &msg)
-            .await,
-        format_args!("job {job}: retiring concluded suspended attempt"),
-    );
 }
 
 /// Fetch `repo`'s clone and return the tip of its default branch: where a
@@ -3964,10 +3971,6 @@ pub async fn run_fix(
         start.previous_blocker.as_ref(),
     )
     .await?;
-    let concluded = matches!(
-        outcome,
-        FixOutcome::Declined { .. } | FixOutcome::Shipped { .. }
-    );
     record_fix_outcome(
         store,
         finding,
@@ -3977,10 +3980,6 @@ pub async fn run_fix(
         &mut summary,
     )
     .await?;
-    if state == JobState::Suspended && concluded {
-        let outcome = summary.outcome.as_deref().unwrap_or_default();
-        retire_concluded(store, start.job, outcome).await;
-    }
     close_workspace(store, &start.ws).await;
     Ok(summary)
 }
@@ -5015,10 +5014,21 @@ pub async fn run_engage(
         .await;
         false
     };
-    if state == JobState::Suspended
-        && let Some(outcome @ ("withdrawn" | "withdraw-failed")) = summary.outcome.as_deref()
-    {
-        retire_concluded(store, start.job, outcome).await;
+    // A withdrawal is this attempt's end even when the worker was cut off
+    // after writing it: a successful one takes the finding out of
+    // `pr_open`, which drops the checkpoint with it, and a failed one must
+    // not be resumed into the same withdrawal either.
+    if state == JobState::Suspended && summary.outcome.as_deref() == Some("withdraw-failed") {
+        let msg = format!(
+            "job {} suspended after its withdrawal failed; nothing to resume",
+            start.job
+        );
+        log_write_failure(
+            store
+                .drop_checkpoint(fid, FindingJobKind::Engage, start.job, &msg)
+                .await,
+            format_args!("job {}: dropping the engage checkpoint", start.job),
+        );
     }
     if closed_on_forge {
         continue_into_harvest(

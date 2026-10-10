@@ -677,7 +677,8 @@ async fn a_fresh_fix_superseding_a_suspended_fix_takes_over_its_branch() {
     let (state, reason, _) = job_state(&f.pool, old).await;
     assert_eq!(
         (state.as_str(), reason.as_deref()),
-        ("killed", Some("superseded"))
+        ("suspended", Some("cap")),
+        "the superseded checkpoint's row is left as it ended"
     );
     assert!(
         !old_tree.exists(),
@@ -726,6 +727,7 @@ async fn the_sweep_removes_legacy_trees_no_live_job_uses() {
     .execute(&f.pool)
     .await
     .unwrap();
+    support::point_checkpoint(&f.pool, 5, "engage", 30).await;
 
     let report = workspace::sweep(&f.store, &f.cfg.work_root, hunter::util::now_ms())
         .await
@@ -737,7 +739,7 @@ async fn the_sweep_removes_legacy_trees_no_live_job_uses() {
         !git(&f.clone, &["worktree", "list", "--porcelain"]).contains("/wt/h9"),
         "and unregistered from its clone"
     );
-    assert!(in_use.is_dir(), "a suspended job's legacy tree is kept");
+    assert!(in_use.is_dir(), "a checkpoint's legacy tree is kept");
     assert_eq!(
         (report.legacy_trees_removed, report.legacy_trees_kept),
         (2, 1)
@@ -848,12 +850,13 @@ async fn a_cold_job_fetches_the_clone_but_never_moves_its_checkout() {
 // -- fix: a suspension is not a failure --------------------------------------
 
 /// A fix whose worker concluded before the cap stopped it — here it left
-/// its verdict — is retired rather than left `suspended`: the finding is
-/// no longer queued, so nothing could ever resume it, and a suspension
-/// kept around would pin its tree and be offered every cycle. Every
-/// status a decline can land at counts, not only `rejected`.
+/// its verdict — keeps no checkpoint: the finding left the fix's tier, so
+/// nothing could ever resume it, and a checkpoint kept around would pin
+/// its tree and be offered every cycle. The job row stays `suspended`, as
+/// the attempt ended. Every status a decline can land at counts, not only
+/// `rejected`.
 #[tokio::test]
-async fn a_suspended_fix_whose_work_concluded_is_retired_and_released() {
+async fn a_suspended_fix_whose_work_concluded_keeps_no_checkpoint_and_is_released() {
     for (report, outcome) in [
         ("Classification: wrong\nmisread the code", "rejected"),
         ("Classification: superseded\nfixed by abc1234", "superseded"),
@@ -874,7 +877,7 @@ async fn a_suspended_fix_whose_work_concluded_is_retired_and_released() {
 
         assert_eq!(summary.outcome.as_deref(), Some(outcome));
         let job = summary.job_id.unwrap();
-        assert_eq!(job_state(&f.pool, job).await.0, "killed", "{outcome}");
+        assert_eq!(job_state(&f.pool, job).await.0, "suspended", "{outcome}");
         assert!(
             f.store.list_resumable_jobs().await.unwrap().is_empty(),
             "{outcome}"
@@ -917,6 +920,10 @@ async fn a_suspended_harvest_keeps_its_tree() {
     .execute(&f.pool)
     .await
     .unwrap();
+    f.store
+        .set_finding_status(fid, hunter::domain::FindingStatus::Merged)
+        .await
+        .unwrap();
     std::fs::write(
         f.dir.join("playbooks").join("harvest.md"),
         "harvest {{WORKTREE}}\n",

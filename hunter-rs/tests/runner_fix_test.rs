@@ -435,18 +435,30 @@ async fn verdict_after_selection_stops_the_fix_before_its_job() {
     assert_eq!(finding.status.as_str(), "rejected");
     assert_eq!(finding.verdict_reason.as_deref(), Some("not worth it"));
 
+    // The verdict took the finding out of the fix's tier, which ends the
+    // work item: queued again, the fix starts over.
     f.store
         .set_finding_status(f.fid, hunter::domain::FindingStatus::Queued)
         .await
         .unwrap();
-    let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
-        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
-            .await
-            .unwrap()
-    else {
-        panic!("the checkpoint must still resume");
-    };
-    assert_eq!(plan.predecessor_id, summary.job_id.unwrap());
+    let picked = hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            picked,
+            Some(hunter::scheduler::Candidate::Finding { finding_id, .. }) if finding_id == f.fid
+        ),
+        "{picked:?}"
+    );
+    let job = summary.job_id.unwrap();
+    let row = f.store.jobs_by_finding(f.fid).await.unwrap();
+    let row = row.iter().find(|j| j.id == job).unwrap();
+    assert_eq!(
+        row.state,
+        hunter::domain::JobState::Suspended,
+        "left as it ended"
+    );
 }
 
 /// Stage an implemented fix plus durable reports and its metered transcript.
@@ -988,8 +1000,9 @@ async fn unremovable_stale_report_holds_the_checkpoint_blocked() {
     assert_eq!(again.predecessor_id, plan.predecessor_id);
 }
 
-/// Rejecting a blocked fix ends its checkpoint: the next sweep retires the
-/// suspension and releases its tree, instead of holding both forever.
+/// Rejecting a blocked fix ends its checkpoint: the verdict drops the
+/// pointer and the next sweep releases its tree, instead of holding it
+/// forever. The job row stays as it ended.
 #[tokio::test]
 async fn rejecting_a_blocked_fix_lets_the_sweep_release_its_checkpoint() {
     let (f, blocked, summary, _) = blocked_fixture().await;
@@ -1014,9 +1027,16 @@ async fn rejecting_a_blocked_fix_lets_the_sweep_release_its_checkpoint() {
         .unwrap();
     assert!(!tree.exists(), "the rejected checkpoint's tree is released");
     let jobs = f.store.jobs_by_finding(f.fid).await.unwrap();
-    let retired = jobs.iter().find(|j| j.id == job).unwrap();
-    assert_eq!(retired.state, hunter::domain::JobState::Killed);
-    assert_eq!(retired.killed_reason.as_deref(), Some("finding-moved"));
+    let held = jobs.iter().find(|j| j.id == job).unwrap();
+    assert_eq!(held.state, hunter::domain::JobState::Suspended);
+    assert_eq!(
+        f.store
+            .checkpoint_job(f.fid, FindingJobKind::Fix)
+            .await
+            .unwrap()
+            .map(|j| j.id),
+        None
+    );
 }
 
 /// A blocked resume whose backend fails before any worker runs leaves no
