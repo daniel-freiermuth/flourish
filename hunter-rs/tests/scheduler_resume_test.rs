@@ -1893,6 +1893,51 @@ async fn a_recheck_without_a_verdict_retries_then_returns_to_the_inbox() {
     );
 }
 
+/// A recheck whose tree can never be created -- here the repo names a
+/// default branch origin does not have -- is a failed recheck like any
+/// other: retried, and the third in a row sends the finding back to the
+/// inbox. Left `rechecking` with nothing counted, the recheck tier (above
+/// fix) would take it again every cycle and starve everything below it.
+#[tokio::test]
+async fn a_recheck_whose_tree_can_never_be_made_returns_to_the_inbox() {
+    let (dir, path, pool) = fresh_db().await;
+    let store = rw_store(&path).await;
+    let fid = repo_with_finding(&dir, &pool, &store, FindingStatus::Rechecking).await;
+    sqlx::query("UPDATE repos SET default_branch = 'no-such-branch' WHERE id = 1")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let cfg = test_config(dir.path());
+    let never = ScriptedBackend::new(|_| panic!("nothing may run without a tree"));
+
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        let finding = store.get_finding(fid).await.unwrap().unwrap();
+        let summary = run_recheck(&store, &cfg, &finding, &never, None)
+            .await
+            .unwrap();
+        assert!(
+            summary
+                .failure
+                .as_deref()
+                .is_some_and(|r| r.starts_with("workspace not created")),
+            "{summary:?}"
+        );
+        let after = store.get_finding(fid).await.unwrap().unwrap();
+        seen.push((summary.outcome, after.status, after.recheck_attempts));
+    }
+
+    assert_eq!(
+        seen,
+        [
+            (Some("requeued".into()), FindingStatus::Rechecking, 1),
+            (Some("requeued".into()), FindingStatus::Rechecking, 2),
+            (Some("stuck".into()), FindingStatus::New, 0),
+        ],
+        "(outcome, status, recheck_attempts) per attempt"
+    );
+}
+
 /// Every end of a recheck attempt spends a `once` override — a
 /// suspension, a missing verdict, a landed verdict — and keeps an
 /// `exempt` one, which lasts until a human clears it.

@@ -175,6 +175,74 @@ async fn a_cycle_runs_the_queued_fix() {
     assert_eq!(summary.outcome.as_deref(), Some("rejected"), "{summary:?}");
 }
 
+/// A fix whose tree can never be created -- here the repo names a
+/// default branch origin does not have -- is a failed fix attempt like any
+/// other: it stays `queued` for the retry and, after
+/// `MAX_CONSECUTIVE_SAME_FAILURE` (3) of them in a row, is held as stuck
+/// (`blocked`). Left `queued` with nothing counted, `pick_next` (oldest queued
+/// first) would re-pick it every cycle and no other queued fix would run.
+#[tokio::test]
+async fn a_tree_that_can_never_be_made_ends_stuck_as_blocked() {
+    use hunter::domain::FindingStatus;
+
+    let f = fixture("fix-never-a-tree").await;
+    let rid = f.store.get_finding(f.fid).await.unwrap().unwrap().repo_id;
+    f.store
+        .update_repo(
+            rid,
+            &hunter::store::RepoUpdate {
+                default_branch: Some("no-such-branch".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let never = ScriptedBackend::new(|_| panic!("nothing may run without a tree"));
+
+    let mut outcomes = Vec::new();
+    for attempt in 1..=3 {
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        assert_eq!(
+            finding.status,
+            FindingStatus::Queued,
+            "before attempt {attempt}"
+        );
+        let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &never, None)
+            .await
+            .unwrap();
+        assert!(
+            summary
+                .failure
+                .as_deref()
+                .is_some_and(|r| r.starts_with("workspace not created")),
+            "{summary:?}"
+        );
+        outcomes.push(summary.outcome.unwrap_or_default());
+    }
+
+    assert_eq!(outcomes, ["requeued", "requeued", "blocked"]);
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(finding.status, FindingStatus::Blocked);
+    let shown = shown_blocker(&f).await;
+    assert!(
+        shown.as_deref().is_some_and(|r| r.starts_with(
+            "stuck: 3 consecutive fix attempts hit the same failure: workspace not created"
+        ) && r.contains("no-such-branch")),
+        "{shown:?}"
+    );
+    // The operator's requeue: no worker ever ran, so there is no
+    // checkpoint to continue and the next attempt starts fresh.
+    f.store
+        .set_finding_status(f.fid, FindingStatus::Queued)
+        .await
+        .unwrap();
+    let jobs = f.store.list_resumable_jobs().await.unwrap();
+    assert!(
+        jobs.iter().all(|j| j.finding_id != Some(f.fid)),
+        "a job that never had a tree is nothing to resume"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The cap the job is granted
 // ---------------------------------------------------------------------------

@@ -531,6 +531,59 @@ async fn an_invalid_close_reason_counts_toward_the_streak() {
     );
 }
 
+/// A harvest whose tree can never be created is a failed harvest like any
+/// other: retried, and at the limit the PR is given up on with the finding
+/// left `closed`. Left pending with nothing counted, the harvest tier
+/// (above recheck and fix) would take it again every cycle and starve
+/// everything below it. The tree fails here because `jobs/` is a file:
+/// the harvest fetches its default branch by name first, so a branch
+/// origin lacks would fail before any tree is attempted.
+#[tokio::test]
+async fn a_harvest_whose_tree_can_never_be_made_is_given_up() {
+    let bins = FakeBins::acquire("harvest-never-a-tree");
+    gh_default(&bins);
+    let f = fixture("harvest-never-a-tree", FindingStatus::Closed).await;
+    std::fs::write(f.cfg.work_root.join("jobs"), "not a directory").unwrap();
+    let never = ScriptedBackend::new(|_| panic!("nothing may run without a tree"));
+
+    let mut outcomes = Vec::new();
+    for attempt in 1..=3 {
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        let summary = run_harvest(&f.store, &f.cfg, &finding, &never, None)
+            .await
+            .unwrap();
+        assert!(
+            summary
+                .failure
+                .as_deref()
+                .is_some_and(|r| r.starts_with("workspace not created")),
+            "{summary:?}"
+        );
+        let ps = f.store.get_pr_state(f.fid).await.unwrap().unwrap();
+        if attempt < 3 {
+            assert_eq!(ps.harvest_attempts, attempt, "{summary:?}");
+            assert_eq!(ps.harvested_at, None, "retried, not given up: {summary:?}");
+        } else {
+            assert!(
+                ps.harvested_at.is_some(),
+                "given up at the limit: {summary:?}"
+            );
+        }
+        outcomes.push(summary.outcome);
+    }
+
+    assert_eq!(
+        outcomes,
+        [
+            Some("retry".into()),
+            Some("retry".into()),
+            Some("stuck".into())
+        ]
+    );
+    let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(after.status, FindingStatus::Closed);
+}
+
 /// How many findings carry `fingerprint`.
 async fn filed(f: &Fixture, fingerprint: &str) -> usize {
     f.store
