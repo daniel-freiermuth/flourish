@@ -1059,6 +1059,31 @@ fn gitlab_api(
     run_cmd(&refs, 30)
 }
 
+/// URL of the open MR a refused `glab mr create` says already exists.
+///
+/// GitLab names it by reference only — "Another open merge request already
+/// exists for this source branch: !12" (`MergeRequest#conflicting_mr_message`)
+/// — so the URL `run_fix` recovers onto has to be looked up. `None` for any
+/// other failure, or when the lookup fails.
+fn gitlab_existing_mr_url(repo_path: &Path, create_out: &str) -> Option<String> {
+    let (_, reference) = create_out.split_once("already exists for this source branch: !")?;
+    let iid: String = reference.chars().take_while(char::is_ascii_digit).collect();
+    if iid.is_empty() {
+        return None;
+    }
+    let (rc, out) = run_cmd_cwd(
+        &["glab", "mr", "view", &iid, "--output", "json"],
+        repo_path,
+        60,
+    );
+    if rc != 0 {
+        return None;
+    }
+    let mr: serde_json::Value = serde_json::from_str(out.trim()).ok()?;
+    let url = mr.get("web_url")?.as_str()?;
+    url.contains("/-/merge_requests/").then(|| url.to_owned())
+}
+
 // ---------------------------------------------------------------------------
 // GitHub (via `gh` CLI) — `forge.GitHubForge`
 // ---------------------------------------------------------------------------
@@ -1297,6 +1322,12 @@ impl Forge for GitLabForge {
             300,
         );
         if rc != 0 {
+            if let Some(url) = gitlab_existing_mr_url(repo_path, &out) {
+                anyhow::bail!(
+                    "glab mr create failed (rc={rc}): {} (existing MR: {url})",
+                    out.trim_end()
+                );
+            }
             anyhow::bail!("glab mr create failed (rc={rc}): {out}");
         }
         // glab prints the MR URL; search for it.

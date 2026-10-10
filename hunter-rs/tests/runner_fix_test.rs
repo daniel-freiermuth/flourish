@@ -15,7 +15,7 @@ mod support;
 use hunter::config::Config;
 use hunter::domain::ForgeName;
 use hunter::store::FindingInsert;
-use support::{GitRepo, ScriptedBackend, TempDir, fresh_store, git};
+use support::{FakeBins, GitRepo, ScriptedBackend, TempDir, fresh_store, git};
 
 const REPO_URL: &str = "https://github.com/acme/widget";
 /// Matches the slug `run_fix` derives from the finding summary below.
@@ -34,6 +34,11 @@ struct Fixture {
 
 /// A repo with a queued bug finding — the state `run_fix` expects.
 async fn fixture(label: &str) -> Fixture {
+    fixture_on(label, REPO_URL, ForgeName::Github).await
+}
+
+/// [`fixture`] for a repo registered at `url` on `forge`.
+async fn fixture_on(label: &str, url: &str, forge: ForgeName) -> Fixture {
     let dir = TempDir::new(label);
     let repo = GitRepo::with_branch(&dir, "some-other-branch");
     let (db, store) = fresh_store(&dir, "fix").await;
@@ -41,13 +46,7 @@ async fn fixture(label: &str) -> Fixture {
     let repos_root = dir.path().join("repos");
     std::fs::create_dir_all(&repos_root).unwrap();
     let rid = store
-        .add_repo(
-            "widget",
-            REPO_URL,
-            &repos_root,
-            &repo.default_branch,
-            ForgeName::Github,
-        )
+        .add_repo("widget", url, &repos_root, &repo.default_branch, forge)
         .await
         .unwrap();
     let repo_dir = hunter::store::Store::repo_dir(&repos_root, rid);
@@ -173,6 +172,77 @@ async fn a_cycle_runs_the_queued_fix() {
 
     assert_eq!(summary.finding_id, Some(f.fid), "{summary:?}");
     assert_eq!(summary.outcome.as_deref(), Some("rejected"), "{summary:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Shipping into an MR that already exists
+// ---------------------------------------------------------------------------
+
+const GL_REPO_URL: &str = "https://gitlab.com/acme/widget";
+const GL_MR_URL: &str = "https://gitlab.com/acme/widget/-/merge_requests/12";
+
+/// A worker that ships: one commit on the fix branch and a PR description.
+fn shipping_worker() -> ScriptedBackend {
+    ScriptedBackend::new(|cwd| {
+        std::fs::write(cwd.join("FIX.md"), "fixed\n").unwrap();
+        git(cwd, &["add", "FIX.md"]);
+        git(cwd, &["commit", "-m", "fix: a real bug"]);
+        std::fs::write(cwd.join("PR-DESCRIPTION.md"), "the fix\n").unwrap();
+        support::done()
+    })
+}
+
+/// A re-run of a fix whose MR is still open from an earlier attempt: the
+/// push lands, `glab mr create` is refused because the branch already has
+/// an open MR, and that MR is the fix's MR. GitLab names it only by
+/// reference (`!12`, from `MergeRequest#conflicting_mr_message`), never by
+/// URL, so the finding must end `pr_open` on that MR — the same recovery
+/// a `gh` "already exists" error gets. Requeueing instead fails the same
+/// way on every attempt until the streak rejects the finding as stuck,
+/// with its MR still open.
+#[tokio::test]
+async fn gitlab_mr_that_already_exists_is_recovered() {
+    let bins = FakeBins::acquire("fix-gl-mr-exists");
+    bins.script(
+        "glab",
+        &format!(
+            "case \"$1 $2\" in\n\
+             'mr create') echo 'POST https://gitlab.com/api/v4/projects/acme%2Fwidget/merge_requests: 409 {{message: [Another open merge request already exists for this source branch: !12]}}' >&2; exit 1;;\n\
+             'mr view') echo '{{\"iid\":12,\"state\":\"opened\",\"source_branch\":\"{BRANCH}\",\"web_url\":\"{GL_MR_URL}\"}}'; exit 0;;\n\
+             esac\n\
+             exit 1"
+        ),
+    );
+    let f = fixture_on("fix-gl-mr-exists", GL_REPO_URL, ForgeName::Gitlab).await;
+    // `run_fix` pushes to the forge's SSH URL; point it at the local origin.
+    let origin = git(&f.repo_dir, &["remote", "get-url", "origin"]);
+    git(
+        &f.repo_dir,
+        &[
+            "config",
+            &format!("url.{}.insteadOf", origin.trim()),
+            "git@gitlab.com:acme/widget.git",
+        ],
+    );
+
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &shipping_worker(), None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        summary.outcome.as_deref(),
+        Some("pr_open"),
+        "the existing MR must be adopted, not retried: {summary:?}"
+    );
+    assert_eq!(summary.pr_url.as_deref(), Some(GL_MR_URL));
+    let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(after.status, hunter::domain::FindingStatus::PrOpen);
+    assert_eq!(after.pr_url.as_deref(), Some(GL_MR_URL));
+    assert_eq!(
+        after.fix_attempts, 0,
+        "a recovered MR is not a failed attempt"
+    );
 }
 
 // ---------------------------------------------------------------------------

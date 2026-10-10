@@ -465,6 +465,41 @@ fn gitlab_create_pr_propagates_a_non_zero_exit() {
     );
 }
 
+/// GitLab refuses a second MR for a branch with an open one, naming the
+/// open MR by reference only (`!12`, `MergeRequest#conflicting_mr_message`).
+/// The refusal must stay an error — nothing was created — but carry the
+/// existing MR's URL, which is what `run_fix` recovers the finding onto.
+#[test]
+fn gitlab_create_pr_names_the_mr_that_already_exists() {
+    let bins = FakeBins::acquire("forge-gl-create-exists");
+    let dir = TempDir::new("forge-gl-create-exists-cwd");
+    bins.script(
+        "glab",
+        "case \"$1 $2\" in\n\
+         'mr create') echo 'POST https://gitlab.com/api/v4/projects/group%2Fwidget/merge_requests: 409 {message: [Another open merge request already exists for this source branch: !12]}' >&2; exit 1;;\n\
+         'mr view') echo '{\"iid\":12,\"web_url\":\"https://gitlab.com/group/widget/-/merge_requests/12\"}'; exit 0;;\n\
+         esac\n\
+         exit 1",
+    );
+
+    let err = forge_for(ForgeName::Gitlab)
+        .create_pr(dir.path(), "fix/x", "main", "t", "b")
+        .expect_err("a refused create created nothing");
+    let msg = err.to_string();
+    assert!(msg.contains("already exists"), "{msg}");
+    assert!(
+        msg.contains("https://gitlab.com/group/widget/-/merge_requests/12"),
+        "the existing MR's URL must be in the error: {msg}"
+    );
+
+    let calls = bins.calls();
+    let view = position_of(&calls, "glab", &["mr", "view"]).expect("view call");
+    assert_eq!(
+        calls[view],
+        ["glab", "mr", "view", "12", "--output", "json"]
+    );
+}
+
 // ---------------------------------------------------------------------------
 // push
 // ---------------------------------------------------------------------------

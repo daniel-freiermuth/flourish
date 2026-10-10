@@ -2935,17 +2935,20 @@ pub async fn run_standards(
     run_analysis_job(store, cfg, repo, &STANDARDS_SPEC, backend, resume).await
 }
 
+/// The first GitHub PR or GitLab MR URL in `text`, cut after its number.
 fn extract_pr_url(text: &str) -> Option<String> {
     for word in text.split_whitespace() {
         if word.starts_with("https://")
-            && let Some(idx) = word.find("/pull/")
+            && let Some(end) = ["/pull/", "/-/merge_requests/"]
+                .into_iter()
+                .find_map(|marker| word.find(marker).map(|idx| idx + marker.len()))
         {
-            let after = &word[idx + 6..];
+            let after = &word[end..];
             let digit_end = after
                 .find(|c: char| !c.is_ascii_digit())
                 .unwrap_or(after.len());
             if digit_end > 0 {
-                return Some(word[..idx + 6 + digit_end].to_owned());
+                return Some(word[..end + digit_end].to_owned());
             }
         }
     }
