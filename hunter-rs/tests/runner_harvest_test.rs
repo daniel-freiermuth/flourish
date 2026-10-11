@@ -15,7 +15,9 @@
 mod support;
 
 use hunter::config::Config;
-use hunter::domain::{BudgetOverride, FindingJobKind, FindingStatus, ForgeName, JobState};
+use hunter::domain::{
+    BudgetOverride, FindingJobKind, FindingStatus, ForgeName, JobState, ReleaseAction,
+};
 use hunter::scheduler::{Candidate, pick_next, run_harvest};
 use hunter::store::{FindingInsert, Store};
 use hunter::types::RunResult;
@@ -479,8 +481,9 @@ async fn a_follow_up_never_reopens_a_rejected_finding() {
 }
 
 /// A review that does not say why the PR closed is a failed harvest: it
-/// counts toward the identical-failure streak, and at the limit the PR is
-/// given up on with the finding left `closed` — never suppressed.
+/// counts toward the identical-failure streak, and at the limit the
+/// harvest is held for the operator with the finding left `closed` —
+/// never suppressed, and never stamped harvested unreviewed.
 #[tokio::test]
 async fn an_invalid_close_reason_counts_toward_the_streak() {
     let bins = FakeBins::acquire("harvest-invalid");
@@ -504,10 +507,7 @@ async fn an_invalid_close_reason_counts_toward_the_streak() {
             assert_eq!(harvest_streak(&f).await, attempt, "{summary:?}");
             assert_eq!(ps.harvested_at, None, "retried, not given up: {summary:?}");
         } else {
-            assert!(
-                ps.harvested_at.is_some(),
-                "given up at the limit: {summary:?}"
-            );
+            assert_eq!(ps.harvested_at, None, "held, not stamped: {summary:?}");
         }
         outcomes.push(summary.outcome);
     }
@@ -517,17 +517,38 @@ async fn an_invalid_close_reason_counts_toward_the_streak() {
         [
             Some("retry".into()),
             Some("retry".into()),
-            Some("stuck".into())
+            Some("held".into())
         ]
     );
     let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
     assert_eq!(after.status, FindingStatus::Closed);
+    assert_held(&f, ReleaseAction::Classify).await;
     let events = f.store.recent_events(50).await.unwrap();
     assert!(
         events
             .iter()
-            .any(|e| e.kind == "error" && e.message.contains("gave up after 3")),
+            .any(|e| e.kind == "error" && e.message.contains("held after 3")),
         "{events:?}"
+    );
+}
+
+/// The fixture's harvest is held as `stuck` and skipped by the harvest
+/// tier, and `last` is how a closed PR (`classify`) or a merged one
+/// (`mark_harvested`) can be ended by hand.
+async fn assert_held(f: &Fixture, last: ReleaseAction) {
+    let hold = support::hold_of(&f.store, f.fid, FindingJobKind::Harvest)
+        .await
+        .expect("held at the limit");
+    assert_eq!(hold.reason, hunter::domain::HoldReason::Stuck);
+    assert_eq!(hold.actions().last(), Some(&last), "{hold:?}");
+    let picked = pick_next(&f.store, &f.cfg, None).await.unwrap();
+    assert!(
+        !matches!(
+            picked,
+            Some(Candidate::Finding { kind: FindingJobKind::Harvest, finding_id, .. })
+                if finding_id == f.fid
+        ),
+        "held work is skipped: {picked:?}"
     );
 }
 
@@ -624,10 +645,12 @@ async fn a_retried_harvest_files_no_follow_ups() {
     );
 }
 
-/// A harvest given up on is not reviewed again, so its last attempt's
-/// follow-ups are the only ones the PR will ever get: they are filed.
+/// A held harvest files no follow-ups: the operator's `continue` or
+/// `restart` reviews the PR again, and that review files the open work.
+/// Before holds, a harvest given up on was never reviewed again, so its
+/// last attempt's follow-ups were filed.
 #[tokio::test]
-async fn a_harvest_given_up_on_files_its_last_follow_ups() {
+async fn a_held_harvest_files_no_follow_ups() {
     let bins = FakeBins::acquire("harvest-stuck-followups");
     gh_default(&bins);
     let f = fixture("harvest-stuck-followups", FindingStatus::Closed).await;
@@ -655,8 +678,12 @@ async fn a_harvest_given_up_on_files_its_last_follow_ups() {
         [
             (Some("retry".into()), 0),
             (Some("retry".into()), 0),
-            (Some("stuck".into()), 1)
+            (Some("held".into()), 0)
         ]
+    );
+    assert!(
+        unfiled_because(&f, "the attempt will be redone").await,
+        "the unfiled follow-ups are logged, not silently dropped"
     );
 }
 
@@ -997,11 +1024,8 @@ async fn a_failing_pr_diff_counts_toward_the_streak() {
             assert_eq!(ps.harvested_at, None, "retried, not given up");
             assert!(still_pending, "attempt {attempt}: {picked:?}");
         } else {
-            assert!(ps.harvested_at.is_some(), "given up at the limit");
-            assert!(
-                !still_pending,
-                "a given-up PR must not be picked: {picked:?}"
-            );
+            assert_eq!(ps.harvested_at, None, "held, not stamped");
+            assert!(!still_pending, "a held PR must not be picked: {picked:?}");
         }
     }
 
@@ -1011,7 +1035,7 @@ async fn a_failing_pr_diff_counts_toward_the_streak() {
     assert!(
         events
             .iter()
-            .any(|e| e.kind == "error" && e.message.contains("gave up after 3")),
+            .any(|e| e.kind == "error" && e.message.contains("held after 3")),
         "{events:?}"
     );
 }
@@ -1049,11 +1073,8 @@ async fn a_failing_pr_view_counts_toward_the_streak() {
             assert_eq!(ps.harvested_at, None, "retried, not given up");
             assert!(still_pending, "attempt {attempt}: {picked:?}");
         } else {
-            assert!(ps.harvested_at.is_some(), "given up at the limit");
-            assert!(
-                !still_pending,
-                "a given-up PR must not be picked: {picked:?}"
-            );
+            assert_eq!(ps.harvested_at, None, "held, not stamped");
+            assert!(!still_pending, "a held PR must not be picked: {picked:?}");
         }
     }
 
@@ -1061,9 +1082,63 @@ async fn a_failing_pr_view_counts_toward_the_streak() {
     assert!(
         events
             .iter()
-            .any(|e| e.kind == "error" && e.message.contains("gave up after 3")),
+            .any(|e| e.kind == "error" && e.message.contains("held after 3")),
         "{events:?}"
     );
+}
+
+/// A harvest whose tree can never be created is a failed harvest like any
+/// other: retried, and at the limit held for the operator with the finding
+/// left `closed`. Left pending with nothing counted, the harvest tier
+/// (above recheck and fix) would take it again every cycle and starve
+/// everything below it. The tree fails here because `jobs/` is a file:
+/// the harvest fetches its default branch by name first, so a branch
+/// origin lacks would fail before any tree is attempted. No worker ran,
+/// so the hold has no checkpoint to continue.
+#[tokio::test]
+async fn a_harvest_whose_tree_can_never_be_made_is_held() {
+    let bins = FakeBins::acquire("harvest-never-a-tree");
+    gh_default(&bins);
+    let f = fixture("harvest-never-a-tree", FindingStatus::Closed).await;
+    std::fs::write(f.cfg.work_root.join("jobs"), "not a directory").unwrap();
+    let never = ScriptedBackend::new(|_| panic!("nothing may run without a tree"));
+
+    let mut outcomes = Vec::new();
+    for attempt in 1..=3 {
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        let summary = run_harvest(&f.store, &f.cfg, &finding, &never, None)
+            .await
+            .unwrap();
+        assert!(
+            summary
+                .failure
+                .as_deref()
+                .is_some_and(|r| r.starts_with("workspace not created")),
+            "{summary:?}"
+        );
+        let ps = f.store.get_pr_state(f.fid).await.unwrap().unwrap();
+        if attempt < 3 {
+            assert_eq!(harvest_streak(&f).await, attempt, "{summary:?}");
+        }
+        assert_eq!(ps.harvested_at, None, "never stamped: {summary:?}");
+        outcomes.push(summary.outcome);
+    }
+
+    assert_eq!(
+        outcomes,
+        [
+            Some("retry".into()),
+            Some("retry".into()),
+            Some("held".into())
+        ]
+    );
+    let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(after.status, FindingStatus::Closed);
+    assert_held(&f, ReleaseAction::Classify).await;
+    let hold = support::hold_of(&f.store, f.fid, FindingJobKind::Harvest)
+        .await
+        .unwrap();
+    assert_eq!(hold.checkpoint_job_id, None);
 }
 
 /// The cold review runs in a tree at the default branch, which does not
@@ -1385,4 +1460,146 @@ async fn a_worker_that_never_reached_its_provider_keeps_the_checkpoint() {
             .all(|j| j.state != JobState::Running),
         "no job is left running"
     );
+}
+
+/// A paused harvest is continued without asking the forge for the PR: the
+/// view only feeds the playbook, which a resume does not send. A laptop
+/// that wakes before its network is back used to fail that view, and the
+/// failure dropped the checkpoint and with it the partial review.
+#[tokio::test]
+async fn a_paused_harvest_continues_without_the_forge() {
+    let bins = FakeBins::acquire("harvest-resume-offline");
+    gh_default(&bins);
+    let f = fixture("harvest-resume-offline", FindingStatus::Closed).await;
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let paused = run_harvest(&f.store, &f.cfg, &finding, &suspending(), None)
+        .await
+        .unwrap();
+    assert_eq!(paused.outcome.as_deref(), Some("suspended"));
+    bins.script("gh", "echo 'dial tcp: no route to host' >&2\nexit 1");
+
+    let resumed = resume_harvest(&f, &suspending()).await;
+
+    assert_eq!(resumed.outcome.as_deref(), Some("suspended"), "{resumed:?}");
+    let checkpoint = f
+        .store
+        .checkpoint_job(f.fid, FindingJobKind::Harvest)
+        .await
+        .unwrap()
+        .map(|j| j.id);
+    assert_eq!(checkpoint, resumed.job_id);
+    assert_eq!(harvest_streak(&f).await, 0);
+}
+
+/// A held harvest's follow-ups are filed when the operator ends it without
+/// another review (`classify` on a closed PR, `mark_harvested` on a merged
+/// one): no later attempt will file them, and the tree they are in is
+/// released with the checkpoint. Before, they were lost with the tree.
+/// `continue` and `restart` file nothing: the review they run files its
+/// own, and filing the held attempt's too would file the same open work
+/// twice.
+#[tokio::test]
+async fn a_held_harvest_ended_by_the_operator_files_its_follow_ups() {
+    let bins = FakeBins::acquire("harvest-held-released");
+    gh_default(&bins);
+    for (action, filed_after) in [
+        (ReleaseAction::Classify, 1),
+        (ReleaseAction::Continue, 0),
+        (ReleaseAction::Restart, 0),
+    ] {
+        let f = fixture(&format!("harvest-held-{action}"), FindingStatus::Closed).await;
+        let unclassifiable = ScriptedBackend::new(|tree| {
+            std::fs::write(tree.join("CLOSE-REASON.json"), close_reason("maybe")).unwrap();
+            std::fs::write(tree.join("FOLLOW-UPS.json"), FOLLOW_UP).unwrap();
+            support::done_with_transcript(tree)
+        });
+        for _ in 0..3 {
+            let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+            run_harvest(&f.store, &f.cfg, &finding, &unclassifiable, None)
+                .await
+                .unwrap();
+        }
+        assert!(
+            support::hold_of(&f.store, f.fid, FindingJobKind::Harvest)
+                .await
+                .is_some_and(|h| h.checkpoint_job_id.is_some())
+        );
+        assert_eq!(filed(&f, "widget:src/lib.rs:left-open").await, 0);
+
+        let by = support::operator(&f.store).await;
+        let classify = action == ReleaseAction::Classify;
+        hunter::scheduler::release_hold(
+            &f.store,
+            &f.cfg,
+            f.fid,
+            FindingJobKind::Harvest,
+            &hunter::store::HoldRelease {
+                action,
+                reason: classify.then_some("superseded by #9"),
+                classification: classify.then_some(hunter::domain::ClosureClass::Superseded),
+                by: &by,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            filed(&f, "widget:src/lib.rs:left-open").await,
+            filed_after,
+            "{action}"
+        );
+    }
+}
+
+/// A merged PR's held harvest files its follow-ups when the operator marks
+/// it harvested, as a closed one's does on `classify`: no review follows
+/// that would file them.
+#[tokio::test]
+async fn a_held_merged_harvest_marked_harvested_files_its_follow_ups() {
+    let bins = FakeBins::acquire("harvest-held-merged");
+    gh_default(&bins);
+    let f = fixture("harvest-held-merged", FindingStatus::Merged).await;
+    f.store.mark_pr_merged(f.fid, 7, 2).await.unwrap();
+    // Killed after metered work, with a transcript: a counted failure whose
+    // attempt can be continued, so the hold keeps it as the checkpoint.
+    let killed = ScriptedBackend::new(|tree| {
+        std::fs::write(tree.join("FOLLOW-UPS.json"), FOLLOW_UP).unwrap();
+        RunResult {
+            exit_code: None,
+            killed_reason: Some("unmetered".to_owned()),
+            ..support::done_with_transcript(tree)
+        }
+    });
+    for _ in 0..3 {
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        run_harvest(&f.store, &f.cfg, &finding, &killed, None)
+            .await
+            .unwrap();
+    }
+    assert!(
+        support::hold_of(&f.store, f.fid, FindingJobKind::Harvest)
+            .await
+            .is_some_and(|h| h.checkpoint_job_id.is_some())
+    );
+    assert_eq!(filed(&f, "widget:src/lib.rs:left-open").await, 0);
+
+    let by = support::operator(&f.store).await;
+    hunter::scheduler::release_hold(
+        &f.store,
+        &f.cfg,
+        f.fid,
+        FindingJobKind::Harvest,
+        &hunter::store::HoldRelease {
+            action: ReleaseAction::MarkHarvested,
+            reason: None,
+            classification: None,
+            by: &by,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(filed(&f, "widget:src/lib.rs:left-open").await, 1);
+    let ps = f.store.get_pr_state(f.fid).await.unwrap().unwrap();
+    assert!(ps.harvested_at.is_some());
 }

@@ -959,7 +959,7 @@ async fn release_hold(
         classification,
         by: &user,
     };
-    match state.store.release_hold(fid, kind, &release).await {
+    match crate::scheduler::release_hold(&state.store, &state.config, fid, kind, &release).await {
         Ok(()) => {}
         Err(StoreWriteError::Refused(msg)) => return Err(ApiError::Conflict(msg)),
         Err(StoreWriteError::Db(e)) => return Err(e.into()),

@@ -3762,6 +3762,12 @@ impl Store {
     /// and return the streak it makes: one more than before when the last
     /// failure had the same key, else 1. One statement, so two writers
     /// cannot both read the old streak and lose a count.
+    ///
+    /// The checkpoint is left alone (WORK-MODEL.md §6.3): an attempt that
+    /// ran has moved it in `complete_job` already, and a failure without a
+    /// new attempt (a fetch, a PR view, a runner that would not start) did
+    /// no work that could replace the paused one, so throwing it away would
+    /// lose that work to what is most often a network that is not back yet.
     pub async fn record_work_failure(
         &self,
         finding_id: i64,
@@ -3782,23 +3788,6 @@ impl Store {
         )
         .fetch_one(&self.pool)
         .await
-    }
-
-    /// End `finding_id`'s `kind` streak: the work concluded or was given up.
-    pub async fn clear_work_streak(
-        &self,
-        finding_id: i64,
-        kind: FindingJobKind,
-    ) -> sqlx::Result<()> {
-        sqlx::query!(
-            "UPDATE finding_work SET streak = 0, last_failure = NULL \
-             WHERE finding_id = ?1 AND kind = ?2",
-            finding_id,
-            kind
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(())
     }
 
     // -- holds (WORK-MODEL.md §9) ---------------------------------------------

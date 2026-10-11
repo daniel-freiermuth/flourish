@@ -734,7 +734,8 @@ async fn count_given_up_chain(
         }
         FindingJobKind::Harvest => {
             let detail = format!("{failure}: {why}");
-            record_harvest_failure(store, fid, Some(job), failure, &detail).await
+            record_harvest_failure(store, fid, Some(job), failure, &detail, HoldReason::GaveUp)
+                .await
         }
         FindingJobKind::Engage => {
             let set_aside = store.set_attention_aside(fid).await;
@@ -1241,6 +1242,69 @@ pub async fn record_job(
             .await;
     }
     Ok(state)
+}
+
+/// End a hold for the operator ([`Store::release_hold`]), and file what the
+/// held work leaves behind that nothing else will: a harvest ended without
+/// another review (`classify`, `mark_harvested`) files the `FOLLOW-UPS.json`
+/// in its checkpoint's tree. The file is read before the release: the
+/// release drops the checkpoint, and the daemon's workspace sweep, which
+/// runs alongside the API, may release the tree as soon as it has. It is
+/// filed only once the release has happened, best effort, as a concluding
+/// harvest's is.
+pub async fn release_hold(
+    store: &Store,
+    cfg: &Config,
+    finding_id: i64,
+    kind: FindingJobKind,
+    release: &crate::store::HoldRelease<'_>,
+) -> Result<(), StoreWriteError> {
+    let ends_harvest = kind == FindingJobKind::Harvest
+        && matches!(
+            release.action,
+            crate::domain::ReleaseAction::Classify | crate::domain::ReleaseAction::MarkHarvested
+        );
+    let followups = if ends_harvest {
+        held_followups(store, cfg, finding_id, kind).await?
+    } else {
+        None
+    };
+    store.release_hold(finding_id, kind, release).await?;
+    if let Some((repo_id, job, bytes)) = followups {
+        // Staged under `out/`, which no sweep touches, for the ingest to
+        // read as it reads a worker's tree.
+        let staged = cfg.work_root.join("out").join(format!("release-{job}"));
+        if std::fs::create_dir_all(&staged)
+            .and_then(|()| std::fs::write(staged.join("FOLLOW-UPS.json"), &bytes))
+            .is_ok()
+        {
+            ingest_followups(store, repo_id, &staged, finding_id, job, "harvest").await;
+        }
+        let _ = std::fs::remove_dir_all(&staged);
+    }
+    Ok(())
+}
+
+/// The `FOLLOW-UPS.json` in the tree of `finding_id`'s `kind` checkpoint,
+/// with the repo and job to file it under; `None` without a checkpoint or
+/// a file.
+async fn held_followups(
+    store: &Store,
+    cfg: &Config,
+    finding_id: i64,
+    kind: FindingJobKind,
+) -> sqlx::Result<Option<(i64, i64, Vec<u8>)>> {
+    let Some(job) = store.checkpoint_job(finding_id, kind).await? else {
+        return Ok(None);
+    };
+    let origin = store.resume_origin_job(job.id).await?;
+    let Some(repo) = store.get_repo_by_id(job.repo_id).await? else {
+        return Ok(None);
+    };
+    let ws = Workspace::for_chain(&cfg.work_root, Path::new(&repo.path), origin);
+    Ok(std::fs::read(ws.tree.join("FOLLOW-UPS.json"))
+        .ok()
+        .map(|bytes| (repo.id, job.id, bytes)))
 }
 
 /// Ingest a worker's `FOLLOW-UPS.json`, returning what happened so the
@@ -3628,7 +3692,7 @@ async fn record_fix_failure(
 }
 
 /// How [`open_workspace`] reports a tree it could not make, and the
-/// failure a fix or recheck that hit it records in its streak.
+/// failure a fix, recheck or harvest that hit it records in its streak.
 const TREE_NOT_MADE: &str = "workspace not created";
 
 /// Count a fix whose tree could not be made ([`open_workspace`] has failed
@@ -5230,10 +5294,10 @@ async fn continue_into_harvest(
 /// Record a harvest that failed before its job row exists. Nothing else
 /// records such an attempt: left alone, a PR whose view or diff never loads
 /// stays unharvested, and as the oldest pending one it is picked again on
-/// every cycle, starving the tier. `key` leaves out the error text so repeats
-/// of one outage count as identical. A failure while a host the harvest
-/// needs is unreachable is the network's, and ends the cycle denied
-/// instead ([`unreachable_now`]): the returned summary.
+/// every cycle, starving the tier and every tier below it. `key` leaves out the error text so repeats of
+/// one outage count as identical. A failure while a host the harvest needs
+/// is unreachable is the network's, and ends the cycle denied instead
+/// ([`unreachable_now`]): the returned summary.
 ///
 /// Not for a handoff: it is an extra chance, not one of the harvest's own
 /// attempts, and counting it would cost the cold harvest, which still
@@ -5253,7 +5317,7 @@ async fn harvest_prefetch_failed(
             .log_event(
                 "error",
                 &format!(
-                    "harvest #{fid}: PR/MR {what} failed: {e}; counted no attempt, \
+                    "harvest #{fid}: {what} failed: {e}; counted no attempt, \
                      it will be harvested cold"
                 ),
                 None,
@@ -5267,30 +5331,37 @@ async fn harvest_prefetch_failed(
             offline_denial(store, FindingJobKind::Harvest.into(), Some(fid), None, host).await,
         );
     }
-    let detail = format!("PR/MR {what} failed: {e}");
-    record_harvest_failure(store, fid, None, key, &detail).await;
+    let detail = format!("{what} failed: {e}");
+    record_harvest_failure(store, fid, None, key, &detail, HoldReason::Stuck).await;
     None
 }
 
 /// Count a failed harvest in the finding's streak, `key` naming the
 /// failure and `detail` describing it. The
-/// [`MAX_CONSECUTIVE_SAME_FAILURE`]th identical failure gives the PR up,
-/// unreviewed, as harvested; the finding keeps whatever status it has:
-/// `closed`, never suppressed, for a closed PR nobody could classify.
+/// [`MAX_CONSECUTIVE_SAME_FAILURE`]th identical failure holds the harvest
+/// for the operator as `at_limit` ([`Store::hold_work`]) — `stuck`, or
+/// `gave_up` when the give-up ceiling's failure completed the streak —
+/// with `job` as its checkpoint if a worker ran in it. The PR stays
+/// unharvested and the finding keeps its status; the harvest tier skips
+/// it until a release: `continue`, `restart`, `classify` for a closed PR,
+/// `mark_harvested` for a merged one. Stamping it harvested instead, as
+/// before the work model, left a merged PR's give-up with no way back.
 ///
 /// Every failed harvest is counted here — before its job exists
-/// ([`harvest_prefetch_failed`]), by its worker ([`run_harvest`]), or as a
-/// given-up resume chain ([`count_given_up_chain`]) — so they cannot
-/// drift apart on what a stuck harvest becomes.
+/// ([`harvest_prefetch_failed`]), without a tree or by its worker
+/// ([`run_harvest`]), or as a given-up resume chain
+/// ([`count_given_up_chain`]) — so they cannot drift apart on what a stuck
+/// harvest becomes.
 ///
-/// True when the PR is now given up. A count or a give-up that could not
-/// be recorded is reported as such and ends nothing.
+/// True when the harvest is now held. A count or a hold that could not be
+/// recorded is reported as such and ends nothing.
 async fn record_harvest_failure(
     store: &Store,
     fid: i64,
     job: Option<i64>,
     key: &str,
     detail: &str,
+    at_limit: HoldReason,
 ) -> bool {
     let log = |message: String| async move {
         let _ = store.log_event("error", &message, job, Some(fid)).await;
@@ -5312,22 +5383,34 @@ async fn record_harvest_failure(
         log(format!("harvest #{fid}: {detail}, will retry")).await;
         return false;
     }
-    if let Err(e) = store.mark_pr_harvested(fid, now_ms()).await {
-        log(format!(
-            "harvest #{fid}: {streak} identical failures ({detail}), but giving it up failed: {e}; will retry"
-        ))
-        .await;
-        return false;
+    match store
+        .hold_work(fid, FindingJobKind::Harvest, at_limit, detail, job)
+        .await
+    {
+        Ok(true) => {
+            log(format!(
+                "harvest #{fid}: held after {streak} identical failures ({detail})"
+            ))
+            .await;
+            true
+        }
+        Ok(false) => {
+            log(format!(
+                "harvest #{fid}: {streak} identical failures ({detail}), but it no longer \
+                 awaits its harvest; nothing held"
+            ))
+            .await;
+            false
+        }
+        Err(e) => {
+            log(format!(
+                "harvest #{fid}: {streak} identical failures ({detail}), but holding it \
+                 failed: {e}; will retry"
+            ))
+            .await;
+            false
+        }
     }
-    log_write_failure(
-        store.clear_work_streak(fid, FindingJobKind::Harvest).await,
-        format_args!("#{fid}: clearing harvest attempts"),
-    );
-    log(format!(
-        "harvest #{fid}: gave up after {streak} identical failures ({detail}) -- not reviewed, will not retry"
-    ))
-    .await;
-    true
 }
 
 /// Run harvest job (`scheduler.run_harvest`).
@@ -5407,6 +5490,7 @@ pub async fn run_harvest(
     // here on: a fresh default branch to compare against, the diff and
     // the full playbook. Only its tree and transcript are inherited.
     let fresh = resume.is_none_or(|p| p.handoff);
+    let handoff = resume.is_some_and(|p| p.handoff);
     // Fetch the default branch into the clone for a fresh attempt; a cold
     // tree is added at it once the job exists, and a handoff's worker
     // reads it as `origin/<default>`. Never on a resume: the chain
@@ -5455,19 +5539,32 @@ pub async fn run_harvest(
     };
 
     let fg = forge::forge_for(repo.forge);
-    let handoff = resume.is_some_and(|p| p.handoff);
-    let pr = match fg.view_pr_engage(&repo.url, pr_number, &cfg.review_bots) {
-        Ok(p) => p,
-        Err(e) => {
-            let net = (cfg, backend, repo.url.as_str());
-            if let Some(denied) =
-                harvest_prefetch_failed(store, net, fid, handoff, "pr view failed", "view", &e)
-                    .await
-            {
-                return Ok(denied);
+    // The view feeds only the playbook, which a resume does not send: a
+    // paused harvest continues without the forge, where a failed view
+    // would count against it for nothing.
+    let pr = if fresh {
+        match fg.view_pr_engage(&repo.url, pr_number, &cfg.review_bots) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                let net = (cfg, backend, repo.url.as_str());
+                if let Some(denied) = harvest_prefetch_failed(
+                    store,
+                    net,
+                    fid,
+                    handoff,
+                    "pr view failed",
+                    "PR/MR view",
+                    &e,
+                )
+                .await
+                {
+                    return Ok(denied);
+                }
+                anyhow::bail!("PR/MR view failed");
             }
-            anyhow::bail!("PR/MR view failed");
         }
+    } else {
+        None
     };
     let closed = ps.state.as_deref() == Some("CLOSED");
     // A closed PR's changes are on no branch the tree can be made from, so
@@ -5478,9 +5575,16 @@ pub async fn run_harvest(
             Ok(d) => d,
             Err(e) => {
                 let net = (cfg, backend, repo.url.as_str());
-                if let Some(denied) =
-                    harvest_prefetch_failed(store, net, fid, handoff, "pr diff failed", "diff", &e)
-                        .await
+                if let Some(denied) = harvest_prefetch_failed(
+                    store,
+                    net,
+                    fid,
+                    handoff,
+                    "pr diff failed",
+                    "PR/MR diff",
+                    &e,
+                )
+                .await
                 {
                     return Ok(denied);
                 }
@@ -5530,18 +5634,36 @@ pub async fn run_harvest(
     .await?
     {
         Ok(opened) => opened,
-        Err(failed) => return Ok(failed),
+        Err(mut failed) => {
+            // A failed harvest under the fixed [`TREE_NOT_MADE`], as a fix's
+            // is ([`count_unmade_tree`]). Uncounted, the PR stays pending
+            // and the harvest tier takes it again every cycle. Only a cold
+            // harvest makes a tree, so this is never a handoff. No worker
+            // ran, so a one-shot override is not spent.
+            let note = failed.failure.clone().unwrap_or_default();
+            let held = record_harvest_failure(
+                store,
+                fid,
+                Some(job),
+                TREE_NOT_MADE,
+                &note,
+                HoldReason::Stuck,
+            )
+            .await;
+            failed.outcome = Some(if held { "held" } else { "retry" }.into());
+            return Ok(failed);
+        }
     };
     let worktree = ws.tree.clone();
     let repo_notes = Store::repo_notes(&cfg.work_root, repo.id);
-    let prompt = match resume {
-        Some(plan) if !plan.handoff => RESUME_PROMPT.to_owned(),
-        _ if closed => playbooks::build_harvest_closed_prompt(
+    let prompt = match &pr {
+        None => RESUME_PROMPT.to_owned(),
+        Some(pr) if closed => playbooks::build_harvest_closed_prompt(
             &cfg.root,
             finding,
             &worktree,
             &repo,
-            &pr,
+            pr,
             pr_number,
             &pr_diff,
             if resume.is_some() {
@@ -5551,13 +5673,13 @@ pub async fn run_harvest(
             },
             &repo_notes,
         )?,
-        _ => playbooks::build_harvest_prompt(
+        Some(pr) => playbooks::build_harvest_prompt(
             &cfg.root,
             finding,
             &worktree,
             &repo.default_branch,
             &repo,
-            &pr,
+            pr,
             pr_number,
             &repo_notes,
         )?,
@@ -5602,22 +5724,29 @@ pub async fn run_harvest(
     };
     // A failed handoff is no attempt of the harvest's own: its streak is
     // left alone (see below).
-    let gave_up = match &failure {
+    let held = match &failure {
         Some(failure) if !handoff => Some(
-            record_harvest_failure(store, fid, Some(job), &failure.streak_key, &failure.detail)
-                .await,
+            record_harvest_failure(
+                store,
+                fid,
+                Some(job),
+                &failure.streak_key,
+                &failure.detail,
+                HoldReason::Stuck,
+            )
+            .await,
         ),
         _ => None,
     };
     // An attempt that will be continued or tried again files no
     // follow-ups. A failed handoff is reviewed again cold, and any other
-    // failure the harvest did not give up on is retried; either is a
-    // review from scratch, and its worker files the same open work under
-    // slugs of its own. A suspension keeps its tree and FOLLOW-UPS.json for
-    // the resume, whose last run files them, but a chain that is given up
-    // or whose resume fails ends in that cold review too. So only an
-    // attempt nothing will redo files its follow-ups.
-    let redone = state == JobState::Suspended || (failure.is_some() && gave_up != Some(true));
+    // failed harvest is retried, or held until the operator continues or
+    // restarts it; each of those is a later review, and its worker files
+    // the same open work under slugs of its own. A suspension keeps its
+    // tree and FOLLOW-UPS.json for the resume, whose last run files them,
+    // but a chain that is given up or whose resume fails ends in a cold
+    // review too. So only an attempt that concluded files its follow-ups.
+    let redone = state == JobState::Suspended || failure.is_some();
     // Follow-ups are read from the tree, so before it is released. The
     // release itself is state-checked: a suspended harvest keeps its tree
     // for the resume, where this used to drop it after every run.
@@ -5703,9 +5832,9 @@ pub async fn run_harvest(
         summary.failure = Some(failure.detail.clone());
         return Ok(summary);
     }
-    if let (Some(failure), Some(gave_up)) = (failure, gave_up) {
+    if let (Some(failure), Some(held)) = (failure, held) {
         let detail = &failure.detail;
-        summary.outcome = Some(if gave_up { "stuck" } else { "retry" }.into());
+        summary.outcome = Some(if held { "held" } else { "retry" }.into());
         summary.failure = Some(detail.clone());
         if override_mode == Some(BudgetOverride::Once) {
             log_write_failure(
@@ -5801,10 +5930,6 @@ pub async fn run_harvest(
         );
         "reviewed for follow-ups".to_owned()
     };
-    log_write_failure(
-        store.clear_work_streak(fid, FindingJobKind::Harvest).await,
-        format_args!("#{fid}: clearing harvest attempts"),
-    );
     let _ = store
         .log_event(
             "harvest",

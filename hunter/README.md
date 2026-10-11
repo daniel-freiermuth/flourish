@@ -147,11 +147,19 @@ new ──recheck──> new / superseded / rejected
   left open (`FOLLOW-UPS.json`): superseded / duplicate / obsolete →
   `superseded` (valid, not suppressed), wrong → `rejected`, unwanted →
   `wontfix`, abandoned → `new`. A review that cannot classify it counts
-  toward the harvest's failure streak; given up on, the finding stays
-  `closed`.
+  toward the harvest's failure streak; at the limit the harvest is held
+  for you and the finding stays `closed` until you continue or restart
+  the harvest, or classify the closure by hand.
 - **`merged`** → queued for a one-time **harvest** pass reviewing the PR's
   complete lifetime (not just its open-time snapshot) for genuine deferred
-  follow-up work, filed as new findings via `FOLLOW-UPS.json`.
+  follow-up work, filed as new findings via `FOLLOW-UPS.json`. A harvest
+  that keeps failing (a PR that will not load, a worker that never
+  finishes) is held for you like a fix; for a
+  merged PR, **Mark harvested** ends it without a review. A held harvest
+  files its follow-ups only when you end it that way (or with **Classify**
+  on a closed PR); **Continue** or **Restart** reviews the PR again, and
+  that review files them. A paused harvest continues without asking the
+  forge for anything, so a network that is not back yet costs it nothing.
 - **`rejected` / `wontfix`** (with a required reason) become the
   **suppression corpus**: injected into every future hunt/analysis prompt
   for that repo+type so the same already-decided issue isn't re-proposed.

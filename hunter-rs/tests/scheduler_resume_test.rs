@@ -2371,7 +2371,8 @@ async fn a_given_up_recheck_chain_counts_toward_the_failure_streak() {
 }
 
 /// Each given-up harvest chain is one failed harvest, and the harvest
-/// starts over; the third gives the PR up as harvested, unreviewed.
+/// starts over; the third holds it, with that chain as its checkpoint,
+/// where it used to give the PR up as harvested, unreviewed.
 #[tokio::test]
 async fn a_given_up_harvest_chain_counts_toward_the_failure_streak() {
     let seen = give_up_three_chains("harvest", "merged").await;
@@ -2380,7 +2381,7 @@ async fn a_given_up_harvest_chain_counts_toward_the_failure_streak() {
         [
             (1, FindingStatus::Merged, false, false, true),
             (2, FindingStatus::Merged, false, false, true),
-            (0, FindingStatus::Merged, true, false, false),
+            (0, FindingStatus::Merged, false, true, false),
         ]
     );
 }

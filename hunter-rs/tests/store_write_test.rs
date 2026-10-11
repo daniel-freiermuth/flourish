@@ -2499,3 +2499,28 @@ async fn a_held_fix_is_not_counted_as_queued() {
 
     assert_eq!(store.count_queued().await.unwrap(), 0);
 }
+
+/// Counting a failure leaves the checkpoint alone (WORK-MODEL.md §6.3): an
+/// attempt that ran has moved the pointer already when its job finished,
+/// and a failure before any attempt (a fetch, a PR view, a runner that
+/// would not start) has done no work that could replace the paused one.
+#[tokio::test]
+async fn counting_a_failure_keeps_the_checkpoint() {
+    let (_dir, store, pool) = hold_fixture().await;
+    support::point_checkpoint(&pool, 2, "fix", 10).await;
+
+    let streak = store
+        .record_work_failure(2, FindingJobKind::Fix, "runner error")
+        .await
+        .unwrap();
+
+    assert_eq!(streak, 1);
+    assert_eq!(
+        store
+            .checkpoint_job(2, FindingJobKind::Fix)
+            .await
+            .unwrap()
+            .map(|j| j.id),
+        Some(10)
+    );
+}

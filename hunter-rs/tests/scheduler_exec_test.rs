@@ -653,11 +653,6 @@ async fn work_failure_streak_tracking() {
         streak(Fix).await.last_failure.as_deref(),
         Some("PR create failed")
     );
-
-    // Clear resets everything, for that kind only
-    store.clear_work_streak(1, Fix).await.unwrap();
-    assert_eq!(streak(Fix).await, hunter::store::WorkStreak::default());
-    assert_eq!(streak(Harvest).await.streak, 1);
 }
 
 // -- 3b. reconcile_and_log: an orphan that did work is kept for resume -------
