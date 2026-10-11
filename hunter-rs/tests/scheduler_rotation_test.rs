@@ -80,7 +80,7 @@ async fn fixture(label: &str) -> (TempDir, PathBuf, SqlitePool, Config) {
         "test gaps in {{REPO_NAME}} -> {{OUT_PATH}}\n",
     )
     .unwrap();
-    let mut cfg = Config::load(dir.path()).expect("load config");
+    let mut cfg = support::load_config(dir.path());
     cfg.work_root = dir.subdir("work_root");
 
     (dir, path, pool, cfg)
@@ -462,7 +462,7 @@ async fn two_hunts_due(label: &str) -> (TempDir, Store, Config) {
         "hunt {{REPO_PATH}} {{DIFF_RANGE}} -> {{OUT_PATH}}\n",
     )
     .unwrap();
-    let mut cfg = Config::load(dir.path()).expect("load config");
+    let mut cfg = support::load_config(dir.path());
     cfg.work_root = dir.subdir("work_root");
     let store = Store::connect(&path).await.unwrap();
     (dir, store, cfg)

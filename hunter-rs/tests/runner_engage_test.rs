@@ -304,7 +304,7 @@ async fn fixture(label: &str) -> Fixture {
         "closed: the worktree is {{WORKTREE_STATE}}.\n```diff\n{{PR_DIFF}}\n```\n",
     )
     .unwrap();
-    let mut cfg = Config::load(dir.path()).expect("load config");
+    let mut cfg = support::load_config(dir.path());
     cfg.work_root = dir.subdir("work_root");
     Fixture {
         _dir: dir,
@@ -907,7 +907,7 @@ async fn a_clone_of_a_different_repository_is_refused() {
     let row = store.get_repo_by_id(rid).await.unwrap().unwrap();
     let playbooks = dir.subdir("playbooks");
     std::fs::write(playbooks.join("hunt.md"), "hunt {{WORKTREE}}\n").unwrap();
-    let mut cfg = Config::load(dir.path()).expect("load config");
+    let mut cfg = support::load_config(dir.path());
     cfg.work_root = dir.subdir("work_root");
     // Never reached: the sync refuses before any worker is spawned, which
     // is itself part of the contract.
@@ -971,7 +971,7 @@ async fn an_insteadof_rewrite_of_the_origin_is_not_refused() {
         "hunt {{REPO_PATH}} {{DIFF_RANGE}} -> {{OUT_PATH}}\n",
     )
     .unwrap();
-    let mut cfg = Config::load(dir.path()).expect("load config");
+    let mut cfg = support::load_config(dir.path());
     cfg.work_root = dir.subdir("work_root");
     let backend = ScriptedBackend::writing("findings.json", "[]");
     let summary = hunter::scheduler::run_hunt(&store, &cfg, &row, &backend, None)
@@ -1018,7 +1018,7 @@ async fn a_hunt_refused_because_its_repo_was_deleted_names_what_it_skipped() {
 
     let playbooks = dir.subdir("playbooks");
     std::fs::write(playbooks.join("hunt.md"), "hunt {{WORKTREE}}\n").unwrap();
-    let mut cfg = Config::load(dir.path()).expect("load config");
+    let mut cfg = support::load_config(dir.path());
     cfg.work_root = dir.subdir("work_root");
     // Never reached: the job row is refused before any worker is spawned.
     let backend = ScriptedBackend::writing("findings.json", "[]");

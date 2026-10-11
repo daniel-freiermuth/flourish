@@ -80,7 +80,7 @@ impl Fixture {
         // No config.json under a scratch root → every default, including
         // `ompBin = "omp"`. Only the meter tick is overridden: the 2 s
         // production poll would make each of these tests a 2 s test.
-        let mut cfg = Config::load(dir.path()).expect("load config");
+        let mut cfg = support::load_config(dir.path());
         cfg.poll_s = 0.02;
         let ws = Workspace::for_chain(&cfg.work_root, &dir.join("clone"), 1);
         std::fs::create_dir_all(&ws.tree).expect("create the chain's tree");

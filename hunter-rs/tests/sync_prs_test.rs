@@ -138,7 +138,7 @@ async fn fixture(label: &str) -> Fixture {
         .await
         .unwrap();
     store.set_finding_pr_open(fid, PR_URL).await.unwrap();
-    let mut cfg = Config::load(dir.path()).expect("load config");
+    let mut cfg = support::load_config(dir.path());
     cfg.work_root = dir.subdir("work_root");
     Fixture {
         cfg,

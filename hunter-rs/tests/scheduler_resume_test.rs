@@ -78,6 +78,8 @@ fn test_config(root: &Path) -> Config {
         model_fix: None,
         backend_type: "omp-scavenge".to_owned(),
         llm_provider: hunter::backends::omp_scavenge::LlmProvider::Anthropic,
+        provider_hosts: None,
+        network_gate: false,
         hunt_max_wall_s: 1800,
         hunt_max_findings: 8,
         fix_max_wall_s: 2700,
@@ -1233,6 +1235,10 @@ impl Backend for RecordingBackend {
         Ok(String::new())
     }
 
+    fn worker_hosts(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     async fn run(
         &self,
         ws: &Workspace,
@@ -1493,6 +1499,10 @@ impl Backend for GateProbe {
 
     async fn status_html(&self) -> anyhow::Result<String> {
         Ok(String::new())
+    }
+
+    fn worker_hosts(&self) -> Vec<String> {
+        Vec::new()
     }
 
     async fn run(

@@ -28,7 +28,7 @@ async fn fixture(label: &str) -> (TempDir, Store, Config) {
     .await
     .unwrap();
     pool.close().await;
-    let mut cfg = Config::load(dir.path()).expect("load config");
+    let mut cfg = support::load_config(dir.path());
     cfg.work_root = dir.subdir("work_root");
     cfg.min_free_disk_bytes = 0;
     let store = Store::connect(&path).await.unwrap();

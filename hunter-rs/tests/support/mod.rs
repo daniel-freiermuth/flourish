@@ -83,6 +83,17 @@ impl Drop for TempDir {
 // Databases
 // ---------------------------------------------------------------------------
 
+/// `Config::load` over `root`, with the network gate off.
+///
+/// No test may reach the network, and the gate would probe the forge of
+/// any repo a cycle picks: the fixtures' `https://github.com/acme/widget`
+/// included. A test of the gate itself turns it back on.
+pub fn load_config(root: &Path) -> hunter::config::Config {
+    let mut cfg = hunter::config::Config::load(root).expect("load config");
+    cfg.network_gate = false;
+    cfg
+}
+
 /// Path to the schema-only `dev.db` that `build.rs` regenerates from
 /// `migrations/`. Never opened directly — always copied first.
 fn dev_db() -> PathBuf {
@@ -333,7 +344,9 @@ pub struct Run {
 /// always grants, so a test never has to satisfy the budget gate. The
 /// headroom it grants is `None` — no token bound — unless
 /// [`ScriptedBackend::granting`] says otherwise, or a window too small for
-/// large reservations ([`ScriptedBackend::denying_above`]). Every run is
+/// large reservations ([`ScriptedBackend::denying_above`]). It reports no
+/// worker hosts, so the reachability gate probes none of its own, unless
+/// [`ScriptedBackend::needing`] names some. Every run is
 /// recorded ([`ScriptedBackend::runs`]), so a test can assert on the prompt
 /// and the transcript a worker was given.
 pub struct ScriptedBackend {
@@ -343,6 +356,7 @@ pub struct ScriptedBackend {
     /// `run` returns `Err` instead of a result: the harness itself failed
     /// (a panicked blocking task), not the worker.
     fails: bool,
+    hosts: Vec<String>,
     runs: Mutex<Vec<Run>>,
 }
 
@@ -360,6 +374,7 @@ impl ScriptedBackend {
             cap_tokens: None,
             deny_above: None,
             fails: false,
+            hosts: Vec::new(),
             runs: Mutex::new(Vec::new()),
         }
     }
@@ -376,6 +391,13 @@ impl ScriptedBackend {
     #[must_use]
     pub fn granting(mut self, cap_tokens: Option<i64>) -> Self {
         self.cap_tokens = cap_tokens;
+        self
+    }
+
+    /// Report `hosts` as the hosts a worker needs (`Backend::worker_hosts`).
+    #[must_use]
+    pub fn needing(mut self, hosts: &[&str]) -> Self {
+        self.hosts = hosts.iter().map(|&h| h.to_owned()).collect();
         self
     }
 
@@ -449,6 +471,10 @@ impl Backend for ScriptedBackend {
 
     async fn status_html(&self) -> anyhow::Result<String> {
         Ok(String::new())
+    }
+
+    fn worker_hosts(&self) -> Vec<String> {
+        self.hosts.clone()
     }
 
     async fn run(

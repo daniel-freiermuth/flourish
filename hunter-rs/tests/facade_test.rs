@@ -54,6 +54,8 @@ fn cfg_with(stale_after_s: f64, omp_bin: &str) -> Config {
         model_fix: None,
         backend_type: "omp-scavenge".to_owned(),
         llm_provider: hunter::backends::omp_scavenge::LlmProvider::Anthropic,
+        provider_hosts: None,
+        network_gate: false,
         hunt_max_wall_s: 1800,
         hunt_max_findings: 8,
         hunt_rehunt_days: 90,
@@ -2351,4 +2353,37 @@ fn copilot_monthly_freshness_uses_configured_stale_threshold() {
     }
     let foreign_only = healthy_windows(0.0, 4.5);
     assert!(!backend.is_fresh(&foreign_only));
+}
+
+// ---- worker_hosts: what the reachability gate probes -----------------------
+
+/// A worker talks to its provider's API, so that is what is probed.
+#[test]
+fn worker_hosts_are_the_configured_providers() {
+    use hunter::backends::omp_scavenge::LlmProvider;
+    for (provider, host) in [
+        (LlmProvider::Anthropic, "api.anthropic.com"),
+        (LlmProvider::OpenAiCodex, "chatgpt.com"),
+        (LlmProvider::GitHubCopilot, "api.githubcopilot.com"),
+    ] {
+        let cfg = Config {
+            llm_provider: provider,
+            ..cfg()
+        };
+        let backend = make_backend_with(FakeLedger::new(0, 0), cfg, FakeProber::new(0));
+        assert_eq!(backend.worker_hosts(), [host], "{provider:?}");
+    }
+}
+
+/// `backend.providerHosts` replaces the provider's hosts outright: an
+/// operator behind a gateway names the gateway, and the provider's own
+/// host is then not one the worker needs.
+#[test]
+fn configured_provider_hosts_replace_the_providers() {
+    let cfg = Config {
+        provider_hosts: Some(vec!["llm-gw.corp:8443".to_owned()]),
+        ..cfg()
+    };
+    let backend = make_backend_with(FakeLedger::new(0, 0), cfg, FakeProber::new(0));
+    assert_eq!(backend.worker_hosts(), ["llm-gw.corp:8443"]);
 }

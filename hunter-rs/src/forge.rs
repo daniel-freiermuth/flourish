@@ -1524,6 +1524,29 @@ pub fn url_host(url: &str) -> Option<&str> {
     (!host.is_empty()).then_some(host)
 }
 
+/// Where the forge behind `url` answers on the web, as `host` or
+/// `host:port` for [`crate::reach::first_unreachable`]: the host of
+/// [`url_host`], with the port of an `http(s)://` URL that names one, and
+/// 80 for a plain `http://` URL that does not.
+///
+/// An `ssh://` port is git's, not the web API's, which `gh`/`glab` still
+/// reach on the host's HTTPS port; the scp form has no port at all.
+pub fn web_host(url: &str) -> Option<String> {
+    let host = url_host(url)?;
+    let (rest, default_port) = match strip_scheme(url, "https") {
+        Some(rest) => (Some(rest), None),
+        None => (strip_scheme(url, "http"), Some("80")),
+    };
+    let port = rest
+        .and_then(|rest| rest.split('/').next())
+        .map(|authority| authority.rsplit_once('@').map_or(authority, |(_, h)| h))
+        .and_then(|authority| authority.split_once(':'))
+        .map(|(_, port)| port)
+        .filter(|port| port.parse::<u16>().is_ok())
+        .or(rest.and(default_port));
+    Some(port.map_or_else(|| host.to_owned(), |port| format!("{host}:{port}")))
+}
+
 /// Which forge serves `url`, from its host alone.
 ///
 /// The asymmetry is the point: GitHub is only ever reachable at domains

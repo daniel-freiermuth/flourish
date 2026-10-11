@@ -77,7 +77,7 @@ async fn fixture_on(label: &str, url: &str, forge: ForgeName) -> Fixture {
     // template has to do is render.
     let playbooks = dir.subdir("playbooks");
     std::fs::write(playbooks.join("fix.md"), "fix {{WORKTREE}}\n").unwrap();
-    let mut cfg = Config::load(dir.path()).expect("load config");
+    let mut cfg = support::load_config(dir.path());
     cfg.work_root = dir.subdir("work_root");
     Fixture {
         _dir: dir,
