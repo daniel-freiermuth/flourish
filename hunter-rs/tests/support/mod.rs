@@ -836,3 +836,10 @@ pub async fn release(
         .await
         .unwrap();
 }
+
+/// The forge a test repo is on, as the reachability probe sees it: a name,
+/// never a host the test reaches (`ScriptedBackend::offline` marks it down).
+pub const FORGE_HOST: &str = "forge.example";
+
+/// The provider a test backend's worker talks to (`ScriptedBackend::needing`).
+pub const PROVIDER_HOST: &str = "provider.example";

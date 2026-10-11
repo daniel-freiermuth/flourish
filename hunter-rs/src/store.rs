@@ -2046,6 +2046,25 @@ impl Store {
         .await
     }
 
+    /// Make the finished attempt `job_id` its work item's checkpoint, when
+    /// it has a transcript to continue: an attempt whose work is done but
+    /// could not be published while the network was down (#95), which the
+    /// next cycle continues to publish instead of redoing the work. Without
+    /// a transcript the pointer is left as it is.
+    pub async fn keep_attempt_as_checkpoint(&self, job_id: i64) -> sqlx::Result<()> {
+        let resumable = sqlx::query_scalar!(
+            r#"SELECT session_file IS NOT NULL AS "resumable!: bool" FROM jobs WHERE id = ?1"#,
+            job_id
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or(false);
+        if resumable {
+            point_checkpoint(&self.pool, job_id, true).await?;
+        }
+        Ok(())
+    }
+
     /// Give up `finding_id`'s `kind` checkpoint at `job_id`, logging `msg`
     /// as a `resume` event in the same transaction. The job row is left as
     /// it ended. A pointer that has moved on since is left alone: `false`.

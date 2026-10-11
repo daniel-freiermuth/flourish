@@ -241,6 +241,18 @@ and sleeps, so being offline is a normal state, not a failure of the work
 it would have started. The Status page shows such a cycle as **offline**,
 naming the host, until a cycle gets past the gate.
 
+The network can also go while work runs. So before a finding's failure is
+counted, the same hosts are probed again: a forge call that failed before
+the work started (a harvest's PR view or diff), a worker that failed
+without doing any metered work, and publishing a finished worker's work
+(a fix's push or PR). A finished attempt that could not publish is kept
+as the checkpoint, so the next cycle publishes it rather than redoing it. If a host is unreachable then, the
+failure is the machine's, not the work's: nothing is counted, a worker's
+job is closed as never started, the checkpoint stays where it was, and
+the cycle ends denied for the host like the gate's own denial. The probe
+decides, never the error's text. With `network.gate: false` there is no
+probe here either, and every failure counts.
+
 Known limits of the gate:
 
 - A captive portal (hotel or train Wi-Fi before its login page) accepts

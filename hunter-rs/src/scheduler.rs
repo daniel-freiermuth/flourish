@@ -2328,6 +2328,11 @@ pub async fn run_recheck(
             resume.map(|r| r.session_file.as_path()),
         )
         .await?;
+    let ran = (FindingJobKind::Recheck, fid, job);
+    if let Some(denied) = unmetered_offline(store, cfg, backend, &repo.url, ran, &rr).await {
+        close_workspace(store, &ws).await;
+        return Ok(denied);
+    }
     let state = log_write_failure(
         record_job(store, job, &rr, model, resume).await,
         format_args!("job {job}: recording outcome"),
@@ -3392,6 +3397,12 @@ enum FixOutcome {
     /// No PR this time: counted in the finding's failure streak
     /// ([`record_fix_failure`]).
     Failed { failure: String },
+    /// The finished worker's branch could not be pushed or its PR opened
+    /// while a host the fix needs is unreachable (#95): the network's
+    /// failure, not the fix's. Nothing is counted and the attempt is kept
+    /// as the checkpoint, so the next cycle continues it and only has to
+    /// publish.
+    Offline { host: String },
 }
 
 /// A worker's report file, read lossily: whatever bytes it wrote are its
@@ -3495,6 +3506,7 @@ fn header(line: &str) -> Option<(String, String)> {
 /// part of deciding (a push or a PR that fails is a failed attempt).
 async fn conclude_fix(
     store: &Store,
+    (cfg, backend): (&Config, &dyn Backend),
     finding: &Finding,
     start: &FixStart,
     state: JobState,
@@ -3535,14 +3547,18 @@ async fn conclude_fix(
         return Ok(FixOutcome::Held { report });
     }
 
-    let failure = match ship_pr(&start.repo, &start.branch, worktree, state).await {
-        Ok((pr_url, recovered)) => return Ok(FixOutcome::Shipped { pr_url, recovered }),
-        Err(failure) => failure,
-    };
+    let ShipFailure { failure, at_forge } =
+        match ship_pr(&start.repo, &start.branch, worktree, state).await {
+            Ok((pr_url, recovered)) => return Ok(FixOutcome::Shipped { pr_url, recovered }),
+            Err(failure) => failure,
+        };
     if state == JobState::Suspended {
         // A suspension is a pause, not a failure: counting it toward the
         // streak would turn three pauses of one healthy fix into "stuck".
         return Ok(FixOutcome::Suspended);
+    }
+    if at_forge && let Some(host) = unreachable_now(cfg, &start.repo.url, backend).await {
+        return Ok(FixOutcome::Offline { host });
     }
     Ok(FixOutcome::Failed { failure })
 }
@@ -3652,6 +3668,30 @@ async fn count_unmade_tree(
     summary
 }
 
+/// Why a fix did not ship: the failure as the streak counts it, and
+/// whether it came from the forge (the push, the PR's creation), the
+/// failures a network that went away can cause.
+struct ShipFailure {
+    failure: String,
+    at_forge: bool,
+}
+
+impl ShipFailure {
+    fn local(failure: String) -> Self {
+        Self {
+            failure,
+            at_forge: false,
+        }
+    }
+
+    fn forge(failure: String) -> Self {
+        Self {
+            failure,
+            at_forge: true,
+        }
+    }
+}
+
 /// Push the fix branch and open its draft PR: `(url, recovered)`, or why
 /// not. Nothing to ship (no commits, no `PR-DESCRIPTION.md`, a worker
 /// that did not finish) is a failure like a push that fails.
@@ -3660,7 +3700,7 @@ async fn ship_pr(
     branch: &str,
     worktree: &Path,
     state: JobState,
-) -> Result<(String, bool), String> {
+) -> Result<(String, bool), ShipFailure> {
     let db = repo.default_branch.clone();
     let wts = worktree.to_string_lossy().to_string();
     let db2 = db.clone();
@@ -3697,7 +3737,7 @@ async fn ship_pr(
     let commits = commits.trim();
     let pr_desc = worktree.join("PR-DESCRIPTION.md");
     if rc != 0 || commits.is_empty() || !pr_desc.exists() {
-        return Err(if state == JobState::Done {
+        return Err(ShipFailure::local(if state == JobState::Done {
             if commits.is_empty() {
                 "no commits".to_owned()
             } else {
@@ -3705,7 +3745,7 @@ async fn ship_pr(
             }
         } else {
             format!("worker {state}")
-        });
+        }));
     }
 
     let f = forge::forge_for(repo.forge);
@@ -3721,10 +3761,13 @@ async fn ship_pr(
     .unwrap_or((127, "spawn error".to_owned()));
     if prc != 0 {
         let tail = crate::util::tail(&pout, 300);
-        return Err(format!("push failed: {tail}"));
+        return Err(ShipFailure::forge(format!("push failed: {tail}")));
     }
     if f.owner_repo(&repo.url).is_none() {
-        return Err(format!("unparseable repo url for PR: {:?}", repo.url));
+        return Err(ShipFailure::local(format!(
+            "unparseable repo url for PR: {:?}",
+            repo.url
+        )));
     }
     let body = std::fs::read_to_string(&pr_desc).unwrap_or_default();
     let wts = worktree.to_string_lossy().to_string();
@@ -3745,7 +3788,7 @@ async fn ship_pr(
                 return Ok((pr_url, true));
             }
             let head: String = err_msg.chars().take(300).collect();
-            Err(format!("PR create failed: {head}"))
+            Err(ShipFailure::forge(format!("PR create failed: {head}")))
         }
     }
 }
@@ -3906,6 +3949,24 @@ async fn record_fix_outcome(
         FixOutcome::Failed { failure } => {
             record_fix_failure(store, fid, job, &failure, tail, HoldReason::Stuck, summary).await;
         }
+        FixOutcome::Offline { host } => {
+            // Nothing concluded, so a one-shot override is kept for the
+            // attempt that publishes.
+            log_write_failure(
+                store.keep_attempt_as_checkpoint(job).await,
+                format_args!("job {job}: keeping the unpublished attempt as the checkpoint"),
+            );
+            *summary = offline_denial(
+                store,
+                FindingJobKind::Fix.into(),
+                Some(fid),
+                Some(job),
+                host,
+            )
+            .await;
+            release_claim(store, fid).await;
+            return Ok(());
+        }
     }
     if finding.budget_override == Some(BudgetOverride::Once) {
         log_write_failure(
@@ -3961,6 +4022,12 @@ pub async fn run_fix(
             anyhow::bail!("{e}");
         }
     };
+    let ran = (FindingJobKind::Fix, fid, start.job);
+    if let Some(denied) = unmetered_offline(store, cfg, backend, &start.repo.url, ran, &rr).await {
+        release_claim(store, fid).await;
+        close_workspace(store, &start.ws).await;
+        return Ok(denied);
+    }
     let state = log_write_failure(
         record_job(store, start.job, &rr, model, resume).await,
         format_args!("job {}: recording outcome", start.job),
@@ -3975,7 +4042,7 @@ pub async fn run_fix(
         tokens_new: Some(rr.tokens_new),
         ..Default::default()
     };
-    let outcome = conclude_fix(store, finding, &start, state).await?;
+    let outcome = conclude_fix(store, (cfg, backend), finding, &start, state).await?;
     record_fix_outcome(
         store,
         finding,
@@ -5164,7 +5231,9 @@ async fn continue_into_harvest(
 /// records such an attempt: left alone, a PR whose view or diff never loads
 /// stays unharvested, and as the oldest pending one it is picked again on
 /// every cycle, starving the tier. `key` leaves out the error text so repeats
-/// of one outage count as identical.
+/// of one outage count as identical. A failure while a host the harvest
+/// needs is unreachable is the network's, and ends the cycle denied
+/// instead ([`unreachable_now`]): the returned summary.
 ///
 /// Not for a handoff: it is an extra chance, not one of the harvest's own
 /// attempts, and counting it would cost the cold harvest, which still
@@ -5172,12 +5241,13 @@ async fn continue_into_harvest(
 /// `closed` and pending.
 async fn harvest_prefetch_failed(
     store: &Store,
+    (cfg, backend, repo_url): (&Config, &dyn Backend, &str),
     fid: i64,
     handoff: bool,
     key: &str,
     what: &str,
     e: &impl std::fmt::Display,
-) {
+) -> Option<CycleSummary> {
     if handoff {
         let _ = store
             .log_event(
@@ -5190,10 +5260,16 @@ async fn harvest_prefetch_failed(
                 Some(fid),
             )
             .await;
-        return;
+        return None;
+    }
+    if let Some(host) = unreachable_now(cfg, repo_url, backend).await {
+        return Some(
+            offline_denial(store, FindingJobKind::Harvest.into(), Some(fid), None, host).await,
+        );
     }
     let detail = format!("PR/MR {what} failed: {e}");
     record_harvest_failure(store, fid, None, key, &detail).await;
+    None
 }
 
 /// Count a failed harvest in the finding's streak, `key` naming the
@@ -5383,7 +5459,13 @@ pub async fn run_harvest(
     let pr = match fg.view_pr_engage(&repo.url, pr_number, &cfg.review_bots) {
         Ok(p) => p,
         Err(e) => {
-            harvest_prefetch_failed(store, fid, handoff, "pr view failed", "view", &e).await;
+            let net = (cfg, backend, repo.url.as_str());
+            if let Some(denied) =
+                harvest_prefetch_failed(store, net, fid, handoff, "pr view failed", "view", &e)
+                    .await
+            {
+                return Ok(denied);
+            }
             anyhow::bail!("PR/MR view failed");
         }
     };
@@ -5395,7 +5477,13 @@ pub async fn run_harvest(
         match fg.pr_diff(&repo.url, pr_number) {
             Ok(d) => d,
             Err(e) => {
-                harvest_prefetch_failed(store, fid, handoff, "pr diff failed", "diff", &e).await;
+                let net = (cfg, backend, repo.url.as_str());
+                if let Some(denied) =
+                    harvest_prefetch_failed(store, net, fid, handoff, "pr diff failed", "diff", &e)
+                        .await
+                {
+                    return Ok(denied);
+                }
                 anyhow::bail!("PR/MR diff failed");
             }
         }
@@ -5485,6 +5573,11 @@ pub async fn run_harvest(
             resume.map(|r| r.session_file.as_path()),
         )
         .await?;
+    let ran = (FindingJobKind::Harvest, fid, job);
+    if let Some(denied) = unmetered_offline(store, cfg, backend, &repo.url, ran, &rr).await {
+        close_workspace(store, &ws).await;
+        return Ok(denied);
+    }
     let state = log_write_failure(
         record_job(store, job, &rr, model, resume).await,
         format_args!("job {job}: recording outcome"),
@@ -5873,6 +5966,79 @@ pub fn work_hosts(repo_url: &str, backend: &dyn Backend) -> Vec<String> {
         .collect()
 }
 
+/// Layer 2 of the network gate (#95): the host the work on the repo at
+/// `repo_url` needs that cannot be reached right now, if any, asked again
+/// when a failure is about to be counted. A failure while one is
+/// unreachable is the machine's, not the work's, and counts nothing. The
+/// same probe as the gate's ([`work_hosts`], `Backend::first_unreachable`);
+/// always `None` with
+/// `network.gate` off. Never read from the error's text: a forge or a
+/// provider words an outage in too many ways.
+async fn unreachable_now(cfg: &Config, repo_url: &str, backend: &dyn Backend) -> Option<String> {
+    if !cfg.network_gate {
+        return None;
+    }
+    backend
+        .first_unreachable(&work_hosts(repo_url, backend))
+        .await
+}
+
+/// The cycle's end when a host its work needs is unreachable: denied, to
+/// be retried in [`NETWORK_RETRY_MS`], with a `deny` event naming the host
+/// and the host in the summary, so the status page shows it offline.
+/// Before dispatch ([`network_gate`]) or once a failure turned out to be
+/// the network's ([`unreachable_now`]); either way nothing is counted and
+/// no checkpoint moves.
+async fn offline_denial(
+    store: &Store,
+    kind: JobKind,
+    finding_id: Option<i64>,
+    job_id: Option<i64>,
+    host: String,
+) -> CycleSummary {
+    let reason = format!("offline: {host} unreachable");
+    let _ = store.log_event("deny", &reason, job_id, finding_id).await;
+    CycleSummary {
+        kind: Some(kind),
+        finding_id,
+        job_id,
+        denied: Some(reason),
+        retry_at: Some(now_ms() + NETWORK_RETRY_MS),
+        unreachable: Some(host),
+        ..Default::default()
+    }
+}
+
+/// A finding's worker that failed without doing any metered work, while a
+/// host its work needs is unreachable: it never got to the work, so its
+/// failure is not counted. Its job is closed `failed` as unstarted, which
+/// leaves the checkpoint it was continuing in place, and the cycle ends as
+/// [`offline_denial`]. `None` for any other run: one that did metered work
+/// failed at the work, and is counted as before.
+async fn unmetered_offline(
+    store: &Store,
+    cfg: &Config,
+    backend: &dyn Backend,
+    repo_url: &str,
+    (kind, fid, job): (FindingJobKind, i64, i64),
+    rr: &RunResult,
+) -> Option<CycleSummary> {
+    if !matches!(job_state(rr), JobState::Failed | JobState::Killed) || rr.tokens_new > 0 {
+        return None;
+    }
+    let host = unreachable_now(cfg, repo_url, backend).await?;
+    log_write_failure(
+        store
+            .fail_unstarted_job(
+                job,
+                &format!("offline: {host} unreachable; the worker did no metered work"),
+            )
+            .await,
+        format_args!("job {job}: failing unstarted"),
+    );
+    Some(offline_denial(store, kind.into(), Some(fid), Some(job), host).await)
+}
+
 /// The host `candidate` needs that cannot be reached, if any; always
 /// `None` with `network.gate` off.
 async fn network_gate(
@@ -6093,15 +6259,9 @@ async fn run_cycle_inner(
     // and before dispatch, so none of its work starts, fails or is
     // counted while its forge or provider cannot be reached (#95).
     if let Some(host) = network_gate(store, cfg, backend, &candidate).await? {
-        let reason = format!("offline: {host} unreachable");
-        let _ = store.log_event("deny", &reason, None, None).await;
         return Ok(CycleSummary {
-            kind: Some(candidate.job_kind()),
-            denied: Some(reason),
-            retry_at: Some(now_ms() + NETWORK_RETRY_MS),
-            unreachable: Some(host),
             sync,
-            ..Default::default()
+            ..offline_denial(store, candidate.job_kind(), None, None, host).await
         });
     }
 
