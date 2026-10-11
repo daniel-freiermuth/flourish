@@ -345,8 +345,9 @@ pub struct Run {
 /// headroom it grants is `None` — no token bound — unless
 /// [`ScriptedBackend::granting`] says otherwise, or a window too small for
 /// large reservations ([`ScriptedBackend::denying_above`]). It reports no
-/// worker hosts, so the reachability gate probes none of its own, unless
-/// [`ScriptedBackend::needing`] names some. Every run is
+/// worker hosts unless [`ScriptedBackend::needing`] names some, and it
+/// answers the reachability probe itself, without a socket: every host is
+/// reachable unless [`ScriptedBackend::offline`] marks it down. Every run is
 /// recorded ([`ScriptedBackend::runs`]), so a test can assert on the prompt
 /// and the transcript a worker was given.
 pub struct ScriptedBackend {
@@ -357,6 +358,8 @@ pub struct ScriptedBackend {
     /// (a panicked blocking task), not the worker.
     fails: bool,
     hosts: Vec<String>,
+    /// The hosts the reachability probe reports unreachable.
+    offline: Vec<String>,
     runs: Mutex<Vec<Run>>,
 }
 
@@ -375,6 +378,7 @@ impl ScriptedBackend {
             deny_above: None,
             fails: false,
             hosts: Vec::new(),
+            offline: Vec::new(),
             runs: Mutex::new(Vec::new()),
         }
     }
@@ -398,6 +402,14 @@ impl ScriptedBackend {
     #[must_use]
     pub fn needing(mut self, hosts: &[&str]) -> Self {
         self.hosts = hosts.iter().map(|&h| h.to_owned()).collect();
+        self
+    }
+
+    /// Answer the reachability probe with `hosts` down
+    /// (`Backend::first_unreachable`): the machine is offline for them.
+    #[must_use]
+    pub fn offline(mut self, hosts: &[&str]) -> Self {
+        self.offline = hosts.iter().map(|&h| h.to_owned()).collect();
         self
     }
 
@@ -475,6 +487,11 @@ impl Backend for ScriptedBackend {
 
     fn worker_hosts(&self) -> Vec<String> {
         self.hosts.clone()
+    }
+
+    /// No socket: the first of `hosts` marked [`ScriptedBackend::offline`].
+    async fn first_unreachable(&self, hosts: &[String]) -> Option<String> {
+        hosts.iter().find(|h| self.offline.contains(h)).cloned()
     }
 
     async fn run(
