@@ -651,6 +651,19 @@ impl Backend for OmpScavengeBackend {
         Ok(rc == 0)
     }
 
+    /// `backend.providerHosts` when the operator set it, else the hosts
+    /// omp calls for the configured provider.
+    fn worker_hosts(&self) -> Vec<String> {
+        self.cfg.provider_hosts.clone().unwrap_or_else(|| {
+            self.cfg
+                .llm_provider
+                .api_hosts()
+                .iter()
+                .map(|&h| h.to_owned())
+                .collect()
+        })
+    }
+
     async fn status_html(&self) -> anyhow::Result<String> {
         let now_ms = crate::util::now_ms();
         let db = self.agent_db.clone();

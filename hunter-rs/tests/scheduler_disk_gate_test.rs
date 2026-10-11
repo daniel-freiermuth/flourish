@@ -43,7 +43,7 @@ async fn fixture(label: &str) -> (TempDir, Store, Config) {
         "test gaps in {{REPO_NAME}} -> {{OUT_PATH}}\n",
     )
     .unwrap();
-    let mut cfg = Config::load(dir.path()).expect("load config");
+    let mut cfg = support::load_config(dir.path());
     cfg.work_root = dir.subdir("work_root");
     let store = Store::connect(&path).await.unwrap();
     (dir, store, cfg)
@@ -116,7 +116,7 @@ async fn a_cycle_short_of_disk_is_denied_before_any_job_starts() {
 #[test]
 fn the_default_threshold_is_one_gib_inclusive() {
     let dir = TempDir::new("disk-threshold");
-    let cfg = Config::load(dir.path()).expect("load config");
+    let cfg = support::load_config(dir.path());
     let gib: u64 = 1 << 30;
 
     assert!(disk_denial(&cfg, gib - 1).is_some());

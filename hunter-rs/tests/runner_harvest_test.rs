@@ -110,7 +110,7 @@ async fn fixture(label: &str, status: FindingStatus) -> Fixture {
     )
     .unwrap();
     std::fs::write(playbooks.join("harvest.md"), "merged {{WORKTREE}}\n").unwrap();
-    let mut cfg = Config::load(dir.path()).expect("load config");
+    let mut cfg = support::load_config(dir.path());
     cfg.work_root = dir.subdir("work_root");
     Fixture {
         cfg,

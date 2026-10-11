@@ -128,6 +128,18 @@ impl LlmProvider {
         }
     }
 
+    /// The API hosts a worker on this provider talks to: what the
+    /// reachability gate probes when `backend.providerHosts` does not say
+    /// otherwise. The endpoints omp itself calls for the provider.
+    pub const fn api_hosts(self) -> &'static [&'static str] {
+        match self {
+            Self::Anthropic => &["api.anthropic.com"],
+            // Codex on a ChatGPT plan is served from chatgpt.com/backend-api.
+            Self::OpenAiCodex => &["chatgpt.com"],
+            Self::GitHubCopilot => &["api.githubcopilot.com"],
+        }
+    }
+
     pub fn quota(self) -> &'static Quota {
         match self {
             Self::Anthropic => &ANTHROPIC,

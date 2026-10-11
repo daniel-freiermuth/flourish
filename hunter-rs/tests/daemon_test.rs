@@ -24,7 +24,6 @@ mod support;
 
 use std::time::{Duration, Instant};
 
-use hunter::config::Config;
 use serde_json::Value;
 use support::{FakeBins, TempDir};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -116,7 +115,7 @@ async fn a_paused_daemon_reports_it_and_stops_on_sigterm() {
         format!(r#"{{"ompBin": "omp", "serve": {{"port": {port}}}}}"#),
     )
     .unwrap();
-    let cfg = Config::load(root.path()).expect("load scratch config");
+    let cfg = support::load_config(root.path());
     // The API wants a session; the account goes in before the daemon opens
     // the database.
     let cookie = {
@@ -200,7 +199,7 @@ async fn the_daemon_binds_the_configured_address() {
         format!(r#"{{"ompBin": "omp", "serve": {{"host": "127.0.0.2", "port": {port}}}}}"#),
     )
     .unwrap();
-    let cfg = Config::load(root.path()).expect("load scratch config");
+    let cfg = support::load_config(root.path());
     let daemon = std::thread::spawn(move || {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -256,7 +255,7 @@ async fn a_starting_daemon_reclaims_leftover_trees() {
     let bins = FakeBins::acquire("daemon-sweep");
     bins.fail("omp", 1, "fake omp: no usage data here");
     let _home = bins.env("HOME", dir.path());
-    let mut cfg = Config::load(dir.path()).expect("load config");
+    let mut cfg = support::load_config(dir.path());
     cfg.work_root = dir.subdir("work_root");
     cfg.db_path = support::db_copy(&dir, "hunter");
     cfg.serve_port = free_port();

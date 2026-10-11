@@ -183,6 +183,8 @@ def status(self) -> str                                      # :209-221
 - `keep_fresh`: refresh stale accounting, log observations, record calibration. Called from the server's dedicated prober thread on a fixed tick, decoupled from dispatch cadence. Returns True iff a refresh was performed (:198-207).
 - `status`: HTML fragment; UI injects via innerHTML each 5 s poll. Disciplines (:215-219): every interpolated datum HTML-escaped (backend's job); backend-specific class prefix; stateless-render-safe (rebuilt every tick).
 
+**Rust addition: `fn worker_hosts(&self) -> Vec<String>`** (no Python counterpart). The hosts a worker needs to reach, each `host` or `host:port` (port 443 when omitted). The scheduler probes them, after the repo's forge host, before it dispatches any candidate (`scheduler::work_hosts`, `reach::first_unreachable`; every kind can run a worker, so every candidate needs them) and denies the cycle while one is unreachable. Synchronous: it is configuration, not I/O. `omp_scavenge` returns `backend.providerHosts` when set, else `LlmProvider::api_hosts` for `backend.llmProvider` (`api.anthropic.com`, `chatgpt.com`, `api.githubcopilot.com`). `OverdriveBackend` forwards; `NullBackend` and the test backends return none, so a test probes only the hosts it injects.
+
 ### 1.8 `RunResult` (types.py:243-253)
 `exit_code: int|None`; `killed_reason: str|None` = `None|"cap"|"wallclock"`; `tokens_new: int` (input+output+cacheWrite from worker ledger); `calls: int`; `session_file: str|None`; `duration_s: float`; `stdout_tail: str = ""`; `usage_delta: float|None = None` (provider 7d used_fraction change during the job; set by facade's snapshot sandwich, facade.py:311-323). Consumed by `scheduler._record_job` (Rust: `scheduler::record_job`), which maps it to a job state — see the state-mapping table below.
 
@@ -458,6 +460,8 @@ Three consequences the implementation is built around. (1) A resumed attempt run
 | `models.hunt` | `model_hunt` | `None` | `model_for("hunt")` |
 | `models.fix` | `model_fix` | `None` | `model_for(kind != "hunt")` |
 | `backend.type` | `backend_type` | `"omp-scavenge"` | `make_backend` discriminator types.py:228-239; unknown → `ValueError(f"unknown backend_type: {self.backend_type!r}")` |
+| `backend.providerHosts` | `provider_hosts` | `None` (= `LlmProvider::api_hosts`) | `worker_hosts` (§1.7); entries must be `host[:port]` — no scheme, slash, whitespace or blank |
+| `network.gate` | `network_gate` | `true` | scheduler's reachability gate; `false` probes nothing |
 
 **Retired: `hunt.capNewTokens` and `fix.capNewTokens`.** Both parsers dropped them; the job's token bound is `Granted.cap_tokens` and nothing else (§0). Neither parser rejects unknown keys (no `deny_unknown_fields` on the Rust side, `raw.get(...)` on the Python side), so a deployed config.json that still names them keeps starting cleanly and the values are simply ignored — an operator is not handed a daemon that refuses to boot over a stale key. `hunt.maxWallS` (1800) and `fix.maxWallS` (2700) are untouched and remain the defence against a runaway worker.
 

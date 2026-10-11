@@ -45,6 +45,7 @@ struct RawConfig {
     standards: RawScan,
     renovate: RawRenovate,
     feedback: RawFeedback,
+    network: RawNetwork,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -81,6 +82,8 @@ struct RawBackend {
     kind: Option<String>,
     #[serde(rename = "llmProvider")]
     llm_provider: Option<String>,
+    #[serde(rename = "providerHosts")]
+    provider_hosts: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -112,6 +115,12 @@ struct RawRenovate {
 #[serde(default)]
 struct RawFeedback {
     bots: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawNetwork {
+    gate: Option<bool>,
 }
 
 /// A credential read from config.json. `Debug` prints a placeholder, so
@@ -206,6 +215,15 @@ pub struct Config {
     /// backend.type discriminator; only "omp-scavenge" exists.
     pub backend_type: String,
     pub llm_provider: LlmProvider,
+    /// backend.providerHosts — the hosts a worker needs, each `host` or
+    /// `host:port`, in place of the provider's own
+    /// (`LlmProvider::api_hosts`). `None` = the provider's.
+    pub provider_hosts: Option<Vec<String>>,
+    /// network.gate — whether a cycle probes the hosts its candidate
+    /// needs before dispatching it (`scheduler::network_gate`). Off for a
+    /// machine that reaches them only through a proxy, where a direct
+    /// connection never succeeds.
+    pub network_gate: bool,
 
     pub hunt_max_wall_s: i64,
     pub hunt_max_findings: i64,
@@ -385,6 +403,18 @@ impl Config {
             cfg_path.display()
         );
         let review_bots = ReviewBots::new(&raw_bots);
+        // An entry is handed to a TCP connect as `host[:port]`, so a URL
+        // or a blank would probe nothing and deny every cycle.
+        if let Some(hosts) = &raw.backend.provider_hosts {
+            anyhow::ensure!(
+                hosts.iter().all(|h| {
+                    !h.is_empty() && !h.contains(|c: char| c.is_whitespace() || c == '/')
+                }),
+                "{}: backend.providerHosts entries must be host names such as \
+                 \"api.anthropic.com\", optionally with a :port (got {hosts:?})",
+                cfg_path.display()
+            );
+        }
 
         let serve_host = match raw.serve.host.as_deref() {
             None => std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST),
@@ -459,6 +489,8 @@ impl Config {
                 .kind
                 .unwrap_or_else(|| "omp-scavenge".to_owned()),
             llm_provider,
+            provider_hosts: raw.backend.provider_hosts,
+            network_gate: raw.network.gate.unwrap_or(true),
             hunt_max_wall_s,
             hunt_max_findings: raw.hunt.max_findings.unwrap_or(8),
             hunt_rehunt_days: raw.hunt.rehunt_days.unwrap_or(90),

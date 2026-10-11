@@ -334,7 +334,7 @@ Rules:
 - **A ceiling give-up is a failure** with the key `resume chain gave up` and the reason as detail, as #56 introduced.
 - **The streak lives on the work item.** It replaces `findings.fix_attempts`, `findings.recheck_attempts`, `pr_state.harvest_attempts` and their `last_*_failure` columns, and engage gets one.
 
-What is **not** a failure: a budget or disk-gate denial, operator pause, or a pause by the worker. These are scheduler-level waits; they don't belong to one work item.
+What is **not** a failure: a budget, disk-gate or network-gate denial, operator pause, or a pause by the worker. These are scheduler-level waits; they don't belong to one work item.
 
 ---
 
@@ -499,7 +499,7 @@ All of them only left an event behind, and backfilling would mean parsing event 
 ## 13. Out of scope
 
 - **Repo-level work** (hunt, analysis scans, dep updates). It keeps its current mechanism: rotation timestamps, give-up bumps, and suspended rows as checkpoints. Holds are finding-only. This leaves two checkpoint mechanisms until repo work is moved over; see §15.
-- **Scheduler-level waits:** budget denial, the disk gate, operator pause, overdrive.
+- **Scheduler-level waits:** budget denial, the disk gate, the network gate, operator pause, overdrive.
 - **PR sync errors** (an unparseable URL, a failed PR view): logged per cycle, as today.
 
 ---

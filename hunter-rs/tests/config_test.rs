@@ -362,3 +362,49 @@ fn unknown_llm_provider_is_rejected() {
     let message = err(&dir, r#"{"backend": {"llmProvider": "unknown-provider"}}"#);
     assert!(message.contains("backend.llmProvider"), "{message}");
 }
+
+// ---------------------------------------------------------------------------
+// backend.providerHosts, network.gate
+// ---------------------------------------------------------------------------
+
+/// Unset, the backend probes its provider's own hosts and the gate is on.
+#[test]
+fn the_network_gate_is_on_and_probes_the_providers_hosts_by_default() {
+    let dir = TempDir::new("cfg-network-defaults");
+    let cfg = load(&dir, "{}").unwrap();
+    assert!(cfg.network_gate);
+    assert_eq!(cfg.provider_hosts, None);
+}
+
+#[test]
+fn provider_hosts_and_the_gate_switch_load() {
+    let dir = TempDir::new("cfg-network-set");
+    let cfg = load(
+        &dir,
+        r#"{"backend": {"providerHosts": ["llm-gw.corp:8443"]}, "network": {"gate": false}}"#,
+    )
+    .unwrap();
+    assert!(!cfg.network_gate);
+    assert_eq!(
+        cfg.provider_hosts,
+        Some(vec!["llm-gw.corp:8443".to_owned()])
+    );
+}
+
+/// An entry goes to a TCP connect as `host[:port]`: a URL or a blank
+/// resolves nowhere, and would hold every cycle as offline.
+#[test]
+fn provider_hosts_that_are_not_host_names_are_rejected() {
+    let dir = TempDir::new("cfg-provider-hosts-invalid");
+    for bad in [
+        r#"["https://api.anthropic.com"]"#,
+        r#"[""]"#,
+        r#"["api anthropic.com"]"#,
+    ] {
+        let msg = err(
+            &dir,
+            &format!(r#"{{"backend": {{"providerHosts": {bad}}}}}"#),
+        );
+        assert!(msg.contains("backend.providerHosts"), "{bad}: {msg}");
+    }
+}

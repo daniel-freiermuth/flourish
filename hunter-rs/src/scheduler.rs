@@ -5826,6 +5826,43 @@ pub fn disk_denial(cfg: &Config, free: u64) -> Option<String> {
     })
 }
 
+/// How soon a cycle denied for an unreachable host is retried. A probe
+/// is one connection attempt per host, so this only bounds how long work
+/// waits once the network is back.
+const NETWORK_RETRY_MS: i64 = 3 * 60_000;
+
+/// The hosts work on the repo at `repo_url` needs, for
+/// [`crate::reach::first_unreachable`]: the forge the URL names, if any
+/// (a local clone has none), then the hosts `backend`'s workers talk to.
+///
+/// Every kind needs both, since every kind can run a worker: even a
+/// `dep_update` that Renovate usually answers falls back to one.
+pub fn work_hosts(repo_url: &str, backend: &dyn Backend) -> Vec<String> {
+    crate::forge::web_host(repo_url)
+        .into_iter()
+        .chain(backend.worker_hosts())
+        .collect()
+}
+
+/// The host `candidate` needs that cannot be reached, if any; always
+/// `None` with `network.gate` off.
+async fn network_gate(
+    store: &Store,
+    cfg: &Config,
+    backend: &dyn Backend,
+    candidate: &Candidate,
+) -> anyhow::Result<Option<String>> {
+    if !cfg.network_gate {
+        return Ok(None);
+    }
+    // A repo that is gone has no forge to probe; dispatch reports it.
+    let hosts = match store.get_repo_by_id(candidate.repo_id()).await? {
+        Some(repo) => work_hosts(&repo.url, backend),
+        None => backend.worker_hosts(),
+    };
+    Ok(crate::reach::first_unreachable(&hosts).await)
+}
+
 /// Run one cycle: sync PRs, `pick_next`, dispatch to the appropriate runner (`scheduler.run_cycle`).
 pub async fn run_cycle(
     store: &Store,
@@ -6022,6 +6059,21 @@ async fn run_cycle_inner(
             ..Default::default()
         });
     };
+
+    // Once the candidate is known, so only the hosts it needs are probed,
+    // and before dispatch, so none of its work starts, fails or is
+    // counted while its forge or provider cannot be reached (#95).
+    if let Some(host) = network_gate(store, cfg, backend, &candidate).await? {
+        let reason = format!("offline: {host} unreachable");
+        let _ = store.log_event("deny", &reason, None, None).await;
+        return Ok(CycleSummary {
+            kind: Some(candidate.job_kind()),
+            denied: Some(reason),
+            retry_at: Some(now_ms() + NETWORK_RETRY_MS),
+            sync,
+            ..Default::default()
+        });
+    }
 
     let dispatched = dispatch(store, cfg, backend, &candidate).await;
     // Starvation prevention for rotation kinds: a scan whose attempt ended

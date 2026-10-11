@@ -40,7 +40,7 @@ async fn setup() -> (
         "SUPPRESSIONS:\n{{SUPPRESSIONS}}\nKNOWN:\n{{KNOWN_GAPS}}\nOUT {{OUT_PATH}}\n",
     )
     .unwrap();
-    let mut cfg = hunter::config::Config::load(dir.path()).expect("load config");
+    let mut cfg = support::load_config(dir.path());
     cfg.work_root = dir.subdir("work_root");
 
     (dir, store, cfg, repo)

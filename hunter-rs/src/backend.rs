@@ -159,6 +159,10 @@ pub trait Backend: Send + Sync {
     /// (innerHTML'd by the UI every 5 s; byte-parity spec in
     /// BACKEND-CONTRACT.md §2.3).
     async fn status_html(&self) -> anyhow::Result<String>;
+    /// The hosts a worker needs to reach, each `host` or `host:port` (443
+    /// when it names none), for the scheduler's reachability gate
+    /// ([`crate::reach::first_unreachable`]). Empty = nothing to probe.
+    fn worker_hosts(&self) -> Vec<String>;
     /// Execute a worker job in its chain's workspace: the worker runs in
     /// `ws.tree` and its transcript goes to `ws.session`. `cap_tokens` is
     /// the token bound the ramp
@@ -214,6 +218,10 @@ impl Backend for OverdriveBackend {
         self.inner.status_html().await
     }
 
+    fn worker_hosts(&self) -> Vec<String> {
+        self.inner.worker_hosts()
+    }
+
     async fn run(
         &self,
         ws: &crate::workspace::Workspace,
@@ -251,6 +259,11 @@ impl Backend for NullBackend {
 
     async fn status_html(&self) -> anyhow::Result<String> {
         Ok(r#"<div class="scv-note">No window data available</div>"#.to_owned())
+    }
+
+    /// None: a router test never reaches the network through it.
+    fn worker_hosts(&self) -> Vec<String> {
+        vec![]
     }
 
     async fn run(
@@ -293,6 +306,10 @@ mod tests {
 
         async fn status_html(&self) -> anyhow::Result<String> {
             Ok(String::new())
+        }
+
+        fn worker_hosts(&self) -> Vec<String> {
+            Vec::new()
         }
 
         async fn run(

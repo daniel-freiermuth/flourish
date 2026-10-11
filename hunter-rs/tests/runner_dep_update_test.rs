@@ -73,7 +73,7 @@ impl Rig {
             "dep update\n",
         )
         .unwrap();
-        let mut cfg = hunter::config::Config::load(dir.path()).expect("load config");
+        let mut cfg = support::load_config(dir.path());
         cfg.work_root = dir.subdir("work_root");
         let model_ran = Arc::new(AtomicBool::new(false));
         let backend = ScriptedBackend::new({

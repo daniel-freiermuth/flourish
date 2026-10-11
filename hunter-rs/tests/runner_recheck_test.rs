@@ -106,7 +106,7 @@ async fn fixture(label: &str, status: FindingStatus) -> Fixture {
         "recheck {{REPO_PATH}} -> {{OUT_PATH}}\n",
     )
     .unwrap();
-    let mut cfg = Config::load(dir.path()).expect("load config");
+    let mut cfg = support::load_config(dir.path());
     cfg.work_root = dir.subdir("work_root");
     Fixture {
         cfg,

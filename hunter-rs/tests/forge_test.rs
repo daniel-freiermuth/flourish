@@ -533,3 +533,30 @@ fn a_slash_before_the_colon_is_not_the_scp_form() {
     assert_eq!(url_host("git@github.com:acme/w.git"), Some("github.com"));
     assert_eq!(detect_forge("git@github.com:acme/w.git"), ForgeName::Github);
 }
+
+/// The reachability gate probes the forge where its web API answers.
+#[test]
+fn web_host_is_where_the_forge_api_answers() {
+    for (url, want) in [
+        ("https://github.com/acme/widget", Some("github.com")),
+        ("git@github.com:acme/widget.git", Some("github.com")),
+        ("HTTPS://gitlab.corp.com/g/w.git", Some("gitlab.corp.com")),
+        // A web URL's own port is where its web API is served.
+        (
+            "https://gitlab.corp.com:8443/g/w",
+            Some("gitlab.corp.com:8443"),
+        ),
+        ("https://user@127.0.0.1:9/g/w", Some("127.0.0.1:9")),
+        ("http://gitlab.lan/g/w", Some("gitlab.lan:80")),
+        ("http://gitlab.lan:8080/g/w", Some("gitlab.lan:8080")),
+        // An SSH port is git's: the API is still on the HTTPS port.
+        (
+            "ssh://git@gitlab.corp.com:2222/g/w.git",
+            Some("gitlab.corp.com"),
+        ),
+        // A local clone has no forge to reach.
+        ("/srv/git/widget", None),
+    ] {
+        assert_eq!(web_host(url).as_deref(), want, "web_host({url})");
+    }
+}

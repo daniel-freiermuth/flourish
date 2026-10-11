@@ -72,7 +72,7 @@ async fn fixture(label: &str, default_branch: &str) -> Fixture {
         "gaps {{REPO_PATH}} -> {{OUT_PATH}}\n",
     )
     .unwrap();
-    let mut cfg = Config::load(dir.path()).expect("load config");
+    let mut cfg = support::load_config(dir.path());
     cfg.work_root = dir.subdir("work_root");
     Fixture {
         cfg,
@@ -193,6 +193,10 @@ impl Backend for StagedBackend {
 
     async fn status_html(&self) -> anyhow::Result<String> {
         Ok(String::new())
+    }
+
+    fn worker_hosts(&self) -> Vec<String> {
+        Vec::new()
     }
 
     async fn run(

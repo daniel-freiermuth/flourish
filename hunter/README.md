@@ -221,6 +221,30 @@ Each of 1-5 picks a (finding, kind). When that finding has a suspended
 attempt of that same kind that can still be continued, the tier continues
 it, at the tier's own position, instead of starting the work fresh.
 
+Before the picked work is dispatched, the cycle checks that this machine
+can reach the hosts it needs: the repo's **forge** (the host of its URL,
+e.g. `github.com` or the GitLab instance; none for a local clone) and the
+**LLM provider's API** (`api.anthropic.com`, `chatgpt.com` or
+`api.githubcopilot.com`, per `backend.llmProvider`). Every kind needs
+both, since every kind can run a worker. The probe opens a TCP connection
+to port 443 (or the URL's own port) on all of the host's addresses at
+once, and one must accept within 2 seconds, lookup included; no request
+is sent. If a host is unreachable, the cycle is denied with a
+`deny` event naming the host and retried in 3 minutes: nothing runs,
+nothing counts toward a failure streak or a rotation turn, and no job row,
+claim or checkpoint is touched. The daemon runs on a laptop that travels
+and sleeps, so being offline is a normal state, not a failure of the work
+it would have started.
+
+Known limits of the gate:
+
+- A captive portal (hotel or train Wi-Fi before its login page) accepts
+  TCP on 443 for every host, so the gate passes and the work then fails.
+  Re-probing a failure before it is counted (#94) passes there too, so
+  those failures still count.
+- A network that reaches the forge and provider only through a proxy
+  never accepts a direct connection: set `network.gate: false` there.
+
 The cost ceiling applies only when the historical typical estimate is
 positive. An absent or zero estimate is not a zero-token allowance;
 the attempt ceiling and provider budget still bound the run.
@@ -354,6 +378,9 @@ are gated against two linear ramps:
   no token bound, and `maxWallS` alone stops it.
 - Stale or missing usage data → conservative denial, never an optimistic
   guess.
+- The budget gate only reads usage data, and data recorded before the
+  machine went offline still grants. The network gate in § Scheduling
+  loop is what keeps a worker from starting without its provider.
 
 ### PR follow-up loop
 
@@ -580,6 +607,13 @@ quota source for one installation.
   github.com lookups (Actions, GitHub tags/releases). Only GitHub-hosted
   repos get a token: this one if set, else the `gh auth token --hostname
   github.com` login. Without either, those deps are silently skipped.
+- `backend.providerHosts` — the hosts a worker needs, probed by the
+  network gate (§ Scheduling loop) in place of the provider's own, each
+  `host` or `host:port` (443 when omitted), e.g. `["llm-gw.corp:8443"]`
+  for a gateway. Default: the provider's API host.
+- `network.gate` — `false` turns the network gate off, for a machine that
+  reaches its forge and provider only through a proxy, where a direct
+  connection never succeeds. Default `true`.
 - `feedback.bots` — review bots whose PR comments engage and harvest act on,
   e.g. `["coderabbitai"]` (either `name` or `name[bot]`). Besides these,
   only people who can push to the repo count (GitHub: write access or above;
@@ -661,5 +695,7 @@ to the window reset; genuinely idle → 15 minutes. PR-comment polling is
 decoupled from the token-budget backoff loop, so a long budget-driven sleep
 never delays noticing new PR feedback. Every wake re-checks the budget gate
 before spending anything, and starts no job while the filesystem holding
-`workRoot` has less than 1 GiB free (retried every 5 minutes).
+`workRoot` has less than 1 GiB free (retried every 5 minutes), or while
+the picked work's forge or provider is unreachable (retried every 3
+minutes).
 

@@ -866,7 +866,7 @@ async fn repo_with_an_undecodable_finding(
         std::fs::write(playbooks.join(name), "work in {{REPO_PATH}}\n").unwrap();
     }
     let row = store.get_repo_by_id(rid).await.unwrap().unwrap();
-    let mut cfg = hunter::config::Config::load(dir.path()).expect("load config");
+    let mut cfg = support::load_config(dir.path());
     cfg.work_root = dir.subdir("work_root");
     (path, store, row, cfg)
 }

@@ -107,6 +107,8 @@ async fn test_state() -> TestState {
         model_fix: None,
         backend_type: "omp-scavenge".into(),
         llm_provider: hunter::backends::omp_scavenge::LlmProvider::Anthropic,
+        provider_hosts: None,
+        network_gate: false,
         hunt_max_wall_s: 1800,
         hunt_max_findings: 8,
         hunt_rehunt_days: 90,
