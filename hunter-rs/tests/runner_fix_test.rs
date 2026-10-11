@@ -1647,3 +1647,70 @@ async fn gitlab_retry_adopts_the_mr_that_already_exists() {
     assert_eq!(finding.status, hunter::domain::FindingStatus::PrOpen);
     assert_eq!(finding.pr_url.as_deref(), Some(GL_MR_URL));
 }
+
+/// A finished fix whose push fails while the forge cannot be reached is
+/// the network's failure, not the fix's: nothing is counted, the attempt
+/// becomes the checkpoint, so its commits and transcript are kept and the
+/// next cycle continues it to publish, and the cycle ends denied for the
+/// host (#95). Counted, a lid closed right after the worker finished cost
+/// the whole metered run and one step toward a hold. The same failure with
+/// the forge reachable is the fix's, and counts.
+#[tokio::test]
+async fn a_failed_push_counts_only_while_the_forge_is_reachable() {
+    let host = support::FORGE_HOST;
+    for counted in [false, true] {
+        let url = format!("https://{host}/acme/widget");
+        let mut f = fixture_on("fix-push-offline", &url, ForgeName::Github).await;
+        f.cfg.network_gate = true;
+        // The push goes nowhere, and fails at once, without a network.
+        let push_url = hunter::forge::forge_for(ForgeName::Github).ssh_url(&url);
+        let nowhere = f.cfg.work_root.join("no-such-remote.git");
+        git(
+            &f.repo_dir,
+            &[
+                "config",
+                &format!("url.{}.insteadOf", nowhere.display()),
+                &push_url,
+            ],
+        );
+        let down: &[&str] = if counted { &[] } else { &[host] };
+        let finished = ScriptedBackend::new(|tree| {
+            std::fs::write(tree.join("FIX.md"), "fixed\n").unwrap();
+            git(tree, &["add", "-A"]);
+            git(tree, &["commit", "-m", "fix: the real bug"]);
+            std::fs::write(tree.join("PR-DESCRIPTION.md"), "the body").unwrap();
+            support::done_with_transcript(tree)
+        })
+        .offline(down);
+
+        let summary = fix(&f, &finished).await;
+
+        let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        assert_eq!(after.status, hunter::domain::FindingStatus::Queued);
+        if counted {
+            assert_eq!(summary.outcome.as_deref(), Some("requeued"), "{summary:?}");
+            assert_eq!(
+                fix_streak(&f).await.streak,
+                1,
+                "the forge answered: counted"
+            );
+            continue;
+        }
+        assert_eq!(summary.unreachable.as_deref(), Some(host), "{summary:?}");
+        assert!(summary.retry_at.is_some(), "{summary:?}");
+        assert_eq!(fix_streak(&f).await.streak, 0);
+        let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
+            hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+                .await
+                .unwrap()
+        else {
+            panic!("the unpublished attempt is continued");
+        };
+        assert_eq!(Some(plan.predecessor_id), summary.job_id);
+        assert_eq!(
+            git(&plan.workspace.tree, &["log", "-1", "--format=%s"]).trim(),
+            "fix: the real bug",
+            "its commits are kept"
+        );
+    }
+}

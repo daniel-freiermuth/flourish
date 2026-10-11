@@ -1266,3 +1266,123 @@ async fn a_resumed_closed_harvest_gets_neither_the_playbook_nor_the_diff_again()
     );
     assert_eq!(diff_fetches(&bins), 1, "{:?}", bins.calls_to("gh"));
 }
+
+/// Point the fixture's repo at a forge on `host` and turn the network gate
+/// on, so failures are re-probed (#95 layer 2). Whether `host` answers is
+/// up to the test backend (`ScriptedBackend::offline`).
+async fn served_at(f: &mut Fixture, host: &str) {
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    sqlx::query("UPDATE repos SET url = ?1")
+        .bind(format!("https://{host}/acme/widget"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    f.cfg.network_gate = true;
+}
+
+/// A PR view that fails while the forge cannot be reached is the
+/// machine's failure, not the harvest's: nothing is counted, and the cycle
+/// ends denied for the host, to be retried, as the network gate's own
+/// denial does (#95). The same failure with the forge reachable is the
+/// harvest's, and counts.
+#[tokio::test]
+async fn a_failed_pr_view_counts_only_while_the_forge_is_reachable() {
+    let bins = FakeBins::acquire("harvest-view-offline");
+    bins.script("gh", "echo 'connection reset' >&2\nexit 1");
+    let host = support::FORGE_HOST;
+    for counted in [false, true] {
+        let mut f = fixture("harvest-view-offline", FindingStatus::Closed).await;
+        served_at(&mut f, host).await;
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        let down: &[&str] = if counted { &[] } else { &[host] };
+        let never = ScriptedBackend::new(|_| panic!("no worker without the PR")).offline(down);
+
+        let result = run_harvest(&f.store, &f.cfg, &finding, &never, None).await;
+
+        if counted {
+            assert!(result.is_err(), "{result:?}");
+            assert_eq!(harvest_streak(&f).await, 1, "the forge answered: counted");
+            continue;
+        }
+        let summary = result.unwrap();
+        assert_eq!(
+            (
+                summary.denied.as_deref(),
+                summary.unreachable.as_deref(),
+                summary.finding_id
+            ),
+            (
+                Some(format!("offline: {host} unreachable").as_str()),
+                Some(host),
+                Some(f.fid)
+            )
+        );
+        assert!(summary.retry_at.is_some(), "{summary:?}");
+        assert_eq!(
+            harvest_streak(&f).await,
+            0,
+            "the network's failure counts nothing"
+        );
+    }
+}
+
+/// A resumed harvest whose worker fails without doing any metered work
+/// while its provider cannot be reached never got to the work: nothing is
+/// counted, its job is closed as unstarted, and the paused attempt it was
+/// continuing stays the checkpoint, where it used to be counted as a
+/// failed harvest (#95).
+#[tokio::test]
+async fn a_worker_that_never_reached_its_provider_keeps_the_checkpoint() {
+    let bins = FakeBins::acquire("harvest-worker-offline");
+    gh_default(&bins);
+    let mut f = fixture("harvest-worker-offline", FindingStatus::Closed).await;
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let paused = run_harvest(&f.store, &f.cfg, &finding, &suspending(), None)
+        .await
+        .unwrap();
+    let provider = support::PROVIDER_HOST;
+    served_at(&mut f, support::FORGE_HOST).await;
+    let plan = match pick_next(&f.store, &f.cfg, None).await.unwrap() {
+        Some(Candidate::Resume { plan, .. }) => *plan,
+        other => panic!("the paused harvest resumes, got {other:?}"),
+    };
+    let unmetered = ScriptedBackend::new(|_| RunResult {
+        exit_code: Some(1),
+        tokens_new: 0,
+        session_file: None,
+        ..support::done()
+    })
+    .needing(&[provider])
+    .offline(&[provider]);
+
+    // The view fails here before the resume skips it (step 6), the worker
+    // after; either way it is the provider that is down.
+    let summary = run_harvest(&f.store, &f.cfg, &finding, &unmetered, Some(&plan))
+        .await
+        .unwrap();
+
+    assert_eq!(summary.unreachable.as_deref(), Some(provider));
+    assert_eq!(harvest_streak(&f).await, 0);
+    let checkpoint = f
+        .store
+        .checkpoint_job(f.fid, FindingJobKind::Harvest)
+        .await
+        .unwrap()
+        .map(|j| j.id);
+    assert_eq!(
+        checkpoint, paused.job_id,
+        "the paused attempt is still the checkpoint"
+    );
+    assert!(
+        f.store
+            .jobs_by_finding(f.fid)
+            .await
+            .unwrap()
+            .iter()
+            .all(|j| j.state != JobState::Running),
+        "no job is left running"
+    );
+}

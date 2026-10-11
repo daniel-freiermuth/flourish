@@ -561,3 +561,43 @@ async fn a_stuck_recheck_keeps_its_tree_for_the_continue() {
     assert_eq!(Some(plan.predecessor_id), hold.checkpoint_job_id);
     assert!(plan.workspace.tree.is_dir());
 }
+
+/// A recheck worker that fails without doing any metered work while its
+/// provider cannot be reached never got to the finding: nothing is
+/// counted and the cycle ends denied for the host (#95). One that did
+/// metered work failed at the recheck, offline or not, and counts.
+#[tokio::test]
+async fn an_unmetered_failure_counts_only_while_the_provider_is_reachable() {
+    let provider = support::PROVIDER_HOST;
+    for (tokens_new, counted) in [(0, false), (5_000, true)] {
+        let mut f = fixture("recheck-worker-offline", FindingStatus::Rechecking).await;
+        f.cfg.network_gate = true;
+        let failing = ScriptedBackend::new(move |_| RunResult {
+            exit_code: Some(1),
+            tokens_new,
+            ..support::done()
+        })
+        .needing(&[provider])
+        .offline(&[provider]);
+
+        let summary = f.recheck(&failing).await;
+
+        let streak = f
+            .store
+            .work_streak(f.fid, FindingJobKind::Recheck)
+            .await
+            .unwrap()
+            .streak;
+        assert_eq!(
+            streak,
+            i64::from(counted),
+            "{tokens_new} tokens: {summary:?}"
+        );
+        assert_eq!(
+            summary.unreachable.as_deref(),
+            (!counted).then_some(provider),
+            "{summary:?}"
+        );
+        assert_eq!(f.finding().await.status, FindingStatus::Rechecking);
+    }
+}
