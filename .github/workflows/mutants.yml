@@ -69,9 +69,11 @@ jobs:
         id: plan
         env:
           # Mutants per shard. At -j 2 on a hosted runner a mutant costs
-          # about 30 s (48 mutants took 25 min on PR #69), so 40 fits the
-          # 35-minute cap in the shard job with room for the baseline.
-          MAX_MUTANTS: "40"
+          # about 50 s with today's suite (shards of 37 took 23-35 min on
+          # PR #94, and two hit the cap; it was 30 s when 40 was chosen on
+          # PR #69). 20 keeps a shard near 15 min, well inside the
+          # 35-minute cap in the shard job, as the suite keeps growing.
+          MAX_MUTANTS: "20"
           BASE_REF: ${{ github.base_ref }}
         run: |
           # --relative is load-bearing: without it git emits repo-relative
