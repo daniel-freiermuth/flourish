@@ -543,34 +543,60 @@ async fn only_maintainers_and_configured_bots_flag_new_comments() {
 
 /// A failed withdrawal must not become an unbounded retry.
 ///
-/// Leaving the finding untouched puts it straight back into
-/// `list_attention`, which `pick_next` ranks second — so a persistently
-/// failing forge would run a fresh worker every cycle forever, starving
-/// every other kind of work. `fix`, `recheck` and `harvest` each cap this
-/// with an attempt counter; engage has none, so the attention reason is
-/// marked addressed instead and the finding waits for real PR activity.
+/// Left untouched, the finding is straight back in the engage tier, which
+/// `pick_next` ranks first among the findings — so a persistently failing
+/// forge would run a fresh worker every cycle forever, starving every
+/// other kind of work. Until the work model, engage had no failure streak,
+/// so the attention reason was marked addressed instead and the PR left
+/// review until it changed. Now a refused withdrawal counts in the engage
+/// streak like any failed engage: the third in a row holds the engage for
+/// the operator, and the attention is left as the forge reports it.
 #[tokio::test]
-async fn failed_close_marks_the_attention_addressed_so_it_stops_being_repicked() {
+async fn a_failed_withdrawal_counts_toward_the_engage_streak() {
     let f = fixture("engage-close-fails-bounded").await;
     let bins = FakeBins::acquire("engage-close-fails-bounded");
     bins.ok_unless_action("gh", "pr comment", PR_VIEW_JSON);
+    let backend = ScriptedBackend::writing("WITHDRAW.md", "not worth pursuing");
 
+    let mut outcomes = Vec::new();
+    for _ in 0..3 {
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        let summary = hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &backend, None)
+            .await
+            .unwrap();
+        outcomes.push(summary.outcome);
+    }
+
+    assert_eq!(
+        outcomes,
+        [
+            Some("withdraw-failed".into()),
+            Some("withdraw-failed".into()),
+            Some("held".into())
+        ]
+    );
     assert_eq!(
         f.addressed_fp().await,
         None,
-        "precondition: not yet addressed"
+        "the attention is not set aside"
     );
-
-    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-    let backend = ScriptedBackend::writing("WITHDRAW.md", "not worth pursuing");
-    hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &backend, None)
+    let hold = support::hold_of(&f.store, f.fid, hunter::domain::FindingJobKind::Engage)
+        .await
+        .expect("held at the limit");
+    assert_eq!(hold.reason, hunter::domain::HoldReason::Stuck);
+    assert!(hold.detail.starts_with("PR close failed"), "{hold:?}");
+    let picked = hunter::scheduler::pick_next(&f.store, &f.cfg, None)
         .await
         .unwrap();
-
-    assert_eq!(
-        f.addressed_fp().await.as_deref(),
-        Some("af-1"),
-        "the attention reason must be marked addressed, or the next cycle picks it straight back up"
+    assert!(
+        !matches!(
+            picked,
+            Some(
+                hunter::scheduler::Candidate::Finding { .. }
+                    | hunter::scheduler::Candidate::Resume { .. }
+            )
+        ),
+        "a held engage is skipped: {picked:?}"
     );
 }
 
@@ -1733,7 +1759,12 @@ async fn only_a_suspended_engage_reports_its_kept_worktree() {
             .await
             .unwrap();
 
-        assert_eq!(summary.outcome.as_deref(), Some("retry"), "{summary:?}");
+        let (outcome, said) = if suspended {
+            ("suspended", "suspended (")
+        } else {
+            ("retry", "incomplete (")
+        };
+        assert_eq!(summary.outcome.as_deref(), Some(outcome), "{summary:?}");
         assert_eq!(
             summary.state == Some(hunter::domain::JobState::Suspended),
             suspended,
@@ -1742,7 +1773,7 @@ async fn only_a_suspended_engage_reports_its_kept_worktree() {
         let events = f.store.recent_events(20).await.unwrap();
         let incomplete = events
             .iter()
-            .find(|e| e.message.starts_with(&format!("#{} incomplete (", f.fid)))
+            .find(|e| e.message.starts_with(&format!("#{} {said}", f.fid)))
             .unwrap_or_else(|| panic!("{events:?}"));
         assert_eq!(
             incomplete.message.contains("; worktree kept at "),
@@ -1978,10 +2009,9 @@ async fn a_suspended_engage_that_withdrew_keeps_no_checkpoint_and_continues_into
 }
 
 /// A cap-killed engage whose withdrawal the forge refused keeps no
-/// checkpoint either. `withdraw-failed` marks the attention addressed, so
-/// the finding waits for new PR activity; a checkpoint left behind would
-/// be resumed every cycle meanwhile, re-running a worker that already
-/// decided, and would pin its tree.
+/// checkpoint either: the refusal is a failed engage, and a failure ends
+/// the checkpoint (WORK-MODEL.md §6.3). A checkpoint left behind would be
+/// resumed into the same withdrawal, and would pin its tree.
 #[tokio::test]
 async fn a_suspended_engage_whose_withdrawal_failed_keeps_no_checkpoint_and_is_released() {
     let f = fixture("engage-suspended-withdraw-failed").await;
@@ -2008,12 +2038,14 @@ async fn a_suspended_engage_whose_withdrawal_failed_keeps_no_checkpoint_and_is_r
         (state.as_str(), killed_reason.as_deref()),
         ("suspended", Some("cap"))
     );
-    let events = f.store.recent_events(50).await.unwrap();
-    assert!(
-        events.iter().any(|e| e.kind == "resume"
-            && e.job_id == Some(job)
-            && e.message.contains("withdrawal failed; nothing to resume")),
-        "{events:?}"
+    assert_eq!(
+        f.store
+            .work_streak(f.fid, hunter::domain::FindingJobKind::Engage)
+            .await
+            .unwrap()
+            .streak,
+        1,
+        "counted as a failed engage"
     );
     assert!(f.store.list_resumable_jobs().await.unwrap().is_empty());
     let runs = backend.runs();
@@ -2046,12 +2078,8 @@ async fn a_suspended_engage_that_did_not_withdraw_keeps_its_tree_for_the_resume(
         .await
         .unwrap();
 
-    assert_eq!(summary.outcome.as_deref(), Some("retry"), "{summary:?}");
-    assert_eq!(
-        summary.failure.as_deref(),
-        Some("worker suspended"),
-        "a suspended attempt must not reach the push"
-    );
+    assert_eq!(summary.outcome.as_deref(), Some("suspended"), "{summary:?}");
+    assert_eq!(summary.failure, None, "a pause is not a failure");
     assert!(
         !bins.called_with("gh", "comment"),
         "a suspended attempt must not post its reply: {:?}",
@@ -2093,4 +2121,457 @@ async fn a_suspended_engage_that_did_not_withdraw_keeps_its_tree_for_the_resume(
             ))),
         "{events:?}"
     );
+}
+
+/// An engage whose worker keeps failing the same way counts in the engage
+/// streak, and the third failure in a row holds it for the operator. Until
+/// the work model engage had no streak: the Err arm said `retry` and the
+/// still-flagged PR was picked again every cycle, the highest finding tier
+/// with no counter at all (#23).
+#[tokio::test]
+async fn a_failing_engage_is_held_at_the_streak_limit() {
+    let f = fixture("engage-fails-thrice").await;
+    let bins = FakeBins::acquire("engage-fails-thrice");
+    bins.ok("gh", PR_VIEW_JSON);
+    let failing = ScriptedBackend::new(|_| hunter::types::RunResult {
+        exit_code: Some(1),
+        ..done()
+    });
+
+    let mut outcomes = Vec::new();
+    for _ in 0..3 {
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        let summary = hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &failing, None)
+            .await
+            .unwrap();
+        outcomes.push(summary.outcome);
+    }
+
+    assert_eq!(
+        outcomes,
+        [
+            Some("retry".into()),
+            Some("retry".into()),
+            Some("held".into())
+        ]
+    );
+    let hold = support::hold_of(&f.store, f.fid, hunter::domain::FindingJobKind::Engage)
+        .await
+        .expect("held at the limit");
+    assert!(hold.detail.starts_with("worker failed"), "{hold:?}");
+    assert_eq!(
+        hold.actions(),
+        [
+            hunter::domain::ReleaseAction::Restart,
+            hunter::domain::ReleaseAction::Dismiss
+        ]
+    );
+    let ps = f.store.get_pr_state(f.fid).await.unwrap().unwrap();
+    assert!(
+        ps.needs_attention.is_some(),
+        "holding leaves the flag alone"
+    );
+}
+
+/// An engage that fails before its worker runs — here the PR will not load
+/// — is a failed engage too: counted, and held at the limit.
+#[tokio::test]
+async fn an_engage_whose_pr_will_not_load_is_held_at_the_streak_limit() {
+    let f = fixture("engage-view-fails").await;
+    let bins = FakeBins::acquire("engage-view-fails");
+    bins.script("gh", "echo \"HTTP 502 at $(date +%s%N)\" >&2\nexit 1");
+    let never = ScriptedBackend::new(|_| panic!("no worker without the PR"));
+
+    for _ in 0..3 {
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        let err = hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &never, None)
+            .await
+            .expect_err("a PR that will not load fails the engage");
+        assert!(err.to_string().contains("view failed"), "{err}");
+    }
+
+    let hold = support::hold_of(&f.store, f.fid, hunter::domain::FindingJobKind::Engage)
+        .await
+        .expect("held at the limit");
+    assert!(hold.detail.starts_with("PR/MR view failed"), "{hold:?}");
+    assert_eq!(hold.checkpoint_job_id, None, "no worker ran");
+}
+
+/// A held engage stays held when its PR gets new activity: only the
+/// operator releases it (WORK-MODEL.md §9.4). The activity is shown on the
+/// hold, since it may well be what the hold waits for.
+#[tokio::test]
+async fn a_held_engage_stays_held_through_new_pr_activity() {
+    let f = fixture("engage-held-activity").await;
+    assert!(
+        f.store
+            .hold_work(
+                f.fid,
+                hunter::domain::FindingJobKind::Engage,
+                hunter::domain::HoldReason::Stuck,
+                "push failed",
+                None
+            )
+            .await
+            .unwrap()
+    );
+    let held = support::hold_of(&f.store, f.fid, hunter::domain::FindingJobKind::Engage)
+        .await
+        .unwrap();
+    assert!(!held.new_activity);
+
+    // The reviewer answers: the next sync raises the PR's activity.
+    f.store
+        .sync_pr_open(
+            f.fid,
+            &SyncPrData {
+                pr_number: 7,
+                state: "open".to_owned(),
+                mergeable: "mergeable".to_owned(),
+                checks: None,
+                head_ref: BRANCH.to_owned(),
+                head_sha: "deadbeef".to_owned(),
+                last_activity_at: held.held_at + 1,
+                last_engaged_activity_at: 0,
+                needs_attention: Some("new_comments".to_owned()),
+                attention_fingerprint: Some("af-2".to_owned()),
+                synced_at: held.held_at + 1,
+                attention_since: Some(Some(held.held_at + 1)),
+                clear_addressed: false,
+            },
+        )
+        .await
+        .unwrap();
+
+    let after = support::hold_of(&f.store, f.fid, hunter::domain::FindingJobKind::Engage)
+        .await
+        .expect("still held");
+    assert!(after.new_activity);
+    let picked = hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        .await
+        .unwrap();
+    assert!(
+        !matches!(picked, Some(hunter::scheduler::Candidate::Finding { .. })),
+        "{picked:?}"
+    );
+}
+
+/// A paused engage is continued without asking the forge for the PR: the
+/// view only feeds the playbook, which a resume does not send. A laptop
+/// that wakes before its network is back used to fail that view, count it,
+/// and drop the checkpoint with the worker's unpushed commits.
+#[tokio::test]
+async fn a_paused_engage_continues_without_the_forge() {
+    let f = fixture("engage-resume-offline").await;
+    let bins = FakeBins::acquire("engage-resume-offline");
+    bins.ok("gh", PR_VIEW_JSON);
+    let pausing = ScriptedBackend::new(|tree| suspended_by(tree, "cap"));
+    let paused = f.run(&pausing).await.unwrap();
+    assert_eq!(paused.outcome.as_deref(), Some("suspended"));
+    bins.script("gh", "echo 'dial tcp: no route to host' >&2\nexit 1");
+    let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
+        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+            .await
+            .unwrap()
+    else {
+        panic!("the paused engage resumes");
+    };
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+
+    let resumed = hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &pausing, Some(&plan))
+        .await
+        .unwrap();
+
+    assert_eq!(resumed.outcome.as_deref(), Some("suspended"), "{resumed:?}");
+    let checkpoint = f
+        .store
+        .checkpoint_job(f.fid, hunter::domain::FindingJobKind::Engage)
+        .await
+        .unwrap()
+        .map(|j| j.id);
+    assert_eq!(checkpoint, resumed.job_id);
+    assert_eq!(
+        f.store
+            .work_streak(f.fid, hunter::domain::FindingJobKind::Engage)
+            .await
+            .unwrap()
+            .streak,
+        0
+    );
+}
+
+/// The streak counts *identical* failures, by what failed: two refused
+/// pushes are the same failure whatever git says about each (the key drops
+/// the text after the colon), while a push, a reply and an unfinished
+/// worker are three different ones and hold nothing.
+#[tokio::test]
+async fn engage_failures_count_by_what_failed() {
+    let f = fixture("engage-failure-keys").await;
+    let bins = FakeBins::acquire("engage-failure-keys");
+    bins.ok_unless_action("gh", "pr comment", PR_VIEW_JSON);
+    // Pushes to a remote that refuses every one.
+    push_to(&f, Some("/nonexistent/remote.git")).await;
+    let pushing = ScriptedBackend::new(|tree| {
+        git(tree, &["commit", "--allow-empty", "-qm", "address review"]);
+        done()
+    });
+    let replying = ScriptedBackend::new(|tree| {
+        std::fs::write(tree.join("PR-REPLY.md"), "answered").unwrap();
+        done()
+    });
+    let unfinished = ScriptedBackend::new(|_| hunter::types::RunResult {
+        exit_code: Some(1),
+        ..done()
+    });
+    let streak = async || {
+        f.store
+            .work_streak(f.fid, hunter::domain::FindingJobKind::Engage)
+            .await
+            .unwrap()
+    };
+
+    let mut seen = Vec::new();
+    for backend in [&pushing, &pushing, &replying, &unfinished] {
+        let summary = f.run(backend).await.unwrap();
+        let s = streak().await;
+        seen.push((summary.outcome, s.streak, s.last_failure));
+    }
+
+    let failure = |key: &str| Some(key.to_owned());
+    assert_eq!(
+        seen,
+        [
+            (Some("retry".into()), 1, failure("push failed")),
+            (Some("retry".into()), 2, failure("push failed")),
+            (Some("retry".into()), 1, failure("PR comment failed")),
+            (Some("retry".into()), 1, failure("worker failed")),
+        ]
+    );
+}
+
+/// An engage that succeeds ends its streak: engage is the one kind whose
+/// outcome does not leave its tier, so nothing else resets it. Fail,
+/// succeed, fail, fail is a streak of two, not the three that hold.
+#[tokio::test]
+async fn a_successful_engage_ends_its_failure_streak() {
+    let f = fixture("engage-success-clears").await;
+    let bins = FakeBins::acquire("engage-success-clears");
+    bins.ok("gh", PR_VIEW_JSON);
+    let failing = ScriptedBackend::new(|_| hunter::types::RunResult {
+        exit_code: Some(1),
+        ..done()
+    });
+    let noop = ScriptedBackend::new(|_| done());
+
+    let mut outcomes = Vec::new();
+    for backend in [&failing, &noop, &failing, &failing] {
+        outcomes.push(f.run(backend).await.unwrap().outcome);
+    }
+
+    assert_eq!(
+        outcomes,
+        [
+            Some("retry".into()),
+            Some("engaged".into()),
+            Some("retry".into()),
+            Some("retry".into()),
+        ]
+    );
+    assert_eq!(
+        f.store
+            .work_streak(f.fid, hunter::domain::FindingJobKind::Engage)
+            .await
+            .unwrap()
+            .streak,
+        2
+    );
+    assert_eq!(
+        support::hold_of(&f.store, f.fid, hunter::domain::FindingJobKind::Engage).await,
+        None
+    );
+}
+
+/// A PR view that fails while the forge cannot be reached is the
+/// machine's failure, not the engage's: nothing is counted, and the cycle
+/// ends denied for the host, to be retried, as the network gate's own
+/// denial does (#95). The same failure with the forge reachable is the
+/// engage's, and counts.
+#[tokio::test]
+async fn a_failed_pr_view_counts_only_while_the_forge_is_reachable() {
+    let bins = FakeBins::acquire("engage-view-offline");
+    bins.script("gh", "echo 'connection reset' >&2\nexit 1");
+    let host = support::FORGE_HOST;
+    for counted in [false, true] {
+        let mut f = fixture("engage-view-offline").await;
+        let pool = sqlx::SqlitePool::connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE repos SET url = ?1")
+            .bind(format!("https://{host}/acme/widget"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        f.cfg.network_gate = true;
+        let down: &[&str] = if counted { &[] } else { &[host] };
+        let never = ScriptedBackend::new(|_| panic!("no worker without the PR")).offline(down);
+
+        let result = f.run(&never).await;
+
+        let streak = f
+            .store
+            .work_streak(f.fid, hunter::domain::FindingJobKind::Engage)
+            .await
+            .unwrap()
+            .streak;
+        if counted {
+            assert!(result.is_err(), "{result:?}");
+            assert_eq!(streak, 1, "the forge answered: counted");
+            continue;
+        }
+        let summary = result.unwrap();
+        assert_eq!(summary.unreachable.as_deref(), Some(host), "{summary:?}");
+        assert!(summary.retry_at.is_some(), "{summary:?}");
+        assert_eq!(streak, 0, "the network's failure counts nothing");
+    }
+}
+
+/// Pause the fixture's engage (the forge is answered), then point its repo
+/// at a `forge` on `host` and turn the network gate
+/// on, so failures are re-probed (#95 layer 2); the paused engage's resume.
+/// A resume reads no PR view, so the move only shows where the engage
+/// publishes.
+async fn paused_then_served_at(
+    f: &mut Fixture,
+    forge: &str,
+    host: &str,
+) -> hunter::scheduler::ResumePlan {
+    let paused = f
+        .run(&ScriptedBackend::new(|tree| suspended_by(tree, "cap")))
+        .await
+        .unwrap();
+    assert_eq!(paused.outcome.as_deref(), Some("suspended"), "{paused:?}");
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    sqlx::query("UPDATE repos SET url = ?1, forge = ?2")
+        .bind(format!("https://{host}/acme/widget"))
+        .bind(forge)
+        .execute(&pool)
+        .await
+        .unwrap();
+    f.cfg.network_gate = true;
+    match hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        .await
+        .unwrap()
+    {
+        Some(hunter::scheduler::Candidate::Resume { plan, .. }) => *plan,
+        other => panic!("the paused engage resumes, got {other:?}"),
+    }
+}
+
+/// A finished engage whose reply cannot be posted while the forge cannot be
+/// reached is the network's failure, not the engage's: nothing is counted,
+/// the attempt becomes the checkpoint, so its tree and the drafted
+/// `PR-REPLY.md` are kept, and the next cycle continues it to post; the
+/// cycle ends denied for the host (#95). The same failure with the forge
+/// reachable is the engage's, and counts.
+#[tokio::test]
+async fn a_failed_reply_counts_only_while_the_forge_is_reachable() {
+    let bins = FakeBins::acquire("engage-reply-offline");
+    bins.ok("gh", PR_VIEW_JSON);
+    let host = support::FORGE_HOST;
+    for counted in [false, true] {
+        let mut f = fixture("engage-reply-offline").await;
+        // A GitHub repo on a host that is not GitHub's: the reply cannot be
+        // posted.
+        let plan = paused_then_served_at(&mut f, "github", host).await;
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        let down: &[&str] = if counted { &[] } else { &[host] };
+        let replying = ScriptedBackend::new(|tree| {
+            std::fs::write(tree.join("PR-REPLY.md"), "answered").unwrap();
+            support::done_with_transcript(tree)
+        })
+        .offline(down);
+
+        let summary =
+            hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &replying, Some(&plan))
+                .await
+                .unwrap();
+
+        let streak = f
+            .store
+            .work_streak(f.fid, hunter::domain::FindingJobKind::Engage)
+            .await
+            .unwrap()
+            .streak;
+        if counted {
+            assert_eq!(summary.outcome.as_deref(), Some("retry"), "{summary:?}");
+            assert_eq!(streak, 1, "the forge answered: counted");
+            continue;
+        }
+        assert_eq!(summary.unreachable.as_deref(), Some(host), "{summary:?}");
+        assert_eq!(streak, 0, "the network's failure counts nothing");
+        let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
+            hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+                .await
+                .unwrap()
+        else {
+            panic!("the unpublished engage is continued");
+        };
+        assert_eq!(Some(plan.predecessor_id), summary.job_id);
+        assert!(
+            plan.workspace.tree.join("PR-REPLY.md").exists(),
+            "the reply is kept"
+        );
+    }
+}
+
+/// A withdrawal the forge cannot be reached to make is the network's
+/// failure: nothing is counted, the withdrawing attempt becomes the
+/// checkpoint, where a refused withdrawal drops it, and the cycle ends
+/// denied for the host (#95).
+#[tokio::test]
+async fn a_withdrawal_while_the_forge_is_unreachable_keeps_its_checkpoint() {
+    let bins = FakeBins::acquire("engage-withdraw-offline");
+    bins.ok("gh", PR_VIEW_JSON);
+    bins.fail("glab", 1, "dial tcp: connect: connection refused");
+    let mut f = fixture("engage-withdraw-offline").await;
+    let down = support::FORGE_HOST;
+    // GitLab, which takes any host: the close is attempted, and fails.
+    let plan = paused_then_served_at(&mut f, "gitlab", down).await;
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let withdrawing = ScriptedBackend::new(|tree| {
+        std::fs::write(tree.join("WITHDRAW.md"), "superseded by #9").unwrap();
+        support::done_with_transcript(tree)
+    })
+    .offline(&[down]);
+
+    let summary =
+        hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &withdrawing, Some(&plan))
+            .await
+            .unwrap();
+
+    assert_eq!(summary.unreachable.as_deref(), Some(down), "{summary:?}");
+    assert_eq!(
+        f.store
+            .work_streak(f.fid, hunter::domain::FindingJobKind::Engage)
+            .await
+            .unwrap()
+            .streak,
+        0
+    );
+    assert_eq!(
+        f.store
+            .checkpoint_job(f.fid, hunter::domain::FindingJobKind::Engage)
+            .await
+            .unwrap()
+            .map(|j| j.id),
+        summary.job_id,
+        "the withdrawing attempt is kept to withdraw once the forge is back"
+    );
+    let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(after.status, FindingStatus::PrOpen);
 }

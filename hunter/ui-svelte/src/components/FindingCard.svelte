@@ -265,6 +265,9 @@
         <div class="hold-head">
           <strong>Needs you:</strong> {hold.kind} — {holdReasonLabel(hold.reason)}
           <span class="hold-at">since {datetime(hold.held_at)}</span>
+          {#if hold.new_activity}
+            <span class="attn-badge" title="The PR has had activity since this was held">new activity since hold</span>
+          {/if}
         </div>
         <div class="hold-detail">{hold.detail || "(no detail recorded)"}</div>
         {#if actions}

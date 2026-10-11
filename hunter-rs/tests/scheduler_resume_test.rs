@@ -2308,6 +2308,16 @@ async fn give_up_three_chains(
     seed_repo(&pool, &dir).await;
     seed_history(&pool).await;
     seed_finding_in(&pool, status).await;
+    if kind == "engage" {
+        // An open PR, flagged: the engage tier's work.
+        sqlx::query(
+            "UPDATE pr_state SET state = 'OPEN', needs_attention = 'new_comments' \
+             WHERE finding_id = 1",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
     let store = rw_store(&path).await;
     let cfg = test_config(dir.path());
 
@@ -2427,66 +2437,22 @@ async fn a_given_up_chains_streak_events_say_why_it_was_given_up() {
     }
 }
 
-/// A given-up engage chain sets its PR's attention aside, as an engage
-/// that did nothing would: the engage tier lets go of it, and only the
-/// PR's next change flags it again. That drops the PR out of the review
-/// column, so it is logged as an error that says why the chain was given
-/// up, as an aborted withdrawal is.
-///
-/// Engage is the highest finding tier, and has no failure streak to
-/// count into, so left alone the tier started the same engage fresh
-/// after every given-up chain, forever.
+/// A given-up engage chain is one failed engage, as for every other kind:
+/// it counts in the engage streak and the flagged PR's engage starts
+/// fresh; the third holds it for the operator. The PR's attention is not
+/// touched. Until the work model engage had no streak, so a given-up chain
+/// set the attention aside instead, and the PR left review until it
+/// changed with nothing but an error event to show for it.
 #[tokio::test]
-async fn a_given_up_engage_chain_sets_the_prs_attention_aside() {
-    let (dir, path, pool) = fresh_db().await;
-    seed_repo(&pool, &dir).await;
-    seed_history(&pool).await;
-    seed_flagged_finding(&pool, 1).await;
-    sqlx::query(
-        "UPDATE pr_state SET last_activity_at = 4000, last_engaged_activity_at = 3000, \
-         attention_fingerprint = 'checks:ci', head_sha = 'head1' WHERE finding_id = 1",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    seed_finding_chain(&pool, &dir, "engage", 1, 10).await;
-    let store = rw_store(&path).await;
-    let cfg = test_config(dir.path());
-
-    let next = pick_next(&store, &cfg, None).await.unwrap();
-
-    assert!(
-        !matches!(
-            next,
-            Some(Candidate::Finding { .. } | Candidate::Resume { .. })
-        ),
-        "the engage tier must let go of the PR, got {next:?}"
-    );
-    assert_eq!(job_row(&pool, 13).await.0, "suspended");
-    assert_eq!(checkpoint_of(&store, 1, FindingJobKind::Engage).await, None);
-    let ps = store.get_pr_state(1).await.unwrap().unwrap();
+async fn a_given_up_engage_chain_counts_toward_the_failure_streak() {
+    let seen = give_up_three_chains("engage", "pr_open").await;
     assert_eq!(
-        (
-            ps.needs_attention,
-            ps.last_engaged_activity_at,
-            ps.addressed_fingerprint.as_deref(),
-            ps.addressed_head_sha.as_deref(),
-        ),
-        (None, Some(4000), Some("checks:ci"), Some("head1"))
-    );
-    let event = store
-        .recent_events(100)
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|e| e.job_id == Some(13))
-        .expect("the give-up must be logged against the given-up job");
-    assert_eq!(event.kind, "error", "{event:?}");
-    assert!(
-        event.message.contains("resume chain gave up")
-            && event.message.contains("giving up after")
-            && event.message.contains("4 attempts, the limit"),
-        "{event:?}"
+        seen,
+        [
+            (1, FindingStatus::PrOpen, false, false, true),
+            (2, FindingStatus::PrOpen, false, false, true),
+            (0, FindingStatus::PrOpen, false, true, false),
+        ]
     );
 }
 
@@ -2666,5 +2632,65 @@ async fn a_dismissed_engage_does_not_resume() {
         ),
         "{next:?}"
     );
+    assert_eq!(checkpoint_of(&store, 5, FindingJobKind::Engage).await, None);
+}
+
+/// Engage is active while its finding is `pr_open`; the attention flag only
+/// decides whether it may start fresh (WORK-MODEL.md §6.1, G1). A paused
+/// engage whose PR lost its flag for a cycle — `sync_prs` recomputes it,
+/// and it flaps with a flaky check — is still continued by the engage
+/// tier, ahead of a queued fix. It used to wait for the resume tier,
+/// below every finding tier.
+#[tokio::test]
+async fn a_paused_engage_continues_while_its_pr_is_open_whatever_the_flag() {
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo(&pool, &dir).await;
+    let cfg = test_config(dir.path());
+    seed_quiet_finding(&pool, 5).await;
+    let session = seed_session_in(&dir, 20, CTX);
+    seed_finding_suspension(&pool, 20, "engage", 5, &session).await;
+    sqlx::query(
+        "INSERT INTO findings (id, type, repo_id, fingerprint, severity, confidence, summary, \
+         status, created_at, updated_at) \
+         VALUES (6, 'bug', 1, 'fp6', 'high', 0.9, 'bug 6', 'queued', 1000, 1000)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let store = rw_store(&path).await;
+
+    let plan = resume_plan_of(pick_next(&store, &cfg, None).await.unwrap());
+
+    assert_eq!(plan.predecessor_id, 20);
+    assert_eq!(plan.kind, JobKind::from(FindingJobKind::Engage));
+}
+
+/// The flag still gates a fresh start: a flagless PR whose engage
+/// checkpoint can no longer be continued (its tree is gone) has nothing to
+/// do, and the selection moves on rather than starting an engage nobody
+/// asked for.
+#[tokio::test]
+async fn a_flagless_pr_never_starts_a_fresh_engage() {
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo(&pool, &dir).await;
+    let cfg = test_config(dir.path());
+    seed_quiet_finding(&pool, 5).await;
+    let session = seed_session_in(&dir, 20, CTX);
+    std::fs::remove_dir_all(cfg.work_root.join("jobs").join("20").join("tree")).unwrap();
+    seed_finding_suspension(&pool, 20, "engage", 5, &session).await;
+    let store = rw_store(&path).await;
+
+    let previewed = preview_next(&store, &cfg).await.unwrap();
+    let picked = pick_next(&store, &cfg, None).await.unwrap();
+
+    for c in [&previewed, &picked] {
+        assert!(
+            !matches!(
+                c,
+                Some(Candidate::Finding { .. } | Candidate::Resume { .. })
+            ),
+            "{c:?}"
+        );
+    }
     assert_eq!(checkpoint_of(&store, 5, FindingJobKind::Engage).await, None);
 }

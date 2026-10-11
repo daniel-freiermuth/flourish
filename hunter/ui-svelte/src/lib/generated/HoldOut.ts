@@ -19,4 +19,9 @@ held_at: number,
  * What `POST /api/hold/release` accepts for it right now. `continue`
  * only while the work has a checkpoint to continue.
  */
-actions: Array<ReleaseAction>, };
+actions: Array<ReleaseAction>, 
+/**
+ * An engage hold's PR has had activity since it was held, which may be
+ * what it waits for. It does not release the hold.
+ */
+new_activity: boolean, };
