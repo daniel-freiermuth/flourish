@@ -2717,3 +2717,49 @@ async fn a_suspended_engage_that_wrote_blocked_is_held_and_pushes_nothing() {
         "nothing pushed"
     );
 }
+
+/// The operator's `continue` on an engage held for repeated failures
+/// resumes it with a prompt that says so, the failure as context
+/// (WORK-MODEL.md §9.1), rather than the bare "you were interrupted".
+#[tokio::test]
+async fn a_continued_stuck_engage_resumes_with_its_reason() {
+    let f = fixture("engage-continue").await;
+    let bins = FakeBins::acquire("engage-continue");
+    bins.ok_unless_action("gh", "pr comment", PR_VIEW_JSON);
+    // Finished, with a transcript to continue, but its reply never lands.
+    let failing = ScriptedBackend::new(|tree| {
+        std::fs::write(tree.join("PR-REPLY.md"), "answered").unwrap();
+        support::done_with_transcript(tree)
+    });
+    for _ in 0..3 {
+        f.run(&failing).await.unwrap();
+    }
+    let hold = support::hold_of(&f.store, f.fid, hunter::domain::FindingJobKind::Engage)
+        .await
+        .expect("held at the limit");
+    assert!(hold.checkpoint_job_id.is_some(), "{hold:?}");
+    support::release(
+        &f.store,
+        f.fid,
+        hunter::domain::FindingJobKind::Engage,
+        hunter::domain::ReleaseAction::Continue,
+    )
+    .await;
+    let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
+        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+            .await
+            .unwrap()
+    else {
+        panic!("a continued hold resumes its checkpoint");
+    };
+    let resumed = ScriptedBackend::new(|_| done());
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+
+    hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &resumed, Some(&plan))
+        .await
+        .unwrap();
+
+    let prompt = &resumed.runs()[0].prompt;
+    assert!(prompt.contains("kept failing the same way"), "{prompt}");
+    assert!(prompt.contains("PR comment failed"), "{prompt}");
+}
