@@ -256,10 +256,12 @@ naming the host, until a cycle gets past the gate.
 
 The network can also go while work runs. So before a finding's failure is
 counted, the same hosts are probed again: a forge call that failed before
-the work started (a harvest's PR view or diff), a worker that failed
-without doing any metered work, and publishing a finished worker's work
-(a fix's push or PR). A finished attempt that could not publish is kept
-as the checkpoint, so the next cycle publishes it rather than redoing it. If a host is unreachable then, the
+the work started (a harvest's PR view or diff, an engage's target
+or PR view), a backend that could not start the worker, a worker that
+failed without doing any metered work, and publishing a finished
+worker's work (a fix's push or PR, an engage's push, reply or
+withdrawal). A finished attempt that could not publish is kept as the
+checkpoint, so the next cycle publishes it rather than redoing it. If a host is unreachable then, the
 failure is the machine's, not the work's: nothing is counted, a worker's
 job is closed as never started, the checkpoint stays where it was, and
 the cycle ends denied for the host like the gate's own denial. The probe
