@@ -454,6 +454,21 @@ pub fn done() -> RunResult {
     }
 }
 
+/// A worker in `tree` that finished, leaving a one-record transcript in its
+/// workspace's `session/`: an attempt that can be continued.
+pub fn done_with_transcript(tree: &Path) -> RunResult {
+    let session = tree.parent().unwrap().join("session/session.jsonl");
+    std::fs::write(
+        &session,
+        "{\"message\":{\"role\":\"assistant\",\"usage\":{\"input\":1000,\"output\":100}}}\n",
+    )
+    .unwrap();
+    RunResult {
+        session_file: Some(session.to_string_lossy().into_owned()),
+        ..done()
+    }
+}
+
 #[async_trait::async_trait]
 impl Backend for ScriptedBackend {
     async fn decide(&self, anticipated_tokens: i64) -> anyhow::Result<Outlook> {

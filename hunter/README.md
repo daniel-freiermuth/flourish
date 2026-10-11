@@ -127,7 +127,10 @@ new ──recheck──> new / superseded / rejected
   failing, and the ways out: **Continue** resumes the checkpoint with a
   fresh give-up budget (a prerequisite hold asks the worker to re-evaluate
   it, a failure hold to finish the work), **Restart** starts over,
-  **Reject**/**Wontfix** decide the finding.
+  **Reject**/**Wontfix** decide the finding. A recheck whose worker fails
+  the same way three times is held the same way and stays `rechecking`,
+  where it used to go back to `new` looking like a finding nobody had
+  rechecked.
 - **`pr_open`** — tracked via `sync_prs` (free — `gh pr view`, no worker)
   every cycle: merged → `merged`; closed unmerged → `closed`; new
   comments/reviews, `CHANGES_REQUESTED`, merge conflicts, or failing checks
