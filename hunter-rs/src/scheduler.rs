@@ -705,8 +705,18 @@ async fn count_given_up_chain(
     match kind {
         FindingJobKind::Recheck => {
             let detail = format!("{failure}: {why}");
-            handle_recheck_failure(store, &mut summary, fid, job, failure, &detail, None).await;
-            summary.outcome.as_deref() == Some("stuck")
+            handle_recheck_failure(
+                store,
+                &mut summary,
+                fid,
+                job,
+                failure,
+                &detail,
+                HoldReason::GaveUp,
+                None,
+            )
+            .await;
+            summary.outcome.as_deref() == Some("held")
         }
         // Only a hold that landed takes the fix out of its tier's picks.
         FindingJobKind::Fix => {
@@ -2041,7 +2051,13 @@ pub async fn run_hunt(
 
 /// Handle a recheck that failed to produce a valid verdict: `failure` is
 /// the streak key that identical failures share, `detail` describes this
-/// one in the events (for a given-up chain, also why it was given up).
+/// one in the events and the hold (for a given-up chain, also why it was
+/// given up). The [`MAX_CONSECUTIVE_SAME_FAILURE`]th identical failure holds
+/// the recheck for the operator as `at_limit` ([`Store::hold_work`]) —
+/// `stuck`, or `gave_up` when the give-up ceiling's failure completed the
+/// streak — with `job` as its checkpoint if a worker ran in it. The finding
+/// stays `rechecking`: sent back to `new` it looked exactly like a finding
+/// nobody had rechecked.
 async fn handle_recheck_failure(
     store: &Store,
     summary: &mut CycleSummary,
@@ -2049,6 +2065,7 @@ async fn handle_recheck_failure(
     job: i64,
     failure: &str,
     detail: &str,
+    at_limit: HoldReason,
     override_mode: Option<BudgetOverride>,
 ) -> CycleSummary {
     let log = |message: String| async move {
@@ -2070,18 +2087,33 @@ async fn handle_recheck_failure(
         Ok(streak) if streak < MAX_CONSECUTIVE_SAME_FAILURE => {
             log(format!("#{fid}: job {job} {detail} -- will retry")).await;
         }
-        Ok(streak) => {
-            if let Err(e) = store.set_finding_status(fid, FindingStatus::New).await {
-                log(format!("#{fid} {streak} identical failures ({detail}), but sending it back to the inbox failed: {e}; will retry")).await;
-            } else {
-                log_write_failure(
-                    store.clear_work_streak(fid, FindingJobKind::Recheck).await,
-                    format_args!("#{fid}: clearing recheck attempts"),
-                );
-                log(format!("#{fid} gave up after {streak} identical failures ({detail}); back to inbox for human triage")).await;
-                summary.outcome = Some("stuck".into());
+        Ok(streak) => match store
+            .hold_work(fid, FindingJobKind::Recheck, at_limit, detail, Some(job))
+            .await
+        {
+            Ok(true) => {
+                log(format!(
+                    "#{fid} held after {streak} identical failures ({detail})"
+                ))
+                .await;
+                summary.outcome = Some("held".into());
+                summary.attempts = Some(streak);
             }
-        }
+            Ok(false) => {
+                log(format!(
+                    "#{fid} {streak} identical failures ({detail}), but it is no longer \
+                     rechecking; nothing held"
+                ))
+                .await;
+            }
+            Err(e) => {
+                log(format!(
+                    "#{fid} {streak} identical failures ({detail}), but holding it failed: {e}; \
+                     will retry"
+                ))
+                .await;
+            }
+        },
     }
     if override_mode == Some(BudgetOverride::Once) {
         log_write_failure(
@@ -2255,6 +2287,7 @@ pub async fn run_recheck(
                 job,
                 TREE_NOT_MADE,
                 &note,
+                HoldReason::Stuck,
                 None,
             )
             .await);
@@ -2300,9 +2333,6 @@ pub async fn run_recheck(
         format_args!("job {job}: recording outcome"),
     )
     .unwrap_or(JobState::Failed);
-    // Released here rather than at each return below: everything after
-    // this point reads the verdict under `out/`, never the tree.
-    close_workspace(store, &ws).await;
     let mut summary = CycleSummary {
         kind: Some(FindingJobKind::Recheck.into()),
         finding_id: Some(fid),
@@ -2336,6 +2366,7 @@ pub async fn run_recheck(
                 format_args!("#{fid}: clearing one-shot budget override"),
             );
         }
+        close_workspace(store, &ws).await;
         return Ok(summary);
     }
 
@@ -2361,28 +2392,36 @@ pub async fn run_recheck(
         } else {
             "unparseable verdict file".to_owned()
         };
-        return Ok(handle_recheck_failure(
+        let summary = handle_recheck_failure(
             store,
             &mut summary,
             fid,
             job,
             &failure,
             &failure,
+            HoldReason::Stuck,
             override_mode,
         )
-        .await);
+        .await;
+        // Released only once the failure is counted: a hold makes this
+        // attempt the checkpoint, and its tree is what `continue` resumes.
+        close_workspace(store, &ws).await;
+        return Ok(summary);
     };
     let Some(ref outcome) = verdict_obj.verdict else {
-        return Ok(handle_recheck_failure(
+        let summary = handle_recheck_failure(
             store,
             &mut summary,
             fid,
             job,
             "missing verdict field",
             "missing verdict field",
+            HoldReason::Stuck,
             override_mode,
         )
-        .await);
+        .await;
+        close_workspace(store, &ws).await;
+        return Ok(summary);
     };
 
     let reason_owned = verdict_obj.reason.as_deref().unwrap_or_default();
@@ -2421,10 +2460,6 @@ pub async fn run_recheck(
                 store.set_finding_status(fid, FindingStatus::New).await,
                 format_args!("#{fid}: status -> new"),
             );
-            log_write_failure(
-                store.clear_work_streak(fid, FindingJobKind::Recheck).await,
-                format_args!("#{fid}: clearing recheck attempts"),
-            );
             let _ = store
                 .log_event(
                     "recheck",
@@ -2450,10 +2485,6 @@ pub async fn run_recheck(
                     )
                     .await,
                 format_args!("#{fid}: verdict -> superseded"),
-            );
-            log_write_failure(
-                store.clear_work_streak(fid, FindingJobKind::Recheck).await,
-                format_args!("#{fid}: clearing recheck attempts"),
             );
             let _ = store
                 .log_event(
@@ -2485,10 +2516,6 @@ pub async fn run_recheck(
                     .await,
                 format_args!("#{fid}: verdict -> rejected"),
             );
-            log_write_failure(
-                store.clear_work_streak(fid, FindingJobKind::Recheck).await,
-                format_args!("#{fid}: clearing recheck attempts"),
-            );
             let _ = store
                 .log_event(
                     "recheck",
@@ -2503,18 +2530,23 @@ pub async fn run_recheck(
         // Unknown already handled above — included for exhaustiveness
         RecheckOutcome::Unknown(raw) => {
             let failure = format!("invalid verdict value: {raw:?}");
-            return Ok(handle_recheck_failure(
+            let summary = handle_recheck_failure(
                 store,
                 &mut summary,
                 fid,
                 job,
                 &failure,
                 &failure,
+                HoldReason::Stuck,
                 override_mode,
             )
-            .await);
+            .await;
+            close_workspace(store, &ws).await;
+            return Ok(summary);
         }
     };
+    // A verdict ends the recheck: its tree is no checkpoint.
+    close_workspace(store, &ws).await;
     summary.verdict = Some(verdict_str.to_owned());
     summary.reason = Some(reason.to_owned());
     if override_mode == Some(BudgetOverride::Once) {

@@ -1884,10 +1884,10 @@ async fn a_stale_recheck_supersedes_and_only_an_invalid_one_suppresses() {
 }
 
 /// A recheck that leaves no verdict is retried, and the third identical
-/// failure in a row sends the finding back to the inbox for a human with
-/// its streak cleared.
+/// failure in a row holds it for a human, with its streak cleared; the
+/// finding stays `rechecking`.
 #[tokio::test]
-async fn a_recheck_without_a_verdict_retries_then_returns_to_the_inbox() {
+async fn a_recheck_without_a_verdict_retries_then_is_held() {
     let (dir, path, pool) = fresh_db().await;
     let store = rw_store(&path).await;
     let fid = repo_with_finding(&dir, &pool, &store, FindingStatus::Rechecking).await;
@@ -1913,7 +1913,7 @@ async fn a_recheck_without_a_verdict_retries_then_returns_to_the_inbox() {
         [
             (Some("requeued".into()), FindingStatus::Rechecking, 1),
             (Some("requeued".into()), FindingStatus::Rechecking, 2),
-            (Some("stuck".into()), FindingStatus::New, 0),
+            (Some("held".into()), FindingStatus::Rechecking, 0),
         ],
         "(outcome, status, recheck_attempts) per attempt"
     );
@@ -1921,11 +1921,11 @@ async fn a_recheck_without_a_verdict_retries_then_returns_to_the_inbox() {
 
 /// A recheck whose tree can never be created -- here the repo names a
 /// default branch origin does not have -- is a failed recheck like any
-/// other: retried, and the third in a row sends the finding back to the
-/// inbox. Left `rechecking` with nothing counted, the recheck tier (above
-/// fix) would take it again every cycle and starve everything below it.
+/// other: retried, and the third in a row holds it for a human. Left
+/// `rechecking` with nothing counted, the recheck tier (above fix) would
+/// take it again every cycle and starve everything below it.
 #[tokio::test]
-async fn a_recheck_whose_tree_can_never_be_made_returns_to_the_inbox() {
+async fn a_recheck_whose_tree_can_never_be_made_is_held() {
     let (dir, path, pool) = fresh_db().await;
     let store = rw_store(&path).await;
     let fid = repo_with_finding(&dir, &pool, &store, FindingStatus::Rechecking).await;
@@ -1962,10 +1962,15 @@ async fn a_recheck_whose_tree_can_never_be_made_returns_to_the_inbox() {
         [
             (Some("requeued".into()), FindingStatus::Rechecking, 1),
             (Some("requeued".into()), FindingStatus::Rechecking, 2),
-            (Some("stuck".into()), FindingStatus::New, 0),
+            (Some("held".into()), FindingStatus::Rechecking, 0),
         ],
         "(outcome, status, recheck_attempts) per attempt"
     );
+    let hold = support::hold_of(&store, fid, FindingJobKind::Recheck)
+        .await
+        .unwrap();
+    assert!(hold.detail.contains("no-such-branch"), "{hold:?}");
+    assert_eq!(hold.checkpoint_job_id, None, "no worker ran");
 }
 
 /// Every end of a recheck attempt spends a `once` override — a
@@ -2201,8 +2206,8 @@ fn suspended_at_wallclock(session: &Path) -> RunResult {
 }
 
 /// A recheck whose worker overruns its wall clock on every attempt ends
-/// "stuck" back in the inbox, as three killed attempts did before
-/// wallclock kills became suspensions.
+/// held as `gave_up`, as three killed attempts ended stuck before wallclock
+/// kills became suspensions.
 ///
 /// Every attempt is a suspension, which never counts toward the failure
 /// streak, so the only bound is the chain's give-up ceiling. Uncounted,
@@ -2210,7 +2215,7 @@ fn suspended_at_wallclock(session: &Path) -> RunResult {
 /// fresh chain in the same cycle, and the finding took every cycle
 /// forever: no hunt or other work ever ran.
 #[tokio::test]
-async fn a_recheck_that_keeps_overrunning_ends_stuck_instead_of_restarting_forever() {
+async fn a_recheck_that_keeps_overrunning_is_held_instead_of_restarting_forever() {
     let (dir, path, pool) = fresh_db().await;
     let store = rw_store(&path).await;
     let fid = repo_with_finding(&dir, &pool, &store, FindingStatus::Rechecking).await;
@@ -2230,9 +2235,12 @@ async fn a_recheck_that_keeps_overrunning_ends_stuck_instead_of_restarting_forev
     let next = pick_next(&store, &cfg, None).await.unwrap();
 
     let finding = store.get_finding(fid).await.unwrap().unwrap();
+    assert_eq!(finding.status, FindingStatus::Rechecking);
     assert_eq!(
-        finding.status,
-        FindingStatus::New,
+        support::hold_of(&store, fid, FindingJobKind::Recheck)
+            .await
+            .map(|h| h.reason),
+        Some(hunter::domain::HoldReason::GaveUp),
         "cycles: {kinds:?}, next: {next:?}"
     );
     assert!(
@@ -2348,7 +2356,7 @@ async fn a_given_up_fix_chain_counts_toward_the_failure_streak() {
 }
 
 /// Each given-up recheck chain is one failed recheck, and the recheck
-/// starts over; the third sends the finding back to the inbox.
+/// starts over; the third holds it, with that chain as its checkpoint.
 #[tokio::test]
 async fn a_given_up_recheck_chain_counts_toward_the_failure_streak() {
     let seen = give_up_three_chains("recheck", "rechecking").await;
@@ -2357,7 +2365,7 @@ async fn a_given_up_recheck_chain_counts_toward_the_failure_streak() {
         [
             (1, FindingStatus::Rechecking, false, false, true),
             (2, FindingStatus::Rechecking, false, false, true),
-            (0, FindingStatus::New, false, false, false),
+            (0, FindingStatus::Rechecking, false, true, false),
         ]
     );
 }

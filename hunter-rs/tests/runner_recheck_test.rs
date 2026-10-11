@@ -5,7 +5,7 @@
 //! and its failure path is the subtle part: a worker that produced no
 //! usable verdict leaves the finding `rechecking` (so the scheduler picks
 //! it again) until the same failure repeats `MAX_CONSECUTIVE_SAME_FAILURE`
-//! times, when the finding goes back to the inbox. Reading the wrong file
+//! times, when the recheck is held for a human. Reading the wrong file
 //! — one left by a crashed attempt, or one a killed worker half-wrote —
 //! would silently reject a real bug, so those guards are pinned here too.
 //!
@@ -209,11 +209,12 @@ async fn each_failure_is_a_retry_recorded_under_its_own_name() {
     }
 }
 
-/// The third identical failure in a row gives up: the finding goes back
-/// to the inbox as `new` for a human, and the streak is cleared so a later
-/// recheck of it starts from zero.
+/// The third identical failure in a row holds the recheck for a human as
+/// `stuck`, with what kept failing. The finding stays `rechecking`: sent
+/// back to `new` (as it was until the work model), it looked exactly like
+/// a fresh finding nobody had rechecked. The streak ends with the hold.
 #[tokio::test]
-async fn the_third_identical_failure_returns_the_finding_to_the_inbox() {
+async fn the_third_identical_failure_holds_the_recheck() {
     let f = fixture("recheck-stuck", FindingStatus::Rechecking).await;
     let silent = ScriptedBackend::noop();
 
@@ -230,13 +231,83 @@ async fn the_third_identical_failure_returns_the_finding_to_the_inbox() {
         [
             Some("requeued".into()),
             Some("requeued".into()),
-            Some("stuck".into())
+            Some("held".into())
         ]
     );
     let after = f.finding().await;
-    assert_eq!(after.status, FindingStatus::New);
-    assert_eq!(f.streak().await.streak, 0);
-    assert_eq!(f.streak().await.last_failure, None);
+    assert_eq!(after.status, FindingStatus::Rechecking);
+    assert_eq!(f.streak().await, WorkStreak::default());
+    let hold = support::hold_of(&f.store, f.fid, FindingJobKind::Recheck)
+        .await
+        .expect("held at the limit");
+    assert_eq!(hold.reason, hunter::domain::HoldReason::Stuck);
+    assert_eq!(hold.detail, "no verdict file");
+    assert_eq!(
+        hold.actions(),
+        [
+            hunter::domain::ReleaseAction::Restart,
+            hunter::domain::ReleaseAction::Reject,
+            hunter::domain::ReleaseAction::Wontfix
+        ],
+        "no transcript to continue"
+    );
+    assert!(
+        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+            .await
+            .unwrap()
+            .is_none_or(|c| c.job_kind() != FindingJobKind::Recheck.into()),
+        "the recheck tier skips held work"
+    );
+}
+
+/// A held recheck released with `restart` is the recheck tier's again,
+/// started fresh with a full streak; `reject` ends it with the verdict.
+#[tokio::test]
+async fn a_held_recheck_is_released_by_the_operator() {
+    use hunter::domain::ReleaseAction;
+    let f = fixture("recheck-release", FindingStatus::Rechecking).await;
+    let silent = ScriptedBackend::noop();
+    for _ in 0..3 {
+        f.recheck(&silent).await;
+    }
+    support::release(
+        &f.store,
+        f.fid,
+        FindingJobKind::Recheck,
+        ReleaseAction::Restart,
+    )
+    .await;
+    let picked = hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            picked,
+            Some(hunter::scheduler::Candidate::Finding {
+                kind: FindingJobKind::Recheck,
+                ..
+            })
+        ),
+        "{picked:?}"
+    );
+    for _ in 0..3 {
+        f.recheck(&silent).await;
+    }
+    let by = support::operator(&f.store).await;
+    f.store
+        .release_hold(
+            f.fid,
+            FindingJobKind::Recheck,
+            &hunter::store::HoldRelease {
+                action: ReleaseAction::Reject,
+                reason: Some("cannot be verified"),
+                classification: None,
+                by: &by,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(f.finding().await.status, FindingStatus::Rejected);
 }
 
 /// Only IDENTICAL failures make a streak: two kinds alternating never
@@ -454,4 +525,39 @@ async fn a_once_override_is_spent_by_any_finished_attempt() {
         Some("confirmed")
     );
     assert_eq!(f.finding().await.budget_override, None, "after a verdict");
+}
+
+/// A recheck held for repeated failures keeps the tree of the attempt it
+/// holds, so the operator's `continue` resumes it. The tree used to be
+/// released before the failure was counted: the hold offered `continue`,
+/// and `continue` found no tree and silently started a fresh recheck.
+#[tokio::test]
+async fn a_stuck_recheck_keeps_its_tree_for_the_continue() {
+    let f = fixture("recheck-stuck-tree", FindingStatus::Rechecking).await;
+    // Finished, with a transcript, but no verdict file.
+    let silent = ScriptedBackend::new(support::done_with_transcript);
+    for _ in 0..3 {
+        f.recheck(&silent).await;
+    }
+    let hold = support::hold_of(&f.store, f.fid, FindingJobKind::Recheck)
+        .await
+        .expect("held at the limit");
+    assert!(hold.checkpoint_job_id.is_some(), "{hold:?}");
+    support::release(
+        &f.store,
+        f.fid,
+        FindingJobKind::Recheck,
+        hunter::domain::ReleaseAction::Continue,
+    )
+    .await;
+
+    let picked = hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        .await
+        .unwrap();
+
+    let Some(hunter::scheduler::Candidate::Resume { plan, .. }) = picked else {
+        panic!("continue resumes the held attempt, got {picked:?}");
+    };
+    assert_eq!(Some(plan.predecessor_id), hold.checkpoint_job_id);
+    assert!(plan.workspace.tree.is_dir());
 }
