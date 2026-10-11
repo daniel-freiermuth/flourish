@@ -162,8 +162,8 @@ new ──recheck──> new / superseded / rejected
 - **`merged`** → queued for a one-time **harvest** pass reviewing the PR's
   complete lifetime (not just its open-time snapshot) for genuine deferred
   follow-up work, filed as new findings via `FOLLOW-UPS.json`. A harvest
-  that keeps failing (a PR that will not load, a worker that never
-  finishes) is held for you like a fix; for a
+  that keeps failing (a PR that will not load, a clone that will not
+  fetch, a worker that never finishes) is held for you like a fix; for a
   merged PR, **Mark harvested** ends it without a review. A held harvest
   files its follow-ups only when you end it that way (or with **Classify**
   on a closed PR); **Continue** or **Restart** reviews the PR again, and
@@ -263,7 +263,7 @@ naming the host, until a cycle gets past the gate.
 
 The network can also go while work runs. So before a finding's failure is
 counted, the same hosts are probed again: a forge call that failed before
-the work started (a harvest's PR view or diff, an engage's target
+the work started (a harvest's fetch, PR view or diff, an engage's target
 or PR view), a backend that could not start the worker, a worker that
 failed without doing any metered work, and publishing a finished
 worker's work (a fix's push or PR, an engage's push, reply or

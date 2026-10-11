@@ -5795,9 +5795,10 @@ async fn continue_into_harvest(
 }
 
 /// Record a harvest that failed before its job row exists. Nothing else
-/// records such an attempt: left alone, a PR whose view or diff never loads
-/// stays unharvested, and as the oldest pending one it is picked again on
-/// every cycle, starving the tier and every tier below it. `key` leaves out the error text so repeats of
+/// records such an attempt: left alone, a PR whose default branch never
+/// fetches or whose view or diff never loads stays unharvested, and as the
+/// oldest pending one it is picked again on every cycle, starving the tier
+/// and every tier below it. `key` leaves out the error text so repeats of
 /// one outage count as identical. A failure while a host the harvest needs
 /// is unreachable is the network's, and ends the cycle denied instead
 /// ([`unreachable_now`]): the returned summary.
@@ -6039,17 +6040,14 @@ pub async fn run_harvest(
         .unwrap_or((127, "spawn error".to_owned()));
         if rc != 0 {
             let tail = crate::util::tail(&out, 300);
-            let _ = store
-                .log_event(
-                    "error",
-                    &format!(
-                        "harvest #{fid}: fetch {} failed: {tail}",
-                        repo.default_branch
-                    ),
-                    None,
-                    Some(fid),
-                )
-                .await;
+            let what = format!("fetch {}", repo.default_branch);
+            let net = (cfg, backend, repo.url.as_str());
+            if let Some(denied) =
+                harvest_prefetch_failed(store, net, fid, handoff, "fetch failed", &what, &tail)
+                    .await
+            {
+                return Ok(denied);
+            }
             anyhow::bail!("fetch failed: {tail}");
         }
     }
