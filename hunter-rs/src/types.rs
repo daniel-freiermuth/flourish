@@ -461,7 +461,9 @@ pub struct Stats {
 #[derive(Debug, Clone)]
 pub struct RunResult {
     pub exit_code: Option<i32>,
-    pub killed_reason: Option<String>, // None | "cap" | "wallclock" | "unmetered"
+    /// None | "cap" | "wallclock" | "unmetered" | "resume-unavailable";
+    /// what each maps to is `scheduler::job_state`.
+    pub killed_reason: Option<String>,
     pub tokens_new: i64,
     pub calls: i64,
     pub session_file: Option<String>,

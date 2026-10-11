@@ -358,6 +358,9 @@ pub enum JobState {
     /// repo-level work whether nothing continues it yet. Resume chains are
     /// bounded by the give-up ceiling. See `scheduler::job_state`.
     Suspended,
+    /// Never written by this daemon: the budget gate refuses before a job
+    /// row exists. Kept so the Python daemon's `denied` rows still decode,
+    /// and the stats still count them.
     Denied,
 }
 
