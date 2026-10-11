@@ -302,13 +302,14 @@ The states aren't stored as an enum. They are derived from the work item's field
 |---|---|---|---|---|
 | Attempt ends with the work's outcome (§7) | reset | cleared | – | kind's own |
 | Attempt ends paused (`job_state` = `suspended`) | unchanged | set to this job | – | `resume` |
-| Failure, streak below `MAX_CONSECUTIVE_SAME_FAILURE` | +1, or 1 if the failure differs | cleared | – | kind's own |
-| Failure reaching the limit | reset | kept if the failing attempt has a transcript, else cleared | `stuck` | `hold` |
+| Failure of an attempt, streak below `MAX_CONSECUTIVE_SAME_FAILURE` | +1, or 1 if the failure differs | cleared (the attempt ended without pausing) | – | kind's own |
+| Failure without a new attempt (fetch, PR view, runner error), streak below the limit | +1, or 1 if the failure differs | kept: no work replaced it | – | kind's own |
+| Failure reaching the limit | reset | the failing attempt if it has a transcript, else the checkpoint the work item already had | `stuck` | `hold` |
 | Ceiling reached | counts as the failure `resume chain gave up` | cleared, unless this creates a hold | `gave_up` if the limit is reached | `hold` or kind's own |
 | Worker wrote `BLOCKED.md` | reset | set to this job | `prerequisite`, with the report as detail | `hold` |
 | Release `continue` | – | kept | released | `release` |
 | Release `restart` | – | cleared | released | `release` |
-| Release with a terminal action (§9.3) | – | cleared | released | `release`, `verdict` |
+| Release with a terminal action (§9.3) | – | cleared; a harvest's `FOLLOW-UPS.json` in it is filed first | released | `release`, `verdict` |
 | Finding leaves the tier | reset | cleared | released by `finding-left-tier` | `release` |
 | Daemon restart: an orphaned `running` attempt that did work | unchanged | set to that job | unchanged | `resume` |
 
