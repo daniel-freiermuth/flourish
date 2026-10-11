@@ -4,4 +4,4 @@
  * Finding lifecycle status. The DB column is TEXT; sqlx maps via
  * `rename_all` = "`snake_case`".
  */
-export type FindingStatus = "new" | "rechecking" | "queued" | "fixing" | "blocked" | "pr_open" | "merged" | "closed" | "superseded" | "rejected" | "wontfix" | "note";
+export type FindingStatus = "new" | "rechecking" | "queued" | "fixing" | "pr_open" | "merged" | "closed" | "superseded" | "rejected" | "wontfix" | "note";

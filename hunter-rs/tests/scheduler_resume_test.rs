@@ -515,7 +515,7 @@ async fn zero_progress_handoffs_do_not_exhaust_the_useful_work_retry_limit() {
     .await
     .unwrap();
     let store = rw_store(&path).await;
-    let stats = store.resume_chain_stats(newest).await.unwrap();
+    let stats = store.resume_chain_stats(newest, None).await.unwrap();
     assert_eq!(stats.attempts, 2);
     assert_eq!(stats.total, 230_000);
     let picked = pick_next(&store, &test_config(dir.path()), None)
@@ -536,7 +536,14 @@ async fn zero_spend_cap_kills_still_exhaust_the_attempt_limit() {
     let session = seed_session(&dir);
     let newest = seed_chain(&pool, &session, &[120_000, 0, 0, 0]).await;
     let store = rw_store(&path).await;
-    assert_eq!(store.resume_chain_stats(newest).await.unwrap().attempts, 4);
+    assert_eq!(
+        store
+            .resume_chain_stats(newest, None)
+            .await
+            .unwrap()
+            .attempts,
+        4
+    );
 
     let picked = pick_next(&store, &test_config(dir.path()), None)
         .await
@@ -1141,6 +1148,7 @@ async fn resume_unavailable_fails_the_attempt_and_retires_the_predecessor() {
         typical: Z,
         chain_spent: 40_000,
         handoff: false,
+        after_hold: None,
     };
     // What the harness returns when it refuses to hand omp a path it
     // cannot resolve: nothing spawned, no exit code, no transcript.
@@ -2305,7 +2313,9 @@ async fn give_up_three_chains(
             state, "suspended",
             "the given-up job row is left as it ended"
         );
-        let held = store.job_blocker(first + 3).await.unwrap().is_some();
+        let held = support::hold_of(&store, 1, kind.parse().unwrap())
+            .await
+            .is_some();
         let checkpoint = checkpoint_of(&store, 1, kind.parse().unwrap()).await;
         assert_eq!(
             checkpoint,
@@ -2321,8 +2331,9 @@ async fn give_up_three_chains(
 }
 
 /// Each given-up fix chain is one failed fix attempt, and the fix starts
-/// over; the third holds the finding blocked, with that chain as its
-/// checkpoint, like any three identical failures, and starts nothing.
+/// over; the third holds the fix for the operator, with that chain as its
+/// checkpoint, like any three identical failures, and starts nothing. The
+/// finding stays `queued`.
 #[tokio::test]
 async fn a_given_up_fix_chain_counts_toward_the_failure_streak() {
     let seen = give_up_three_chains("fix", "queued").await;
@@ -2331,7 +2342,7 @@ async fn a_given_up_fix_chain_counts_toward_the_failure_streak() {
         [
             (1, FindingStatus::Queued, false, false, true),
             (2, FindingStatus::Queued, false, false, true),
-            (0, FindingStatus::Blocked, false, true, false),
+            (0, FindingStatus::Queued, false, true, false),
         ]
     );
 }
@@ -2393,7 +2404,7 @@ async fn a_given_up_chains_streak_events_say_why_it_was_given_up() {
             .await
             .unwrap()
             .into_iter()
-            .filter(|e| e.message.contains("resume chain gave up"))
+            .filter(|e| e.kind != "hold" && e.message.contains("resume chain gave up"))
             .map(|e| e.message)
             .collect();
 
@@ -2505,7 +2516,9 @@ async fn the_summary_preview_neither_retires_nor_counts_a_given_up_chain() {
     pick_next(&store, &cfg, None).await.unwrap();
     let after_pick = (
         job_row(&pool, 33).await.0,
-        store.get_finding(1).await.unwrap().unwrap().status,
+        support::hold_of(&store, 1, FindingJobKind::Fix)
+            .await
+            .map(|h| h.reason),
     );
 
     assert!(
@@ -2513,32 +2526,78 @@ async fn the_summary_preview_neither_retires_nor_counts_a_given_up_chain() {
         "{previewed:?}"
     );
     assert_eq!(after_preview, ("suspended".to_owned(), 2));
-    assert_eq!(after_pick, ("suspended".to_owned(), FindingStatus::Blocked));
+    assert_eq!(
+        after_pick,
+        (
+            "suspended".to_owned(),
+            Some(hunter::domain::HoldReason::GaveUp)
+        )
+    );
 }
 
-/// "Resume fix" on a fix held after its third given-up chain resumes
-/// that chain. Every chain given up for good is past the ceiling, so
-/// giving it up again turned the operator's resume into a fresh start
-/// that left the checkpoint behind.
+/// `continue` on a fix held after its third given-up chain resumes that
+/// chain: the ceiling counts only what the scheduler did since the
+/// release (WORK-MODEL.md §8), so the operator's call gets a fresh budget
+/// where giving the chain up again would turn it into a fresh start that
+/// leaves the checkpoint behind.
 #[tokio::test]
-async fn a_held_fix_an_operator_requeues_resumes_past_the_ceiling() {
+async fn a_continued_fix_resumes_past_the_ceiling() {
     let (dir, path, pool) = fix_one_give_up_from_blocked().await;
     let store = rw_store(&path).await;
     let cfg = test_config(dir.path());
     pick_next(&store, &cfg, None).await.unwrap();
-    assert_eq!(
-        store.get_finding(1).await.unwrap().unwrap().status,
-        FindingStatus::Blocked
+    assert!(
+        support::hold_of(&store, 1, FindingJobKind::Fix)
+            .await
+            .is_some()
     );
 
-    store
-        .set_finding_status(1, FindingStatus::Queued)
-        .await
-        .unwrap();
+    support::release(
+        &store,
+        1,
+        FindingJobKind::Fix,
+        hunter::domain::ReleaseAction::Continue,
+    )
+    .await;
     let plan = resume_plan_of(pick_next(&store, &cfg, None).await.unwrap());
 
     assert_eq!(plan.predecessor_id, 33);
     assert_eq!(job_row(&pool, 33).await.0, "suspended");
+}
+
+/// Nothing but an operator's release resets the ceiling: a hold that ended
+/// because the finding left its tier, a released claim or a daemon restart
+/// leave the count where it was (`operator_requeued` used to infer an
+/// operator from a leftover column, which any of those could set).
+#[tokio::test]
+async fn only_a_release_gives_a_chain_a_fresh_budget() {
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo(&pool, &dir).await;
+    seed_history(&pool).await;
+    seed_finding_in(&pool, "queued").await;
+    seed_finding_chain(&pool, &dir, "fix", 1, 30).await;
+    let store = rw_store(&path).await;
+    let cfg = test_config(dir.path());
+    // A chain of four, its attempts long before any release.
+    sqlx::query("UPDATE jobs SET started_at = 1000 WHERE id BETWEEN 30 AND 33")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // A hold released before the chain started gives it nothing.
+    sqlx::query(
+        "INSERT INTO work_holds (finding_id, kind, reason, detail, held_at, released_at, \
+         released_by, release_action) VALUES (1, 'fix', 'stuck', 'x', 100, 500, 'tester', 'continue')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let picked = preview_next(&store, &cfg).await.unwrap();
+
+    assert!(
+        matches!(picked, Some(Candidate::Finding { finding_id: 1, .. })),
+        "the chain is past the ceiling and gives way to a fresh fix: {picked:?}"
+    );
 }
 
 /// The failure streak of finding `fid`'s `kind` work.
@@ -2549,4 +2608,54 @@ async fn streak(store: &Store, fid: i64, kind: FindingJobKind) -> i64 {
 /// The job finding `fid`'s `kind` work continues from, if any.
 async fn checkpoint_of(store: &Store, fid: i64, kind: FindingJobKind) -> Option<i64> {
     store.checkpoint_job(fid, kind).await.unwrap().map(|j| j.id)
+}
+
+/// `dismiss` ends a held engage: the operator has said this PR's attention
+/// needs nothing from hunter. So it drops the engage's checkpoint too, and
+/// nothing resumes the engage that was held, where it used to be picked up
+/// by the next cycle and push or reply on the PR the operator had just
+/// dismissed (WORK-MODEL.md §6.3).
+#[tokio::test]
+async fn a_dismissed_engage_does_not_resume() {
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo(&pool, &dir).await;
+    let cfg = test_config(dir.path());
+    seed_flagged_finding(&pool, 5).await;
+    let session = seed_session_in(&dir, 20, CTX);
+    seed_finding_suspension(&pool, 20, "engage", 5, &session).await;
+    let store = rw_store(&path).await;
+    assert!(
+        store
+            .hold_work(
+                5,
+                FindingJobKind::Engage,
+                hunter::domain::HoldReason::Prerequisite,
+                "two reviewers disagree",
+                Some(20)
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        checkpoint_of(&store, 5, FindingJobKind::Engage).await,
+        Some(20)
+    );
+
+    support::release(
+        &store,
+        5,
+        FindingJobKind::Engage,
+        hunter::domain::ReleaseAction::Dismiss,
+    )
+    .await;
+
+    let next = pick_next(&store, &cfg, None).await.unwrap();
+    assert!(
+        !matches!(
+            next,
+            Some(Candidate::Resume { .. } | Candidate::Finding { .. })
+        ),
+        "{next:?}"
+    );
+    assert_eq!(checkpoint_of(&store, 5, FindingJobKind::Engage).await, None);
 }

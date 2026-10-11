@@ -21,7 +21,8 @@
 //!   Option<Option<T>> (None = absent, Some(None) = null).
 
 use crate::domain::{
-    BudgetOverride, BugClass, FindingStatus, FindingType, ForgeName, JobKind, JobState, Severity,
+    BudgetOverride, BugClass, FindingJobKind, FindingStatus, FindingType, ForgeName, HoldReason,
+    JobKind, JobState, ReleaseAction, Severity,
 };
 use serde::Serialize;
 use ts_rs::TS;
@@ -187,17 +188,29 @@ pub struct FindingOut {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub needs_attention: Option<Option<String>>,
-    /// Present ONLY for status == "blocked" rows whose held fix checkpoint
-    /// carries a report (`jobs.blocker`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub blocker: Option<String>,
+    /// The finding's work held for the operator (WORK-MODEL.md §9), at
+    /// most one per kind, oldest first. Always present, [] when none.
+    pub holds: Vec<HoldOut>,
     /// The finding whose engage/harvest job filed this one as a follow-up;
     /// null for everything a hunt or analysis job found. Always present.
     pub follow_up_of: Option<i64>,
     /// Findings filed as follow-ups by jobs working on this one, ascending
     /// id. Always present, [] when none.
     pub follow_ups: Vec<i64>,
+}
+
+/// One active hold on a finding's work, as `GET /api/findings` shows it.
+#[derive(Debug, Clone, Serialize, TS)]
+pub struct HoldOut {
+    pub kind: FindingJobKind,
+    pub reason: HoldReason,
+    /// The worker's report, or the failure and its output.
+    pub detail: String,
+    /// Epoch ms.
+    pub held_at: i64,
+    /// What `POST /api/hold/release` accepts for it right now. `continue`
+    /// only while the work has a checkpoint to continue.
+    pub actions: Vec<ReleaseAction>,
 }
 
 /// jobs row (17 columns) + `repo_name` from the JOIN. The two finding_*

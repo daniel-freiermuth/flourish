@@ -14,7 +14,10 @@ mod support;
 use std::path::{Path, PathBuf};
 
 use hunter::backend::SpendLedger;
-use hunter::domain::{BudgetOverride, FindingStatus, ForgeName, JobState, RepoJobKind};
+use hunter::domain::{
+    BudgetOverride, ClosureClass, FindingJobKind, FindingStatus, ForgeName, HoldReason, JobState,
+    ReleaseAction, RepoJobKind,
+};
 use hunter::store::{RepoUpdate, ResumeChainStats, Store, StoreWriteError};
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnectOptions;
@@ -1548,7 +1551,7 @@ async fn resume_chain_stats_measure_every_attempt_from_any_link() {
 
     for link in &chain {
         assert_eq!(
-            store.resume_chain_stats(*link).await.unwrap(),
+            store.resume_chain_stats(*link, None).await.unwrap(),
             ResumeChainStats {
                 total: 240_000,
                 attempts: 3,
@@ -1574,7 +1577,7 @@ async fn resume_chain_stats_measure_every_attempt_from_any_link() {
         .id;
     set_tokens(&pool, loner, 7_000).await;
     assert_eq!(
-        store.resume_chain_stats(loner).await.unwrap(),
+        store.resume_chain_stats(loner, None).await.unwrap(),
         ResumeChainStats {
             total: 7_000,
             attempts: 1,
@@ -1633,7 +1636,7 @@ async fn resume_chain_stats_terminate_on_a_cyclic_link() {
 
     let stats = tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        store.resume_chain_stats(chain[0]),
+        store.resume_chain_stats(chain[0], None),
     )
     .await
     .expect("the walk must terminate on a cycle, not run until the harness kills it")
@@ -1658,11 +1661,9 @@ async fn resume_chain_stats_terminate_on_a_cyclic_link() {
 /// its tree.
 #[tokio::test]
 async fn leaving_a_tier_drops_the_checkpoint_and_keeps_the_job_row() {
-    use hunter::domain::FindingJobKind;
     for (kind, at) in [
         (FindingJobKind::Fix, FindingStatus::Queued),
         (FindingJobKind::Fix, FindingStatus::Fixing),
-        (FindingJobKind::Fix, FindingStatus::Blocked),
         (FindingJobKind::Recheck, FindingStatus::Rechecking),
         (FindingJobKind::Engage, FindingStatus::PrOpen),
         (FindingJobKind::Harvest, FindingStatus::Merged),
@@ -1697,7 +1698,7 @@ async fn leaving_a_tier_drops_the_checkpoint_and_keeps_the_job_row() {
                     (kind, to),
                     (
                         FindingJobKind::Fix,
-                        FindingStatus::Queued | FindingStatus::Fixing | FindingStatus::Blocked
+                        FindingStatus::Queued | FindingStatus::Fixing
                     ) | (
                         FindingJobKind::Harvest,
                         FindingStatus::Merged | FindingStatus::Closed
@@ -1736,7 +1737,6 @@ async fn leaving_a_tier_drops_the_checkpoint_and_keeps_the_job_row() {
 /// finding's status says.
 #[tokio::test]
 async fn harvesting_a_pr_drops_its_harvest_checkpoint() {
-    use hunter::domain::FindingJobKind;
     let (_dir, path, pool) = fresh_db().await;
     seed_repo_and_findings(&pool).await;
     let store = rw_store(&path).await;
@@ -1827,232 +1827,534 @@ async fn finding_checkpoints_resume_only_at_their_actionable_status() {
     }
 }
 
-async fn blocked_store_fixture() -> (TempDir, hunter::store::Store, String) {
+/// Finding 2 queued, two fix attempts behind it: job 10 ran a worker (a
+/// transcript), job 11 never did. Its fix streak stands at 2.
+async fn hold_fixture() -> (TempDir, Store, SqlitePool) {
     let (dir, path, pool) = fresh_db().await;
     seed_repo_and_findings(&pool).await;
     sqlx::raw_sql(
-        "INSERT INTO finding_work (finding_id, kind, streak, last_failure) VALUES \
-             (1, 'fix', 3, 'old failure'), (2, 'fix', 3, 'old failure'); \
-         INSERT INTO jobs (id, kind, repo_id, finding_id, state, pid, session_file, \
-                           tokens_new, calls, usage_delta, cap_tokens, exit_code, killed_reason, \
-                           model, started_at, finished_at, pinned_sha) VALUES \
-         (10, 'fix', 1, 1, 'done', NULL, '/s/10/session.jsonl', 900, 7, 0.25, \
-          2000, 0, NULL, 'model-a', 1000, 2000, 'original-sha'), \
-         (11, 'fix', 1, 2, 'running', 123, '/s/11/session.jsonl', 1200, 9, 0.5, \
-          3000, 1, 'cap', 'model-b', 1100, NULL, 'original-sha');",
+        "INSERT INTO finding_work (finding_id, kind, streak, last_failure) \
+             VALUES (2, 'fix', 2, 'no commits'); \
+         INSERT INTO jobs (id, kind, repo_id, finding_id, state, session_file, started_at, \
+                           finished_at) VALUES \
+         (10, 'fix', 1, 2, 'done', '/s/10/session.jsonl', 1000, 2000), \
+         (11, 'fix', 1, 2, 'failed', NULL, 3000, 3000);",
     )
     .execute(&pool)
     .await
     .unwrap();
     let store = rw_store(&path).await;
-    let reason = format!(
-        "Verification blocker\n{}\nFull diagnostic tail",
-        "λ".repeat(800)
-    );
-    (dir, store, reason)
+    (dir, store, pool)
 }
 
-#[tokio::test]
-async fn blocked_fix_retains_checkpoint_without_suppressing_the_finding() {
-    let (_dir, store, reason) = blocked_store_fixture().await;
+/// Hold finding 2's fix: whether a hold landed.
+async fn hold_fix(store: &Store, reason: HoldReason, detail: &str, job: Option<i64>) -> bool {
+    store
+        .hold_work(2, FindingJobKind::Fix, reason, detail, job)
+        .await
+        .unwrap()
+}
 
-    for (finding_id, job_id) in [(1, 10), (2, 11)] {
-        let before = store.jobs_by_finding(finding_id).await.unwrap().remove(0);
-        let before_reason = store
-            .get_finding(finding_id)
-            .await
-            .unwrap()
-            .unwrap()
-            .verdict_reason;
+async fn fix_hold(store: &Store, fid: i64) -> Option<hunter::store::WorkHold> {
+    store
+        .active_holds()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|h| h.finding_id == fid && h.kind == FindingJobKind::Fix)
+}
+
+/// A hold stops the work item, not the finding: the status stays, the
+/// streak ends, and the checkpoint is the held attempt only when a worker
+/// ran in it. One active hold per work item; work outside its tier is not
+/// held at all.
+#[tokio::test]
+async fn holding_work_keeps_the_status_and_a_checkpoint_only_with_a_transcript() {
+    let (_dir, store, _pool) = hold_fixture().await;
+
+    assert!(hold_fix(&store, HoldReason::Stuck, "no commits\n\ntail", Some(10)).await);
+    let finding = store.get_finding(2).await.unwrap().unwrap();
+    assert_eq!(finding.status, FindingStatus::Queued);
+    assert_eq!(finding.verdict_reason, None, "the detail is not copied");
+    let hold = fix_hold(&store, 2).await.unwrap();
+    assert_eq!(
+        (hold.reason, hold.detail.as_str(), hold.checkpoint_job_id),
+        (HoldReason::Stuck, "no commits\n\ntail", Some(10))
+    );
+    assert_eq!(
+        hold.actions(),
+        [
+            ReleaseAction::Continue,
+            ReleaseAction::Restart,
+            ReleaseAction::Reject,
+            ReleaseAction::Wontfix
+        ]
+    );
+    assert_eq!(
+        store.work_streak(2, FindingJobKind::Fix).await.unwrap(),
+        hunter::store::WorkStreak::default()
+    );
+    assert!(
         store
-            .block_fix_job(finding_id, job_id, &reason)
+            .held_work()
             .await
-            .unwrap();
-        let finding = store.get_finding(finding_id).await.unwrap().unwrap();
-        assert_eq!(finding.status, FindingStatus::Blocked);
-        assert_eq!(
-            finding.verdict_reason, before_reason,
-            "the report is not copied"
-        );
-        assert_eq!(
-            store.held_fix_blockers().await.unwrap().get(&finding_id),
-            Some(&reason)
-        );
-        assert_eq!(
-            store
-                .work_streak(finding_id, hunter::domain::FindingJobKind::Fix)
-                .await
-                .unwrap(),
-            hunter::store::WorkStreak::default()
-        );
-        assert!(finding.updated_at > 1000);
-        let job = store.jobs_by_finding(finding_id).await.unwrap().remove(0);
-        assert_eq!(job.state, JobState::Suspended);
-        assert_eq!(job.pid, None);
-        assert_eq!(job.notes, before.notes);
-        assert_eq!(job.session_file, before.session_file);
-        assert_eq!(job.tokens_new, before.tokens_new);
-        assert_eq!(job.calls, before.calls);
-        assert_eq!(job.usage_delta, before.usage_delta);
-        assert_eq!(job.cap_tokens, before.cap_tokens);
-        assert_eq!(job.exit_code, before.exit_code);
-        assert_eq!(job.killed_reason, before.killed_reason);
-        assert_eq!(job.model, before.model);
-        assert_eq!(job.started_at, before.started_at);
-        if before.finished_at.is_some() {
-            assert_eq!(job.finished_at, before.finished_at);
-        } else {
-            assert!(job.finished_at.unwrap() > 1000);
-        }
-        assert_eq!(
-            store.pinned_sha(job_id).await.unwrap().as_deref(),
-            Some("original-sha")
-        );
-        assert_eq!(
-            store.job_blocker(job_id).await.unwrap().as_deref(),
-            Some(reason.as_str())
-        );
-    }
-    assert!(store.list_resumable_jobs().await.unwrap().is_empty());
-    assert_eq!(store.status_counts().await.unwrap()["blocked"], 2);
+            .unwrap()
+            .contains(&(2, FindingJobKind::Fix))
+    );
     assert!(store.suppressions(1, "bug").await.unwrap().is_empty());
+    let events = store.recent_events(10).await.unwrap();
+    let event = events.iter().find(|e| e.kind == "hold").unwrap();
     assert_eq!(
-        store
-            .known_active(1, "bug")
-            .await
-            .unwrap()
-            .iter()
-            .map(|f| f.id)
-            .collect::<Vec<_>>(),
-        vec![1, 2, 3, 4]
+        (event.message.as_str(), event.finding_id, event.job_id),
+        ("#2 fix held (stuck): no commits", Some(2), Some(10)),
+        "the activity log says what is held and why"
     );
+
+    assert!(
+        !hold_fix(&store, HoldReason::Prerequisite, "again", Some(10)).await,
+        "one active hold per work item"
+    );
+    assert!(
+        !store
+            .hold_work(1, FindingJobKind::Fix, HoldReason::Stuck, "new", None)
+            .await
+            .unwrap(),
+        "finding 1 is new: no fix work to hold"
+    );
+    assert_eq!(fix_hold(&store, 1).await, None);
+
+    let by = support::operator(&store).await;
+    let release = |action| hunter::store::HoldRelease {
+        action,
+        reason: None,
+        classification: None,
+        by: &by,
+    };
     store
-        .set_finding_verdict(3, FindingStatus::Rejected, "not a defect")
+        .release_hold(2, FindingJobKind::Fix, &release(ReleaseAction::Restart))
         .await
         .unwrap();
-    assert_eq!(store.suppressions(1, "bug").await.unwrap()[0].id, 3);
-    assert_eq!(
-        store
-            .known_active(1, "bug")
-            .await
-            .unwrap()
-            .iter()
-            .map(|f| f.id)
-            .collect::<Vec<_>>(),
-        vec![1, 2, 4]
-    );
+    assert!(hold_fix(&store, HoldReason::Stuck, "no tree", Some(11)).await);
+    let hold = fix_hold(&store, 2).await.unwrap();
+    assert_eq!(hold.checkpoint_job_id, None, "job 11 never ran a worker");
+    assert!(!hold.actions().contains(&ReleaseAction::Continue));
 }
 
+/// A release records who, when and how, and does what its action says:
+/// `continue` keeps the checkpoint, `restart` drops it, `reject` writes the
+/// verdict (which ends the work item). Refused: no active hold, an action
+/// that does not apply to the kind, `continue` with nothing to continue,
+/// a verdict without its reason.
 #[tokio::test]
-async fn queued_blocked_fix_continues_the_original_checkpoint() {
-    let (_dir, store, reason) = blocked_store_fixture().await;
-    for (finding_id, job_id) in [(1, 10), (2, 11)] {
+async fn releasing_a_hold_records_the_operator_and_applies_the_action() {
+    let (_dir, store, pool) = hold_fixture().await;
+    let by = support::operator(&store).await;
+    let release = |action, reason| hunter::store::HoldRelease {
+        action,
+        reason,
+        classification: None,
+        by: &by,
+    };
+    let refused = |r: Result<(), StoreWriteError>| matches!(r, Err(StoreWriteError::Refused(_)));
+
+    assert!(refused(
         store
-            .block_fix_job(finding_id, job_id, &reason)
+            .release_hold(
+                2,
+                FindingJobKind::Fix,
+                &release(ReleaseAction::Continue, None)
+            )
+            .await
+    ));
+    assert!(hold_fix(&store, HoldReason::Prerequisite, "needs a rig", Some(10)).await);
+    assert!(refused(
+        store
+            .release_hold(
+                2,
+                FindingJobKind::Fix,
+                &release(ReleaseAction::Dismiss, None)
+            )
+            .await
+    ));
+    assert!(refused(
+        store
+            .release_hold(
+                2,
+                FindingJobKind::Recheck,
+                &release(ReleaseAction::Continue, None)
+            )
+            .await
+    ));
+    assert_eq!(
+        store.last_release_at(2, FindingJobKind::Fix).await.unwrap(),
+        None
+    );
+
+    store
+        .release_hold(
+            2,
+            FindingJobKind::Fix,
+            &release(ReleaseAction::Continue, None),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fix_hold(&store, 2).await, None);
+    assert!(store.held_work().await.unwrap().is_empty());
+    assert_eq!(
+        store
+            .checkpoint_job(2, FindingJobKind::Fix)
+            .await
+            .unwrap()
+            .map(|j| j.id),
+        Some(10),
+        "continue keeps the checkpoint"
+    );
+    assert_eq!(
+        store
+            .continued_hold(2, FindingJobKind::Fix, 10)
+            .await
+            .unwrap(),
+        Some((HoldReason::Prerequisite, "needs a rig".to_owned()))
+    );
+    let released: (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT released_by, release_action FROM work_holds WHERE finding_id = 2")
+            .fetch_one(&pool)
             .await
             .unwrap();
-    }
-    store
-        .set_finding_status(1, FindingStatus::Queued)
-        .await
-        .unwrap();
-    let resumed = store.list_resumable_jobs().await.unwrap();
-    assert_eq!(resumed.iter().map(|j| j.id).collect::<Vec<_>>(), vec![10]);
     assert_eq!(
-        resumed[0].session_file.as_deref(),
-        Some("/s/10/session.jsonl")
+        released,
+        (Some("tester".to_owned()), Some("continue".to_owned()))
     );
-    let shown = store.held_fix_blockers().await.unwrap();
-    assert_eq!(shown.get(&1), None, "a requeued finding shows no blocker");
-    assert_eq!(shown.get(&2), Some(&reason), "the other is still held");
-    assert_eq!(store.resume_chain_stats(10).await.unwrap().total, 900);
-    let continued = store
-        .create_job(
-            hunter::domain::FindingJobKind::Fix.into(),
-            1,
-            Some(1),
-            None,
-            JobState::Running,
-            Some(100),
-            Some(10),
-        )
-        .await
-        .unwrap();
-    assert_eq!(continued.superseded, [] as [i64; 0]);
-    assert_eq!(store.resume_origin_job(continued.id).await.unwrap(), 10);
-    assert_eq!(
-        store.pinned_sha(continued.id).await.unwrap().as_deref(),
-        Some("original-sha")
+    assert!(
+        store
+            .last_release_at(2, FindingJobKind::Fix)
+            .await
+            .unwrap()
+            .is_some()
     );
-    assert_eq!(
-        store.job_blocker(continued.id).await.unwrap().as_deref(),
-        Some(reason.as_str()),
-        "a resume inherits the blocker it works against"
-    );
-    let fresh = store
-        .create_job(
-            hunter::domain::FindingJobKind::Recheck.into(),
-            1,
-            Some(3),
-            None,
-            JobState::Running,
-            Some(100),
-            None,
-        )
-        .await
-        .unwrap();
-    assert_eq!(store.job_blocker(fresh.id).await.unwrap(), None);
-    assert_eq!(
-        store.jobs_by_finding(1).await.unwrap()[1].state,
-        JobState::Suspended
-    );
-    assert!(store.list_resumable_jobs().await.unwrap().is_empty());
+    let events = store.recent_events(10).await.unwrap();
+    let event = events.iter().find(|e| e.kind == "release").unwrap();
+    assert_eq!(event.username.as_deref(), Some("tester"));
+    assert_eq!(event.message, "#2 fix hold released: continue");
 }
 
+/// `restart` drops the checkpoint: the work starts fresh.
 #[tokio::test]
-async fn block_fix_job_guards_identity_and_rolls_back_both_rows_on_error() {
+async fn restarting_a_hold_drops_the_checkpoint() {
+    let (_dir, store, _pool) = hold_fixture().await;
+    let by = support::operator(&store).await;
+    let release = |action| hunter::store::HoldRelease {
+        action,
+        reason: None,
+        classification: None,
+        by: &by,
+    };
+    assert!(hold_fix(&store, HoldReason::Stuck, "no commits", Some(10)).await);
+    store
+        .release_hold(2, FindingJobKind::Fix, &release(ReleaseAction::Restart))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .checkpoint_job(2, FindingJobKind::Fix)
+            .await
+            .unwrap()
+            .map(|j| j.id),
+        None,
+        "restart drops the checkpoint"
+    );
+}
+
+/// `reject` writes the verdict with the operator's reason, which ends the
+/// work item; without a reason it is refused.
+#[tokio::test]
+async fn rejecting_a_held_fix_writes_the_verdict() {
+    let (_dir, store, pool) = hold_fixture().await;
+    let by = support::operator(&store).await;
+    let release = |action, reason| hunter::store::HoldRelease {
+        action,
+        reason,
+        classification: None,
+        by: &by,
+    };
+    assert!(hold_fix(&store, HoldReason::Stuck, "no commits", Some(10)).await);
+    assert!(matches!(
+        store
+            .release_hold(
+                2,
+                FindingJobKind::Fix,
+                &release(ReleaseAction::Reject, None)
+            )
+            .await,
+        Err(StoreWriteError::Refused(_))
+    ));
+    store
+        .release_hold(
+            2,
+            FindingJobKind::Fix,
+            &release(ReleaseAction::Reject, Some("not a defect")),
+        )
+        .await
+        .unwrap();
+    let finding = store.get_finding(2).await.unwrap().unwrap();
+    assert_eq!(
+        (finding.status, finding.verdict_reason.as_deref()),
+        (FindingStatus::Rejected, Some("not a defect"))
+    );
+    assert_eq!(store.suppressions(1, "bug").await.unwrap()[0].id, 2);
+    assert_eq!(
+        store
+            .checkpoint_job(2, FindingJobKind::Fix)
+            .await
+            .unwrap()
+            .map(|j| j.id),
+        None
+    );
+    let action: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT released_by, release_action FROM work_holds WHERE finding_id = 2 ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        action.last().unwrap(),
+        &("tester".to_owned(), Some("reject".to_owned())),
+        "released by the operator, not as finding-left-tier"
+    );
+}
+
+/// The finding leaving its tier releases the work item's hold in the same
+/// write, as `finding-left-tier`, whoever moved it (invariant 2).
+#[tokio::test]
+async fn leaving_the_tier_releases_the_hold() {
+    let (_dir, store, pool) = hold_fixture().await;
+    assert!(hold_fix(&store, HoldReason::Stuck, "no commits", Some(10)).await);
+
+    store
+        .set_finding_status(2, FindingStatus::New)
+        .await
+        .unwrap();
+
+    assert_eq!(fix_hold(&store, 2).await, None);
+    let released: (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT released_by, release_action FROM work_holds WHERE finding_id = 2")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(released, (Some("finding-left-tier".to_owned()), None));
+    let events = store.recent_events(10).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "release" && e.message == "#2 fix hold released: finding is new"),
+        "{events:?}"
+    );
+}
+
+/// Finding 1's PR closed, 3's merged, 4's open with attention; each one's
+/// harvest, resp. engage, held.
+async fn pr_holds_fixture() -> (TempDir, Store) {
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo_and_findings(&pool).await;
+    sqlx::raw_sql(
+        "UPDATE findings SET status = 'closed' WHERE id = 1; \
+         UPDATE findings SET status = 'merged' WHERE id = 3; \
+         UPDATE findings SET status = 'pr_open' WHERE id = 4; \
+         INSERT INTO pr_state (finding_id, pr_number, state, last_activity_at, \
+             needs_attention, attention_fingerprint, head_sha) VALUES \
+         (1, 7, 'CLOSED', NULL, NULL, NULL, NULL), \
+         (3, 8, 'MERGED', NULL, NULL, NULL, NULL), \
+         (4, 9, 'OPEN', 4000, 'new_comments', 'fp-a', 'head1');",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let store = rw_store(&path).await;
+    for (fid, kind) in [
+        (1, FindingJobKind::Harvest),
+        (3, FindingJobKind::Harvest),
+        (4, FindingJobKind::Engage),
+    ] {
+        assert!(
+            store
+                .hold_work(fid, kind, HoldReason::Stuck, "pr view failed", None)
+                .await
+                .unwrap()
+        );
+    }
+    (dir, store)
+}
+
+/// A harvest's release depends on how its PR ended: a closed PR is
+/// classified by hand (its status and the harvest stamp land together), a
+/// merged one marked harvested; an engage's is dismissed, its attention
+/// handled as a no-op engage would.
+#[tokio::test]
+async fn harvest_and_engage_holds_release_into_their_outcomes() {
+    let (_dir, store) = pr_holds_fixture().await;
+    let by = support::operator(&store).await;
+    let actions: Vec<(i64, Vec<ReleaseAction>)> = store
+        .active_holds()
+        .await
+        .unwrap()
+        .iter()
+        .map(|h| (h.finding_id, h.actions()))
+        .collect();
+    assert_eq!(
+        actions,
+        [
+            (1, vec![ReleaseAction::Restart, ReleaseAction::Classify]),
+            (
+                3,
+                vec![ReleaseAction::Restart, ReleaseAction::MarkHarvested]
+            ),
+            (4, vec![ReleaseAction::Restart, ReleaseAction::Dismiss]),
+        ]
+    );
+    let release = |action, reason, classification| hunter::store::HoldRelease {
+        action,
+        reason,
+        classification,
+        by: &by,
+    };
+    assert!(matches!(
+        store
+            .release_hold(
+                3,
+                FindingJobKind::Harvest,
+                &release(
+                    ReleaseAction::Classify,
+                    Some("x"),
+                    Some(ClosureClass::Wrong)
+                )
+            )
+            .await,
+        Err(StoreWriteError::Refused(_))
+    ));
+
+    store
+        .release_hold(
+            1,
+            FindingJobKind::Harvest,
+            &release(
+                ReleaseAction::Classify,
+                Some("landed in #9"),
+                Some(ClosureClass::Superseded),
+            ),
+        )
+        .await
+        .unwrap();
+    let closed = store.get_finding(1).await.unwrap().unwrap();
+    assert_eq!(
+        (closed.status, closed.verdict_reason.as_deref()),
+        (FindingStatus::Superseded, Some("superseded: landed in #9"))
+    );
+    assert!(
+        store
+            .get_pr_state(1)
+            .await
+            .unwrap()
+            .unwrap()
+            .harvested_at
+            .is_some()
+    );
+
+    store
+        .release_hold(
+            3,
+            FindingJobKind::Harvest,
+            &release(ReleaseAction::MarkHarvested, None, None),
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .get_pr_state(3)
+            .await
+            .unwrap()
+            .unwrap()
+            .harvested_at
+            .is_some()
+    );
+    assert_eq!(
+        store.get_finding(3).await.unwrap().unwrap().status,
+        FindingStatus::Merged
+    );
+}
+
+/// An engage hold's `dismiss` marks the PR's current attention handled.
+#[tokio::test]
+async fn dismissing_an_engage_hold_handles_its_attention() {
+    let (_dir, store) = pr_holds_fixture().await;
+    let by = support::operator(&store).await;
+    store
+        .release_hold(
+            4,
+            FindingJobKind::Engage,
+            &hunter::store::HoldRelease {
+                action: ReleaseAction::Dismiss,
+                reason: None,
+                classification: None,
+                by: &by,
+            },
+        )
+        .await
+        .unwrap();
+    assert_dismissed(&store).await;
+    assert_eq!(
+        support::hold_of(&store, 4, FindingJobKind::Engage).await,
+        None
+    );
+}
+
+/// Finding 4's attention is handled as a no-op engage leaves it.
+async fn assert_dismissed(store: &Store) {
+    let ps = store.get_pr_state(4).await.unwrap().unwrap();
+    assert_eq!(
+        (
+            ps.needs_attention,
+            ps.last_engaged_activity_at,
+            ps.addressed_fingerprint.as_deref(),
+            ps.addressed_head_sha.as_deref()
+        ),
+        (None, Some(4000), Some("fp-a"), Some("head1"))
+    );
+}
+
+/// The give-up ceiling counts what the scheduler did since the last
+/// release: attempts started before `since` are left out of the chain's
+/// count and spend, and the chain walk itself is unchanged.
+#[tokio::test]
+async fn chain_stats_since_a_release_count_only_later_attempts() {
     let (_dir, path, pool) = fresh_db().await;
     seed_repo_and_findings(&pool).await;
     sqlx::raw_sql(
-        "INSERT INTO jobs (id, kind, repo_id, finding_id, state, notes, started_at) VALUES \
-         (10, 'fix', 1, 1, 'done', 'original', 1000), \
-         (11, 'recheck', 1, 1, 'done', 'original', 1000);",
+        "INSERT INTO jobs (id, kind, repo_id, finding_id, state, tokens_new, resumed_from, \
+                           started_at) VALUES \
+         (10, 'fix', 1, 2, 'suspended', 100, NULL, 1000), \
+         (11, 'fix', 1, 2, 'suspended', 200, 10, 2000), \
+         (12, 'fix', 1, 2, 'suspended', 300, 11, 3000);",
     )
     .execute(&pool)
     .await
     .unwrap();
     let store = rw_store(&path).await;
-    for (finding_id, job_id) in [(2, 10), (1, 11), (1, 99)] {
-        assert!(matches!(
-            store.block_fix_job(finding_id, job_id, "blocked").await,
-            Err(sqlx::Error::RowNotFound)
-        ));
-    }
-    sqlx::raw_sql(
-        "CREATE TRIGGER reject_blocked BEFORE UPDATE ON findings \
-         WHEN NEW.status = 'blocked' BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    assert!(store.block_fix_job(1, 10, "blocked").await.is_err());
-    for finding_id in [1, 2] {
-        let finding = store.get_finding(finding_id).await.unwrap().unwrap();
-        assert_eq!(
-            finding.status,
-            if finding_id == 1 {
-                FindingStatus::New
-            } else {
-                FindingStatus::Queued
-            }
-        );
-        assert_eq!(finding.updated_at, 1000);
-    }
-    for job in store.jobs_by_finding(1).await.unwrap() {
-        assert_eq!(job.state, JobState::Done);
-        assert_eq!(job.notes.as_deref(), Some("original"));
-        assert_eq!(job.finished_at, None);
-    }
+    assert_eq!(
+        store.resume_chain_stats(12, None).await.unwrap(),
+        ResumeChainStats {
+            total: 600,
+            attempts: 3,
+            max_single: 300
+        }
+    );
+    assert_eq!(
+        store.resume_chain_stats(12, Some(1500)).await.unwrap(),
+        ResumeChainStats {
+            total: 500,
+            attempts: 2,
+            max_single: 300
+        }
+    );
 }
 
 /// A re-hunt request lands only on a live repo: the endpoint's lookup and
@@ -2165,4 +2467,35 @@ async fn dropping_a_checkpoint_that_moved_on_changes_nothing() {
         None
     );
     assert!(logged("drop 10").await);
+}
+
+/// A hold whose attempt left nothing to continue (no job, or one that never
+/// ran a worker) keeps the checkpoint the work item already has: the
+/// paused attempt before it is still the work done so far, and holding
+/// must not throw it away and leave the operator only `restart`.
+#[tokio::test]
+async fn a_hold_without_a_new_checkpoint_keeps_the_existing_one() {
+    for job in [None, Some(11)] {
+        let (_dir, store, pool) = hold_fixture().await;
+        support::point_checkpoint(&pool, 2, "fix", 10).await;
+
+        assert!(hold_fix(&store, HoldReason::Stuck, "pr view failed", job).await);
+
+        let hold = fix_hold(&store, 2).await.unwrap();
+        assert_eq!(hold.checkpoint_job_id, Some(10), "held on {job:?}");
+        assert!(hold.actions().contains(&ReleaseAction::Continue));
+    }
+}
+
+/// A held fix stays `queued` but is no work the daemon can do, so it is not
+/// counted as queued: the daemon drains its queue without sleeping while
+/// it has queued fixes, and a held one would keep it cycling for nothing.
+#[tokio::test]
+async fn a_held_fix_is_not_counted_as_queued() {
+    let (_dir, store, _pool) = hold_fixture().await;
+    assert_eq!(store.count_queued().await.unwrap(), 1);
+
+    assert!(hold_fix(&store, HoldReason::Stuck, "no commits", Some(10)).await);
+
+    assert_eq!(store.count_queued().await.unwrap(), 0);
 }

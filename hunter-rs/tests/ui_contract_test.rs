@@ -14,7 +14,9 @@
 
 use std::path::Path;
 
-use hunter::domain::{FindingJobKind, FindingStatus, FindingType, RepoJobKind};
+use hunter::domain::{
+    FindingJobKind, FindingStatus, FindingType, HoldReason, ReleaseAction, RepoJobKind,
+};
 use ts_rs::TS;
 
 fn format_ts() -> String {
@@ -123,4 +125,36 @@ fn the_ui_badges_every_finding_status() {
         missing.is_empty(),
         "statusBadgeClass in FindingCard.svelte has no case for {missing:?}"
     );
+}
+
+/// Every hold reason and release action has its own label, and an unknown
+/// one still renders.
+///
+/// The Needs-you cards print why work is held and one button per action
+/// the daemon offers (`HoldOut.actions`). A reason or action the switch
+/// does not name shows its raw wire string: legible, but it is the same
+/// silent degradation the finding types had.
+#[test]
+fn the_ui_labels_every_hold_reason_and_release_action() {
+    let src = format_ts();
+    let mut missing = Vec::new();
+    for (helper, wire) in [
+        (
+            "holdReasonLabel",
+            HoldReason::ALL.map(HoldReason::as_str).to_vec(),
+        ),
+        (
+            "releaseActionLabel",
+            ReleaseAction::ALL.map(ReleaseAction::as_str).to_vec(),
+        ),
+    ] {
+        let body = helper_body(&src, helper);
+        assert!(body.contains("default:"), "{helper} needs a fallback");
+        for w in wire {
+            if !body.contains(&format!("case \"{w}\":")) {
+                missing.push(format!("{helper} has no case for {w:?}"));
+            }
+        }
+    }
+    assert!(missing.is_empty(), "format.ts: {missing:#?}");
 }

@@ -18,7 +18,7 @@
 //!   `record_closed_harvest` (a closed PR's classification and its harvest
 //!   stamp). Those transactions close real races; do not unwind them to make a method look like the others.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -27,8 +27,8 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 
 use crate::auth::CurrentUser;
 use crate::domain::{
-    BudgetOverride, BugClass, FindingJobKind, FindingStatus, FindingType, ForgeName, JobKind,
-    JobState, RepoJobKind, Severity,
+    BudgetOverride, BugClass, ClosureClass, FindingJobKind, FindingStatus, FindingType, ForgeName,
+    HoldReason, JobKind, JobState, ReleaseAction, RepoJobKind, Severity,
 };
 use crate::types::{
     Event, Finding, Job, JobListEntry, PrState, Repo, SchedulerState, StatsByFinding, StatsByKind,
@@ -97,6 +97,59 @@ pub struct ResumeChainStats {
 pub struct WorkStreak {
     pub streak: i64,
     pub last_failure: Option<String>,
+}
+
+/// One active hold (`work_holds`), with what its release depends on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkHold {
+    pub id: i64,
+    pub finding_id: i64,
+    pub kind: FindingJobKind,
+    pub reason: HoldReason,
+    pub detail: String,
+    pub held_at: i64,
+    /// The work item's checkpoint: `continue` needs one.
+    pub checkpoint_job_id: Option<i64>,
+    /// The finding's status: a harvest's release depends on how its PR
+    /// ended.
+    pub status: FindingStatus,
+}
+
+impl WorkHold {
+    /// The actions that can release this hold, in [`ReleaseAction::ALL`]'s
+    /// order.
+    pub fn actions(&self) -> Vec<ReleaseAction> {
+        ReleaseAction::ALL
+            .into_iter()
+            .filter(|a| {
+                a.applies_to(self.kind)
+                    && action_fits(*a, self.status, self.checkpoint_job_id.is_some())
+            })
+            .collect()
+    }
+}
+
+/// Whether `action` fits the held work as it stands: `continue` needs a
+/// checkpoint, and a harvest is classified only for a closed PR and marked
+/// harvested only for a merged one.
+fn action_fits(action: ReleaseAction, status: FindingStatus, has_checkpoint: bool) -> bool {
+    match action {
+        ReleaseAction::Continue => has_checkpoint,
+        ReleaseAction::Classify => status == FindingStatus::Closed,
+        ReleaseAction::MarkHarvested => status == FindingStatus::Merged,
+        _ => true,
+    }
+}
+
+/// An operator's release of a hold ([`Store::release_hold`]).
+#[derive(Debug, Clone, Copy)]
+pub struct HoldRelease<'a> {
+    pub action: ReleaseAction,
+    /// The verdict's reason: required by `reject`, `wontfix` and `classify`.
+    pub reason: Option<&'a str>,
+    /// How a closed PR ended: required by `classify`.
+    pub classification: Option<ClosureClass>,
+    pub by: &'a CurrentUser,
 }
 
 /// A job row just inserted, and the checkpoints its insert superseded.
@@ -370,17 +423,176 @@ async fn point_checkpoint<'e, E: sqlx::SqliteExecutor<'e>>(
     Ok(())
 }
 
+/// The verdict a release writes, if its action is one: `(status, reason)`.
+/// Refused when it lacks its reason, or `classify` its classification.
+fn release_verdict(
+    action: ReleaseAction,
+    reason: Option<&str>,
+    classification: Option<ClosureClass>,
+) -> Result<Option<(FindingStatus, String)>, StoreWriteError> {
+    let reason = reason.map(str::trim).filter(|r| !r.is_empty());
+    let refuse = |msg: String| Err(StoreWriteError::Refused(msg));
+    Ok(match action {
+        ReleaseAction::Reject | ReleaseAction::Wontfix => {
+            let Some(reason) = reason else {
+                return refuse(format!("{action} needs a reason"));
+            };
+            let status = if action == ReleaseAction::Reject {
+                FindingStatus::Rejected
+            } else {
+                FindingStatus::Wontfix
+            };
+            Some((status, reason.chars().take(500).collect()))
+        }
+        ReleaseAction::Classify => {
+            let (Some(class), Some(reason)) = (classification, reason) else {
+                return refuse("classify needs a classification and a reason".to_owned());
+            };
+            Some((
+                class.status(),
+                format!("{class}: {reason}").chars().take(500).collect(),
+            ))
+        }
+        _ => None,
+    })
+}
+
+/// Write a release's verdict inside [`Store::release_hold`]'s transaction,
+/// with its `verdict` event as the operator's. The verdict moves the
+/// finding out of the tier, which ends the work item (migration 024's
+/// trigger); the hold is already released, so it is not released again as
+/// `finding-left-tier`. A `classify` also stamps the closed PR harvested,
+/// as its harvest would have.
+async fn write_release_verdict(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    finding_id: i64,
+    action: ReleaseAction,
+    status: FindingStatus,
+    text: &str,
+    user_id: i64,
+    now: i64,
+) -> sqlx::Result<()> {
+    sqlx::query!(
+        "UPDATE findings SET status = ?1, verdict_reason = ?2, updated_at = ?3 WHERE id = ?4",
+        status,
+        text,
+        now,
+        finding_id
+    )
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query!(
+        "DELETE FROM verdict_anchors WHERE finding_id = ?1",
+        finding_id
+    )
+    .execute(&mut **tx)
+    .await?;
+    if action == ReleaseAction::Classify {
+        sqlx::query!(
+            "UPDATE pr_state SET harvested_at = ?1 WHERE finding_id = ?2",
+            now,
+            finding_id
+        )
+        .execute(&mut **tx)
+        .await?;
+    }
+    let message = format!("finding {finding_id} -> {status}: {text}");
+    insert_event(
+        &mut **tx,
+        "verdict",
+        &message,
+        None,
+        Some(finding_id),
+        Some(user_id),
+    )
+    .await
+}
+
+/// The effect of releasing a hold with `action` on the work item and the
+/// PR, inside [`Store::release_hold`]'s transaction: `restart` drops the
+/// checkpoint, `mark_harvested` stamps the PR harvested, `dismiss` marks
+/// its current attention handled as a no-op engage would and drops the
+/// engage's checkpoint, since the finding stays in the engage tier and no
+/// trigger ends its work.
+async fn apply_release(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    finding_id: i64,
+    kind: FindingJobKind,
+    action: ReleaseAction,
+    now: i64,
+) -> sqlx::Result<()> {
+    match action {
+        ReleaseAction::Restart => {
+            sqlx::query!(
+                "UPDATE finding_work SET checkpoint_job_id = NULL \
+                 WHERE finding_id = ?1 AND kind = ?2",
+                finding_id,
+                kind
+            )
+            .execute(&mut **tx)
+            .await?;
+        }
+        ReleaseAction::MarkHarvested => {
+            sqlx::query!(
+                "UPDATE pr_state SET harvested_at = ?1 WHERE finding_id = ?2",
+                now,
+                finding_id
+            )
+            .execute(&mut **tx)
+            .await?;
+        }
+        ReleaseAction::Dismiss => {
+            // Dismissing ends the engage, as a no-op engage would: nothing
+            // may resume it and act on the PR the operator dismissed.
+            sqlx::query!(
+                "UPDATE finding_work SET checkpoint_job_id = NULL, streak = 0, last_failure = NULL \
+                 WHERE finding_id = ?1 AND kind = ?2",
+                finding_id,
+                kind
+            )
+            .execute(&mut **tx)
+            .await?;
+            sqlx::query!(
+                "UPDATE pr_state SET \
+                 last_engaged_activity_at = COALESCE(last_activity_at, ?1), \
+                 addressed_fingerprint = attention_fingerprint, \
+                 addressed_head_sha = head_sha, \
+                 needs_attention = NULL, attention_since = NULL \
+                 WHERE finding_id = ?2",
+                now,
+                finding_id
+            )
+            .execute(&mut **tx)
+            .await?;
+        }
+        // `continue` keeps the checkpoint; a verdict is written by the
+        // caller, with its event.
+        ReleaseAction::Continue
+        | ReleaseAction::Reject
+        | ReleaseAction::Wontfix
+        | ReleaseAction::Classify => {}
+    }
+    Ok(())
+}
+
 impl Store {
     // Private — all SQL goes through typed store methods.
     // No code outside this module can access the raw pool (field is not pub).
 
     // ── counting helpers (daemon sleep logic) ─────────────────────────
 
+    /// Queued fixes the scheduler can work on: held ones stay `queued` but
+    /// wait for the operator, and counting them would keep the daemon
+    /// cycling without sleep for nothing.
     pub async fn count_queued(&self) -> sqlx::Result<i64> {
         let status = FindingStatus::Queued;
+        let fix = FindingJobKind::Fix;
         sqlx::query_scalar!(
-            r#"SELECT COUNT(*) AS "n!: i64" FROM findings WHERE status = ?1"#,
-            status
+            r#"SELECT COUNT(*) AS "n!: i64" FROM findings f WHERE f.status = ?1
+               AND NOT EXISTS (SELECT 1 FROM work_holds h WHERE h.finding_id = f.id
+                               AND h.kind = ?2 AND h.released_at IS NULL)"#,
+            status,
+            fix
         )
         .fetch_one(&self.pool)
         .await
@@ -819,73 +1031,6 @@ impl Store {
         }
         tx.commit().await?;
         Ok(reopened)
-    }
-
-    /// Retain a fix checkpoint without treating its blocker as a rejection.
-    /// Both rows change atomically; a mismatched finding or non-fix job is an
-    /// error and leaves them untouched. Spend, transcript, notes, and the
-    /// original kill reason survive. The report is stored once, as the job's
-    /// `blocker`, which every resume of this chain inherits
-    /// ([`Self::create_job`]) and reads ([`Self::job_blocker`]), and the API
-    /// shows ([`Self::held_fix_blockers`]).
-    ///
-    /// The held job becomes the fix's checkpoint. An attempt whose worker
-    /// never ran (`Backend::run` failed) has no transcript of its own; it
-    /// takes over its predecessor's, so the chain still continues from
-    /// where it was when the operator queues it again.
-    pub async fn block_fix_job(
-        &self,
-        finding_id: i64,
-        job_id: i64,
-        reason: &str,
-    ) -> sqlx::Result<()> {
-        let now = now_ms();
-        let suspended = JobState::Suspended;
-        let fix = JobKind::Finding(FindingJobKind::Fix);
-        let blocked = FindingStatus::Blocked;
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let job = sqlx::query!(
-            "UPDATE jobs SET state = ?1, pid = NULL, blocker = ?2, \
-             finished_at = COALESCE(finished_at, ?3), \
-             session_file = COALESCE(session_file, \
-                 (SELECT p.session_file FROM jobs p WHERE p.id = jobs.resumed_from)) \
-             WHERE id = ?4 AND finding_id = ?5 AND kind = ?6",
-            suspended,
-            reason,
-            now,
-            job_id,
-            finding_id,
-            fix
-        )
-        .execute(&mut *tx)
-        .await?;
-        if job.rows_affected() == 0 {
-            return Err(sqlx::Error::RowNotFound);
-        }
-        let finding = sqlx::query!(
-            "UPDATE findings SET status = ?1, updated_at = ?2 WHERE id = ?3",
-            blocked,
-            now,
-            finding_id
-        )
-        .execute(&mut *tx)
-        .await?;
-        if finding.rows_affected() == 0 {
-            return Err(sqlx::Error::RowNotFound);
-        }
-        let fix_work = FindingJobKind::Fix;
-        sqlx::query!(
-            "INSERT INTO finding_work (finding_id, kind, streak, last_failure, checkpoint_job_id) \
-             VALUES (?1, ?2, 0, NULL, ?3) \
-             ON CONFLICT (finding_id, kind) DO UPDATE SET \
-                 streak = 0, last_failure = NULL, checkpoint_job_id = excluded.checkpoint_job_id",
-            finding_id,
-            fix_work,
-            job_id
-        )
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await
     }
 
     /// Set finding status to `pr_open` with PR URL.
@@ -1602,36 +1747,6 @@ impl Store {
             .collect())
     }
 
-    /// The worker report each `blocked` finding's held fix checkpoint is
-    /// blocked on (`jobs.blocker`, newest chain link without a successor):
-    /// `finding_id` -> report. The job row is the only store of that
-    /// report; this is how the API shows it.
-    pub async fn held_fix_blockers(&self) -> sqlx::Result<BTreeMap<i64, String>> {
-        let blocked = FindingStatus::Blocked;
-        let suspended = JobState::Suspended;
-        let fix = JobKind::Finding(FindingJobKind::Fix);
-        let rows = sqlx::query!(
-            r#"
-            SELECT j.finding_id AS "finding_id!: i64", j.blocker AS "blocker!: String"
-            FROM jobs j
-            JOIN findings f ON f.id = j.finding_id
-            WHERE f.status = ?1 AND j.state = ?2 AND j.kind = ?3
-              AND j.blocker IS NOT NULL
-              AND NOT EXISTS (SELECT 1 FROM jobs s WHERE s.resumed_from = j.id)
-            ORDER BY j.id
-            "#,
-            blocked,
-            suspended,
-            fix
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| (r.finding_id, r.blocker))
-            .collect())
-    }
-
     /// All `FindingStatus` keys zero-filled, then GROUP BY status counts.
     pub async fn status_counts(&self) -> sqlx::Result<BTreeMap<String, i64>> {
         let mut counts: BTreeMap<String, i64> = FindingStatus::ALL
@@ -1834,8 +1949,10 @@ impl Store {
     ///   the implicit-resume behaviour that once re-cached an unrelated
     ///   290-call transcript for 508,709 tokens on a single call;
     /// - a finding's work resumes only at the status its kind starts from:
-    ///   a fix at `queued`, not `fixing` (claimed) or `blocked` (held for
-    ///   the operator), and not while an attempt continuing it still runs.
+    ///   a fix at `queued`, not `fixing` (claimed), and not while an attempt
+    ///   continuing it still runs. Held work is still listed: whether it is
+    ///   held is the one shared query, [`Self::held_work`], which the
+    ///   scheduler applies to this list as to every tier.
     pub async fn list_resumable_jobs(&self) -> sqlx::Result<Vec<Job>> {
         let suspended = JobState::Suspended;
         let running = JobState::Running;
@@ -2013,7 +2130,15 @@ impl Store {
     /// IN (SELECT ...)` rather than a join: a node reachable by several
     /// paths appears once per depth, and joining on it would count that
     /// job's tokens once per appearance.
-    pub async fn resume_chain_stats(&self, job_id: i64) -> sqlx::Result<ResumeChainStats> {
+    ///
+    /// `since` limits the aggregate to attempts started after that instant:
+    /// the give-up ceiling counts only what the scheduler did after the
+    /// operator last released the work (WORK-MODEL.md §8).
+    pub async fn resume_chain_stats(
+        &self,
+        job_id: i64,
+        since: Option<i64>,
+    ) -> sqlx::Result<ResumeChainStats> {
         sqlx::query_as!(
             ResumeChainStats,
             r#"
@@ -2030,9 +2155,11 @@ impl Store {
                    COALESCE(SUM(resumed_from IS NULL OR killed_reason = 'cap' OR COALESCE(tokens_new, 0) > 0), 0) AS "attempts!: i64",
                    COALESCE(MAX(tokens_new), 0) AS "max_single!: i64"
             FROM jobs WHERE id IN (SELECT id FROM chain)
+              AND (?3 IS NULL OR started_at > ?3)
             "#,
             job_id,
-            RESUME_CHAIN_MAX_DEPTH
+            RESUME_CHAIN_MAX_DEPTH,
+            since
         )
         .fetch_one(&self.pool)
         .await
@@ -2240,10 +2367,9 @@ impl Store {
     /// holds its branch checked out, and git refuses to check one branch
     /// out in two worktrees.
     ///
-    /// A resumed attempt copies `pinned_sha` and `blocker` from the attempt
-    /// it continues, here in the INSERT, so every link of a chain names the
-    /// commit its shared tree was created at and the prerequisite, if any,
-    /// it was blocked on.
+    /// A resumed attempt copies `pinned_sha` from the attempt it continues,
+    /// here in the INSERT, so every link of a chain names the commit its
+    /// shared tree was created at.
     pub async fn create_job(
         &self,
         kind: JobKind,
@@ -2261,10 +2387,9 @@ impl Store {
         let result = sqlx::query!(
             "INSERT INTO jobs \
              (kind, repo_id, finding_id, cap_tokens, state, started_at, estimated_tokens, \
-              resumed_from, pinned_sha, blocker, full_history, full_hunt_request) \
+              resumed_from, pinned_sha, full_history, full_hunt_request) \
              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, \
                     (SELECT p.pinned_sha FROM jobs p WHERE p.id = ?8), \
-                    (SELECT p.blocker FROM jobs p WHERE p.id = ?8), \
                     COALESCE((SELECT p.full_history FROM jobs p WHERE p.id = ?8), 0), \
                     (SELECT p.full_hunt_request FROM jobs p WHERE p.id = ?8) \
              WHERE EXISTS (SELECT 1 FROM repos WHERE id = ?2 AND deleted_at IS NULL)",
@@ -2393,17 +2518,6 @@ impl Store {
     pub async fn pinned_sha(&self, job_id: i64) -> sqlx::Result<Option<String>> {
         Ok(
             sqlx::query_scalar!("SELECT pinned_sha FROM jobs WHERE id = ?1", job_id)
-                .fetch_optional(&self.pool)
-                .await?
-                .flatten(),
-        )
-    }
-
-    /// The prerequisite report `job_id`'s fix chain is blocked on: set by
-    /// [`Self::block_fix_job`], inherited by every resume of the chain.
-    pub async fn job_blocker(&self, job_id: i64) -> sqlx::Result<Option<String>> {
-        Ok(
-            sqlx::query_scalar!("SELECT blocker FROM jobs WHERE id = ?1", job_id)
                 .fetch_optional(&self.pool)
                 .await?
                 .flatten(),
@@ -2901,7 +3015,7 @@ impl Store {
 
     /// Non-suppressed findings for a repo+type (novelty comparison).
     ///
-    /// Everything except the verdicts that mean forget this. A blocked fix,
+    /// Everything except the verdicts that mean forget this. A held fix,
     /// merged work, or a noted finding remains knowledge a hunt should not
     /// rediscover as novel; "known" does not mean "still in flight".
     pub async fn known_active(
@@ -3023,8 +3137,8 @@ impl Store {
     /// old one behind. Only `new` and `queued` (no worker has started on
     /// it), and a finding [`Self::supersede_unproposed_dep_updates`] retired,
     /// which comes back as `new`: the scan proposing it again means it never
-    /// landed. Not a `queued` one whose fix has a checkpoint: a worker is
-    /// part way to the old target, and resuming it against a rewritten one
+    /// landed. Not a `queued` one whose fix has a checkpoint or is held: a
+    /// worker is part way to the old target, and resuming it against a rewritten one
     /// would mix the two (WORK-MODEL.md G2). `true` when anything changed.
     pub async fn refresh_dep_update(
         &self,
@@ -3060,6 +3174,8 @@ impl Store {
                AND (status IN (?13, ?16) OR (status = ?12 AND verdict_reason = ?17)) \
                AND NOT EXISTS (SELECT 1 FROM finding_work w WHERE w.finding_id = ?15 \
                    AND w.kind = 'fix' AND w.checkpoint_job_id IS NOT NULL) \
+               AND NOT EXISTS (SELECT 1 FROM work_holds h WHERE h.finding_id = ?15 \
+                   AND h.kind = 'fix' AND h.released_at IS NULL) \
                AND (status = ?12 OR file IS NOT ?1 OR severity IS NOT ?2 \
                     OR confidence IS NOT ?3 OR summary IS NOT ?4 OR detail IS NOT ?5 \
                     OR ecosystem IS NOT ?6 OR package IS NOT ?7 \
@@ -3144,8 +3260,8 @@ impl Store {
     /// before branch grouping keyed on versions, and one whose installed
     /// version moved has a new fingerprint. Without it the queued one and
     /// the proposal would both be worked. A queued finding with no such
-    /// match is left as it is, and so is one whose fix has a checkpoint:
-    /// handing it over would drop the work a paused fix has done for a
+    /// match is left as it is, and so is one whose fix has a checkpoint or
+    /// is held: handing it over would drop the work a paused fix has done for a
     /// fresh fix of the scan's finding (WORK-MODEL.md G2). `moves` is every
     /// move of every finding the scan produced. Returns how many were
     /// handed over.
@@ -3177,6 +3293,8 @@ impl Store {
                WHERE q.repo_id = ?1 AND q.type = 'dep_update' AND q.status = ?2
                  AND NOT EXISTS (SELECT 1 FROM finding_work w WHERE w.finding_id = q.id
                      AND w.kind = 'fix' AND w.checkpoint_job_id IS NOT NULL)
+                 AND NOT EXISTS (SELECT 1 FROM work_holds h WHERE h.finding_id = q.id
+                     AND h.kind = 'fix' AND h.released_at IS NULL)
                  AND q.fingerprint NOT IN
                      (SELECT json_extract(value, '$.fingerprint') FROM json_each(?4))
                GROUP BY q.id"#,
@@ -3661,6 +3779,248 @@ impl Store {
         )
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    // -- holds (WORK-MODEL.md §9) ---------------------------------------------
+
+    /// Every work item held for the operator: the one answer to "is this
+    /// held?", which every finding tier, the resume tier and the summary
+    /// preview all read (§9.5, invariant 3).
+    pub async fn held_work(&self) -> sqlx::Result<BTreeSet<(i64, FindingJobKind)>> {
+        let rows = sqlx::query!(
+            r#"SELECT finding_id AS "finding_id!: i64", kind AS "kind!: FindingJobKind"
+               FROM work_holds WHERE released_at IS NULL"#
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| (r.finding_id, r.kind)).collect())
+    }
+
+    /// Every active hold with the facts its release depends on, oldest
+    /// first: for the API's `holds`.
+    pub async fn active_holds(&self) -> sqlx::Result<Vec<WorkHold>> {
+        sqlx::query_as!(
+            WorkHold,
+            r#"
+            SELECT h.id AS "id!: i64", h.finding_id AS "finding_id!: i64",
+                   h.kind AS "kind!: FindingJobKind", h.reason AS "reason!: HoldReason",
+                   h.detail, h.held_at AS "held_at!: i64",
+                   w.checkpoint_job_id,
+                   f.status AS "status!: FindingStatus"
+            FROM work_holds h
+            JOIN findings f ON f.id = h.finding_id
+            LEFT JOIN finding_work w ON w.finding_id = h.finding_id AND w.kind = h.kind
+            WHERE h.released_at IS NULL
+            ORDER BY h.held_at, h.id
+            "#
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Hold `finding_id`'s `kind` work for the operator (§9), in one
+    /// transaction with its `hold` event. The streak ends, and the work
+    /// item's checkpoint becomes `job` if a worker ran in it (it has a
+    /// transcript). Without one (no job, or a tree never made, G9) the
+    /// checkpoint the work item already had stays: the work done before it
+    /// is still there to continue, and with none the operator can only
+    /// restart.
+    ///
+    /// Only while the finding is in that kind's tier (invariant 2): work
+    /// that has left it is over, and `false` says nothing was held. `false`
+    /// too when the work item is already held, which the partial unique
+    /// index enforces.
+    pub async fn hold_work(
+        &self,
+        finding_id: i64,
+        kind: FindingJobKind,
+        reason: HoldReason,
+        detail: &str,
+        job: Option<i64>,
+    ) -> sqlx::Result<bool> {
+        let now = now_ms();
+        let harvest = FindingJobKind::Harvest;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let held = sqlx::query!(
+            "INSERT INTO work_holds (finding_id, kind, reason, detail, held_at) \
+             SELECT ?1, ?2, ?3, ?4, ?5 \
+             WHERE EXISTS (SELECT 1 FROM findings f \
+                           JOIN work_tiers t ON t.status = f.status AND t.kind = ?2 \
+                           WHERE f.id = ?1) \
+               AND (?2 <> ?6 OR NOT EXISTS (SELECT 1 FROM pr_state p \
+                    WHERE p.finding_id = ?1 AND p.harvested_at IS NOT NULL)) \
+             ON CONFLICT (finding_id, kind) WHERE released_at IS NULL DO NOTHING",
+            finding_id,
+            kind,
+            reason,
+            detail,
+            now,
+            harvest
+        )
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+        if !held {
+            return Ok(false);
+        }
+        sqlx::query!(
+            "INSERT INTO finding_work (finding_id, kind, streak, last_failure, checkpoint_job_id) \
+             VALUES (?1, ?2, 0, NULL, \
+                     (SELECT id FROM jobs WHERE id = ?3 AND session_file IS NOT NULL)) \
+             ON CONFLICT (finding_id, kind) DO UPDATE SET \
+                 streak = 0, last_failure = NULL, \
+                 checkpoint_job_id = COALESCE(excluded.checkpoint_job_id, \
+                                              finding_work.checkpoint_job_id)",
+            finding_id,
+            kind,
+            job
+        )
+        .execute(&mut *tx)
+        .await?;
+        let first_line: String = detail
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .take(200)
+            .collect();
+        let message = format!("#{finding_id} {kind} held ({reason}): {first_line}");
+        insert_event(&mut *tx, "hold", &message, job, Some(finding_id), None).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// When `finding_id`'s `kind` work was last released, if ever. The give-up
+    /// ceiling counts only what the scheduler did after that (§8).
+    pub async fn last_release_at(
+        &self,
+        finding_id: i64,
+        kind: FindingJobKind,
+    ) -> sqlx::Result<Option<i64>> {
+        sqlx::query_scalar!(
+            r#"SELECT MAX(released_at) AS "at?: i64" FROM work_holds
+               WHERE finding_id = ?1 AND kind = ?2"#,
+            finding_id,
+            kind
+        )
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// The hold an operator released with `continue` after checkpoint `job`
+    /// was made, if there is one: the first attempt resuming `job` is the
+    /// one the operator asked for, and its prompt says why the work was
+    /// held. A later checkpoint was made after the release, so its resume
+    /// is an ordinary one.
+    pub async fn continued_hold(
+        &self,
+        finding_id: i64,
+        kind: FindingJobKind,
+        job: i64,
+    ) -> sqlx::Result<Option<(HoldReason, String)>> {
+        let continue_ = ReleaseAction::Continue;
+        let row = sqlx::query!(
+            r#"SELECT h.reason AS "reason!: HoldReason", h.detail
+               FROM work_holds h
+               WHERE h.finding_id = ?1 AND h.kind = ?2 AND h.release_action = ?3
+                 AND h.released_at >= COALESCE(
+                     (SELECT finished_at FROM jobs WHERE id = ?4), 0)
+               ORDER BY h.released_at DESC, h.id DESC
+               LIMIT 1"#,
+            finding_id,
+            kind,
+            continue_,
+            job
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| (r.reason, r.detail)))
+    }
+
+    /// An operator's release of `finding_id`'s `kind` hold (§9.3), in one
+    /// transaction: the hold row records who, when and how, the action
+    /// takes effect, and the `release` event (plus `verdict` for a verdict)
+    /// is logged as theirs.
+    ///
+    /// Refused when there is no active hold, when `action` does not apply
+    /// to the kind or to how the PR ended, when `continue` has no
+    /// checkpoint to continue, or when a verdict lacks its reason or a
+    /// classification its class.
+    pub async fn release_hold(
+        &self,
+        finding_id: i64,
+        kind: FindingJobKind,
+        release: &HoldRelease<'_>,
+    ) -> Result<(), StoreWriteError> {
+        let HoldRelease {
+            action,
+            reason,
+            classification,
+            by,
+        } = *release;
+        let refuse = |msg: String| Err(StoreWriteError::Refused(msg));
+        if !action.applies_to(kind) {
+            return refuse(format!("a {kind} hold cannot be released with {action}"));
+        }
+        let now = now_ms();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let hold = sqlx::query!(
+            r#"SELECT h.id AS "id!: i64", w.checkpoint_job_id,
+                      f.status AS "status!: FindingStatus"
+               FROM work_holds h
+               JOIN findings f ON f.id = h.finding_id
+               LEFT JOIN finding_work w ON w.finding_id = h.finding_id AND w.kind = h.kind
+               WHERE h.finding_id = ?1 AND h.kind = ?2 AND h.released_at IS NULL"#,
+            finding_id,
+            kind
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(hold) = hold else {
+            return refuse(format!("#{finding_id} has no active {kind} hold"));
+        };
+        if !action_fits(action, hold.status, hold.checkpoint_job_id.is_some()) {
+            return refuse(format!(
+                "#{finding_id}'s {kind} hold cannot be released with {action} \
+                 (finding {}, {})",
+                hold.status,
+                if hold.checkpoint_job_id.is_some() {
+                    "with a checkpoint"
+                } else {
+                    "no checkpoint"
+                }
+            ));
+        }
+        let verdict = release_verdict(action, reason, classification)?;
+
+        let released_by = by.username.as_str();
+        sqlx::query!(
+            "UPDATE work_holds SET released_at = ?1, released_by = ?2, release_action = ?3 \
+             WHERE id = ?4",
+            now,
+            released_by,
+            action,
+            hold.id
+        )
+        .execute(&mut *tx)
+        .await?;
+        let message = format!("#{finding_id} {kind} hold released: {action}");
+        insert_event(
+            &mut *tx,
+            "release",
+            &message,
+            None,
+            Some(finding_id),
+            Some(by.id),
+        )
+        .await?;
+        apply_release(&mut tx, finding_id, kind, action, now).await?;
+        if let Some((status, text)) = verdict {
+            write_release_verdict(&mut tx, finding_id, action, status, &text, by.id, now).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 

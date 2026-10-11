@@ -1,7 +1,7 @@
 <script lang="ts">
   import { store, post } from "../lib/api.svelte";
   import type { FindingOut } from "../lib/types";
-  import { isHttpUrl, pct, datetime, typeLabel } from "../lib/format";
+  import { isHttpUrl, pct, datetime, typeLabel, holdReasonLabel, releaseActionLabel } from "../lib/format";
   import { nearViewport } from "../lib/nearViewport";
   import { navigation } from "../lib/navigation.svelte";
   import FindingDetail from "./FindingDetail.svelte";
@@ -17,6 +17,12 @@
   let followUps = $derived(finding.follow_ups ?? []);
   let reasonText = $state("");
   let showReasonPrompt = $state<string | null>(null); // "rejected" | "wontfix" | null
+  // Held work (WORK-MODEL.md §9): absent when talking to a daemon that
+  // predates the field. One hold per kind, so the kind keys a prompt.
+  let holds = $derived(finding.holds ?? []);
+  let holdPrompt = $state<{ kind: string; action: string } | null>(null);
+  let holdReason = $state("");
+  let classification = $state("superseded");
   let busy = $state(false);
   let timelineOpen = $state(false);
 
@@ -36,13 +42,15 @@
   let lastHeight = $state<number | null>(null);
   // Mid-interaction cards stay mounted off screen: unmounting would close an
   // open panel or drop a half-typed reason.
-  const live = $derived(near || expanded || timelineOpen || showReasonPrompt !== null || busy);
+  const live = $derived(
+    near || expanded || timelineOpen || showReasonPrompt !== null || holdPrompt !== null || busy,
+  );
 
   // Which actions the finding's status allows, mirroring the server's state
   // machine (`FindingStatus::awaits_verdict` and the /api/recheck and
   // /api/unqueue preconditions), so a card never offers a button the API
   // would refuse. `actions` only says whether the page shows them at all.
-  const awaitsVerdict = $derived(["new", "blocked", "note", "closed"].includes(finding.status));
+  const awaitsVerdict = $derived(["new", "note", "closed"].includes(finding.status));
   const canRecheck = $derived(finding.status === "new");
   const canUnqueue = $derived(finding.status === "queued");
   // An override is honoured by the tiers that pick queued, rechecking,
@@ -80,7 +88,6 @@
       case "queued": return "status-queued";
       case "rechecking": return "status-rechecking";
       case "fixing": return "status-fixing";
-      case "blocked": return "status-blocked";
       case "pr_open": return "status-pr-open";
       case "merged": return "status-merged";
       case "closed": return "status-closed";
@@ -117,6 +124,35 @@
       console.error(`verdict ${status} for finding ${finding.id} failed`, err);
     } finally {
       // Re-arm the buttons even if the request never reached the server.
+      busy = false;
+    }
+  }
+
+  // A verdict needs the operator's reason, and a closed PR's
+  // classification its class: those actions ask first.
+  const needsReason = (action: string) => ["reject", "wontfix", "classify"].includes(action);
+
+  async function doRelease(kind: string, action: string, reason?: string) {
+    busy = true;
+    try {
+      const r = await post("/api/hold/release", {
+        finding_id: finding.id,
+        kind,
+        action,
+        reason: reason || undefined,
+        classification: action === "classify" ? classification : undefined,
+      });
+      if (!r.ok) {
+        // post() resolves on 4xx/5xx — keep the prompt and its text.
+        console.error(`release ${action} of finding ${finding.id}'s ${kind} rejected with HTTP ${r.status}`);
+        return;
+      }
+      await store.refresh();
+      holdPrompt = null;
+      holdReason = "";
+    } catch (err) {
+      console.error(`release ${action} of finding ${finding.id}'s ${kind} failed`, err);
+    } finally {
       busy = false;
     }
   }
@@ -224,12 +260,51 @@
     <!-- Summary -->
     <p class="summary">{finding.summary}</p>
 
-    {#if finding.status === "blocked"}
-      <div class="blocker-reason">
-        <strong>Blocked:</strong>
-        {finding.blocker ?? "(no reason recorded)"}
+    {#each holds as hold (hold.kind)}
+      <div class="hold">
+        <div class="hold-head">
+          <strong>Needs you:</strong> {hold.kind} — {holdReasonLabel(hold.reason)}
+          <span class="hold-at">since {datetime(hold.held_at)}</span>
+        </div>
+        <div class="hold-detail">{hold.detail || "(no detail recorded)"}</div>
+        {#if actions}
+          {#if holdPrompt?.kind === hold.kind}
+            <div class="reason-row">
+              {#if holdPrompt.action === "classify"}
+                <select class="reason-input" bind:value={classification} aria-label="Classification">
+                  {#each ["superseded", "duplicate", "obsolete", "wrong", "unwanted", "abandoned"] as c (c)}
+                    <option value={c}>{c}</option>
+                  {/each}
+                </select>
+              {/if}
+              <input
+                type="text"
+                class="reason-input"
+                placeholder="Reason for {releaseActionLabel(holdPrompt.action)}…"
+                bind:value={holdReason}
+                onkeydown={(e: KeyboardEvent) => { if (e.key === "Enter" && !busy && holdReason.trim()) doRelease(hold.kind, holdPrompt!.action, holdReason.trim()); }}
+              />
+              <button
+                class="btn btn-confirm"
+                disabled={busy || !holdReason.trim()}
+                onclick={() => doRelease(hold.kind, holdPrompt!.action, holdReason.trim())}
+              >Confirm</button>
+              <button class="btn btn-muted" onclick={() => { holdPrompt = null; holdReason = ""; }}>Cancel</button>
+            </div>
+          {:else}
+            <div class="btn-row">
+              {#each hold.actions as action (action)}
+                <button
+                  class="btn {action === 'continue' ? 'btn-queue' : action === 'reject' ? 'btn-reject' : 'btn-muted'}"
+                  disabled={busy}
+                  onclick={() => { if (needsReason(action)) { holdPrompt = { kind: hold.kind, action }; } else { doRelease(hold.kind, action); } }}
+                >{releaseActionLabel(action)}</button>
+              {/each}
+            </div>
+          {/if}
+        {/if}
       </div>
-    {/if}
+    {/each}
 
     <!-- Subtitle: fingerprint + file:line -->
     <div class="meta-line">
@@ -314,8 +389,8 @@
                 class="btn btn-queue"
                 disabled={busy}
                 onclick={() => doVerdict("queued")}
-                title={finding.status === "blocked" ? "Resume retained fix work after resolving the prerequisite" : "Queue for fix"}
-              >{finding.status === "blocked" ? "Resume fix" : "Queue"}</button>
+                title="Queue for fix"
+              >Queue</button>
               <button class="btn btn-reject" disabled={busy} onclick={() => { showReasonPrompt = "rejected"; }} title="Reject">Reject</button>
               <button class="btn btn-muted" disabled={busy} onclick={() => { showReasonPrompt = "wontfix"; }} title="Won't fix">Wontfix</button>
               {#if finding.status !== "note"}
@@ -541,7 +616,6 @@
   }
   .status-new, .status-rechecking { background: rgba(78, 168, 222, 0.12); color: var(--accent); }
   .status-queued, .status-fixing  { background: rgba(255, 153, 0, 0.12); color: var(--sev-medium); }
-  .status-blocked                 { background: rgba(255, 153, 0, 0.18); color: var(--sev-medium); border: 1px solid var(--sev-medium); }
   .status-pr-open                 { background: rgba(68, 238, 136, 0.12); color: var(--ok); }
   .status-merged                  { background: rgba(68, 238, 136, 0.18); color: var(--ok); }
   /* Closed unmerged, awaiting its harvest: not a failure (and not suppressed),
@@ -561,15 +635,23 @@
     word-break: break-word;
   }
 
-  .blocker-reason {
+  .hold {
     margin-top: 0.5rem;
     padding: 0.5rem 0.625rem;
     border-left: 2px solid var(--sev-medium);
-    background: rgba(255, 153, 0, 0.06);
-    font-size: 0.8125rem;
-    line-height: 1.5;
+    background: var(--bg-panel);
+    font-size: 0.75rem;
+  }
+  .hold-at {
+    color: var(--text-dim);
+    margin-left: 0.375rem;
+  }
+  .hold-detail {
+    margin: 0.25rem 0 0.375rem;
     white-space: pre-wrap;
-    overflow-wrap: anywhere;
+    max-height: 8rem;
+    overflow: auto;
+    color: var(--text-dim);
   }
 
   /* ── Meta (fingerprint + location) ──────────────────────────── */

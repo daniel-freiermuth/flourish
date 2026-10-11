@@ -21,9 +21,14 @@
     { key: "closed", label: "Closed", filter: (f: FindingOut) => f.status === "closed" },
   ];
 
-  // Active pipeline and blocked work share the same filters.
+  // Work held for the operator (WORK-MODEL.md §9): absent from a daemon
+  // that predates the field. Held findings wait in "Needs you", not in the
+  // column of a status nothing will move them out of until a release.
+  const isHeld = (f: FindingOut) => (f.holds ?? []).length > 0;
+
+  // Active pipeline and held work share the same filters.
   const pipelineFindings = $derived(
-    store.findings.filter((f) => f.status === "blocked" || COLUMNS.some((c) => c.filter(f)))
+    store.findings.filter((f) => isHeld(f) || COLUMNS.some((c) => c.filter(f)))
   );
 
   const filtered = $derived(filterFindings(pipelineFindings, navigation.route.params, { repoNames, showStatus: false }));
@@ -32,15 +37,15 @@
   const columns = $derived(
     COLUMNS.map((col) => ({
       ...col,
-      findings: filtered.filter((f) => col.filter(f)),
+      findings: filtered.filter((f) => !isHeld(f) && col.filter(f)),
       attentionCount: col.key === "pr_review"
         ? filtered.filter((f) => f.status === "pr_open" && !!f.needs_attention).length
         : 0,
     }))
   );
 
-  const blocked = $derived(filtered.filter((f) => f.status === "blocked"));
-  const hasBlocked = $derived(store.findings.some((f) => f.status === "blocked"));
+  const held = $derived(filtered.filter(isHeld));
+  const hasHeld = $derived(store.findings.some(isHeld));
 
   // Suppressed (rejected + wontfix) and notes — below the pipeline
   const suppressed = $derived(
@@ -121,18 +126,18 @@
     {/each}
   </div>
 
-  {#if hasBlocked}
-    <section class="blocked-section" aria-labelledby="blocked-heading">
-      <h3 id="blocked-heading" class="blocked-heading">
-        Blocked
-        <span class="section-count">{blocked.length}</span>
+  {#if hasHeld}
+    <section class="held-section" aria-labelledby="held-heading">
+      <h3 id="held-heading" class="held-heading">
+        Needs you
+        <span class="section-count">{held.length}</span>
       </h3>
-      <p class="blocked-help">Fix work is retained. Resolve the prerequisite below, then resume the fix; normal budget limits still apply.</p>
-      {#if blocked.length === 0}
-        <p class="blocked-help">No blocked findings match the current filters.</p>
+      <p class="held-help">Work stopped for you: a missing prerequisite, a failure that kept repeating, or a chain that ran out of budget. Continue resumes the retained work with a fresh budget; restart starts it over.</p>
+      {#if held.length === 0}
+        <p class="held-help">No held work matches the current filters.</p>
       {:else}
-        <div class="section-body" data-scroll-list="blocked">
-          {#each blocked as finding (finding.id)}
+        <div class="section-body" data-scroll-list="held">
+          {#each held as finding (finding.id)}
             <FindingCard {finding} actions={true} />
           {/each}
         </div>
@@ -321,7 +326,7 @@
     margin-bottom: 0;
   }
 
-  .blocked-section {
+  .held-section {
     margin-top: 1.25rem;
     padding: 0.75rem;
     border: 1px solid var(--sev-medium);
@@ -329,7 +334,7 @@
     background: var(--bg-panel);
   }
 
-  .blocked-heading {
+  .held-heading {
     display: flex;
     align-items: center;
     gap: 0.375rem;
@@ -338,7 +343,7 @@
     font-size: 0.875rem;
   }
 
-  .blocked-help {
+  .held-help {
     margin: 0.375rem 0 0.625rem;
     color: var(--text-dim);
     font-size: 0.75rem;

@@ -771,3 +771,53 @@ pub async fn point_checkpoint(pool: &SqlitePool, fid: i64, kind: &str, job: i64)
     .await
     .unwrap();
 }
+
+/// The operator account `tester`, created on first use: who releases a
+/// hold in a test.
+pub async fn operator(store: &Store) -> hunter::auth::CurrentUser {
+    if let Some((user, _)) = store.login_candidate("tester").await.unwrap() {
+        return user;
+    }
+    let id = store.create_user("tester", "unused").await.unwrap();
+    hunter::auth::CurrentUser {
+        id,
+        username: "tester".to_owned(),
+    }
+}
+
+/// The active hold on finding `fid`'s `kind` work, if any.
+pub async fn hold_of(
+    store: &Store,
+    fid: i64,
+    kind: hunter::domain::FindingJobKind,
+) -> Option<hunter::store::WorkHold> {
+    store
+        .active_holds()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|h| h.finding_id == fid && h.kind == kind)
+}
+
+/// Release finding `fid`'s `kind` hold with `action`, as `tester`.
+pub async fn release(
+    store: &Store,
+    fid: i64,
+    kind: hunter::domain::FindingJobKind,
+    action: hunter::domain::ReleaseAction,
+) {
+    let by = operator(store).await;
+    store
+        .release_hold(
+            fid,
+            kind,
+            &hunter::store::HoldRelease {
+                action,
+                reason: None,
+                classification: None,
+                by: &by,
+            },
+        )
+        .await
+        .unwrap();
+}

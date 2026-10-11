@@ -4,6 +4,7 @@ import type { BugClass } from "./BugClass";
 import type { Event } from "./Event";
 import type { FindingStatus } from "./FindingStatus";
 import type { FindingType } from "./FindingType";
+import type { HoldOut } from "./HoldOut";
 import type { Severity } from "./Severity";
 
 /**
@@ -26,10 +27,10 @@ timeline: Array<Event>,
  */
 needs_attention?: string | null, 
 /**
- * Present ONLY for status == "blocked" rows whose held fix checkpoint
- * carries a report (`jobs.blocker`).
+ * The finding's work held for the operator (WORK-MODEL.md §9), at
+ * most one per kind, oldest first. Always present, [] when none.
  */
-blocker?: string, 
+holds: Array<HoldOut>, 
 /**
  * The finding whose engage/harvest job filed this one as a follow-up;
  * null for everything a hunt or analysis job found. Always present.

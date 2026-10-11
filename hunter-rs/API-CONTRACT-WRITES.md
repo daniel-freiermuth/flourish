@@ -63,17 +63,17 @@ A non-string `name` on `/api/repos` used to belong in that row and no longer doe
 
 ### 0.4 Status vocabulary (types.py)
 
-- `FINDING_STATUSES` = all of `Status` (types.py:66): `new, rechecking, queued, fixing, pr_open, merged, rejected, wontfix, note` (types.py:23-32). Rust (`FindingStatus::ALL`) also includes `closed`, `superseded`, and `blocked`.
-- Rust `VERDICT_STATUSES`: `queued, rejected, wontfix, note` (`blocked`, `closed` and `superseded` are scheduler-only; `merged` is set only by the PR sync from the forge's state — a deliberate break from Python, which accepted it as a verdict).
+- `FINDING_STATUSES` = all of `Status` (types.py:66): `new, rechecking, queued, fixing, pr_open, merged, rejected, wontfix, note` (types.py:23-32). Rust (`FindingStatus::ALL`) also includes `closed` and `superseded`. `blocked` existed until migration 025 turned every blocked fix into a hold (WORK-MODEL.md §11).
+- Rust `VERDICT_STATUSES`: `queued, rejected, wontfix, note` (`closed` and `superseded` are scheduler-only; `merged` is set only by the PR sync from the forge's state — a deliberate break from Python, which accepted it as a verdict).
 - Rust `REASON_REQUIRED`: `rejected, wontfix`.
-- `blocked` is a held prerequisite, not suppression, and only the scheduler sets it: a worker `BLOCKED.md` (or repeated identical failures) atomically changes its finding to blocked and its fix job to suspended, preserving the checkpoint and storing the whole report once, in `jobs.blocker` (shown as `/api/findings` `blocker`). `POST /api/verdict` with `queued` enables that original fix transcript for continuation; budget denial leaves reports untouched. While blocked it is excluded from automatic resume selection.
-- **Who owns a finding.** A finding at `new`, `blocked`, `note` or `closed` waits for the operator; every other status belongs to a job (`queued`/`fixing`: fix, `rechecking`: recheck, `pr_open`: engage) or the forge. Operator writes only start from the statuses that ask for them (`/api/verdict`: `new`/`blocked`/`note`/`closed`, `/api/recheck`: `new`, `/api/unqueue`: `queued`), and each is a single UPDATE conditional on the status it just checked, so a job that claims the finding in between keeps it (409). `run_fix` claims `queued` → `fixing` the same way before creating its job; if the operator unqueued the finding after it was picked, the claim fails, the cycle is `skipped`, and the daemon starts the next cycle at once. So nothing changes a finding's status while its job runs, and the jobs' completion writes need no guard of their own.
+- **Held work is not a status.** A hold stops one kind of a finding's work for the operator and leaves its status alone (WORK-MODEL.md §9): a held fix stays `queued`, its tier skips it. `/api/findings` shows each finding's active holds (`holds`, API-CONTRACT.md §4) and `POST /api/hold/release` (§11 below) ends one. Budget denial leaves a hold and its checkpoint untouched.
+- **Who owns a finding.** A finding at `new`, `note` or `closed` waits for the operator, and so does held work at any status; every other status belongs to a job (`queued`/`fixing`: fix, `rechecking`: recheck, `pr_open`: engage) or the forge. Operator writes only start from the statuses that ask for them (`/api/verdict`: `new`/`note`/`closed`, `/api/hold/release`: an active hold, `/api/recheck`: `new`, `/api/unqueue`: `queued`), and each is a single UPDATE conditional on the status it just checked, so a job that claims the finding in between keeps it (409). `run_fix` claims `queued` → `fixing` the same way before creating its job; if the operator unqueued the finding after it was picked, the claim fails, the cycle is `skipped`, and the daemon starts the next cycle at once. So nothing changes a finding's status while its job runs, and the jobs' completion writes need no guard of their own.
 
 Transition legality as enforced by the server:
 
 | Endpoint | Precondition on current status | New status | Reason |
 |---|---|---|---|
-| `/api/verdict` | Rust: `new`, `blocked`, `note` or `closed`, and different from the new status (Python: none — any current status, including `fixing`/`pr_open`) | any of `VERDICT_STATUSES` | mandatory iff new status in `rejected, wontfix`; optional otherwise |
+| `/api/verdict` | Rust: `new`, `note` or `closed`, and different from the new status (Python: none — any current status, including `fixing`/`pr_open`) | any of `VERDICT_STATUSES` | mandatory iff new status in `rejected, wontfix`; optional otherwise |
 | `/api/recheck` | exactly `new` (Rust: conditional write, 409 if it changed after the check) | `rechecking` | n/a |
 | `/api/unqueue` | exactly `queued` (Rust: conditional write, 409 if it changed after the check) | `new` | n/a |
 
@@ -92,7 +92,7 @@ Handler `_verdict` (server.py:458-487).
 2. `status not in VERDICT_STATUSES` -> `400` with `f"status must be one of {list(VERDICT_STATUSES)}"` (server.py:466-471). Because `Status` is a `StrEnum`, the f-string renders **enum reprs**, byte-exact: `status must be one of [<Status.QUEUED: 'queued'>, <Status.REJECTED: 'rejected'>, <Status.WONTFIX: 'wontfix'>, <Status.NOTE: 'note'>, <Status.MERGED: 'merged'>]` `[INFERENCE from CPython StrEnum repr; UI only displays the string]`. String comparison works because StrEnum members `==` their values. Rust emits the plain values and, without `merged`, refuses it here: `status must be one of ['queued', 'rejected', 'wontfix', 'note']`.
 3. `status in REASON_REQUIRED and not reason` -> `400 {"error": "reason required for status 'rejected'"}` (repr-quoted status, server.py:472-474).
 4. `get_finding(fid)` is None -> `404 {"error": "no finding <fid>"}` (server.py:476-479). `get_finding` = `SELECT * FROM findings WHERE id = ?` (store.py:859-861).
-5. **Rust only (deliberate break from Python):** the current status is not one that asks the operator for a verdict (`new`, `blocked`, `note`, `closed`; `FindingStatus::awaits_verdict`), or equals the new status -> `400 {"error": "finding #<id> is '<status>'; a verdict applies only to new, blocked, note or closed findings, and must change its status"}`. `closed` is included because a closed-PR harvest that gives up leaves the finding `closed` and never revisits it, so only a verdict can settle it; a harvest still running keeps the verdict (`record_closed_harvest` only replaces `closed`). Everywhere else a job (`fixing`, `rechecking`, `pr_open`) or the forge (`merged`) owns the finding. The write is conditional on the status just read, so a job that claims the finding in between keeps it: `409 {"error": "finding #<id> changed while the verdict was being applied; reload and retry"}`.
+5. **Rust only (deliberate break from Python):** the current status is not one that asks the operator for a verdict (`new`, `note`, `closed`; `FindingStatus::awaits_verdict`), or equals the new status -> `400 {"error": "finding #<id> is '<status>'; a verdict applies only to new, note or closed findings, and must change its status"}`. `closed` is included because a closed-PR harvest that gives up leaves the finding `closed` and never revisits it, so only a verdict can settle it; a harvest still running keeps the verdict (`record_closed_harvest` only replaces `closed`). Everywhere else a job (`fixing`, `rechecking`, `pr_open`) or the forge (`merged`) owns the finding. The write is conditional on the status just read, so a job that claims the finding in between keeps it: `409 {"error": "finding #<id> changed while the verdict was being applied; reload and retry"}`.
 
 **Writes** (server.py:480-486):
 1. `set_status(fid, status, verdict_reason=reason)` -> `UPDATE findings SET status = ?, updated_at = ?[, verdict_reason = ?] WHERE id = ?` + commit (store.py:913-937). `verdict_reason` is only included when reason is non-None — **a verdict without reason does NOT clear a previously stored verdict_reason**.
@@ -383,7 +383,23 @@ Accounts are created by the operator (`hunter user add|passwd|disable <name>`, `
 - **`GET /api/me`** — `200 {"username": str}` (`SessionUser`).
 - `hunter user passwd` and `hunter user disable` delete every session of the account in the same transaction.
 
-**Attribution.** The handlers that log an event for an operator action (§1 verdict, §3 recheck, §4 unqueue, §5 override, §6–§9 repo writes, including §8.1) record the session's account in `events.user_id` (`Store::log_user_event`); `/api/events` and finding timelines expose it as `username` (null for scheduler events).
+**Attribution.** The handlers that log an event for an operator action (§1 verdict, §3 recheck, §4 unqueue, §5 override, §6–§9 repo writes, including §8.1, §11 hold release) record the session's account in `events.user_id` (`Store::log_user_event`); `/api/events` and finding timelines expose it as `username` (null for scheduler events).
+
+## 11. POST /api/hold/release — end a hold (Rust only)
+
+Ends the active hold on one kind of a finding's work (WORK-MODEL.md §9.3). Behind every gate.
+
+**Request**: `{"finding_id": int, "kind": str, "action": str, "reason"?: str, "classification"?: str}`. `kind` is `recheck`, `fix`, `engage` or `harvest`; `action` one of `continue`, `restart`, `reject`, `wontfix`, `classify`, `mark_harvested`, `dismiss`. `reason` is the verdict's for `reject`, `wontfix` and `classify`; `classification` the closed PR's for `classify` (`superseded`, `duplicate`, `obsolete`, `wrong`, `unwanted`, `abandoned`, as `CLOSE-REASON.json` spells it). Absent, null, empty and whitespace-only strings are absent.
+
+**Validation order** (first failure wins):
+1. `finding_id` not an int -> `400 {"error": "finding_id must be an integer"}`; `kind` or `action` unknown -> `400`.
+2. `reject`/`wontfix`/`classify` without `reason`, or `classify` without a known `classification` -> `400`.
+3. No such finding -> `404 {"error": "no finding <id>"}`.
+4. No active hold on that work, an action that does not apply to the kind (`reject`/`wontfix`: recheck and fix; `classify`: a harvest of a closed PR; `mark_harvested`: a harvest of a merged PR; `dismiss`: engage), or `continue` with no checkpoint to continue -> `409` with the reason. The `actions` the finding's `holds` list (API-CONTRACT.md §4) are exactly the ones that pass this.
+
+**Writes** (one transaction, `Store::release_hold`): the hold row gets `released_at`, `released_by` (the session's username) and `release_action`, and a `release` event attributed to the account. Then: `continue` keeps the checkpoint, and the give-up ceiling counts only attempts started after this release (WORK-MODEL.md §8); `restart` clears the checkpoint; `reject`/`wontfix` set the finding's status and `verdict_reason` (and remove a verdict anchor), with a `verdict` event; `classify` does that with the classification's status (`ClosureClass::status`) and `"<class>: <reason>"`, and stamps the PR harvested; `mark_harvested` stamps the PR harvested and leaves the finding `merged`; `dismiss` marks the PR's current attention handled as a no-op engage would, and clears the engage's checkpoint and streak, so nothing resumes the dismissed engage. A verdict that moves the finding out of the kind's tier ends the work item (streak and checkpoint, migration 024's trigger). The scheduler is woken.
+
+**Success**: `200 {"ok": true, "finding": Row}`.
 
 ## Appendix A. CSRF & concurrency guards
 
@@ -411,5 +427,6 @@ Accounts are created by the operator (`hunter user add|passwd|disable <name>`, `
 | /api/repo/delete | 200 | `{"ok": true}` | — |
 | /api/repo/rehunt | 200 | `{"ok": true, "repo": Row}` | `get_repo_by_id` |
 | /api/repo/notes | 201 | `{"ok": true, "notes": str}` | `repo_notes` (store.py:731-745) |
+| /api/hold/release | 200 | `{"ok": true, "finding": Row}` | `get_finding` |
 
 All finding/repo Rows are `SELECT *` full rows — shapes per round-1 `hunter-rs/API-CONTRACT.md`. **The Svelte UI reads none of them**, including `/api/repo/notes`' `notes` string (§9): every write path calls `store.refresh()` or re-GETs instead. They are soft contract with no consumer today; ship them for parity.

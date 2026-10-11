@@ -5,14 +5,15 @@
 //! endpoint and the loop cannot disagree about what runs next. The
 //! `run_*` executors below are the other half.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::Context as _;
 
 use crate::config::Config;
 use crate::domain::{
-    BudgetOverride, ClosureClass, FindingJobKind, FindingStatus, FindingType, JobKind, JobState,
-    RepoJobKind, Severity,
+    BudgetOverride, ClosureClass, FindingJobKind, FindingStatus, FindingType, HoldReason, JobKind,
+    JobState, RepoJobKind, Severity,
 };
 use crate::store::{CreatedJob, FindingFilter, JobOutcome, Store, StoreWriteError, SyncPrData};
 use crate::types::{Finding, Job, Repo};
@@ -69,6 +70,10 @@ pub struct ResumePlan {
     /// and a failed handoff changes nothing, since the cold harvest still
     /// runs later.
     pub handoff: bool,
+    /// The hold an operator released with `continue` to get here, if this
+    /// is the first attempt since: its reason and detail. The resume prompt
+    /// is chosen from the reason (WORK-MODEL.md §9.1).
+    pub after_hold: Option<(HoldReason, String)>,
 }
 
 /// What `run_cycle` would act on right now, if invoked (scheduler.py
@@ -248,7 +253,7 @@ pub async fn pick_next(
 /// The dashboard polls this, scheduler paused or not, and a poll must not
 /// do the scheduler's work: ending a chain, bumping a rotation
 /// timestamp, or counting a given-up chain against its finding, which can
-/// send the finding to the inbox, hold it blocked or give its PR up. A
+/// send the finding to the inbox, hold it for the operator or give its PR up. A
 /// checkpoint the scheduler would end is only skipped here, so the
 /// preview names the fresh start a given-up chain makes way for, even
 /// where the scheduler's count ends that work instead.
@@ -298,6 +303,15 @@ async fn select(
         pending_harvest.retain(|f| f.repo_id == rid);
         queued.retain(|f| f.repo_id == rid);
     }
+    // Held work waits for the operator: every tier skips it, through the
+    // one shared query (WORK-MODEL.md §9.5, invariant 3).
+    let held = store.held_work().await?;
+    let held_ref = &held;
+    let not_held = |kind: FindingJobKind| move |f: &Finding| !held_ref.contains(&(f.id, kind));
+    rechecking.retain(not_held(FindingJobKind::Recheck));
+    attention.retain(not_held(FindingJobKind::Engage));
+    pending_harvest.retain(not_held(FindingJobKind::Harvest));
+    queued.retain(not_held(FindingJobKind::Fix));
 
     // (1) A budget-overridden finding jumps the queue, scanned in the
     // same kind order the normal priorities use (`scheduler.pick_next`).
@@ -343,7 +357,7 @@ async fn select(
     // re-cache ratio 1.00 across 112 production events) where restarting
     // costs a flat ~37,000-token session floor plus every token already
     // spent, and advances no watermark to show for it.
-    if let Some(c) = pick_resume(store, cfg, force_id, mode).await? {
+    if let Some(c) = pick_resume(store, cfg, force_id, &held, mode).await? {
         return Ok(Some(c));
     }
 
@@ -591,10 +605,16 @@ async fn pick_resume(
     store: &Store,
     cfg: &Config,
     force_id: Option<i64>,
+    held: &BTreeSet<(i64, FindingJobKind)>,
     mode: Pick,
 ) -> anyhow::Result<Option<Candidate>> {
     for job in store.list_resumable_jobs().await? {
         if force_id.is_some_and(|rid| job.repo_id != rid) {
+            continue;
+        }
+        if let (Some(fid), Some(kind)) = (job.finding_id, job.kind.as_finding())
+            && held.contains(&(fid, kind))
+        {
             continue;
         }
         if let Resumable::Yes(plan) = resume_plan(store, cfg, job, mode).await? {
@@ -688,14 +708,19 @@ async fn count_given_up_chain(
             handle_recheck_failure(store, &mut summary, fid, job, failure, &detail, None).await;
             summary.outcome.as_deref() == Some("stuck")
         }
-        // Only a hold that landed sets `blocked`; one that failed has put
-        // the finding back to `queued`.
+        // Only a hold that landed takes the fix out of its tier's picks.
         FindingJobKind::Fix => {
-            if let Err(e) = record_fix_failure(store, fid, job, failure, why, &mut summary).await {
-                let message = format!("#{fid} {failure}; holding it blocked failed: {e}");
-                let _ = fix_event(store, "fix", fid, job, message).await;
-            }
-            summary.outcome.as_deref() == Some("blocked")
+            record_fix_failure(
+                store,
+                fid,
+                job,
+                failure,
+                why,
+                HoldReason::GaveUp,
+                &mut summary,
+            )
+            .await;
+            summary.outcome.as_deref() == Some("held")
         }
         FindingJobKind::Harvest => {
             let detail = format!("{failure}: {why}");
@@ -792,8 +817,25 @@ async fn resume_plan(
     let z = anticipated_tokens(store, cfg, job.repo_id, job.kind)
         .await
         .unwrap_or(0);
-    let chain = store.resume_chain_stats(job.id).await?;
+    let chain = store.resume_chain_stats(job.id, None).await?;
     let chain_spent = chain.total;
+    // The ceiling bounds what the scheduler continues on its own, so it
+    // counts only the attempts and spend since the operator last released
+    // this work (WORK-MODEL.md §8): a `continue` gives a fresh budget, and
+    // nothing else does — not a daemon restart, a failed write or a
+    // released claim. Before any release that is the whole chain.
+    let (released_at, after_hold) = match (job.kind, job.finding_id) {
+        (JobKind::Finding(kind), Some(fid)) => (
+            store.last_release_at(fid, kind).await?,
+            store.continued_hold(fid, kind, job.id).await?,
+        ),
+        _ => (None, None),
+    };
+    let own = if released_at.is_some() {
+        store.resume_chain_stats(job.id, released_at).await?
+    } else {
+        chain
+    };
     // Two independent ways a chain runs out of road, and neither
     // implies the other: too many tries, or too much spent on the
     // tries other than the biggest one.
@@ -815,28 +857,18 @@ async fn resume_plan(
     // least its own cap; retiring on that would end the work before
     // resume had been tried even once, which is the opposite of what
     // this feature is for.
-    let excess = chain_spent - chain.max_single;
-    let too_many = chain.attempts >= MAX_RESUME_ATTEMPTS;
-    let too_costly = z > 0 && chain.attempts >= 2 && excess > GIVE_UP_MULTIPLE * z;
-    // A fix chain carrying a blocker was held for an operator, and only
-    // an operator queues a held fix again. The ceiling bounds what the
-    // scheduler resumes on its own; this resume is the operator's call,
-    // and bounded by it: an attempt of a held chain that does not finish
-    // is held again ([`conclude_fix`]). Giving it up instead would turn
-    // "Resume fix" into a fresh start that discards the checkpoint —
-    // and every chain given up for good is held past the ceiling.
-    let operator_requeued = (too_many || too_costly)
-        && job.kind == JobKind::Finding(FindingJobKind::Fix)
-        && store.job_blocker(job.id).await?.is_some();
-    if (too_many || too_costly) && !operator_requeued {
+    let excess = own.total - own.max_single;
+    let too_many = own.attempts >= MAX_RESUME_ATTEMPTS;
+    let too_costly = z > 0 && own.attempts >= 2 && excess > GIVE_UP_MULTIPLE * z;
+    if too_many || too_costly {
         let why = if too_many {
-            format!("{} attempts, the limit", chain.attempts)
+            format!("{} attempts, the limit", own.attempts)
         } else {
             format!("{excess} tok outside its largest attempt > {GIVE_UP_MULTIPLE}x {z} typical")
         };
         let msg = format!(
-            "resume {} {}: giving up after {chain_spent} tok across the chain ({why})",
-            job.kind, repo.name
+            "resume {} {}: giving up after {} tok across the chain ({why})",
+            job.kind, repo.name, own.total
         );
         if mode == Pick::Preview {
             return Ok(Resumable::No);
@@ -895,6 +927,7 @@ async fn resume_plan(
         typical: z,
         chain_spent,
         handoff: false,
+        after_hold,
     })))
 }
 
@@ -3073,8 +3106,6 @@ struct FixStart {
     pinned: String,
     branch: String,
     cap: Option<i64>,
-    /// The report a resumed blocked chain works against.
-    previous_blocker: Option<String>,
 }
 
 /// Put the finding back to `queued` after a step between the claim and the
@@ -3155,10 +3186,7 @@ async fn start_fix(
             "finding #{fid} is no longer queued"
         ))));
     }
-    let previous_blocker = match prepare_blocked_resume(store, fid, resume).await? {
-        Ok(blocker) => blocker,
-        Err(held) => return Ok(Err(held)),
-    };
+    remove_stale_report(store, fid, resume).await?;
     let created = match store
         .create_job(
             FindingJobKind::Fix.into(),
@@ -3202,7 +3230,7 @@ async fn start_fix(
     }
     let (ws, pinned) = match opened? {
         Ok(opened) => opened,
-        Err(failed) => return Ok(Err(count_unmade_tree(store, fid, created.id, failed).await?)),
+        Err(failed) => return Ok(Err(count_unmade_tree(store, fid, created.id, failed).await)),
     };
     Ok(Ok(FixStart {
         repo,
@@ -3211,62 +3239,33 @@ async fn start_fix(
         pinned,
         branch,
         cap,
-        previous_blocker,
     }))
 }
 
-/// The blocker a resume of a blocked chain works against, read from the
-/// attempt it continues. A report still in the tree is that same blocker
-/// (the daemon died between recording and deleting it), not this attempt's
-/// outcome, so it goes after the claim (which a later verdict wins, so
-/// holding it blocked cannot overwrite one) but before the successor job
-/// exists: a step that fails after that leaves the checkpoint behind a row
-/// nothing resumes. If the stale report cannot be removed, the checkpoint
-/// is held as blocked again, still resumable, rather than retried into the
-/// same failure: `Ok(Err(summary))`. An error releases the claim.
-async fn prepare_blocked_resume(
+/// A report still in the tree on a resume is the one the attempt before
+/// wrote, already recorded as its hold (the daemon died before deleting
+/// it), not this attempt's outcome. Removed after the claim, which a
+/// verdict given since selection still wins, and before the successor job
+/// exists; an error releases the claim.
+async fn remove_stale_report(
     store: &Store,
     fid: i64,
     resume: Option<&ResumePlan>,
-) -> anyhow::Result<Result<Option<String>, CycleSummary>> {
+) -> anyhow::Result<()> {
     let Some(plan) = resume else {
-        return Ok(Ok(None));
-    };
-    let blocker = match store.job_blocker(plan.predecessor_id).await {
-        Ok(blocker) => blocker,
-        Err(e) => {
-            release_claim(store, fid).await;
-            return Err(e.into());
-        }
-    };
-    let Some(blocker) = blocker else {
-        return Ok(Ok(None));
+        return Ok(());
     };
     let stale = plan.workspace.tree.join("BLOCKED.md");
     if stale.exists()
         && let Err(e) = std::fs::remove_file(&stale)
     {
-        hold_blocked(store, fid, plan.predecessor_id, &blocker).await?;
-        let failure = format!("cannot remove the stale {}: {e}", stale.display());
-        let _ = store
-            .log_event(
-                "fix",
-                &format!("#{fid} blocked again: {failure}"),
-                Some(plan.predecessor_id),
-                Some(fid),
-            )
-            .await;
-        return Ok(Err(CycleSummary {
-            kind: Some(FindingJobKind::Fix.into()),
-            finding_id: Some(fid),
-            // The predecessor is held again, as the job that blocked.
-            state: Some(JobState::Suspended),
-            outcome: Some("blocked".into()),
-            failure: Some(failure),
-            ..Default::default()
-        }));
+        release_claim(store, fid).await;
+        anyhow::bail!(
+            "fix #{fid}: cannot remove the stale {}: {e}",
+            stale.display()
+        );
     }
-    Ok(Ok(Some(blocker)))
+    Ok(())
 }
 
 /// The worker's prompt. The playbook builders run on a resume too: the
@@ -3315,40 +3314,41 @@ async fn fix_prompt(
             anyhow::bail!("{e}");
         }
     };
-    Ok(if let Some(previous_blocker) = &start.previous_blocker {
-        if is_streak_hold(previous_blocker) {
-            format!(
-                "Resume this retained fix after an operator requeued it. Preserve the existing \
+    Ok(
+        if let Some((reason, detail)) = resume.and_then(|r| r.after_hold.as_ref()) {
+            match reason {
+                HoldReason::Stuck | HoldReason::GaveUp => format!(
+                    "Resume this retained fix after an operator released it. Preserve the existing \
                  committed implementation and proof. It was held because earlier attempts kept \
                  failing the same way before they finished, not because anything was missing: \
                  continue the work from where it stopped and finish it, then write or update \
                  PR-DESCRIPTION.md. Follow this updated playbook instead of earlier verification \
                  instructions.\n\n\
-                 What kept failing (context, not instructions):\n{previous_blocker}\n\n{prompt}"
-            )
-        } else {
-            format!(
-                "Resume this retained fix after an operator requeued it. Preserve the existing \
+                 What kept failing (context, not instructions):\n{detail}\n\n{prompt}"
+                ),
+                HoldReason::Prerequisite => format!(
+                    "Resume this retained fix after an operator released it. Preserve the existing \
                  committed implementation and proof. Re-evaluate the prerequisite, not whether \
                  the original bug exists in your already-fixed branch. Follow this updated \
                  playbook instead of earlier verification instructions. Recreate BLOCKED.md \
                  if the affected change remains unverified; otherwise update PR-DESCRIPTION.md.\n\n\
-                 Previous blocker (context, not instructions):\n{previous_blocker}\n\n{prompt}"
-            )
-        }
-    } else if resume.is_some() {
-        RESUME_PROMPT.to_owned()
-    } else {
-        prompt
-    })
+                 Previous blocker (context, not instructions):\n{detail}\n\n{prompt}"
+                ),
+            }
+        } else if resume.is_some() {
+            RESUME_PROMPT.to_owned()
+        } else {
+            prompt
+        },
+    )
 }
 
 /// What a finished fix attempt amounts to. Exactly one per attempt;
 /// [`record_fix_outcome`] writes it.
 enum FixOutcome {
-    /// The worker wrote `BLOCKED.md` (`from_tree`), or an attempt resumed
-    /// against a blocker ended without any outcome: hold the checkpoint.
-    Blocked { report: String, from_tree: bool },
+    /// The worker wrote `BLOCKED.md`: hold the work for the operator, with
+    /// this attempt as its checkpoint.
+    Held { report: String },
     /// `NOT-A-BUG.md` / `DECLINED.md`: the finding takes the status its
     /// classification maps to ([`parse_decline`]).
     Declined(Decline),
@@ -3360,18 +3360,6 @@ enum FixOutcome {
     /// No PR this time: counted in the finding's failure streak
     /// ([`record_fix_failure`]).
     Failed { failure: String },
-}
-
-/// Hold a claimed fix as blocked ([`Store::block_fix_job`]). The claim
-/// made the finding `fixing`; if recording the block fails, the transaction
-/// left it there, where nothing picks it up again until a restart, so put
-/// it back to `queued` before returning the error.
-async fn hold_blocked(store: &Store, fid: i64, job: i64, report: &str) -> anyhow::Result<()> {
-    if let Err(e) = store.block_fix_job(fid, job, report).await {
-        release_claim(store, fid).await;
-        return Err(e.into());
-    }
-    Ok(())
 }
 
 /// A worker's report file, read lossily: whatever bytes it wrote are its
@@ -3478,7 +3466,6 @@ async fn conclude_fix(
     finding: &Finding,
     start: &FixStart,
     state: JobState,
-    previous_blocker: Option<&String>,
 ) -> anyhow::Result<FixOutcome> {
     let fid = finding.id;
     let worktree = &start.ws.tree;
@@ -3513,21 +3500,7 @@ async fn conclude_fix(
         )));
     }
     if let Some(report) = report {
-        return Ok(FixOutcome::Blocked {
-            report,
-            from_tree: true,
-        });
-    }
-    // An attempt that ended with no outcome at all (a failed provider
-    // handoff, a cap) did not resolve the prerequisite it was resumed
-    // against, so the implementation stays operator-held.
-    if state != JobState::Done
-        && let Some(report) = previous_blocker
-    {
-        return Ok(FixOutcome::Blocked {
-            report: report.clone(),
-            from_tree: false,
-        });
+        return Ok(FixOutcome::Held { report });
     }
 
     let failure = match ship_pr(&start.repo, &start.branch, worktree, state).await {
@@ -3543,25 +3516,28 @@ async fn conclude_fix(
 }
 
 /// Count a failed fix attempt in the finding's streak. The
-/// [`MAX_CONSECUTIVE_SAME_FAILURE`]th identical failure holds the finding
-/// blocked, with `job` as its checkpoint ([`hold_blocked`]); short of that
-/// the fix tier tries again. `detail` follows the failure in the report
-/// and the event: the worker's output tail, why a chain gave up, or why
-/// a tree could not be made.
+/// [`MAX_CONSECUTIVE_SAME_FAILURE`]th identical failure holds the work for
+/// the operator ([`Store::hold_work`]) as `at_limit` — `stuck`, or
+/// `gave_up` when the give-up ceiling's failure completed the streak —
+/// with `job` as its checkpoint if a worker ran in it; short of that the
+/// fix tier tries again. `detail` follows the failure in the hold and the
+/// event: the worker's output tail, why a chain gave up, or why a tree
+/// could not be made.
 ///
 /// Every failed fix is counted here — a worker's ([`record_fix_outcome`]),
 /// a given-up resume chain ([`count_given_up_chain`]) and a tree that could
 /// not be made ([`count_unmade_tree`]) alike — so they cannot drift apart
-/// on what a stuck fix becomes. A count that could not be recorded is
-/// reported as such and ends nothing.
+/// on what a stuck fix becomes. A count or a hold that could not be
+/// recorded is reported as such and ends nothing.
 async fn record_fix_failure(
     store: &Store,
     fid: i64,
     job: i64,
     failure: &str,
     detail: &str,
+    at_limit: HoldReason,
     summary: &mut CycleSummary,
-) -> anyhow::Result<()> {
+) {
     summary.failure = Some(failure.to_owned());
     summary.outcome = Some("requeued".into());
     let streak = match store
@@ -3573,24 +3549,34 @@ async fn record_fix_failure(
             let message =
                 format!("#{fid} incomplete ({failure}), not counted: {e}. tail: {detail}");
             let _ = fix_event(store, "fix", fid, job, message).await;
-            return Ok(());
+            return;
         }
     };
     if streak < MAX_CONSECUTIVE_SAME_FAILURE {
         let message = format!("#{fid} incomplete ({failure}). tail: {detail}");
         let _ = fix_event(store, "fix", fid, job, message).await;
-        return Ok(());
+        return;
     }
-    let reason = streak_hold_report(streak, failure, detail);
-    // The report lives on the job row; nothing goes in the tree.
-    hold_blocked(store, fid, job, &reason).await?;
-    summary.state = Some(JobState::Suspended);
-    let message =
-        format!("#{fid} gave up after {streak} identical failures ({failure}). tail: {detail}");
+    let report = format!("{failure}\n\n{detail}");
+    let message = match store
+        .hold_work(fid, FindingJobKind::Fix, at_limit, &report, Some(job))
+        .await
+    {
+        Ok(true) => {
+            summary.outcome = Some("held".into());
+            summary.attempts = Some(streak);
+            format!("#{fid} held after {streak} identical failures ({failure}). tail: {detail}")
+        }
+        Ok(false) => format!(
+            "#{fid} {streak} identical failures ({failure}), but it has left the fix tier; \
+             nothing held. tail: {detail}"
+        ),
+        Err(e) => format!(
+            "#{fid} {streak} identical failures ({failure}), but holding it failed: {e}; \
+             will retry. tail: {detail}"
+        ),
+    };
     let _ = fix_event(store, "fix", fid, job, message).await;
-    summary.outcome = Some("blocked".into());
-    summary.attempts = Some(streak);
-    Ok(())
 }
 
 /// How [`open_workspace`] reports a tree it could not make, and the
@@ -3611,7 +3597,7 @@ async fn count_unmade_tree(
     fid: i64,
     job: i64,
     mut summary: CycleSummary,
-) -> anyhow::Result<CycleSummary> {
+) -> CycleSummary {
     let note = summary.failure.take().unwrap_or_default();
     let why = note
         .strip_prefix(TREE_NOT_MADE)
@@ -3619,32 +3605,19 @@ async fn count_unmade_tree(
         .unwrap_or(&note);
     // Counted while the claim still holds the finding, as a worker's
     // failure is ([`record_fix_outcome`]).
-    let counted = record_fix_failure(store, fid, job, TREE_NOT_MADE, why, &mut summary).await;
+    record_fix_failure(
+        store,
+        fid,
+        job,
+        TREE_NOT_MADE,
+        why,
+        HoldReason::Stuck,
+        &mut summary,
+    )
+    .await;
     release_claim(store, fid).await;
-    counted?;
     summary.failure = Some(note);
-    Ok(summary)
-}
-
-/// What follows the streak in a failure-streak hold's report.
-const STREAK_HOLD_FAILURE: &str = " consecutive fix attempts hit the same failure: ";
-
-/// The report a failure streak holds a fix on ([`record_fix_failure`]):
-/// what kept failing, not a prerequisite.
-fn streak_hold_report(streak: i64, failure: &str, detail: &str) -> String {
-    format!("stuck: {streak}{STREAK_HOLD_FAILURE}{failure}\n\n{detail}")
-}
-
-/// Whether a held fix's report is a failure streak's
-/// ([`streak_hold_report`]) rather than a worker's `BLOCKED.md`. The
-/// report is the hold's only record, and every re-hold of the chain
-/// keeps it verbatim, so this holds for every later link too.
-fn is_streak_hold(report: &str) -> bool {
-    report
-        .strip_prefix("stuck: ")
-        .and_then(|rest| rest.strip_prefix(|c: char| c.is_ascii_digit()))
-        .map(|rest| rest.trim_start_matches(|c: char| c.is_ascii_digit()))
-        .is_some_and(|rest| rest.starts_with(STREAK_HOLD_FAILURE))
+    summary
 }
 
 /// Push the fix branch and open its draft PR: `(url, recovered)`, or why
@@ -3756,30 +3729,39 @@ async fn fix_event(
     store.log_event(kind, &message, Some(job), Some(fid)).await
 }
 
-/// A blocked fix: the job row keeps the report and the checkpoint is held
-/// for the operator. Neither a budget override nor the claim is touched:
-/// the finding is `blocked` now, not `fixing`.
-async fn hold_blocked_fix(
+/// A worker's `BLOCKED.md`: the fix is held for the operator as a missing
+/// prerequisite, with this attempt as its checkpoint and the report as the
+/// hold's detail, and the claim goes back to `queued`, where the fix tier
+/// skips held work. The budget override is left alone: nothing concluded.
+async fn hold_prerequisite(
     store: &Store,
     fid: i64,
     start: &FixStart,
     report: &str,
-    from_tree: bool,
     summary: &mut CycleSummary,
 ) -> anyhow::Result<()> {
-    hold_blocked(store, fid, start.job, report).await?;
-    // Recorded: the job row owns the report now, so the tree holds no stale
-    // one for the next attempt to mistake for its own.
-    if from_tree {
-        std::fs::remove_file(start.ws.tree.join("BLOCKED.md"))?;
+    let held = store
+        .hold_work(
+            fid,
+            FindingJobKind::Fix,
+            HoldReason::Prerequisite,
+            report,
+            Some(start.job),
+        )
+        .await;
+    release_claim(store, fid).await;
+    if !held? {
+        anyhow::bail!("fix #{fid}: BLOCKED.md, but the fix has left its tier; nothing held");
     }
+    // Recorded: the hold owns the report now, so the tree holds no stale
+    // one for the next attempt to mistake for its own.
+    std::fs::remove_file(start.ws.tree.join("BLOCKED.md"))?;
     let message = format!(
-        "#{fid} blocked; checkpoint retained at {}",
+        "#{fid} held: prerequisite; checkpoint retained at {}",
         start.ws.root.display()
     );
     fix_event(store, "fix", fid, start.job, message).await?;
-    summary.state = Some(JobState::Suspended);
-    summary.outcome = Some("blocked".into());
+    summary.outcome = Some("held".into());
     Ok(())
 }
 
@@ -3820,10 +3802,6 @@ async fn record_declined_fix(
             .await,
         format_args!("#{fid}: verdict -> {status}"),
     );
-    log_write_failure(
-        store.clear_work_streak(fid, FindingJobKind::Fix).await,
-        format_args!("#{fid}: clearing fix attempts"),
-    );
     let first_line: String = reason
         .lines()
         .next()
@@ -3841,7 +3819,7 @@ async fn record_declined_fix(
 }
 
 /// Write a fix outcome: the finding's status, the event, and the summary.
-/// A one-shot budget override is spent by every outcome but a block or a
+/// A one-shot budget override is spent by every outcome but a hold or a
 /// decline; any outcome that leaves the finding `fixing` returns it to
 /// `queued`.
 async fn record_fix_outcome(
@@ -3856,8 +3834,8 @@ async fn record_fix_outcome(
     let job = start.job;
     let tail = crate::util::tail(stdout_tail, 300);
     match outcome {
-        FixOutcome::Blocked { report, from_tree } => {
-            return hold_blocked_fix(store, fid, start, &report, from_tree, summary).await;
+        FixOutcome::Held { report } => {
+            return hold_prerequisite(store, fid, start, &report, summary).await;
         }
         FixOutcome::Declined(decline) => {
             record_declined_fix(store, finding, start, decline, summary).await;
@@ -3867,10 +3845,6 @@ async fn record_fix_outcome(
             log_write_failure(
                 store.set_finding_pr_open(fid, &pr_url).await,
                 format_args!("#{fid}: status -> pr_open ({pr_url})"),
-            );
-            log_write_failure(
-                store.clear_work_streak(fid, FindingJobKind::Fix).await,
-                format_args!("#{fid}: clearing fix attempts"),
             );
             let message = if recovered {
                 format!("#{fid} recovered existing PR: {pr_url}")
@@ -3898,7 +3872,7 @@ async fn record_fix_outcome(
             summary.worktree = Some(start.ws.tree.to_string_lossy().into_owned());
         }
         FixOutcome::Failed { failure } => {
-            record_fix_failure(store, fid, job, &failure, tail, summary).await?;
+            record_fix_failure(store, fid, job, &failure, tail, HoldReason::Stuck, summary).await;
         }
     }
     if finding.budget_override == Some(BudgetOverride::Once) {
@@ -3941,11 +3915,17 @@ pub async fn run_fix(
     {
         Ok(r) => r,
         Err(e) => {
-            if let Some(previous_blocker) = &start.previous_blocker {
-                hold_blocked(store, fid, start.job, previous_blocker).await?;
-            } else {
-                release_claim(store, fid).await;
-            }
+            // No worker ran, so the job is closed as unstarted rather than
+            // left `running`, and the checkpoint it would have continued
+            // stays the work item's.
+            log_write_failure(
+                store
+                    .fail_unstarted_job(start.job, &format!("backend failed: {e}"))
+                    .await,
+                format_args!("job {}: failing unstarted", start.job),
+            );
+            release_claim(store, fid).await;
+            close_workspace(store, &start.ws).await;
             anyhow::bail!("{e}");
         }
     };
@@ -3963,14 +3943,7 @@ pub async fn run_fix(
         tokens_new: Some(rr.tokens_new),
         ..Default::default()
     };
-    let outcome = conclude_fix(
-        store,
-        finding,
-        &start,
-        state,
-        start.previous_blocker.as_ref(),
-    )
-    .await?;
+    let outcome = conclude_fix(store, finding, &start, state).await?;
     record_fix_outcome(
         store,
         finding,
@@ -5116,6 +5089,7 @@ async fn continue_into_harvest(
         typical: z,
         chain_spent,
         handoff: true,
+        after_hold: None,
     };
     let Ok(Some(finding)) = store.get_finding(fid).await else {
         return;

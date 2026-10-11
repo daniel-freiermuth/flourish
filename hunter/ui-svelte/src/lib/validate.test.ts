@@ -261,6 +261,27 @@ describe("isFindingList follow_ups", () => {
   });
 });
 
+// FindingCard renders `{#each holds as hold (hold.kind)}` and, per hold,
+// `{#each hold.actions as action (action)}`.
+describe("isFindingList holds", () => {
+  const hold = (kind: unknown, actions: unknown) => ({ kind, actions });
+
+  it("accepts absent, empty and one hold per kind", () => {
+    expect(isFindingList([{ id: 1 }])).toBe(true);
+    expect(isFindingList([{ id: 1, holds: [] }])).toBe(true);
+    expect(
+      isFindingList([{ id: 1, holds: [hold("fix", ["continue", "restart"]), hold("engage", [])] }]),
+    ).toBe(true);
+  });
+
+  it("rejects a repeated kind, a missing kind, and repeated or missing actions", () => {
+    expect(isFindingList([{ id: 1, holds: [hold("fix", []), hold("fix", [])] }])).toBe(false);
+    expect(isFindingList([{ id: 1, holds: [{ actions: [] }] }])).toBe(false);
+    expect(isFindingList([{ id: 1, holds: [hold("fix", ["continue", "continue"])] }])).toBe(false);
+    expect(isFindingList([{ id: 1, holds: [{ kind: "fix" }] }])).toBe(false);
+  });
+});
+
 describe("isSummary repos entries", () => {
   it("accepts an empty list and a list of records", () => {
     expect(isSummary({ ...summary, repos: [] })).toBe(true);

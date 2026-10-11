@@ -117,16 +117,17 @@ new ──recheck──> new / superseded / rejected
   way: superseded / duplicate / obsolete → `superseded`, wrong →
   `rejected`, unwanted → `wontfix`; a decline that classifies nothing
   goes back to `new` for triage.
-- **`blocked`** — valid work waiting on a verification prerequisite,
-  dependency, or human decision. The full reason is stored with the job;
-  the fix job becomes a suspended checkpoint, keeping committed work,
-  uncommitted reports, and its transcript. It is NOT suppressed and cannot
-  resume automatically. Resolve the prerequisite and select **Resume fix**
-  in Kanban; this queues the retained checkpoint under normal budget rules.
-  Repeated unsuccessful fix attempts become blocked, not rejected; their
-  stored reason is what kept failing, and resuming one asks the worker to
-  finish the work rather than re-evaluate a prerequisite. Only the
-  scheduler sets `blocked`; it is not a verdict.
+- **Held work** is not a status. When a fix worker writes `BLOCKED.md`
+  (a verification prerequisite, dependency, or human decision is
+  missing), or the same failure repeats three times in a row, the fix is
+  *held* for you: the finding stays `queued`, the scheduler skips it, and
+  the attempt is kept as its checkpoint (committed work, uncommitted
+  reports, transcript) when a worker ran in it. It is NOT suppressed.
+  Kanban's **Needs you** section lists it with the report or what kept
+  failing, and the ways out: **Continue** resumes the checkpoint with a
+  fresh give-up budget (a prerequisite hold asks the worker to re-evaluate
+  it, a failure hold to finish the work), **Restart** starts over,
+  **Reject**/**Wontfix** decide the finding.
 - **`pr_open`** — tracked via `sync_prs` (free — `gh pr view`, no worker)
   every cycle: merged → `merged`; closed unmerged → `closed`; new
   comments/reviews, `CHANGES_REQUESTED`, merge conflicts, or failing checks
@@ -279,9 +280,9 @@ Engage has no streak: a given-up engage chain sets the PR's attention
 aside, as an engage that did nothing would, until the PR's next comment,
 review or push flags it again; it is logged as an `error` event with the
 give-up reason, since the PR has left review. The ceiling bounds what
-the scheduler continues on its own, so it does not apply to a blocked
-fix an operator selects **Resume fix** on: that resumes the held
-checkpoint, and any attempt of it that does not finish is held again.
+the scheduler continues on its own, so it counts only the attempts since
+you last released the work: **Continue** on a held fix gives its chain a
+fresh budget, and after that it is bounded like any other.
 The dashboard's "what's next" preview makes the same selection without
 any of these writes; the scheduler does them when it selects.
 
@@ -406,8 +407,8 @@ Served at `http://localhost:8377` (configurable). Left-nav pages:
 |---|---|
 | **Status** | Budget bars (used + available, per window), Run/Pause and Overdrive controls, what the scheduler is doing right now / why it isn't, and the recent event log |
 | **Inbox** | New findings awaiting triage, with per-type filters |
-| **Kanban / Pipeline** | Findings in flight, a separate Blocked section with prerequisite reports and Resume fix controls, suppressed (rejected/wontfix), and informational (note) findings |
-| **All Findings** | Every finding, filterable by repo/type/status/severity, with full detail (jobs, PR state, timeline) on expand, and the actions its status allows (verdicts on new/blocked/note/closed, Recheck on new, Unqueue on queued, budget override while something will still pick it) |
+| **Kanban / Pipeline** | Findings in flight, a separate Needs you section with held work (why it is held, the report, and its Continue/Restart/... controls), suppressed (rejected/wontfix), and informational (note) findings |
+| **All Findings** | Every finding, filterable by repo/type/status/severity, with full detail (jobs, PR state, timeline) on expand, and the actions its status allows (verdicts on new/note/closed, releases of held work, Recheck on new, Unqueue on queued, budget override while something will still pick it) |
 | **Repos** | Add/remove/pause repos; queue a full re-hunt (the next hunt reviews the repo's complete history instead of only new commits — the same scope as the periodic `hunt.rehuntDays` re-hunt — and the request stays pending until such a hunt finishes cleanly); per-repo notes (free-text context injected into every prompt for that repo — coding conventions, known false positives, anything worth a hunter remembering across runs) |
 | **Stats** | Aggregate totals by kind and by finding type |
 | **Log** | Full job and event history |
