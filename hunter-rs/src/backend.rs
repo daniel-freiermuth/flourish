@@ -163,6 +163,14 @@ pub trait Backend: Send + Sync {
     /// when it names none), for the scheduler's reachability gate
     /// ([`crate::reach::first_unreachable`]). Empty = nothing to probe.
     fn worker_hosts(&self) -> Vec<String>;
+    /// The first of `hosts` this machine cannot reach, if any: the
+    /// reachability probe the scheduler's network gate and its re-probe of
+    /// a failure ask (#95). Part of the backend, the scheduler's outside
+    /// world, so a test answers it without opening a socket; the real one
+    /// is [`crate::reach::first_unreachable`].
+    async fn first_unreachable(&self, hosts: &[String]) -> Option<String> {
+        crate::reach::first_unreachable(hosts).await
+    }
     /// Execute a worker job in its chain's workspace: the worker runs in
     /// `ws.tree` and its transcript goes to `ws.session`. `cap_tokens` is
     /// the token bound the ramp
@@ -220,6 +228,10 @@ impl Backend for OverdriveBackend {
 
     fn worker_hosts(&self) -> Vec<String> {
         self.inner.worker_hosts()
+    }
+
+    async fn first_unreachable(&self, hosts: &[String]) -> Option<String> {
+        self.inner.first_unreachable(hosts).await
     }
 
     async fn run(

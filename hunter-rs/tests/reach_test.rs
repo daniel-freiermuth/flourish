@@ -127,3 +127,21 @@ async fn a_silent_address_does_not_hide_an_accepting_one() {
     .await;
     assert_eq!(raced.ok(), Some(true));
 }
+
+/// A backend that does not answer the probe itself (here `NullBackend`)
+/// asks the real one: what the scheduler's network gate and its re-probe
+/// of a failure get from the daemon's backend.
+#[tokio::test]
+async fn a_backend_probes_with_the_real_probe_by_default() {
+    use hunter::backend::{Backend, NullBackend};
+    let (_l, up) = listener().await;
+    let down = closed_port().await;
+
+    assert_eq!(
+        NullBackend
+            .first_unreachable(&[up.clone(), down.clone()])
+            .await,
+        Some(down)
+    );
+    assert_eq!(NullBackend.first_unreachable(&[up]).await, None);
+}

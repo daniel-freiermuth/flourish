@@ -8,8 +8,9 @@
 //! candidate's forge and provider before dispatch and denies the cycle
 //! instead.
 //!
-//! No network: an unreachable host is a local port nobody listens on, a
-//! reachable one a local listener.
+//! No network and no sockets: the probe's answer comes from the test
+//! backend, every host reachable unless `ScriptedBackend::offline` marks it
+//! down. The probe itself is `reach_test`'s.
 
 mod support;
 
@@ -22,21 +23,12 @@ use std::sync::atomic::AtomicBool;
 
 use hunter::backend::{NullBackend, OverdriveBackend};
 use support::{FakeBins, GitRepo, ScriptedBackend, TempDir};
-use tokio::net::TcpListener;
 
-/// A local port that accepts connections while the listener lives.
-async fn listener() -> (TcpListener, String) {
-    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = l.local_addr().unwrap().to_string();
-    (l, addr)
-}
+/// The forge the fixture's repo is on, as the probe sees it.
+const FORGE: &str = "forge.example";
 
-/// A local port nobody listens on.
-async fn closed_port() -> String {
-    let (l, addr) = listener().await;
-    drop(l);
-    addr
-}
+/// The provider a worker of the test backend talks to.
+const PROVIDER: &str = "provider.example";
 
 /// The forge URL of a repo served at `addr`.
 fn forge_url(addr: &str) -> String {
@@ -128,11 +120,11 @@ async fn assert_denied_for(store: &Store, summary: &CycleSummary, host: &str, be
 /// does not count as its turn either.
 #[tokio::test]
 async fn an_unreachable_forge_denies_a_scan() {
-    let down = closed_port().await;
-    let (_l, provider) = listener().await;
+    let down = FORGE.to_owned();
     let (_dir, store, cfg) = fixture("net-forge-down", &forge_url(&down), true).await;
-    let backend =
-        ScriptedBackend::new(|_| panic!("no worker may start offline")).needing(&[&provider]);
+    let backend = ScriptedBackend::new(|_| panic!("no worker may start offline"))
+        .needing(&[PROVIDER])
+        .offline(&[FORGE]);
 
     let before = hunter::util::now_ms();
     let summary = run_cycle(&store, &cfg, &backend, None).await;
@@ -156,10 +148,11 @@ async fn an_unreachable_forge_denies_a_scan() {
 /// provider, so a worker kind needs both of its hosts.
 #[tokio::test]
 async fn an_unreachable_provider_denies_a_scan() {
-    let (_l, forge) = listener().await;
-    let down = closed_port().await;
-    let (_dir, store, cfg) = fixture("net-provider-down", &forge_url(&forge), true).await;
-    let backend = ScriptedBackend::new(|_| panic!("no worker may start offline")).needing(&[&down]);
+    let down = PROVIDER.to_owned();
+    let (_dir, store, cfg) = fixture("net-provider-down", &forge_url(FORGE), true).await;
+    let backend = ScriptedBackend::new(|_| panic!("no worker may start offline"))
+        .needing(&[PROVIDER])
+        .offline(&[PROVIDER]);
 
     let before = hunter::util::now_ms();
     let summary = run_cycle(&store, &cfg, &backend, None).await;
@@ -171,9 +164,9 @@ async fn an_unreachable_provider_denies_a_scan() {
 /// not tried the clone.
 #[tokio::test]
 async fn an_unreachable_forge_denies_the_cloning_hunt() {
-    let down = closed_port().await;
+    let down = FORGE.to_owned();
     let (dir, store, cfg) = fixture("net-hunt-down", &forge_url(&down), false).await;
-    let backend = ScriptedBackend::new(|_| panic!("no worker may start offline"));
+    let backend = ScriptedBackend::new(|_| panic!("no worker may start offline")).offline(&[FORGE]);
 
     let before = hunter::util::now_ms();
     let summary = run_cycle(&store, &cfg, &backend, None).await;
@@ -191,7 +184,7 @@ async fn an_unreachable_forge_denies_the_cloning_hunt() {
 /// the gate runs before anything touches the finding.
 #[tokio::test]
 async fn a_denied_fix_leaves_its_finding_queued() {
-    let down = closed_port().await;
+    let down = FORGE.to_owned();
     let (_dir, store, cfg) = fixture("net-fix-down", &forge_url(&down), true).await;
     let (fid, _) = store
         .upsert_finding(
@@ -214,7 +207,7 @@ async fn a_denied_fix_leaves_its_finding_queued() {
         .await
         .unwrap();
     let before_row = store.get_finding(fid).await.unwrap().unwrap();
-    let backend = ScriptedBackend::new(|_| panic!("no worker may start offline"));
+    let backend = ScriptedBackend::new(|_| panic!("no worker may start offline")).offline(&[FORGE]);
 
     let before = hunter::util::now_ms();
     let summary = run_cycle(&store, &cfg, &backend, None).await;
@@ -239,11 +232,11 @@ async fn a_denied_fix_leaves_its_finding_queued() {
 /// ever see the forge.
 #[tokio::test]
 async fn the_overdrive_wrapper_reports_the_providers_hosts() {
-    let (_l, forge) = listener().await;
-    let down = closed_port().await;
-    let (_dir, store, cfg) = fixture("net-overdrive", &forge_url(&forge), true).await;
-    let provider =
-        ScriptedBackend::new(|_| panic!("no worker may start offline")).needing(&[&down]);
+    let down = PROVIDER.to_owned();
+    let (_dir, store, cfg) = fixture("net-overdrive", &forge_url(FORGE), true).await;
+    let provider = ScriptedBackend::new(|_| panic!("no worker may start offline"))
+        .needing(&[PROVIDER])
+        .offline(&[PROVIDER]);
     let backend = OverdriveBackend::new(Arc::new(provider), Arc::new(AtomicBool::new(false)));
 
     let before = hunter::util::now_ms();
@@ -274,7 +267,7 @@ async fn a_backend_without_hosts_adds_nothing_to_probe() {
 async fn an_offline_cycle_still_reports_its_pr_sync() {
     let bins = FakeBins::acquire("net-sync");
     bins.fail("gh", 1, "offline");
-    let down = closed_port().await;
+    let down = FORGE.to_owned();
     let (_dir, store, cfg) = fixture("net-sync", &forge_url(&down), true).await;
     let (fid, _) = store
         .upsert_finding(
@@ -296,7 +289,7 @@ async fn an_offline_cycle_still_reports_its_pr_sync() {
         .set_finding_pr_open(fid, &format!("{}/pull/7", forge_url(&down)))
         .await
         .unwrap();
-    let backend = ScriptedBackend::new(|_| panic!("no worker may start offline"));
+    let backend = ScriptedBackend::new(|_| panic!("no worker may start offline")).offline(&[FORGE]);
 
     let summary = run_cycle(&store, &cfg, &backend, None).await;
 
@@ -316,10 +309,8 @@ async fn an_offline_cycle_still_reports_its_pr_sync() {
 /// Both hosts answer: the candidate runs.
 #[tokio::test]
 async fn reachable_hosts_let_the_candidate_run() {
-    let (_forge_l, forge) = listener().await;
-    let (_provider_l, provider) = listener().await;
-    let (_dir, store, cfg) = fixture("net-up", &forge_url(&forge), true).await;
-    let backend = ScriptedBackend::noop().needing(&[&provider]);
+    let (_dir, store, cfg) = fixture("net-up", &forge_url(FORGE), true).await;
+    let backend = ScriptedBackend::noop().needing(&[PROVIDER]);
 
     let summary = run_cycle(&store, &cfg, &backend, None).await;
 
@@ -337,10 +328,11 @@ async fn reachable_hosts_let_the_candidate_run() {
 /// hosts only through a proxy would otherwise never run anything.
 #[tokio::test]
 async fn the_gate_switched_off_probes_nothing() {
-    let down = closed_port().await;
-    let (_dir, store, mut cfg) = fixture("net-off", &forge_url(&down), true).await;
+    let (_dir, store, mut cfg) = fixture("net-off", &forge_url(FORGE), true).await;
     cfg.network_gate = false;
-    let backend = ScriptedBackend::noop().needing(&[&down]);
+    let backend = ScriptedBackend::noop()
+        .needing(&[PROVIDER])
+        .offline(&[FORGE, PROVIDER]);
 
     let summary = run_cycle(&store, &cfg, &backend, None).await;
 
@@ -352,13 +344,10 @@ async fn the_gate_switched_off_probes_nothing() {
 /// forge to reach.
 #[test]
 fn work_needs_the_forge_and_the_provider() {
-    let backend = ScriptedBackend::noop().needing(&["api.anthropic.com"]);
+    let backend = ScriptedBackend::noop().needing(&[PROVIDER]);
     assert_eq!(
-        work_hosts("git@github.com:acme/widget.git", &backend),
-        ["github.com", "api.anthropic.com"]
+        work_hosts("git@forge.example:acme/widget.git", &backend),
+        [FORGE, PROVIDER]
     );
-    assert_eq!(
-        work_hosts("/srv/git/widget", &backend),
-        ["api.anthropic.com"]
-    );
+    assert_eq!(work_hosts("/srv/git/widget", &backend), [PROVIDER]);
 }

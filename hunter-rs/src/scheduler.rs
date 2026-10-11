@@ -5864,7 +5864,7 @@ async fn network_gate(
         Some(repo) => work_hosts(&repo.url, backend),
         None => backend.worker_hosts(),
     };
-    Ok(crate::reach::first_unreachable(&hosts).await)
+    Ok(backend.first_unreachable(&hosts).await)
 }
 
 /// Run one cycle: sync PRs, `pick_next`, dispatch to the appropriate runner (`scheduler.run_cycle`).
