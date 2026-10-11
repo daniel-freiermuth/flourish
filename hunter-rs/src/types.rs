@@ -211,6 +211,9 @@ pub struct HoldOut {
     /// What `POST /api/hold/release` accepts for it right now. `continue`
     /// only while the work has a checkpoint to continue.
     pub actions: Vec<ReleaseAction>,
+    /// An engage hold's PR has had activity since it was held, which may be
+    /// what it waits for. It does not release the hold.
+    pub new_activity: bool,
 }
 
 /// jobs row (17 columns) + `repo_name` from the JOIN. The two finding_*

@@ -113,6 +113,10 @@ pub struct WorkHold {
     /// The finding's status: a harvest's release depends on how its PR
     /// ended.
     pub status: FindingStatus,
+    /// An engage hold's PR has had activity since it was held. It stays
+    /// held: whether that activity resolves it is the operator's call
+    /// (WORK-MODEL.md §9.4).
+    pub new_activity: bool,
 }
 
 impl WorkHold {
@@ -2065,6 +2069,22 @@ impl Store {
         Ok(())
     }
 
+    /// The findings whose `kind` work has a checkpoint.
+    pub async fn findings_with_checkpoint(
+        &self,
+        kind: FindingJobKind,
+    ) -> sqlx::Result<BTreeSet<i64>> {
+        Ok(sqlx::query_scalar!(
+            r#"SELECT finding_id AS "finding_id!: i64" FROM finding_work
+               WHERE kind = ?1 AND checkpoint_job_id IS NOT NULL"#,
+            kind
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .collect())
+    }
+
     /// Give up `finding_id`'s `kind` checkpoint at `job_id`, logging `msg`
     /// as a `resume` event in the same transaction. The job row is left as
     /// it ended. A pointer that has moved on since is left alone: `false`.
@@ -3534,26 +3554,6 @@ impl Store {
         Ok(())
     }
 
-    /// Set a flagged PR's attention aside without engaging it: the engage
-    /// watermark moves to its latest activity and its static reasons count
-    /// as addressed at its current head, as an engage that did nothing
-    /// leaves them ([`Self::mark_pr_engaged`]), and the flag clears now
-    /// rather than at the next sync. New activity or a push raises it again.
-    pub async fn set_attention_aside(&self, finding_id: i64) -> sqlx::Result<()> {
-        let now = now_ms();
-        sqlx::query!(
-            "UPDATE pr_state SET last_engaged_activity_at = COALESCE(last_activity_at, ?1), \
-             addressed_fingerprint = attention_fingerprint, addressed_head_sha = head_sha, \
-             needs_attention = NULL, attention_since = NULL \
-             WHERE finding_id = ?2",
-            now,
-            finding_id
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
     /// Mark a merged PR as harvested.
     pub async fn mark_pr_harvested(&self, finding_id: i64, harvested_at: i64) -> sqlx::Result<()> {
         sqlx::query!(
@@ -3790,6 +3790,25 @@ impl Store {
         .await
     }
 
+    /// End `finding_id`'s `kind` streak: the work concluded without
+    /// leaving its tier, as an engage does (leaving the tier ends it on its
+    /// own, migration 024's trigger).
+    pub async fn clear_work_streak(
+        &self,
+        finding_id: i64,
+        kind: FindingJobKind,
+    ) -> sqlx::Result<()> {
+        sqlx::query!(
+            "UPDATE finding_work SET streak = 0, last_failure = NULL \
+             WHERE finding_id = ?1 AND kind = ?2",
+            finding_id,
+            kind
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     // -- holds (WORK-MODEL.md §9) ---------------------------------------------
 
     /// Every work item held for the operator: the one answer to "is this
@@ -3815,10 +3834,13 @@ impl Store {
                    h.kind AS "kind!: FindingJobKind", h.reason AS "reason!: HoldReason",
                    h.detail, h.held_at AS "held_at!: i64",
                    w.checkpoint_job_id,
-                   f.status AS "status!: FindingStatus"
+                   f.status AS "status!: FindingStatus",
+                   (h.kind = 'engage' AND COALESCE(p.last_activity_at, 0) > h.held_at)
+                       AS "new_activity!: bool"
             FROM work_holds h
             JOIN findings f ON f.id = h.finding_id
             LEFT JOIN finding_work w ON w.finding_id = h.finding_id AND w.kind = h.kind
+            LEFT JOIN pr_state p ON p.finding_id = h.finding_id
             WHERE h.released_at IS NULL
             ORDER BY h.held_at, h.id
             "#

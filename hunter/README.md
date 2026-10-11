@@ -138,6 +138,11 @@ new ──recheck──> new / superseded / rejected
   withdraw the PR (→ `closed`); the same worker session then carries on
   into the closed-PR harvest below when the window has room, else the
   harvest runs cold later.
+  An engage that keeps failing the same way (the worker never finishes,
+  the push or the reply fails, the forge refuses the withdrawal) is held
+  for you after three in a row; new PR activity does not release it, but
+  the card says there is some. **Dismiss** marks the PR's current
+  attention handled, as an engage that found nothing to do would.
 - **`closed`** — the PR closed without merging. Deliberately NOT a
   rejection: of the first 16 closed PRs, 15 were engage withdrawals (14 of
   them superseded or obsolete) and one was closed by a human, so a closure
@@ -295,14 +300,11 @@ continued again. A chain
 that has never been resumed is never retired: one attempt's spend is by
 definition at least its own cap, and the largest attempt is discounted
 because one enormous attempt says the job is big, not that the chain is
-stuck. For fix, recheck and harvest a given-up chain is one failed
-attempt in that finding's streak, so three given-up chains in a row end
-the work like three identical failures; otherwise a worker that suspends
-on every attempt would have its finding's tier start it fresh forever.
-Engage has no streak: a given-up engage chain sets the PR's attention
-aside, as an engage that did nothing would, until the PR's next comment,
-review or push flags it again; it is logged as an `error` event with the
-give-up reason, since the PR has left review. The ceiling bounds what
+stuck. For every finding kind (recheck, fix, engage, harvest) a given-up
+chain is one failed attempt in that finding's streak, so three given-up
+chains in a row hold the work like three identical failures; otherwise a
+worker that suspends on every attempt would have its finding's tier start
+it fresh forever. The ceiling bounds what
 the scheduler continues on its own, so it counts only the attempts since
 you last released the work: **Continue** on a held fix gives its chain a
 fresh budget, and after that it is bounded like any other.

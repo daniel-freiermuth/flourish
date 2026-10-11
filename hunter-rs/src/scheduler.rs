@@ -194,24 +194,38 @@ async fn findings_with_status(store: &Store, status: FindingStatus) -> sqlx::Res
         .await
 }
 
-/// store.py `list_attention`: `pr_open` findings whose `pr_state` row has
-/// `needs_attention` IS NOT NULL, ORDER BY `COALESCE(attention_since`,
-/// `synced_at`) ascending — oldest-outstanding reason first, NULL first
-/// (SQLite NULL-first ASC == Option's None < Some). Composed from the
-/// frozen `list_findings` + `get_pr_state` instead of a bespoke JOIN; the
-/// JOIN's row-presence requirement is implied by `needs_attention` being
-/// non-NULL.
-async fn list_attention(store: &Store) -> sqlx::Result<Vec<Finding>> {
-    let mut rows: Vec<(Option<i64>, Finding)> = Vec::new();
+/// The engage tier's work: `pr_open` findings whose PR is flagged for
+/// attention (`pr_state.needs_attention` set) or whose engage has a
+/// checkpoint, with the ids of the flagged ones. Flagged ones first, then
+/// by `COALESCE(attention_since, synced_at)` ascending — oldest-outstanding
+/// reason first, NULL first (SQLite NULL-first ASC == Option's None < Some).
+///
+/// Engage is active while the finding is `pr_open` (WORK-MODEL.md §6.1,
+/// G1): the flag only decides whether it may start fresh. `sync_prs`
+/// recomputes the flag every cycle and it can flap, so a paused engage
+/// whose PR lost its flag for a cycle is still continued here, where it
+/// used to wait for the resume tier below every finding tier.
+async fn list_engage(store: &Store) -> sqlx::Result<(Vec<Finding>, BTreeSet<i64>)> {
+    let paused = store
+        .findings_with_checkpoint(FindingJobKind::Engage)
+        .await?;
+    let mut flagged = BTreeSet::new();
+    let mut rows: Vec<((bool, Option<i64>), Finding)> = Vec::new();
     for f in findings_with_status(store, FindingStatus::PrOpen).await? {
-        if let Some(ps) = store.get_pr_state(f.id).await?
-            && ps.needs_attention.is_some()
-        {
-            rows.push((ps.attention_since.or(ps.synced_at), f));
+        let ps = store.get_pr_state(f.id).await?;
+        let flag = ps.as_ref().is_some_and(|p| p.needs_attention.is_some());
+        if flag {
+            flagged.insert(f.id);
+        }
+        if flag || paused.contains(&f.id) {
+            let key = ps.and_then(|p| p.attention_since.or(p.synced_at));
+            rows.push(((!flag, key), f));
         }
     }
-    rows.sort_by_key(|(key, _)| *key); // stable, like SQLite's unspecified tie order
-    Ok(rows.into_iter().map(|(_, f)| f).collect())
+    // Flagged first: a human is waiting on that PR. Stable, like SQLite's
+    // unspecified tie order.
+    rows.sort_by_key(|(key, _)| *key);
+    Ok((rows.into_iter().map(|(_, f)| f).collect(), flagged))
 }
 
 /// Selection — replicates `scheduler.pick_next`'s priority order and
@@ -283,7 +297,7 @@ async fn select(
     mode: Pick,
 ) -> anyhow::Result<Option<Candidate>> {
     let mut rechecking = findings_with_status(store, FindingStatus::Rechecking).await?;
-    let mut attention = list_attention(store).await?;
+    let (mut attention, flagged) = list_engage(store).await?;
     let mut pending_harvest = store.list_pending_harvest().await?;
     let mut queued = findings_with_status(store, FindingStatus::Queued).await?;
 
@@ -313,38 +327,44 @@ async fn select(
     pending_harvest.retain(not_held(FindingJobKind::Harvest));
     queued.retain(not_held(FindingJobKind::Fix));
 
-    // (1) A budget-overridden finding jumps the queue, scanned in the
-    // same kind order the normal priorities use (`scheduler.pick_next`).
-    for (kind, items) in [
+    // list_findings is id DESC: oldest first, as the engage and harvest
+    // lists already are.
+    rechecking.reverse();
+    queued.reverse();
+    // A finding may start its work fresh unless it is an engage whose PR
+    // is not flagged: that one is here only to continue its checkpoint.
+    let may_start = |kind: FindingJobKind, f: &Finding| {
+        kind != FindingJobKind::Engage || flagged.contains(&f.id)
+    };
+    let tiers = [
         (FindingJobKind::Engage, &attention),
         (FindingJobKind::Harvest, &pending_harvest),
         (FindingJobKind::Recheck, &rechecking),
         (FindingJobKind::Fix, &queued),
-    ] {
-        if let Some(f) = items.iter().find(|f| f.budget_override.is_some()) {
-            return match finding_pick(store, cfg, kind, f, mode).await? {
-                Some(c) => Ok(Some(c)),
-                // Its given-up chain just ended `f`'s work: select again.
-                None => Box::pin(select(store, cfg, force_repo, mode)).await,
-            };
-        }
-    }
+    ];
 
-    // (2)-(5) Normal finding-kind priorities, in this order.
-    // attention/pending_harvest are oldest-first; list_findings is id
-    // DESC, so last = oldest.
-    for (kind, oldest) in [
-        (FindingJobKind::Engage, attention.first()),
-        (FindingJobKind::Harvest, pending_harvest.first()),
-        (FindingJobKind::Recheck, rechecking.last()),
-        (FindingJobKind::Fix, queued.last()),
-    ] {
-        if let Some(f) = oldest {
-            return match finding_pick(store, cfg, kind, f, mode).await? {
-                Some(c) => Ok(Some(c)),
-                // Its given-up chain just ended `f`'s work: select again.
-                None => Box::pin(select(store, cfg, force_repo, mode)).await,
-            };
+    // (1) A budget-overridden finding jumps the queue, scanned in the
+    // same kind order the normal priorities use (`scheduler.pick_next`).
+    // (2)-(5) Then the normal finding-kind priorities, in that order,
+    // oldest first.
+    for overridden in [true, false] {
+        for (kind, items) in tiers {
+            for f in items
+                .iter()
+                .filter(|f| !overridden || f.budget_override.is_some())
+            {
+                match finding_pick(store, cfg, kind, f, may_start(kind, f), mode).await? {
+                    Picked::Work(c) => return Ok(Some(c)),
+                    // Its given-up chain just ended `f`'s work, which may
+                    // have held it: select again, from the top.
+                    Picked::Ended => {
+                        return Box::pin(select(store, cfg, force_repo, mode)).await;
+                    }
+                    // A flagless engage whose checkpoint could not be
+                    // continued: nothing to do here, and nothing changed.
+                    Picked::Nothing => {}
+                }
+            }
         }
     }
 
@@ -637,35 +657,59 @@ async fn pick_resume(
 /// replacement keeps the tier's position, label and budget override;
 /// only the plan differs.
 ///
-/// `None` when a chain given up here was the failure that ended `f`'s
-/// work ([`count_given_up_chain`]): `f` is no longer this tier's to pick.
+/// [`Picked::Ended`] when a chain given up here was the failure that ended
+/// `f`'s work ([`count_given_up_chain`]): `f` is no longer this tier's to
+/// pick. [`Picked::Nothing`] when nothing can be continued and `may_start`
+/// is false: an engage whose PR is not flagged is in its tier only to
+/// continue.
 async fn finding_pick(
     store: &Store,
     cfg: &Config,
     kind: FindingJobKind,
     f: &Finding,
+    may_start: bool,
     mode: Pick,
-) -> anyhow::Result<Option<Candidate>> {
-    let fresh = finding_candidate(kind, f);
+) -> anyhow::Result<Picked> {
+    let fresh = || {
+        if may_start {
+            Picked::Work(finding_candidate(kind, f))
+        } else {
+            Picked::Nothing
+        }
+    };
     let Some(job) = store.checkpoint_job(f.id, kind).await? else {
-        return Ok(Some(fresh));
+        return Ok(fresh());
     };
     let job_id = job.id;
-    match resume_plan(store, cfg, job, mode).await? {
-        Resumable::Yes(plan) => Ok(Some(Candidate::Resume {
-            label: fresh.label().map(str::to_owned),
-            budget_override: fresh.budget_override(),
-            plan,
-        })),
+    Ok(match resume_plan(store, cfg, job, mode).await? {
+        Resumable::Yes(plan) => {
+            let tier = finding_candidate(kind, f);
+            Picked::Work(Candidate::Resume {
+                label: tier.label().map(str::to_owned),
+                budget_override: tier.budget_override(),
+                plan,
+            })
+        }
         Resumable::GaveUp(why) => {
             if count_given_up_chain(store, kind, f.id, job_id, &why).await {
-                Ok(None)
+                Picked::Ended
             } else {
-                Ok(Some(fresh))
+                fresh()
             }
         }
-        Resumable::No => Ok(Some(fresh)),
-    }
+        Resumable::No => fresh(),
+    })
+}
+
+/// What [`finding_pick`] made of one finding of a tier.
+enum Picked {
+    /// Run this.
+    Work(Candidate),
+    /// Its work ended here (a given-up chain was counted); the selection
+    /// starts over, since what that wrote can change every tier.
+    Ended,
+    /// Nothing to do for it, and nothing changed.
+    Nothing,
 }
 
 /// The failure a given-up chain records in its finding's streak.
@@ -680,16 +724,10 @@ const CHAIN_GAVE_UP: &str = "resume chain gave up";
 /// cycle, and a worker that overruns its wall clock every time takes
 /// every cycle forever. Counted through the executors' own failure paths
 /// ([`handle_recheck_failure`], [`record_fix_failure`],
-/// [`record_harvest_failure`]), three given-up chains in a row end the
-/// work exactly as three identical failures do. Only here, where `f` is
-/// known to still be in this tier: the resume tier also ends chains, for
-/// findings a human may since have moved on.
-///
-/// Engage has no failure streak: its tier is a flag that the PR's next
-/// change raises again, so a given-up engage chain sets the flag aside
-/// ([`Store::set_attention_aside`]) as an engage that did nothing would.
-/// That drops the PR out of review until it changes, so it is logged as
-/// an `error`, with the reason, as an aborted withdrawal is.
+/// [`record_harvest_failure`], [`record_engage_failure`]), three given-up
+/// chains in a row hold the work exactly as three identical failures do.
+/// Only here, where `f` is known to still be in this tier: the resume tier
+/// also ends chains, for findings a human may since have moved on.
 ///
 /// True when this count ended the work, so the finding has left its
 /// tier.
@@ -738,19 +776,8 @@ async fn count_given_up_chain(
                 .await
         }
         FindingJobKind::Engage => {
-            let set_aside = store.set_attention_aside(fid).await;
-            let message = match &set_aside {
-                Ok(()) => {
-                    format!("#{fid} {failure}: {why}; attention set aside until the PR changes")
-                }
-                Err(e) => {
-                    format!("#{fid} {failure}: {why}; setting its attention aside failed: {e}")
-                }
-            };
-            let _ = store
-                .log_event("error", &message, Some(job), Some(fid))
-                .await;
-            set_aside.is_ok()
+            let detail = format!("{failure}: {why}");
+            record_engage_failure(store, fid, Some(job), failure, &detail, HoldReason::GaveUp).await
         }
     }
 }
@@ -4655,11 +4682,54 @@ struct EngageStart {
     ps: crate::types::PrState,
     head_ref: String,
     pr_number: i64,
-    pr: PrView,
+    /// The PR as the forge shows it, for the playbook: `None` on a resume,
+    /// which sends no playbook and so does not ask the forge.
+    pr: Option<PrView>,
     job: i64,
     ws: Workspace,
     pinned: String,
     cap: Option<i64>,
+}
+
+/// The PR as the forge shows it, for a fresh engage's playbook. Only a
+/// fresh engage reads it: a paused one continues without the forge (a
+/// resume sends no playbook), where a view that failed while the network
+/// is not back would count against it for nothing. A failed view is a
+/// failed engage ([`engage_prefetch_failed`]), or the network's, which
+/// ends the cycle denied (`Ok(Err(summary))`).
+async fn engage_view(
+    store: &Store,
+    (cfg, backend): (&Config, &dyn Backend),
+    finding: &Finding,
+    repo: &Repo,
+    pr_number: i64,
+    resume: Option<&ResumePlan>,
+) -> anyhow::Result<Result<Option<PrView>, CycleSummary>> {
+    if resume.is_some() {
+        return Ok(Ok(None));
+    }
+    let fg = forge::forge_for(repo.forge);
+    match fg.view_pr_engage(&repo.url, pr_number, &cfg.review_bots) {
+        Ok(p) => Ok(Ok(Some(p))),
+        Err(e) => {
+            let fid = finding.id;
+            let _ = store
+                .log_event(
+                    "error",
+                    &format!("engage #{fid}: PR/MR view failed: {e}"),
+                    None,
+                    Some(fid),
+                )
+                .await;
+            let failure = format!("PR/MR view failed: {e}");
+            if let Some(denied) =
+                engage_prefetch_failed(store, (cfg, backend), finding, &failure).await
+            {
+                return Ok(Err(denied));
+            }
+            anyhow::bail!("PR/MR view failed");
+        }
+    }
 }
 
 /// Everything before the worker runs: target, fetch, budget gate, PR view,
@@ -4672,7 +4742,17 @@ async fn start_engage(
     resume: Option<&ResumePlan>,
 ) -> anyhow::Result<Result<EngageStart, CycleSummary>> {
     let fid = finding.id;
-    let (repo, ps, head_ref, pr_number) = engage_target(store, finding, resume).await?;
+    let (repo, ps, head_ref, pr_number) = match engage_target(store, finding, resume).await {
+        Ok(target) => target,
+        Err(e) => {
+            if let Some(denied) =
+                engage_prefetch_failed(store, (cfg, backend), finding, &e.to_string()).await
+            {
+                return Ok(Err(denied));
+            }
+            return Err(e);
+        }
+    };
 
     let (cap, anticipated) = match budget_gate(
         backend,
@@ -4691,20 +4771,9 @@ async fn start_engage(
         BudgetDecision::Denied(d) => return Ok(Err(*d)),
     };
 
-    let fg = forge::forge_for(repo.forge);
-    let pr = match fg.view_pr_engage(&repo.url, pr_number, &cfg.review_bots) {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = store
-                .log_event(
-                    "error",
-                    &format!("engage #{fid}: PR/MR view failed: {e}"),
-                    None,
-                    Some(fid),
-                )
-                .await;
-            anyhow::bail!("PR/MR view failed");
-        }
+    let pr = match engage_view(store, (cfg, backend), finding, &repo, pr_number, resume).await? {
+        Ok(pr) => pr,
+        Err(denied) => return Ok(Err(denied)),
     };
 
     let created = match store
@@ -4766,12 +4835,13 @@ async fn start_engage(
 /// complete enough to hand to the closed PR's harvest right away.
 async fn withdraw_pr(
     store: &Store,
+    net: (&Config, &dyn Backend),
     fid: i64,
     start: &EngageStart,
     reason: &str,
     summary: &mut CycleSummary,
 ) -> bool {
-    let (repo, job, pr_number, ps) = (&start.repo, start.job, start.pr_number, &start.ps);
+    let (repo, job, pr_number) = (&start.repo, start.job, start.pr_number);
     let fg = forge::forge_for(repo.forge);
     let mut forge_closed = false;
     if fg.owner_repo(&repo.url).is_some() {
@@ -4780,43 +4850,43 @@ async fn withdraw_pr(
             // so a failure here means the PR is still OPEN on the forge.
             // Recording the verdict anyway would mark it closed locally
             // and set the finding Closed -- and sync_prs only revisits
-            // pr_open findings, so nothing would ever reconcile it.
-            //
-            // Leaving the finding untouched is not enough either: it
-            // stays in list_attention, which pick_next ranks second, so
-            // a persistently failing forge would monopolise every cycle
-            // running a fresh worker each time. Unlike fix/recheck/
-            // harvest there is no engage attempt counter to cap that.
-            // So mark THIS attention reason addressed, exactly as a
-            // reply-only engage does: the finding stops being re-picked
-            // until the PR sees genuinely new activity (the attention
-            // fingerprint or head_sha changes), and the error event
-            // below is what surfaces it in the meantime.
+            // pr_open findings, so nothing would ever reconcile it. Left
+            // untouched, the finding stays in the engage tier: a failed
+            // attempt the caller counts in the engage streak, which a
+            // forge that keeps refusing runs into (WORK-MODEL.md §9.4).
             tracing::warn!(finding = fid, pr = pr_number, error = %err, "close_pr failed");
+            if let Some(denied) = unpublished_offline(store, net, fid, start).await {
+                *summary = denied;
+                return false;
+            }
+            let fail = format!("PR close failed: {err}");
+            // A paused attempt that withdrew still ended: its withdrawal
+            // failed, and a failed attempt keeps no checkpoint (§6.3), or it
+            // would be resumed into the same withdrawal.
             log_write_failure(
                 store
-                    .mark_pr_engaged(
+                    .drop_checkpoint(
                         fid,
-                        ps.last_activity_at.unwrap_or_else(now_ms),
-                        now_ms(),
-                        ps.attention_fingerprint.as_deref(),
-                        ps.head_sha.as_deref(),
+                        FindingJobKind::Engage,
+                        job,
+                        &format!(
+                            "resume engage: checkpoint job {job} dropped, its withdrawal failed"
+                        ),
                     )
                     .await,
-                format_args!("#{fid}: marking PR engaged"),
+                format_args!("#{fid}: dropping the withdrawn engage's checkpoint"),
             );
-            let _ = store
-                .log_event(
-                    "error",
-                    &format!(
-                        "#{fid} withdrawal aborted: PR #{pr_number} could not be closed \
-                         (retries when the PR next changes)"
-                    ),
-                    Some(job),
-                    Some(fid),
-                )
-                .await;
-            summary.outcome = Some("withdraw-failed".into());
+            let held = record_engage_failure(
+                store,
+                fid,
+                Some(job),
+                "withdraw failed",
+                &fail,
+                HoldReason::Stuck,
+            )
+            .await;
+            summary.outcome = Some(if held { "held" } else { "withdraw-failed" }.into());
+            summary.failure = Some(fail);
             return false;
         }
         forge_closed = true;
@@ -4976,7 +5046,7 @@ async fn push_and_reply(start: &EngageStart, state: JobState) -> Result<(bool, b
 /// Either way a one-shot budget override is spent.
 async fn record_engage(
     store: &Store,
-    finding: &Finding,
+    (net, finding): ((&Config, &dyn Backend), &Finding),
     start: &EngageStart,
     state: JobState,
     published: Result<(bool, bool), String>,
@@ -4984,7 +5054,40 @@ async fn record_engage(
     summary: &mut CycleSummary,
 ) {
     let (fid, job, ps, pr_number) = (finding.id, start.job, &start.ps, start.pr_number);
+    let tail = crate::util::tail(stdout_tail, 300);
     match published {
+        // A pause, not a failure: the tree and transcript are kept, and
+        // the engage tier continues it while the PR is open (§6.1).
+        Err(fail) if state == JobState::Suspended => {
+            let _ = store
+                .log_event(
+                    "engage",
+                    &format!(
+                        "#{fid} suspended ({fail}); worktree kept at {} for the resume. \
+                         tail: {tail}",
+                        start.ws.tree.display()
+                    ),
+                    Some(job),
+                    Some(fid),
+                )
+                .await;
+            summary.outcome = Some("suspended".into());
+            summary.worktree = Some(start.ws.tree.to_string_lossy().into_owned());
+        }
+        // A failed engage: counted, so a PR whose engage keeps failing the
+        // same way is held at the limit where it used to be picked again
+        // every cycle, the highest finding tier with no counter at all.
+        // A finished worker whose push or reply could not reach the forge
+        // while it was unreachable: the network's failure (#95).
+        Err(_)
+            if state == JobState::Done
+                && let Some(denied) = unpublished_offline(store, net, fid, start).await =>
+        {
+            // Nothing concluded: a one-shot override is kept for the
+            // attempt that publishes.
+            *summary = denied;
+            return;
+        }
         Err(fail) => {
             if state == JobState::Done {
                 log_write_failure(
@@ -4992,26 +5095,17 @@ async fn record_engage(
                     format_args!("job {job}: failing ({fail})"),
                 );
             }
-            let tail = crate::util::tail(stdout_tail, 300);
-            // Only a suspension keeps its tree; any other outcome ends the
-            // chain and the tree is released by the caller.
-            let kept = if state == JobState::Suspended {
-                format!(
-                    "; worktree kept at {} for the resume",
-                    start.ws.tree.display()
-                )
-            } else {
-                String::new()
-            };
-            let _ = store
-                .log_event(
-                    "engage",
-                    &format!("#{fid} incomplete ({fail}){kept}. tail: {tail}"),
-                    Some(job),
-                    Some(fid),
-                )
-                .await;
-            summary.outcome = Some("retry".into());
+            let detail = format!("{fail}\n\n{tail}");
+            let held = record_engage_failure(
+                store,
+                fid,
+                Some(job),
+                engage_failure_key(&fail),
+                &detail,
+                HoldReason::Stuck,
+            )
+            .await;
+            summary.outcome = Some(if held { "held" } else { "retry" }.into());
             summary.failure = Some(fail);
         }
         Ok((pushed, replied)) => {
@@ -5042,6 +5136,10 @@ async fn record_engage(
             } else {
                 did.join(", ")
             };
+            log_write_failure(
+                store.clear_work_streak(fid, FindingJobKind::Engage).await,
+                format_args!("#{fid}: clearing the engage streak"),
+            );
             let _ = store
                 .log_event(
                     "engage",
@@ -5061,6 +5159,150 @@ async fn record_engage(
     }
 }
 
+/// The streak key of a failed engage: what failed, without the forge's or
+/// git's text, which differs on every attempt and would reset the streak
+/// each time (`push failed: <tail>` counts as `push failed`).
+fn engage_failure_key(fail: &str) -> &str {
+    fail.split(':').next().unwrap_or(fail).trim()
+}
+
+/// Count a failed engage in the finding's streak, `key` naming the failure
+/// and `detail` describing it (WORK-MODEL.md §7). The
+/// [`MAX_CONSECUTIVE_SAME_FAILURE`]th identical failure holds the engage for
+/// the operator as `at_limit` ([`Store::hold_work`]), with `job` as its
+/// checkpoint if a worker ran in it. The PR's attention flag is not
+/// touched: the engage tier skips held work, and new PR activity does not
+/// release the hold, only the operator does (§9.4).
+///
+/// Every failed engage is counted here — before its worker runs
+/// ([`engage_prefetch_failed`]), by its worker or its publishing
+/// ([`record_engage`]), a refused withdrawal ([`run_engage`]), or a
+/// given-up resume chain ([`count_given_up_chain`]). True when the engage
+/// is now held. A count or a hold that could not be recorded is reported
+/// as such and ends nothing.
+async fn record_engage_failure(
+    store: &Store,
+    fid: i64,
+    job: Option<i64>,
+    key: &str,
+    detail: &str,
+    at_limit: HoldReason,
+) -> bool {
+    let log = |message: String| async move {
+        let _ = store.log_event("engage", &message, job, Some(fid)).await;
+    };
+    let streak = match store
+        .record_work_failure(fid, FindingJobKind::Engage, key)
+        .await
+    {
+        Ok(streak) => streak,
+        Err(e) => {
+            log(format!("#{fid} incomplete ({detail}), not counted: {e}")).await;
+            return false;
+        }
+    };
+    if streak < MAX_CONSECUTIVE_SAME_FAILURE {
+        log(format!("#{fid} incomplete ({detail}), will retry")).await;
+        return false;
+    }
+    match store
+        .hold_work(fid, FindingJobKind::Engage, at_limit, detail, job)
+        .await
+    {
+        Ok(true) => {
+            log(format!(
+                "#{fid} held after {streak} identical failures ({detail})"
+            ))
+            .await;
+            true
+        }
+        Ok(false) => {
+            log(format!(
+                "#{fid} {streak} identical failures ({detail}), but its PR is no longer open; \
+                 nothing held"
+            ))
+            .await;
+            false
+        }
+        Err(e) => {
+            log(format!(
+                "#{fid} {streak} identical failures ({detail}), but holding it failed: {e}; \
+                 will retry"
+            ))
+            .await;
+            false
+        }
+    }
+}
+
+/// A finished engage that could not publish (push, reply, the withdrawal's
+/// close) while a host it needs is unreachable (#95): the network's
+/// failure, not the engage's. Nothing is counted, the job is left as it
+/// ended, and the attempt becomes the checkpoint, so its tree (commits,
+/// `PR-REPLY.md`, `WITHDRAW.md`) is kept and the next cycle continues it to
+/// publish. `None` when every host is reachable: a real publish failure.
+async fn unpublished_offline(
+    store: &Store,
+    (cfg, backend): (&Config, &dyn Backend),
+    fid: i64,
+    start: &EngageStart,
+) -> Option<CycleSummary> {
+    let host = unreachable_now(cfg, &start.repo.url, backend).await?;
+    let job = start.job;
+    log_write_failure(
+        store.keep_attempt_as_checkpoint(job).await,
+        format_args!("job {job}: keeping the unpublished attempt as the checkpoint"),
+    );
+    Some(
+        offline_denial(
+            store,
+            FindingJobKind::Engage.into(),
+            Some(fid),
+            Some(job),
+            host,
+        )
+        .await,
+    )
+}
+
+/// Count an engage that failed before its worker ran: its target could
+/// not be read (no `pr_state`, no head branch, a head fetch that failed)
+/// or the PR would not load. The caller has logged the `error` already;
+/// this counts it ([`record_engage_failure`]) under the failure's name
+/// without its text. Unless a host the engage needs is unreachable now
+/// ([`unreachable_now`]): then the failure is the network's, nothing is
+/// counted, and the returned summary ends the cycle denied for the host.
+async fn engage_prefetch_failed(
+    store: &Store,
+    (cfg, backend): (&Config, &dyn Backend),
+    finding: &Finding,
+    failure: &str,
+) -> Option<CycleSummary> {
+    let fid = finding.id;
+    // A repo that is gone has no forge to probe: its workers' hosts only.
+    let repo_url = store
+        .get_repo_by_id(finding.repo_id)
+        .await
+        .ok()
+        .flatten()
+        .map_or_else(String::new, |r| r.url);
+    if let Some(host) = unreachable_now(cfg, &repo_url, backend).await {
+        return Some(
+            offline_denial(store, FindingJobKind::Engage.into(), Some(fid), None, host).await,
+        );
+    }
+    record_engage_failure(
+        store,
+        fid,
+        None,
+        engage_failure_key(failure),
+        failure,
+        HoldReason::Stuck,
+    )
+    .await;
+    None
+}
+
 /// Run engage job (`scheduler.run_engage`): start it ([`start_engage`]),
 /// run the worker, then withdraw the PR ([`withdraw_pr`]) or publish its
 /// work ([`push_and_reply`]) and record that ([`record_engage`]).
@@ -5077,15 +5319,15 @@ pub async fn run_engage(
         Err(ended) => return Ok(ended),
     };
     let repo_notes = Store::repo_notes(&cfg.work_root, start.repo.id);
-    let prompt = match resume {
-        Some(_) => RESUME_PROMPT.to_owned(),
-        None => playbooks::build_engage_prompt(
+    let prompt = match &start.pr {
+        None => RESUME_PROMPT.to_owned(),
+        Some(pr) => playbooks::build_engage_prompt(
             &cfg.root,
             finding,
             &start.ws.tree,
             &start.head_ref,
             &start.repo,
-            &start.pr,
+            pr,
             &start.ps,
             &repo_notes,
         )?,
@@ -5101,6 +5343,11 @@ pub async fn run_engage(
             resume.map(|r| r.session_file.as_path()),
         )
         .await?;
+    let ran = (FindingJobKind::Engage, fid, start.job);
+    if let Some(denied) = unmetered_offline(store, cfg, backend, &start.repo.url, ran, &rr).await {
+        close_workspace(store, &start.ws).await;
+        return Ok(denied);
+    }
     let state = log_write_failure(
         record_job(store, start.job, &rr, model, resume).await,
         format_args!("job {}: recording outcome", start.job),
@@ -5135,12 +5382,12 @@ pub async fn run_engage(
                 format_args!("#{fid}: clearing one-shot budget override"),
             );
         }
-        withdraw_pr(store, fid, &start, &reason, &mut summary).await
+        withdraw_pr(store, (cfg, backend), fid, &start, &reason, &mut summary).await
     } else {
         let published = push_and_reply(&start, state).await;
         record_engage(
             store,
-            finding,
+            ((cfg, backend), finding),
             &start,
             state,
             published,
@@ -5150,22 +5397,6 @@ pub async fn run_engage(
         .await;
         false
     };
-    // A withdrawal is this attempt's end even when the worker was cut off
-    // after writing it: a successful one takes the finding out of
-    // `pr_open`, which drops the checkpoint with it, and a failed one must
-    // not be resumed into the same withdrawal either.
-    if state == JobState::Suspended && summary.outcome.as_deref() == Some("withdraw-failed") {
-        let msg = format!(
-            "job {} suspended after its withdrawal failed; nothing to resume",
-            start.job
-        );
-        log_write_failure(
-            store
-                .drop_checkpoint(fid, FindingJobKind::Engage, start.job, &msg)
-                .await,
-            format_args!("job {}: dropping the engage checkpoint", start.job),
-        );
-    }
     if closed_on_forge {
         continue_into_harvest(
             store,

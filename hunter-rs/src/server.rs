@@ -494,6 +494,7 @@ async fn findings(
             detail: hold.detail,
             held_at: hold.held_at,
             actions,
+            new_activity: hold.new_activity,
         });
     }
     let mut follow_up_of: HashMap<i64, i64> = HashMap::new();
