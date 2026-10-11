@@ -219,10 +219,13 @@ what actually runs):
    hands omp that exact session instead of starting cold. So does one
    that died after doing metered work — a provider error omp's retries
    did not absorb, a connection lost across a laptop suspend, or the
-   daemon going down mid-job (found at the next startup). Never a
-   wallclock overrun, which is the runaway signature, and never an
-   attempt that failed before spending a token (a misconfigured model or
-   an exhausted account fails the same way again).
+   daemon going down mid-job (found at the next startup), and one killed
+   for running past its wall-clock limit after doing metered work. Never
+   an attempt that failed before spending a token (a misconfigured model
+   or an exhausted account fails the same way again). A runaway is bounded
+   by the give-up ceiling, not by refusing to continue it: a chain that
+   keeps suspending is given up, and its finding's work counts that as a
+   failure.
    Ranked here because a suspension has already been paid for — it
    outranks *starting* new background work, never a human waiting on a
    PR. Restarting costs a flat ~37k-token session floor and then redoes

@@ -1,6 +1,6 @@
 # WORK-MODEL.md: pausing, holding and giving up
 
-**Status: proposal.** This describes the target model for how per-finding work gets paused, held for an operator, and given up. Nothing in it is implemented yet. Tracking issue: #88.
+**Status: implemented** (#88), as described below, with the deviations listed in the PR that implemented it. This describes the model for how per-finding work gets paused, held for an operator, and given up; §1–§4 describe the problems it replaced. Repo-level work is not on it yet (#92).
 
 It came out of the review of #56. That PR fixed one runaway loop, but it showed that "blocked", "suspended" and "stuck" are each represented differently for every kind of work, in places that don't agree.
 
