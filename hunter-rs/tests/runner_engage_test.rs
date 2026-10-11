@@ -2575,3 +2575,48 @@ async fn a_withdrawal_while_the_forge_is_unreachable_keeps_its_checkpoint() {
     let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
     assert_eq!(after.status, FindingStatus::PrOpen);
 }
+
+/// An engage whose backend cannot run its worker, or whose tree cannot be
+/// made, is a failed engage like any other (WORK-MODEL.md §7, G9): counted
+/// under a fixed key, and held at the limit. Uncounted, the flagged PR
+/// stayed in the engage tier, the highest of them, every cycle.
+#[tokio::test]
+async fn an_engage_that_never_reaches_its_worker_is_held() {
+    for case in ["backend", "tree"] {
+        let f = fixture(&format!("engage-no-worker-{case}")).await;
+        let bins = FakeBins::acquire(&format!("engage-no-worker-{case}"));
+        bins.ok("gh", PR_VIEW_JSON);
+        let backend = if case == "backend" {
+            ScriptedBackend::failing()
+        } else {
+            std::fs::write(f.cfg.work_root.join("jobs"), "not a directory").unwrap();
+            ScriptedBackend::new(|_| panic!("nothing may run without a tree"))
+        };
+        for _ in 0..3 {
+            let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+            let result =
+                hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &backend, None).await;
+            match case {
+                "backend" => assert!(result.is_err(), "{result:?}"),
+                _ => assert!(
+                    result
+                        .unwrap()
+                        .failure
+                        .unwrap()
+                        .starts_with("workspace not created"),
+                    "{case}"
+                ),
+            }
+        }
+        let hold = support::hold_of(&f.store, f.fid, hunter::domain::FindingJobKind::Engage)
+            .await
+            .unwrap_or_else(|| panic!("{case}: held at the limit"));
+        let key = if case == "backend" {
+            "runner error"
+        } else {
+            "workspace not created"
+        };
+        assert!(hold.detail.starts_with(key), "{case}: {hold:?}");
+        drop(bins);
+    }
+}

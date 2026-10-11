@@ -1029,15 +1029,17 @@ async fn rejecting_a_held_fix_lets_the_sweep_release_its_checkpoint() {
     assert!(held(&f).await.is_none());
 }
 
-/// A continued fix whose backend fails before any worker runs has no
-/// attempt to show for it: its job is failed as unstarted and the
-/// checkpoint it was continuing still resumes, rather than the fix
-/// starting cold.
+/// A fix whose backend fails before any worker runs is a failed fix
+/// (WORK-MODEL.md §7): its job is closed `failed` as unstarted instead of
+/// left `running`, the failure counts in the streak under the fixed
+/// `runner error`, and the third in a row holds the fix. Before, nothing
+/// was counted and the cycle failed, the same fix picked again five
+/// minutes later, forever. No worker ran, so nothing replaced the
+/// checkpoint the fix was continuing (§6.3): every attempt continues it,
+/// and the hold keeps it, so the operator can still `continue`.
 #[tokio::test]
-async fn a_continued_fix_whose_backend_fails_stays_resumable() {
-    let (f, blocked, summary, _) = held_fixture().await;
-    let tree = blocked.runs()[0].tree.clone();
-    let transcript = tree.parent().unwrap().join("session/session.jsonl");
+async fn a_fix_whose_backend_keeps_failing_is_held() {
+    let (f, _blocked, summary, _) = held_fixture().await;
     support::release(
         &f.store,
         f.fid,
@@ -1045,34 +1047,46 @@ async fn a_continued_fix_whose_backend_fails_stays_resumable() {
         ReleaseAction::Continue,
     )
     .await;
-    let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
-        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
-            .await
-            .unwrap()
-    else {
-        panic!("continued work must resume");
-    };
-    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let failing = ScriptedBackend::failing();
-    let err = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &failing, Some(&plan))
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("backend failed"), "{err}");
-    let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
-    assert_eq!(after.status.as_str(), "queued");
-
-    let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
-        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+    for attempt in 1..=3 {
+        let plan = match hunter::scheduler::pick_next(&f.store, &f.cfg, None)
             .await
             .unwrap()
-    else {
-        panic!("the checkpoint must still resume after a failed backend");
-    };
-    assert_eq!(plan.predecessor_id, summary.job_id.unwrap());
-    assert_eq!(plan.session_file, transcript);
-    assert_eq!(
-        git(&tree, &["log", "-1", "--format=%s"]).trim(),
-        "implemented candidate"
+        {
+            Some(hunter::scheduler::Candidate::Resume { plan, .. }) => Some(*plan),
+            _ => None,
+        };
+        assert_eq!(
+            plan.as_ref().map(|p| p.predecessor_id),
+            summary.job_id,
+            "the continued checkpoint: attempt {attempt}"
+        );
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        let err = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &failing, plan.as_ref())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("backend failed"), "{err}");
+        let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        assert_eq!(after.status.as_str(), "queued");
+        if attempt < 3 {
+            let streak = fix_streak(&f).await;
+            assert_eq!(
+                (streak.streak, streak.last_failure.as_deref()),
+                (attempt, Some("runner error"))
+            );
+        }
+    }
+
+    let hold = held(&f).await.expect("held at the limit");
+    assert_eq!(hold.reason, HoldReason::Stuck);
+    assert!(hold.detail.contains("backend failed"), "{hold:?}");
+    assert_eq!(hold.checkpoint_job_id, summary.job_id);
+    assert!(hold.actions().contains(&ReleaseAction::Continue));
+    let jobs = f.store.jobs_by_finding(f.fid).await.unwrap();
+    assert!(
+        jobs.iter()
+            .all(|j| j.state != hunter::domain::JobState::Running),
+        "no job is left running: {jobs:?}"
     );
 }
 
@@ -1713,4 +1727,63 @@ async fn a_failed_push_counts_only_while_the_forge_is_reachable() {
             "its commits are kept"
         );
     }
+}
+
+/// A backend that cannot start the worker while the provider is
+/// unreachable is the network's failure, not the fix's: nothing is
+/// counted, the job is closed as never started, the checkpoint the fix was
+/// continuing stays, and the cycle ends denied for the host, as the
+/// network gate's own denial does (#95).
+#[tokio::test]
+async fn a_runner_error_while_the_provider_is_unreachable_counts_nothing() {
+    let (mut f, _blocked, summary, _) = held_fixture().await;
+    support::release(
+        &f.store,
+        f.fid,
+        FindingJobKind::Fix,
+        ReleaseAction::Continue,
+    )
+    .await;
+    let forge = support::FORGE_HOST;
+    let provider = support::PROVIDER_HOST;
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    sqlx::query("UPDATE repos SET url = ?1")
+        .bind(format!("https://{forge}/acme/widget"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    f.cfg.network_gate = true;
+    let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
+        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+            .await
+            .unwrap()
+    else {
+        panic!("the continued fix resumes");
+    };
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let failing = ScriptedBackend::failing()
+        .needing(&[provider])
+        .offline(&[provider]);
+
+    let denied = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &failing, Some(&plan))
+        .await
+        .expect("the network's failure ends the cycle denied, not failed");
+
+    assert_eq!(denied.unreachable.as_deref(), Some(provider));
+    assert!(denied.retry_at.is_some(), "{denied:?}");
+    assert_eq!(fix_streak(&f).await.streak, 0);
+    assert_eq!(held(&f).await, None, "nothing counted, nothing held");
+    assert_eq!(
+        f.store
+            .checkpoint_job(f.fid, FindingJobKind::Fix)
+            .await
+            .unwrap()
+            .map(|j| j.id),
+        summary.job_id
+    );
+    let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(after.status.as_str(), "queued");
 }

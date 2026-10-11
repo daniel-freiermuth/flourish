@@ -601,3 +601,29 @@ async fn an_unmetered_failure_counts_only_while_the_provider_is_reachable() {
         assert_eq!(f.finding().await.status, FindingStatus::Rechecking);
     }
 }
+
+/// A recheck whose backend cannot run its worker is a failed recheck
+/// (WORK-MODEL.md §7): counted under the fixed `runner error`, its job
+/// closed instead of left `running`, and held at the limit. Uncounted, the
+/// recheck tier took it again every cycle.
+#[tokio::test]
+async fn a_recheck_whose_backend_keeps_failing_is_held() {
+    let f = fixture("recheck-backend-fails", FindingStatus::Rechecking).await;
+    let failing = ScriptedBackend::failing();
+    for _ in 0..3 {
+        let finding = f.finding().await;
+        let err = run_recheck(&f.store, &f.cfg, &finding, &failing, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("backend failed"), "{err}");
+    }
+    let hold = support::hold_of(&f.store, f.fid, FindingJobKind::Recheck)
+        .await
+        .expect("held at the limit");
+    assert!(hold.detail.starts_with("runner error"), "{hold:?}");
+    let running: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE state = 'running'")
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(running, 0, "no job is left running");
+}

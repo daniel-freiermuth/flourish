@@ -1603,3 +1603,24 @@ async fn a_held_merged_harvest_marked_harvested_files_its_follow_ups() {
     let ps = f.store.get_pr_state(f.fid).await.unwrap().unwrap();
     assert!(ps.harvested_at.is_some());
 }
+
+/// A harvest whose backend cannot run its worker is a failed harvest
+/// (WORK-MODEL.md §7): counted under the fixed `runner error`, and held at
+/// the limit, the PR left unharvested.
+#[tokio::test]
+async fn a_harvest_whose_backend_keeps_failing_is_held() {
+    let bins = FakeBins::acquire("harvest-backend-fails");
+    gh_default(&bins);
+    let f = fixture("harvest-backend-fails", FindingStatus::Closed).await;
+    let failing = ScriptedBackend::failing();
+    for _ in 0..3 {
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        let err = run_harvest(&f.store, &f.cfg, &finding, &failing, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("backend failed"), "{err}");
+    }
+    assert_held(&f, ReleaseAction::Classify).await;
+    let ps = f.store.get_pr_state(f.fid).await.unwrap().unwrap();
+    assert_eq!(ps.harvested_at, None);
+}

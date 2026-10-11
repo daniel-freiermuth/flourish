@@ -2409,7 +2409,7 @@ pub async fn run_recheck(
         )?,
     };
     let model = cfg.model_for("hunt");
-    let rr = backend
+    let rr = match backend
         .run(
             &ws,
             &prompt,
@@ -2418,7 +2418,16 @@ pub async fn run_recheck(
             JobClass::Hunt,
             resume.map(|r| r.session_file.as_path()),
         )
-        .await?;
+        .await
+    {
+        Ok(rr) => rr,
+        Err(e) => {
+            let ran = (FindingJobKind::Recheck, fid, job);
+            let denied = runner_failed(store, (cfg, backend, &repo.url), ran, &e).await;
+            close_workspace(store, &ws).await;
+            return denied.ok_or(e);
+        }
+    };
     let ran = (FindingJobKind::Recheck, fid, job);
     if let Some(denied) = unmetered_offline(store, cfg, backend, &repo.url, ran, &rr).await {
         close_workspace(store, &ws).await;
@@ -3719,8 +3728,128 @@ async fn record_fix_failure(
 }
 
 /// How [`open_workspace`] reports a tree it could not make, and the
-/// failure a fix, recheck or harvest that hit it records in its streak.
+/// failure a finding's work that hit it records in its streak.
 const TREE_NOT_MADE: &str = "workspace not created";
+
+/// Count an engage whose tree could not be made ([`open_workspace`] has
+/// failed its job and logged why) as a failed engage under the fixed
+/// [`TREE_NOT_MADE`], as for every other kind. Uncounted, the flagged PR
+/// stays in the engage tier, the highest of them, and is picked every
+/// cycle.
+async fn count_unmade_engage_tree(
+    store: &Store,
+    fid: i64,
+    job: i64,
+    mut summary: CycleSummary,
+) -> CycleSummary {
+    let note = summary.failure.clone().unwrap_or_default();
+    let held = record_engage_failure(
+        store,
+        fid,
+        Some(job),
+        TREE_NOT_MADE,
+        &note,
+        HoldReason::Stuck,
+    )
+    .await;
+    summary.outcome = Some(if held { "held" } else { "retry" }.into());
+    summary
+}
+
+/// The failure a finding's work records when the backend could not run its
+/// worker at all (`Backend::run` returned an error). The error follows it
+/// in the detail; it is not the key, which must stay the same for one
+/// outage to count as identical failures.
+const RUNNER_ERROR: &str = "runner error";
+
+/// Count a finding's work whose backend failed before any worker ran
+/// (WORK-MODEL.md §7). The job is closed `failed` as unstarted rather than
+/// left `running`, and the failure goes through the kind's own streak, so
+/// a backend that keeps failing ends in a hold instead of the same work
+/// being picked again every cycle. The caller releases what it holds (a
+/// fix's claim, the tree) and returns the error, which fails the cycle as
+/// before.
+///
+/// Unless a host the work needs is unreachable now ([`unreachable_now`]):
+/// a backend that cannot start a worker offline is the network's failure.
+/// Then the job is closed with that note, nothing is counted, and the
+/// returned summary ends the cycle denied for the host, as the network
+/// gate's own denial does (#95).
+async fn runner_failed(
+    store: &Store,
+    (cfg, backend, repo_url): (&Config, &dyn Backend, &str),
+    (kind, fid, job): (FindingJobKind, i64, i64),
+    err: &anyhow::Error,
+) -> Option<CycleSummary> {
+    if let Some(host) = unreachable_now(cfg, repo_url, backend).await {
+        log_write_failure(
+            store
+                .fail_unstarted_job(
+                    job,
+                    &format!("offline: {host} unreachable; {RUNNER_ERROR}: {err}"),
+                )
+                .await,
+            format_args!("job {job}: failing unstarted"),
+        );
+        return Some(offline_denial(store, kind.into(), Some(fid), Some(job), host).await);
+    }
+    let detail = format!("{RUNNER_ERROR}: {err}");
+    log_write_failure(
+        store.fail_unstarted_job(job, &detail).await,
+        format_args!("job {job}: failing unstarted"),
+    );
+    let mut summary = CycleSummary::default();
+    match kind {
+        FindingJobKind::Recheck => {
+            handle_recheck_failure(
+                store,
+                &mut summary,
+                fid,
+                job,
+                RUNNER_ERROR,
+                &detail,
+                HoldReason::Stuck,
+                None,
+            )
+            .await;
+        }
+        FindingJobKind::Fix => {
+            record_fix_failure(
+                store,
+                fid,
+                job,
+                RUNNER_ERROR,
+                &err.to_string(),
+                HoldReason::Stuck,
+                &mut summary,
+            )
+            .await;
+        }
+        FindingJobKind::Engage => {
+            record_engage_failure(
+                store,
+                fid,
+                Some(job),
+                RUNNER_ERROR,
+                &detail,
+                HoldReason::Stuck,
+            )
+            .await;
+        }
+        FindingJobKind::Harvest => {
+            record_harvest_failure(
+                store,
+                fid,
+                Some(job),
+                RUNNER_ERROR,
+                &detail,
+                HoldReason::Stuck,
+            )
+            .await;
+        }
+    }
+    None
+}
 
 /// Count a fix whose tree could not be made ([`open_workspace`] has failed
 /// its job and logged why) as a failed attempt ([`record_fix_failure`]),
@@ -4099,18 +4228,13 @@ pub async fn run_fix(
     {
         Ok(r) => r,
         Err(e) => {
-            // No worker ran, so the job is closed as unstarted rather than
-            // left `running`, and the checkpoint it would have continued
-            // stays the work item's.
-            log_write_failure(
-                store
-                    .fail_unstarted_job(start.job, &format!("backend failed: {e}"))
-                    .await,
-                format_args!("job {}: failing unstarted", start.job),
-            );
+            // Counted while the claim still holds the finding, as a
+            // worker's failure is.
+            let ran = (FindingJobKind::Fix, fid, start.job);
+            let denied = runner_failed(store, (cfg, backend, &start.repo.url), ran, &e).await;
             release_claim(store, fid).await;
             close_workspace(store, &start.ws).await;
-            anyhow::bail!("{e}");
+            return denied.ok_or(e);
         }
     };
     let ran = (FindingJobKind::Fix, fid, start.job);
@@ -4815,7 +4939,12 @@ async fn start_engage(
     .await?
     {
         Ok(opened) => opened,
-        Err(failed) => return Ok(Err(failed)),
+        Err(failed) => {
+            return Ok(Err(count_unmade_engage_tree(
+                store, fid, created.id, failed,
+            )
+            .await));
+        }
     };
     Ok(Ok(EngageStart {
         repo,
@@ -5333,7 +5462,7 @@ pub async fn run_engage(
         )?,
     };
     let model = cfg.model_for("fix");
-    let rr = backend
+    let rr = match backend
         .run(
             &start.ws,
             &prompt,
@@ -5342,7 +5471,16 @@ pub async fn run_engage(
             JobClass::Fix,
             resume.map(|r| r.session_file.as_path()),
         )
-        .await?;
+        .await
+    {
+        Ok(rr) => rr,
+        Err(e) => {
+            let ran = (FindingJobKind::Engage, fid, start.job);
+            let denied = runner_failed(store, (cfg, backend, &start.repo.url), ran, &e).await;
+            close_workspace(store, &start.ws).await;
+            return denied.ok_or(e);
+        }
+    };
     let ran = (FindingJobKind::Engage, fid, start.job);
     if let Some(denied) = unmetered_offline(store, cfg, backend, &start.repo.url, ran, &rr).await {
         close_workspace(store, &start.ws).await;
@@ -5916,7 +6054,7 @@ pub async fn run_harvest(
         )?,
     };
     let model = cfg.model_for("fix");
-    let rr = backend
+    let rr = match backend
         .run(
             &ws,
             &prompt,
@@ -5925,7 +6063,28 @@ pub async fn run_harvest(
             JobClass::Fix,
             resume.map(|r| r.session_file.as_path()),
         )
-        .await?;
+        .await
+    {
+        Ok(rr) => rr,
+        Err(e) => {
+            // A failed handoff is an extra chance, not an attempt of the
+            // harvest's own: its job is closed, nothing is counted.
+            let denied = if handoff {
+                log_write_failure(
+                    store
+                        .fail_unstarted_job(job, &format!("{RUNNER_ERROR}: {e}"))
+                        .await,
+                    format_args!("job {job}: failing unstarted"),
+                );
+                None
+            } else {
+                let ran = (FindingJobKind::Harvest, fid, job);
+                runner_failed(store, (cfg, backend, &repo.url), ran, &e).await
+            };
+            close_workspace(store, &ws).await;
+            return denied.ok_or(e);
+        }
+    };
     let ran = (FindingJobKind::Harvest, fid, job);
     if let Some(denied) = unmetered_offline(store, cfg, backend, &repo.url, ran, &rr).await {
         close_workspace(store, &ws).await;
