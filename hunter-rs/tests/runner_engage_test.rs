@@ -2620,3 +2620,100 @@ async fn an_engage_that_never_reaches_its_worker_is_held() {
         drop(bins);
     }
 }
+
+/// An engage whose feedback needs a maintainer's decision writes
+/// `BLOCKED.md` (WORK-MODEL.md §9.1): it is held as a missing
+/// prerequisite on the report, nothing is pushed or posted, and the PR's
+/// attention stays unaddressed for the continue.
+#[tokio::test]
+async fn an_engage_that_needs_a_maintainer_is_held_on_its_report() {
+    let f = fixture("engage-blocked").await;
+    f.store
+        .set_budget_override(f.fid, Some(hunter::domain::BudgetOverride::Once))
+        .await
+        .unwrap();
+    let bins = FakeBins::acquire("engage-blocked");
+    bins.ok("gh", PR_VIEW_JSON);
+    let origin = push_to(&f, None).await;
+    let before = git(&origin, &["rev-parse", BRANCH]);
+    let backend = ScriptedBackend::new(|tree| {
+        std::fs::write(tree.join("BLOCKED.md"), "two reviewers want opposite APIs").unwrap();
+        std::fs::write(tree.join("PR-REPLY.md"), "not posted").unwrap();
+        git(tree, &["commit", "--allow-empty", "-qm", "not pushed"]);
+        support::done_with_transcript(tree)
+    });
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+
+    let summary = hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &backend, None)
+        .await
+        .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("held"));
+    let hold = support::hold_of(&f.store, f.fid, hunter::domain::FindingJobKind::Engage)
+        .await
+        .expect("held on the report");
+    assert_eq!(
+        (hold.reason, hold.detail.as_str(), hold.checkpoint_job_id),
+        (
+            hunter::domain::HoldReason::Prerequisite,
+            "two reviewers want opposite APIs",
+            summary.job_id
+        )
+    );
+    let calls = bins.calls_to("gh");
+    assert!(
+        calls.iter().all(|c| !c.iter().any(|a| a == "comment")),
+        "nothing posted: {calls:?}"
+    );
+    assert_eq!(
+        git(&origin, &["rev-parse", BRANCH]),
+        before,
+        "nothing pushed"
+    );
+    let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(
+        after.budget_override,
+        Some(hunter::domain::BudgetOverride::Once),
+        "a hold concluded nothing: the override is for the continue"
+    );
+    assert_eq!(f.addressed_fp().await, None, "attention left unaddressed");
+}
+
+/// A `BLOCKED.md` holds the engage whatever state its attempt ended in: a
+/// worker that asked for a maintainer and then lost its connection (a
+/// suspension) asked all the same. It used to be read only from a worker
+/// that finished; the resume deleted it as stale and pushed what the
+/// worker had committed before blocking.
+#[tokio::test]
+async fn a_suspended_engage_that_wrote_blocked_is_held_and_pushes_nothing() {
+    let f = fixture("engage-blocked-suspended").await;
+    let bins = FakeBins::acquire("engage-blocked-suspended");
+    bins.ok("gh", PR_VIEW_JSON);
+    let origin = push_to(&f, None).await;
+    let before = git(&origin, &["rev-parse", BRANCH]);
+    let backend = ScriptedBackend::new(|tree| {
+        git(tree, &["commit", "--allow-empty", "-qm", "half done"]);
+        std::fs::write(tree.join("BLOCKED.md"), "needs a maintainer's call").unwrap();
+        suspended_by(tree, "cap")
+    });
+
+    let summary = f.run(&backend).await.unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("held"), "{summary:?}");
+    let hold = support::hold_of(&f.store, f.fid, hunter::domain::FindingJobKind::Engage)
+        .await
+        .expect("held on the report");
+    assert_eq!(
+        (hold.reason, hold.detail.as_str(), hold.checkpoint_job_id),
+        (
+            hunter::domain::HoldReason::Prerequisite,
+            "needs a maintainer's call",
+            summary.job_id
+        )
+    );
+    assert_eq!(
+        git(&origin, &["rev-parse", BRANCH]),
+        before,
+        "nothing pushed"
+    );
+}

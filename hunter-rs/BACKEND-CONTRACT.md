@@ -211,9 +211,12 @@ A cap kill that left a transcript is a **pause**: the worker ran out of window h
 
 **What the scheduler does with a suspension.** Selection (`pick_next`) continues suspended work in two places. Each finding-driven tier — override, flagged PR, pending harvest, recheck, queued fix; all a human waiting on a PR — first looks for a resumable suspension at its own `(finding_id, kind)` and, when there is one, returns a resume of it in the tier's own position, with the tier's label and budget override (`finding_pick`). Those tiers outrank the resume tier, so without that check they started the same work fresh: production engage job 4359 redid suspended engage 4358 for 92 294 tokens where resuming would have re-cached ~75 000, and its worktree handling removed the directory 4358's transcript refers to. The resume tier proper sits after every finding-driven tier and before repo rotation, since a resume is background work already paid for. `Store::list_resumable_jobs` supplies the candidates for both: `state = 'suspended'`, repo live, `session_file` non-NULL, and `NOT EXISTS` a row whose `resumed_from` names it (the successor row IS the record that the work was picked up, which is why there is no `resumed` state). The scheduler additionally requires the chain's workspace (see *Where a job runs* below) to still hold its tree, the job's `session_file` to lie inside that workspace's `session/`, and the job to carry a `pinned_sha`, because a resumed worker continues a conversation, not a filesystem. A suspension failing any of these — including every suspension from before per-chain workspaces, whose tree and transcript are in the old layout — can never be continued, so it is retired `killed` with `killed_reason = "workdir-gone"` and a `resume` event (`resume {kind} {repo}: job {id} retired, workspace {path} is gone`) rather than skipped: a skip left it `suspended` forever. The retirement happens during the walk, so it is not offered and the walk moves on in the same cycle. Both places run one eligibility-and-plan function (`resume_plan`), which also applies the give-up ceiling below.
 
-**Held work (Rust, WORK-MODEL.md §9).** A worker's `BLOCKED.md` is not a false-finding
-verdict, and repeated identical failures are not a rejection: both hold the
-fix for the operator (`Store::hold_work`), a `work_holds` row with a typed
+**Held work (Rust, WORK-MODEL.md §9).** A worker's `BLOCKED.md` (any finding
+kind: recheck, fix, engage, harvest; read after every attempt, whatever state
+it ended in, since a worker that asked for a human and then lost its
+connection asked all the same)
+is not a false-finding verdict, and repeated identical failures are not a
+rejection: both hold the work for the operator (`Store::hold_work`), a `work_holds` row with a typed
 reason (`prerequisite` for the report, `stuck` for the third identical
 failure, `gave_up` when the give-up ceiling's failure completed the streak)
 and the report, or the failure key and its output, as its detail. A hold
@@ -225,10 +228,18 @@ streak, and the held attempt becomes the work item's checkpoint if a worker
 ran in it (it has a transcript); one that left nothing to continue (no job,
 or a tree never made) keeps the checkpoint the work item already had, and
 with none the operator can only restart it. `BLOCKED.md` is deleted from the tree once recorded, so the hold
-is the report's only owner, and one still in the tree when a continued chain
-resumes (the daemon died before deleting it) is removed after the claim
-(so a verdict given since selection still wins) and before a successor job
-exists. The operator ends a hold with `POST /api/hold/release`: `continue`
+is the report's only owner. A resume removes one still in its tree only when
+it is already recorded or not the chain's own: the resume follows the
+operator's `continue` (the daemon died before deleting the recorded
+report), or it is a harvest handoff (the engage wrote it next to its
+`WITHDRAW.md`). It is removed before a successor job exists, for a fix
+after the claim (so a verdict given since selection still wins). Any other
+report in the tree is one no hold recorded yet, and holds the work once the
+resumed attempt ends. A recheck's final verdict wins over its report, and an
+engage's `WITHDRAW.md` over its; a held engage pushes and posts nothing, a
+held harvest files no follow-ups, and a `BLOCKED.md` hold keeps a one-shot
+budget override for the `continue`, for every kind (a streak's hold,
+`stuck` or `gave_up`, spends it: the failing attempt used it). The operator ends a hold with `POST /api/hold/release`: `continue`
 resumes the checkpoint with a prompt chosen by the hold's reason, and the
 give-up ceiling then counts only the attempts started after the release
 (§8); after that the chain is ordinary, bounded by the ceiling and the

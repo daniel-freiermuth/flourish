@@ -117,10 +117,12 @@ new ──recheck──> new / superseded / rejected
   way: superseded / duplicate / obsolete → `superseded`, wrong →
   `rejected`, unwanted → `wontfix`; a decline that classifies nothing
   goes back to `new` for triage.
-- **Held work** is not a status. When a fix worker writes `BLOCKED.md`
+- **Held work** is not a status. When a worker writes `BLOCKED.md`
   (a verification prerequisite, dependency, or human decision is
-  missing), or the same failure repeats three times in a row, the fix is
-  *held* for you: the finding stays `queued`, the scheduler skips it, and
+  missing; every finding kind's playbook says when: a recheck that cannot
+  verify, an engage whose feedback needs a maintainer's decision, a
+  harvest that cannot classify the closure), or the same failure repeats
+  three times in a row, the work is *held* for you. For a fix: the finding stays `queued`, the scheduler skips it, and
   the attempt is kept as its checkpoint (committed work, uncommitted
   reports, transcript) when a worker ran in it. It is NOT suppressed.
   Kanban's **Needs you** section lists it with the report or what kept

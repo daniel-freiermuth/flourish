@@ -1624,3 +1624,103 @@ async fn a_harvest_whose_backend_keeps_failing_is_held() {
     let ps = f.store.get_pr_state(f.fid).await.unwrap().unwrap();
     assert_eq!(ps.harvested_at, None);
 }
+
+/// A closed PR's harvest that cannot classify the closure without a human
+/// writes `BLOCKED.md` (WORK-MODEL.md §9.1): the harvest is held as a
+/// missing prerequisite on the report, the PR stays unharvested and the
+/// finding `closed`, and no follow-ups are filed. A hold concludes
+/// nothing, so a `once` override is kept for the continue, as for every
+/// kind.
+#[tokio::test]
+async fn a_harvest_that_cannot_classify_is_held_on_its_report() {
+    let bins = FakeBins::acquire("harvest-blocked");
+    gh_default(&bins);
+    let f = fixture("harvest-blocked", FindingStatus::Closed).await;
+    f.store
+        .set_budget_override(f.fid, Some(BudgetOverride::Once))
+        .await
+        .unwrap();
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let backend = ScriptedBackend::new(|tree| {
+        std::fs::write(tree.join("BLOCKED.md"), "closed without a word").unwrap();
+        std::fs::write(tree.join("FOLLOW-UPS.json"), FOLLOW_UP).unwrap();
+        support::done_with_transcript(tree)
+    });
+
+    let summary = run_harvest(&f.store, &f.cfg, &finding, &backend, None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        (
+            summary.kind,
+            summary.finding_id,
+            summary.state,
+            summary.pr_number,
+            summary.outcome.as_deref()
+        ),
+        (
+            Some(FindingJobKind::Harvest.into()),
+            Some(f.fid),
+            Some(JobState::Done),
+            Some(7),
+            Some("held")
+        )
+    );
+    let hold = support::hold_of(&f.store, f.fid, FindingJobKind::Harvest)
+        .await
+        .expect("held on the report");
+    assert_eq!(
+        (hold.reason, hold.detail.as_str(), hold.checkpoint_job_id),
+        (
+            hunter::domain::HoldReason::Prerequisite,
+            "closed without a word",
+            summary.job_id
+        )
+    );
+    let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(after.status, FindingStatus::Closed);
+    assert_eq!(after.budget_override, Some(BudgetOverride::Once));
+    let ps = f.store.get_pr_state(f.fid).await.unwrap().unwrap();
+    assert_eq!(ps.harvested_at, None);
+    assert_eq!(
+        filed(&f, "widget:src/lib.rs:left-open").await,
+        0,
+        "nothing filed"
+    );
+}
+
+/// A `BLOCKED.md` holds the harvest whatever state its attempt ended in: a
+/// merged PR's review that asked for a human and then lost its connection
+/// is held, not resumed with the report deleted as stale and the PR
+/// stamped harvested without the review it asked a human about.
+#[tokio::test]
+async fn a_suspended_harvest_that_wrote_blocked_is_held() {
+    let bins = FakeBins::acquire("harvest-blocked-suspended");
+    gh_default(&bins);
+    let f = fixture("harvest-blocked-suspended", FindingStatus::Merged).await;
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let backend = ScriptedBackend::new(|tree| {
+        std::fs::write(tree.join("BLOCKED.md"), "the diff will not load").unwrap();
+        suspended_at(tree)
+    });
+
+    let summary = run_harvest(&f.store, &f.cfg, &finding, &backend, None)
+        .await
+        .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("held"), "{summary:?}");
+    let hold = support::hold_of(&f.store, f.fid, FindingJobKind::Harvest)
+        .await
+        .expect("held on the report");
+    assert_eq!(
+        (hold.reason, hold.detail.as_str(), hold.checkpoint_job_id),
+        (
+            hunter::domain::HoldReason::Prerequisite,
+            "the diff will not load",
+            summary.job_id
+        )
+    );
+    let ps = f.store.get_pr_state(f.fid).await.unwrap().unwrap();
+    assert_eq!(ps.harvested_at, None, "not stamped harvested");
+}

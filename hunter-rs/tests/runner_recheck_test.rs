@@ -627,3 +627,59 @@ async fn a_recheck_whose_backend_keeps_failing_is_held() {
         .unwrap();
     assert_eq!(running, 0, "no job is left running");
 }
+
+/// A recheck that cannot reach a verdict without a human writes
+/// `BLOCKED.md` (WORK-MODEL.md §9.1): the recheck is held as a missing
+/// prerequisite with the report as its detail and this attempt as its
+/// checkpoint, the finding stays `rechecking`, and the report leaves the
+/// tree, so a continue cannot read it as its own. A final verdict written
+/// next to it wins.
+#[tokio::test]
+async fn a_recheck_that_needs_a_human_is_held_on_its_report() {
+    for verdict in [None, Some(serde_json::json!({ "verdict": "confirmed" }))] {
+        let f = fixture("recheck-blocked", FindingStatus::Rechecking).await;
+        f.store
+            .set_budget_override(f.fid, Some(BudgetOverride::Once))
+            .await
+            .unwrap();
+        let out = f.out();
+        let body = verdict.as_ref().map(ToString::to_string);
+        let backend = ScriptedBackend::new(move |tree| {
+            std::fs::write(tree.join("BLOCKED.md"), "needs the staging database").unwrap();
+            if let Some(body) = &body {
+                std::fs::write(&out, body).unwrap();
+            }
+            support::done_with_transcript(tree)
+        });
+
+        let summary = f.recheck(&backend).await;
+
+        let hold = support::hold_of(&f.store, f.fid, FindingJobKind::Recheck).await;
+        if verdict.is_some() {
+            assert_eq!(hold, None, "the verdict wins");
+            assert_eq!(summary.outcome.as_deref(), Some("confirmed"));
+            continue;
+        }
+        assert_eq!(summary.outcome.as_deref(), Some("held"));
+        let hold = hold.expect("held on the report");
+        assert_eq!(
+            (hold.reason, hold.detail.as_str(), hold.checkpoint_job_id),
+            (
+                hunter::domain::HoldReason::Prerequisite,
+                "needs the staging database",
+                summary.job_id
+            )
+        );
+        assert_eq!(f.finding().await.status, FindingStatus::Rechecking);
+        assert_eq!(
+            f.finding().await.budget_override,
+            Some(BudgetOverride::Once),
+            "a hold concluded nothing: the override is for the continue"
+        );
+        let tree = backend.runs()[0].tree.clone();
+        assert!(
+            !tree.join("BLOCKED.md").exists(),
+            "the hold owns the report"
+        );
+    }
+}

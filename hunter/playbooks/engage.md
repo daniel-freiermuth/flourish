@@ -102,3 +102,10 @@ Protocol step 2 applies to maintainers only.
 - If the feedback shows the fix is fundamentally wrong, or this PR is
   superseded/obsolete: write WITHDRAW.md at the worktree root with the
   technical reasoning instead of PR-REPLY.md, and commit nothing new.
+- If addressing the feedback needs a decision only a maintainer of this
+  project can make (two reviewers ask for opposite things, a reviewer asks
+  for a change of scope or design you cannot settle from the code), write
+  BLOCKED.md at the worktree root, NOT COMMITTED, instead of PR-REPLY.md: the decision
+  needed, the options, and the evidence for each. Nothing is pushed or
+  posted, and the PR is held for the operator with your report. A question
+  you can answer from the code is not one: answer it in PR-REPLY.md.
