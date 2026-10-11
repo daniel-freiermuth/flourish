@@ -122,7 +122,8 @@ new ──recheck──> new / superseded / rejected
   missing; every finding kind's playbook says when: a recheck that cannot
   verify, an engage whose feedback needs a maintainer's decision, a
   harvest that cannot classify the closure), or the same failure repeats
-  three times in a row, the work is *held* for you. For a fix: the finding stays `queued`, the scheduler skips it, and
+  three times in a row, the work is *held* for you. For a fix: the
+  finding stays `queued`, the scheduler skips it, and
   the attempt is kept as its checkpoint (committed work, uncommitted
   reports, transcript) when a worker ran in it. It is NOT suppressed.
   Kanban's **Needs you** section lists it with the report or what kept
@@ -132,7 +133,8 @@ new ──recheck──> new / superseded / rejected
   **Reject**/**Wontfix** decide the finding. A recheck whose worker fails
   the same way three times is held the same way and stays `rechecking`,
   where it used to go back to `new` looking like a finding nobody had
-  rechecked.
+  rechecked. Whatever the kind, **Continue** tells the resumed worker why
+  it was held, with the report or the failure as context.
 - **`pr_open`** — tracked via `sync_prs` (free — `gh pr view`, no worker)
   every cycle: merged → `merged`; closed unmerged → `closed`; new
   comments/reviews, `CHANGES_REQUESTED`, merge conflicts, or failing checks

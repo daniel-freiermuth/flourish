@@ -240,7 +240,9 @@ engage's `WITHDRAW.md` over its; a held engage pushes and posts nothing, a
 held harvest files no follow-ups, and a `BLOCKED.md` hold keeps a one-shot
 budget override for the `continue`, for every kind (a streak's hold,
 `stuck` or `gave_up`, spends it: the failing attempt used it). The operator ends a hold with `POST /api/hold/release`: `continue`
-resumes the checkpoint with a prompt chosen by the hold's reason, and the
+resumes the checkpoint with a prompt chosen by the hold's reason and kind,
+the hold's detail as context (`fix_prompt` for a fix, with its updated
+playbook; `resume_prompt` for the others, short like every resume's), and the
 give-up ceiling then counts only the attempts started after the release
 (§8); after that the chain is ordinary, bounded by the ceiling and the
 streak, and an attempt that does not finish is not held again on the spot.

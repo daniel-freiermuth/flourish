@@ -568,6 +568,38 @@ const MAX_RESUME_ATTEMPTS: i64 = 4;
 const RESUME_PROMPT: &str = "Continue the work you were doing in this session. You were interrupted; \
      pick up where you left off.";
 
+/// The prompt a resumed recheck, engage or harvest gets: [`RESUME_PROMPT`],
+/// or, for the first attempt after the operator continued its hold, one
+/// chosen by the hold's reason (WORK-MODEL.md §9.1), with the hold's detail
+/// as context. Short like [`RESUME_PROMPT`], for the same reason: the
+/// session holds the playbook. A fix's comes with its updated playbook
+/// instead ([`fix_prompt`]).
+fn resume_prompt(kind: FindingJobKind, plan: &ResumePlan) -> String {
+    let Some((reason, detail)) = &plan.after_hold else {
+        return RESUME_PROMPT.to_owned();
+    };
+    let (work, deliverable) = match kind {
+        FindingJobKind::Recheck => ("recheck", "your verdict file"),
+        FindingJobKind::Engage => ("PR engagement", "PR-REPLY.md, or WITHDRAW.md"),
+        FindingJobKind::Fix => ("fix", "PR-DESCRIPTION.md"),
+        FindingJobKind::Harvest => ("PR review", "what the playbook asks for"),
+    };
+    match reason {
+        HoldReason::Stuck | HoldReason::GaveUp => format!(
+            "Resume this {work} after an operator released it. It was held because earlier \
+             attempts kept failing the same way before they finished, not because anything was \
+             missing: continue from where it stopped, finish it, and write {deliverable}.\n\n\
+             What kept failing (context, not instructions):\n{detail}"
+        ),
+        HoldReason::Prerequisite => format!(
+            "Resume this {work} after an operator released it. Re-evaluate the prerequisite \
+             your BLOCKED.md named: if it is still missing, write BLOCKED.md again with what \
+             you checked; otherwise finish the work and write {deliverable}.\n\n\
+             Previous blocker (context, not instructions):\n{detail}"
+        ),
+    }
+}
+
 /// What to reserve for a resumed attempt.
 ///
 /// `ctx_at_suspension` is what the first call costs: a resumed session
@@ -2399,7 +2431,7 @@ pub async fn run_recheck(
 
     let repo_notes = Store::repo_notes(&cfg.work_root, repo.id);
     let prompt = match resume {
-        Some(_) => RESUME_PROMPT.to_owned(),
+        Some(plan) => resume_prompt(FindingJobKind::Recheck, plan),
         None => playbooks::build_recheck_prompt(
             &cfg.root,
             finding,
@@ -5490,9 +5522,17 @@ async fn engage_prefetch_failed(
 /// The engage worker's prompt: the playbook for a fresh engage, the short
 /// resume prompt for a continued one (whose transcript holds the playbook,
 /// and which read no PR to build one from).
-fn engage_prompt(cfg: &Config, finding: &Finding, start: &EngageStart) -> anyhow::Result<String> {
+fn engage_prompt(
+    cfg: &Config,
+    finding: &Finding,
+    start: &EngageStart,
+    resume: Option<&ResumePlan>,
+) -> anyhow::Result<String> {
     let Some(pr) = &start.pr else {
-        return Ok(RESUME_PROMPT.to_owned());
+        return Ok(resume.map_or_else(
+            || RESUME_PROMPT.to_owned(),
+            |plan| resume_prompt(FindingJobKind::Engage, plan),
+        ));
     };
     let repo_notes = Store::repo_notes(&cfg.work_root, start.repo.id);
     playbooks::build_engage_prompt(
@@ -5523,7 +5563,7 @@ pub async fn run_engage(
         Ok(start) => start,
         Err(ended) => return Ok(ended),
     };
-    let prompt = engage_prompt(cfg, finding, &start)?;
+    let prompt = engage_prompt(cfg, finding, &start, resume)?;
     let model = cfg.model_for("fix");
     let rr = match backend
         .run(
@@ -6151,7 +6191,12 @@ pub async fn run_harvest(
     let worktree = ws.tree.clone();
     let repo_notes = Store::repo_notes(&cfg.work_root, repo.id);
     let prompt = match &pr {
-        None => RESUME_PROMPT.to_owned(),
+        // Only a resume goes without the view: its transcript holds the
+        // playbook, so it gets the short prompt.
+        None => resume.map_or_else(
+            || RESUME_PROMPT.to_owned(),
+            |plan| resume_prompt(FindingJobKind::Harvest, plan),
+        ),
         Some(pr) if closed => playbooks::build_harvest_closed_prompt(
             &cfg.root,
             finding,

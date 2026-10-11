@@ -683,3 +683,41 @@ async fn a_recheck_that_needs_a_human_is_held_on_its_report() {
         );
     }
 }
+
+/// The operator's `continue` on a recheck held on its report resumes the
+/// checkpoint with a prompt chosen by the hold's reason, the report as
+/// context (WORK-MODEL.md §9.1): the worker re-evaluates the prerequisite
+/// instead of being told it was merely interrupted.
+#[tokio::test]
+async fn a_continued_recheck_hold_resumes_with_its_reason() {
+    let f = fixture("recheck-continue", FindingStatus::Rechecking).await;
+    let blocked = ScriptedBackend::new(|tree| {
+        std::fs::write(tree.join("BLOCKED.md"), "needs the staging database").unwrap();
+        support::done_with_transcript(tree)
+    });
+    f.recheck(&blocked).await;
+    support::release(
+        &f.store,
+        f.fid,
+        FindingJobKind::Recheck,
+        hunter::domain::ReleaseAction::Continue,
+    )
+    .await;
+    let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
+        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+            .await
+            .unwrap()
+    else {
+        panic!("a continued hold resumes its checkpoint");
+    };
+    let resumed = replying(f.out(), &serde_json::json!({ "verdict": "confirmed" }));
+
+    let finding = f.finding().await;
+    run_recheck(&f.store, &f.cfg, &finding, &resumed, Some(&plan))
+        .await
+        .unwrap();
+
+    let prompt = &resumed.runs()[0].prompt;
+    assert!(prompt.contains("Re-evaluate the prerequisite"), "{prompt}");
+    assert!(prompt.contains("needs the staging database"), "{prompt}");
+}
