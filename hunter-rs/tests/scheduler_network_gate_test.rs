@@ -138,6 +138,12 @@ async fn an_unreachable_forge_denies_a_scan() {
     let summary = run_cycle(&store, &cfg, &backend, None).await;
 
     assert_denied_for(&store, &summary, &down, before).await;
+    assert_eq!(summary.unreachable.as_deref(), Some(down.as_str()));
+    assert_eq!(
+        hunter::daemon::describe_cycle(&summary),
+        ("offline".to_owned(), format!("{down} unreachable")),
+        "the status page shows the cycle as offline, naming the host"
+    );
     let repo = store.get_repo_by_id(1).await.unwrap().unwrap();
     assert_eq!(
         repo.last_test_gap_at,

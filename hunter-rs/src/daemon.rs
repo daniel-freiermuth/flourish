@@ -183,6 +183,11 @@ pub fn describe_cycle(summary: &CycleSummary) -> (String, String) {
     if let Some(v) = summary.skipped.as_deref() {
         return ("idle".into(), v.to_owned());
     }
+    // Before `denied`, which it also sets: offline is its own state, so
+    // the status page can say which host is missing rather than "denied".
+    if let Some(host) = summary.unreachable.as_deref() {
+        return ("offline".into(), format!("{host} unreachable"));
+    }
     if let Some(d) = summary.denied.as_deref() {
         return ("denied".into(), format!("last: {d}"));
     }

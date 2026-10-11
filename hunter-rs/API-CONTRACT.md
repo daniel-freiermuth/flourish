@@ -74,7 +74,7 @@ Handler: server.py:216-217 -> `_summary()` (server.py:256-333) -> `_validate_sum
 | `scheduler_overdrive` | bool | process-local overdrive flag from `SchedulerHandle`; when true every budget decision uses the backend's prioritized verdict. Resets to false on daemon restart. |
 | `current_job` | Job object or null | `store.current_job()` (store.py:1243-1280), see below. |
 | `next_candidate` | object or null | computed only when `current_job` is null AND `scheduler.pick_next` yields a candidate (server.py:276-308); see below. |
-| `scheduler_state` | object or null | `store.get_scheduler_state()`: `SELECT * FROM scheduler_state WHERE id = 1` (store.py:1295-1301). Shape (types.py:109-114): `id:1, state:str ("idle"\|"denied"\|"error"), detail:str, next_wake_at:int\|null (epoch ms), updated_at:int`. Null until the daemon loop has run once. |
+| `scheduler_state` | object or null | `store.get_scheduler_state()`: `SELECT * FROM scheduler_state WHERE id = 1` (store.py:1295-1301). Shape (types.py:109-114): `id:1, state:str ("idle"\|"denied"\|"error"; the Rust daemon also writes "offline"), detail:str, next_wake_at:int\|null (epoch ms), updated_at:int`. Null until the daemon loop has run once. |
 | `activity_status` | tagged union on `kind` | `_activity_status(...)` (server.py:1070-1138); see below. |
 
 ### current_job (store.py:1243-1280)
@@ -104,10 +104,11 @@ Discriminated union on `kind`, priority order:
 1. `{"kind":"running","job":<JobDict>}` — when `current_job` non-null
 2. `{"kind":"working"}` — `cycle_running` true, no job row yet
 3. `{"kind":"error","detail":<scheduler_state.detail>}` — `scheduler_state.state == "error"`
-4. `{"kind":"paused","candidate":<NextCandidateDict>}` — candidate present with `budget_state == "denied"`
-5. `{"kind":"ready","candidate":<NextCandidateDict>}` — candidate present otherwise
-6. `{"kind":"idle"}` — scheduler_state present, none of the above
-7. `{"kind":"warming_up"}` — nothing at all (no cycle has ever run)
+4. `{"kind":"offline","detail":<scheduler_state.detail>}` — `scheduler_state.state == "offline"`: the last cycle was denied by the network gate, and `detail` is `"<host> unreachable"` (Rust addition; no Python counterpart)
+5. `{"kind":"paused","candidate":<NextCandidateDict>}` — candidate present with `budget_state == "denied"`
+6. `{"kind":"ready","candidate":<NextCandidateDict>}` — candidate present otherwise
+7. `{"kind":"idle"}` — scheduler_state present, none of the above
+8. `{"kind":"warming_up"}` — nothing at all (no cycle has ever run)
 
 Variants carry ONLY the listed fields (no `job: null` on non-running variants). `StatusPage` switches on `activity_status.kind` with one branch per variant and no fallback (`pages/StatusPage.svelte:83-151`), and `validate.ts` lets an unknown kind through (`hasActivityFields` returns true by default, pinned by `validate.test.ts` with `"hibernating"`). So a **new** variant does not break the dashboard, but that state renders an empty activity card until StatusPage gains an arm for it, and a **renamed** variant looks exactly the same from the client: the old arm stops firing and the new name falls through to the same empty card. Only a variant that keeps its name but loses a field its arm reads is louder — `validate.ts` rejects the whole summary, and with it the other four polled responses (section 13.2). So adding or renaming a variant is a UI change to make alongside it, not a crash; dropping a field is a crash.
 
@@ -373,7 +374,7 @@ Cite the symbol names below, not the line numbers: the numbers are a hint for fi
 
 `lib/validate.ts` is the only client-side check, and it is deliberately *not* a schema mirror: it checks what a component dereferences with no `?.`, plus every `{#each}` key, because Svelte 5 throws `each_key_duplicate` inside the component — past the store, where setting `error` could still have shown the operator a dashboard. Because the five polled responses are validated as a unit (§13.1), a violation anywhere in this list takes all of them down.
 
-- `/api/summary` — `isSummary` (`validate.ts:83-99`): `activity_status` an object with a string `kind`; the field that `kind` implies — `job` object for `running`, `candidate` object for `paused` and `ready`, string `detail` for `error`, nothing for the kinds whose branches render no payload; string `backend_status_html`; `counts` and `type_counts` objects; boolean `scheduler_paused` and `scheduler_overdrive`; `repos` an array of objects each carrying a **distinct numeric `id`**.
+- `/api/summary` — `isSummary` (`validate.ts:83-99`): `activity_status` an object with a string `kind`; the field that `kind` implies — `job` object for `running`, `candidate` object for `paused` and `ready`, string `detail` for `error` and `offline`, nothing for the kinds whose branches render no payload; string `backend_status_html`; `counts` and `type_counts` objects; boolean `scheduler_paused` and `scheduler_overdrive`; `repos` an array of objects each carrying a **distinct numeric `id`**.
 - `/api/stats` — `isStats` (`:99-108`): `totals` an object; `by_kind` rows with a distinct **string** `kind`; `by_finding` rows with a distinct **numeric** `finding_id`.
 - `/api/findings` — `isFindingList` (`:144-146`): rows with distinct numeric `id`, and each row's `timeline`, when present and non-null, rows with distinct numeric `id`.
 - `/api/jobs` — `isJobList` (`:149-151`): rows with distinct numeric `id`, and `produced_finding_ids`, when present and non-null, an array with no repeated entry.
@@ -386,7 +387,7 @@ Nothing else is checked. `api<T>()` casts the parsed JSON to `T` without inspect
 
 Absent here is a dash, an empty cell or a missing badge, with `error` still null and the staleness banner still hidden. That is the failure mode to weigh when deciding whether a key is droppable.
 
-**`/api/summary`.** `backend_status_html` (`{@html}`, `pages/StatusPage.svelte:60`, plus the `<time data-ms>` rewrite at `:37-48`); `cycle_running` (button label and `disabled`, `:67-71`); `last_cycle.{at,kind,message}` (`:73-77`); `scheduler_state.{next_wake_at,detail}` (`:118-123,133-137,144-148,154-156`); `activity_status` payloads — `running` reads `job.{id,kind,repo_name,finding_id,finding_summary,finding_fingerprint,started_at,finished_at,tokens_new}` (`:84-92`), `error` reads `detail` (`:102`), `paused`/`ready` read `candidate.{kind,id,label,is_finding,budget_state,budget_reason,budget_retry_at}` (`:105-137`, label via `candidateLabel`, `:31-33`); `repos[].{id,name}` build the repo-name maps on three pages (`pages/InboxPage.svelte:11`, `pages/AllFindingsPage.svelte:11`, `pages/KanbanPage.svelte:8`), and `repos[].{forge,enabled,url,default_branch,last_hunt_at,full_hunt_requested_at}` are rendered per card by `ReposPage` (`:344-366`) while `{url,added_at}` together form the identity that invalidates a repo's cached notes (`repoIdentity`, `ReposPage:67-68`).
+**`/api/summary`.** `backend_status_html` (`{@html}`, `pages/StatusPage.svelte:60`, plus the `<time data-ms>` rewrite at `:37-48`); `cycle_running` (button label and `disabled`, `:67-71`); `last_cycle.{at,kind,message}` (`:73-77`); `scheduler_state.{next_wake_at,detail}` (`:118-123,133-137,144-148,154-156`); `activity_status` payloads — `running` reads `job.{id,kind,repo_name,finding_id,finding_summary,finding_fingerprint,started_at,finished_at,tokens_new}` (`:84-92`), `error` and `offline` read `detail`, `paused`/`ready` read `candidate.{kind,id,label,is_finding,budget_state,budget_reason,budget_retry_at}` (`:105-137`, label via `candidateLabel`, `:31-33`); `repos[].{id,name}` build the repo-name maps on three pages (`pages/InboxPage.svelte:11`, `pages/AllFindingsPage.svelte:11`, `pages/KanbanPage.svelte:8`), and `repos[].{forge,enabled,url,default_branch,last_hunt_at,full_hunt_requested_at}` are rendered per card by `ReposPage` (`:344-366`) while `{url,added_at}` together form the identity that invalidates a repo's cached notes (`repoIdentity`, `ReposPage:67-68`).
 
 **`/api/findings`.** `FindingCard` renders `id, type, severity, confidence, category, budget_override, needs_attention, pr_url, status, summary, fingerprint, file, line, timeline[].{id,at,kind,message}, detail, evidence_plan, verdict_reason` (`FindingCard.svelte:115-282`). `FilterBar` additionally reads `repo_id, type, category, severity, status, confidence` as filter dimensions and `created_at`/`updated_at` as sort keys (`FilterBar.svelte:22-26,54-87`); `KanbanPage` columns key off `status` plus `needs_attention` (`KanbanPage.svelte:11-16,31-32`).
 

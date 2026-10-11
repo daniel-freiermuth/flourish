@@ -73,6 +73,7 @@ function hasActivityFields(a: Record<string, unknown>): boolean {
     case "ready":
       return isObject(a.candidate);
     case "error":
+    case "offline":
       return typeof a.detail === "string";
     default:
       return true;

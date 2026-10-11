@@ -15,4 +15,4 @@ import type { NextCandidate } from "./NextCandidate";
  * card. Only dropping a field an existing arm reads is louder: the
  * validator rejects the whole summary.
  */
-export type ActivityStatus = { "kind": "running", job: Job, } | { "kind": "working" } | { "kind": "error", detail: string, } | { "kind": "paused", candidate: NextCandidate, } | { "kind": "ready", candidate: NextCandidate, } | { "kind": "idle" } | { "kind": "warming_up" };
+export type ActivityStatus = { "kind": "running", job: Job, } | { "kind": "working" } | { "kind": "error", detail: string, } | { "kind": "offline", detail: string, } | { "kind": "paused", candidate: NextCandidate, } | { "kind": "ready", candidate: NextCandidate, } | { "kind": "idle" } | { "kind": "warming_up" };

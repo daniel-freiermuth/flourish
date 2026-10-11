@@ -234,7 +234,8 @@ is sent. If a host is unreachable, the cycle is denied with a
 nothing counts toward a failure streak or a rotation turn, and no job row,
 claim or checkpoint is touched. The daemon runs on a laptop that travels
 and sleeps, so being offline is a normal state, not a failure of the work
-it would have started.
+it would have started. The Status page shows such a cycle as **offline**,
+naming the host, until a cycle gets past the gate.
 
 Known limits of the gate:
 

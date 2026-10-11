@@ -55,6 +55,7 @@ describe("isSummary", () => {
     ["paused", "candidate", { kind: "fix", id: 2, label: "x" }],
     ["ready", "candidate", { kind: "fix", id: 2, label: "x" }],
     ["error", "detail", "clone failed"],
+    ["offline", "detail", "github.com unreachable"],
   ] as const;
 
   it.each(variants)("requires %s to carry %s", (kind, field, value) => {
