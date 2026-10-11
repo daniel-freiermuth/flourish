@@ -73,4 +73,12 @@ Final verdict JSON schema:
 
 {{VERDICT_CONDITION}}
 
+If you cannot reach a verdict without something only a human can provide
+(credentials, hardware, a service you cannot reach, a decision about what
+the code is meant to do), write BLOCKED.md at the worktree root instead of
+a verdict, naming exactly what is missing and the evidence that it is
+needed. The recheck is held for the operator with your report. Write it
+only for that: a finding you merely cannot prove is not confirmed, and
+"I ran out of time" is no prerequisite.
+
 Then stop.

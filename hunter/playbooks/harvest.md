@@ -80,6 +80,12 @@ genuinely remains open.
    invent something to justify having run.
 
 # Deliverables
+- BLOCKED.md at the worktree root, NOT COMMITTED, only if the review cannot
+  be done without something only a human can provide (the landed diff or
+  the discussion cannot be read, the repository is unreachable): what is
+  missing and why the review needs it. Nothing is filed, and the harvest is
+  held for the operator with your report. An uneventful PR is no reason:
+  an empty review is the common outcome.
 - FOLLOW-UPS.json at the worktree root, NOT COMMITTED, OPTIONAL — only if
   step 3 verified real, still-open work. A JSON array; the scheduler ingests
   it into the finding queue, so each item becomes a normal, triage-able

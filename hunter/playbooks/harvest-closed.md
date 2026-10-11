@@ -116,6 +116,14 @@ a wrong line number sends whoever acts on it to the wrong code. If you did
 not read the line, cite the file and the symbol instead.
 
 # Deliverables
+- BLOCKED.md at the worktree root, NOT COMMITTED, only if the PR cannot be
+  classified without a human: the evidence is contradictory or missing
+  (the closing comment is ambiguous between two classifications, the PR
+  was closed without a word and the code does not tell why), and you
+  cannot settle it from the PR, its discussion or the code. Name the
+  classifications in question and the evidence for each. Write it instead
+  of CLOSE-REASON.json; nothing is filed, and the harvest is held for the
+  operator with your report.
 - CLOSE-REASON.json at the worktree root, NOT COMMITTED, REQUIRED:
   ```json
   {

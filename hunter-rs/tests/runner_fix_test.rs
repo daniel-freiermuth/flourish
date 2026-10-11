@@ -1787,3 +1787,31 @@ async fn a_runner_error_while_the_provider_is_unreachable_counts_nothing() {
     let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
     assert_eq!(after.status.as_str(), "queued");
 }
+
+/// A one-shot budget override survives a hold on the worker's report, as
+/// for every kind: the hold concluded nothing, and the operator's
+/// `continue` is the attempt the override was bought for.
+#[tokio::test]
+async fn a_blocked_fix_keeps_its_one_shot_override() {
+    let f = fixture("fix-blocked-override").await;
+    f.store
+        .set_budget_override(f.fid, Some(hunter::domain::BudgetOverride::Once))
+        .await
+        .unwrap();
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let blocked = ScriptedBackend::new(|tree| {
+        std::fs::write(tree.join("BLOCKED.md"), "needs a device").unwrap();
+        support::done()
+    });
+
+    let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &blocked, None)
+        .await
+        .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("held"));
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(
+        finding.budget_override,
+        Some(hunter::domain::BudgetOverride::Once)
+    );
+}

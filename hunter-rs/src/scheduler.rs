@@ -2326,6 +2326,7 @@ pub async fn run_recheck(
         BudgetDecision::Denied(d) => return Ok(*d),
     };
 
+    remove_stale_report(resume)?;
     let created = match store
         .create_job(
             FindingJobKind::Recheck.into(),
@@ -2446,6 +2447,25 @@ pub async fn run_recheck(
         tokens_new: Some(rr.tokens_new),
         ..Default::default()
     };
+    // A worker that could not verify the finding without something only a
+    // human can provide wrote BLOCKED.md instead of a verdict: hold the
+    // recheck, with this attempt as its checkpoint. A final verdict next
+    // to it wins, as a decline wins over a fix's report.
+    let final_verdict = state == JobState::Done
+        && std::fs::read_to_string(&out_path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<RecheckVerdict>(&t).ok())
+            .and_then(|v| v.verdict)
+            .is_some_and(|v| !matches!(v, RecheckOutcome::Unknown(_)));
+    if !final_verdict && let Some(report) = blocked_report(&ws.tree)? {
+        let held = hold_on_report(store, FindingJobKind::Recheck, fid, job, &ws, &report).await;
+        close_workspace(store, &ws).await;
+        if !held? {
+            anyhow::bail!("recheck #{fid}: BLOCKED.md, but it is no longer rechecking");
+        }
+        summary.outcome = Some("held".into());
+        return Ok(summary);
+    }
     if state == JobState::Suspended {
         // A suspension is a pause, not a failure: the worker stopped
         // mid-work (out of window headroom, or died after doing work) and
@@ -3323,7 +3343,10 @@ async fn start_fix(
             "finding #{fid} is no longer queued"
         ))));
     }
-    remove_stale_report(store, fid, resume).await?;
+    if let Err(e) = remove_stale_report(resume) {
+        release_claim(store, fid).await;
+        anyhow::bail!("fix #{fid}: {e}");
+    }
     let created = match store
         .create_job(
             FindingJobKind::Fix.into(),
@@ -3379,30 +3402,69 @@ async fn start_fix(
     }))
 }
 
-/// A report still in the tree on a resume is the one the attempt before
-/// wrote, already recorded as its hold (the daemon died before deleting
-/// it), not this attempt's outcome. Removed after the claim, which a
-/// verdict given since selection still wins, and before the successor job
-/// exists; an error releases the claim.
-async fn remove_stale_report(
-    store: &Store,
-    fid: i64,
-    resume: Option<&ResumePlan>,
-) -> anyhow::Result<()> {
-    let Some(plan) = resume else {
+/// The file a worker of any kind writes when it cannot go on without
+/// something only a human can provide (WORK-MODEL.md §9.1): its report
+/// holds the work as a missing prerequisite.
+const BLOCKED_REPORT: &str = "BLOCKED.md";
+
+/// A `BLOCKED.md` in the tree a resume continues is removed before the
+/// worker runs only when it is not this chain's open question: the resume
+/// follows the operator's `continue` of a hold, which recorded it (the
+/// daemon died before deleting it), or it is a handoff, whose engage wrote
+/// it next to its `WITHDRAW.md`. Any other report is one no hold has
+/// recorded yet, and it holds the work once this attempt ends, whatever
+/// state that attempt ends in. An error means a recorded report would be
+/// read as this attempt's outcome, so it stops the attempt.
+fn remove_stale_report(resume: Option<&ResumePlan>) -> anyhow::Result<()> {
+    let Some(plan) = resume.filter(|p| p.after_hold.is_some() || p.handoff) else {
         return Ok(());
     };
-    let stale = plan.workspace.tree.join("BLOCKED.md");
+    let stale = plan.workspace.tree.join(BLOCKED_REPORT);
     if stale.exists()
         && let Err(e) = std::fs::remove_file(&stale)
     {
-        release_claim(store, fid).await;
-        anyhow::bail!(
-            "fix #{fid}: cannot remove the stale {}: {e}",
-            stale.display()
-        );
+        anyhow::bail!("cannot remove the stale {}: {e}", stale.display());
     }
     Ok(())
+}
+
+/// The worker's `BLOCKED.md`, if it wrote one: its bytes, read lossily.
+fn blocked_report(tree: &Path) -> std::io::Result<Option<String>> {
+    let path = tree.join(BLOCKED_REPORT);
+    if !path.exists() {
+        return Ok(None);
+    }
+    read_report(&path).map(Some)
+}
+
+/// Hold `kind`'s work for the operator on the worker's `BLOCKED.md`
+/// (WORK-MODEL.md §9.1): reason `prerequisite`, the report as the detail,
+/// `job` as the checkpoint. Then the report leaves the tree, so the hold
+/// owns it and a resume cannot mistake it for its own outcome. `false`
+/// when nothing was held: the finding has left the kind's tier.
+async fn hold_on_report(
+    store: &Store,
+    kind: FindingJobKind,
+    fid: i64,
+    job: i64,
+    ws: &Workspace,
+    report: &str,
+) -> anyhow::Result<bool> {
+    if !store
+        .hold_work(fid, kind, HoldReason::Prerequisite, report, Some(job))
+        .await?
+    {
+        return Ok(false);
+    }
+    std::fs::remove_file(ws.tree.join(BLOCKED_REPORT))?;
+    let message = format!(
+        "#{fid} held: prerequisite; checkpoint retained at {}",
+        ws.root.display()
+    );
+    store
+        .log_event(kind.as_str(), &message, Some(job), Some(fid))
+        .await?;
+    Ok(true)
 }
 
 /// The worker's prompt. The playbook builders run on a resume too: the
@@ -4025,9 +4087,9 @@ async fn fix_event(
 }
 
 /// A worker's `BLOCKED.md`: the fix is held for the operator as a missing
-/// prerequisite, with this attempt as its checkpoint and the report as the
-/// hold's detail, and the claim goes back to `queued`, where the fix tier
-/// skips held work. The budget override is left alone: nothing concluded.
+/// prerequisite ([`hold_on_report`]), and the claim goes back to `queued`,
+/// where the fix tier skips held work. The budget override is left alone:
+/// nothing concluded.
 async fn hold_prerequisite(
     store: &Store,
     fid: i64,
@@ -4035,27 +4097,19 @@ async fn hold_prerequisite(
     report: &str,
     summary: &mut CycleSummary,
 ) -> anyhow::Result<()> {
-    let held = store
-        .hold_work(
-            fid,
-            FindingJobKind::Fix,
-            HoldReason::Prerequisite,
-            report,
-            Some(start.job),
-        )
-        .await;
+    let held = hold_on_report(
+        store,
+        FindingJobKind::Fix,
+        fid,
+        start.job,
+        &start.ws,
+        report,
+    )
+    .await;
     release_claim(store, fid).await;
     if !held? {
         anyhow::bail!("fix #{fid}: BLOCKED.md, but the fix has left its tier; nothing held");
     }
-    // Recorded: the hold owns the report now, so the tree holds no stale
-    // one for the next attempt to mistake for its own.
-    std::fs::remove_file(start.ws.tree.join("BLOCKED.md"))?;
-    let message = format!(
-        "#{fid} held: prerequisite; checkpoint retained at {}",
-        start.ws.root.display()
-    );
-    fix_event(store, "fix", fid, start.job, message).await?;
     summary.outcome = Some("held".into());
     Ok(())
 }
@@ -4114,9 +4168,10 @@ async fn record_declined_fix(
 }
 
 /// Write a fix outcome: the finding's status, the event, and the summary.
-/// A one-shot budget override is spent by every outcome but a hold or a
-/// decline; any outcome that leaves the finding `fixing` returns it to
-/// `queued`.
+/// A one-shot budget override is spent by every outcome but a `BLOCKED.md`
+/// hold, a decline, and an attempt that could not publish offline (none of
+/// them concluded the work's attempt; a streak's hold did, and spends it);
+/// any outcome that leaves the finding `fixing` returns it to `queued`.
 async fn record_fix_outcome(
     store: &Store,
     finding: &Finding,
@@ -5432,6 +5487,26 @@ async fn engage_prefetch_failed(
     None
 }
 
+/// The engage worker's prompt: the playbook for a fresh engage, the short
+/// resume prompt for a continued one (whose transcript holds the playbook,
+/// and which read no PR to build one from).
+fn engage_prompt(cfg: &Config, finding: &Finding, start: &EngageStart) -> anyhow::Result<String> {
+    let Some(pr) = &start.pr else {
+        return Ok(RESUME_PROMPT.to_owned());
+    };
+    let repo_notes = Store::repo_notes(&cfg.work_root, start.repo.id);
+    playbooks::build_engage_prompt(
+        &cfg.root,
+        finding,
+        &start.ws.tree,
+        &start.head_ref,
+        &start.repo,
+        pr,
+        &start.ps,
+        &repo_notes,
+    )
+}
+
 /// Run engage job (`scheduler.run_engage`): start it ([`start_engage`]),
 /// run the worker, then withdraw the PR ([`withdraw_pr`]) or publish its
 /// work ([`push_and_reply`]) and record that ([`record_engage`]).
@@ -5443,24 +5518,12 @@ pub async fn run_engage(
     resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
     let fid = finding.id;
+    remove_stale_report(resume)?;
     let start = match start_engage(store, cfg, finding, backend, resume).await? {
         Ok(start) => start,
         Err(ended) => return Ok(ended),
     };
-    let repo_notes = Store::repo_notes(&cfg.work_root, start.repo.id);
-    let prompt = match &start.pr {
-        None => RESUME_PROMPT.to_owned(),
-        Some(pr) => playbooks::build_engage_prompt(
-            &cfg.root,
-            finding,
-            &start.ws.tree,
-            &start.head_ref,
-            &start.repo,
-            pr,
-            &start.ps,
-            &repo_notes,
-        )?,
-    };
+    let prompt = engage_prompt(cfg, finding, &start)?;
     let model = cfg.model_for("fix");
     let rr = match backend
         .run(
@@ -5521,6 +5584,9 @@ pub async fn run_engage(
             );
         }
         withdraw_pr(store, (cfg, backend), fid, &start, &reason, &mut summary).await
+    } else if let Some(report) = blocked_report(&start.ws.tree)? {
+        engage_blocked(store, fid, &start, &report, &mut summary).await?;
+        false
     } else {
         let published = push_and_reply(&start, state).await;
         record_engage(
@@ -5551,6 +5617,34 @@ pub async fn run_engage(
     }
     close_workspace(store, &start.ws).await;
     Ok(summary)
+}
+
+/// An engage whose feedback needs a decision only a maintainer can make
+/// wrote `BLOCKED.md`: it is held on the report ([`hold_on_report`]), and
+/// nothing is pushed or posted. The attention stays unaddressed, for the
+/// continue to take up.
+async fn engage_blocked(
+    store: &Store,
+    fid: i64,
+    start: &EngageStart,
+    report: &str,
+    summary: &mut CycleSummary,
+) -> anyhow::Result<()> {
+    let held = hold_on_report(
+        store,
+        FindingJobKind::Engage,
+        fid,
+        start.job,
+        &start.ws,
+        report,
+    )
+    .await;
+    if !held? {
+        close_workspace(store, &start.ws).await;
+        anyhow::bail!("engage #{fid}: BLOCKED.md, but the PR is no longer open");
+    }
+    summary.outcome = Some("held".into());
+    Ok(())
 }
 
 /// Carry a withdrawing engage straight on into its closed PR's harvest:
@@ -5782,6 +5876,36 @@ async fn record_harvest_failure(
     }
 }
 
+/// A harvest whose worker could not classify the PR, or review it, without
+/// a human wrote `BLOCKED.md`: the harvest is held on the report
+/// ([`hold_on_report`]), the PR stays unharvested, and its follow-ups wait
+/// for the attempt that concludes, as a failed harvest's do. A one-shot
+/// budget override is kept for the `continue`, as for every kind: the hold
+/// concluded nothing.
+async fn harvest_blocked(
+    store: &Store,
+    fid: i64,
+    (job, state): (i64, JobState),
+    pr_number: i64,
+    ws: &Workspace,
+    report: &str,
+) -> anyhow::Result<CycleSummary> {
+    let held = hold_on_report(store, FindingJobKind::Harvest, fid, job, ws, report).await;
+    close_workspace(store, ws).await;
+    if !held? {
+        anyhow::bail!("harvest #{fid}: BLOCKED.md, but the PR is no longer awaiting harvest");
+    }
+    Ok(CycleSummary {
+        kind: Some(FindingJobKind::Harvest.into()),
+        finding_id: Some(fid),
+        job_id: Some(job),
+        state: Some(state),
+        pr_number: Some(pr_number),
+        outcome: Some("held".into()),
+        ..Default::default()
+    })
+}
+
 /// Run harvest job (`scheduler.run_harvest`).
 ///
 /// One job kind for both ends of a PR's life. A merged PR is reviewed for
@@ -5854,6 +5978,7 @@ pub async fn run_harvest(
         }
     };
 
+    remove_stale_report(resume)?;
     let rpath = PathBuf::from(&repo.path);
     // A handoff starts a new job, so it gets what a cold one gets from
     // here on: a fresh default branch to compare against, the diff and
@@ -6096,6 +6221,9 @@ pub async fn run_harvest(
     )
     .unwrap_or(JobState::Failed);
 
+    if let Some(report) = blocked_report(&worktree)? {
+        return harvest_blocked(store, fid, (job, state), pr_number, &ws, &report).await;
+    }
     // A closed PR's review must say why it closed. Without that the
     // finding would sit `closed` for good, so a missing or unusable
     // CLOSE-REASON.json is a failed harvest like a failed worker, and runs
