@@ -985,6 +985,10 @@ pub struct CycleSummary {
     pub denied: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_at: Option<i64>,
+    /// The host whose reachability probe denied the cycle (`denied` says
+    /// why in prose); the status page shows such a cycle as offline.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unreachable: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6070,6 +6074,7 @@ async fn run_cycle_inner(
             kind: Some(candidate.job_kind()),
             denied: Some(reason),
             retry_at: Some(now_ms() + NETWORK_RETRY_MS),
+            unreachable: Some(host),
             sync,
             ..Default::default()
         });

@@ -382,6 +382,12 @@ async fn summary(State(state): State<AppState>) -> Result<Json<Summary>, ApiErro
         ActivityStatus::Error {
             detail: s.detail.clone(),
         }
+    } else if let Some(s) = scheduler_state.as_ref().filter(|s| s.state == "offline") {
+        // Ahead of the candidate preview: the budget may well allow it, and
+        // "ready" would hide that the last cycle could not reach its hosts.
+        ActivityStatus::Offline {
+            detail: s.detail.clone(),
+        }
     } else if let Some(c) = &next_candidate {
         if c.budget_state == BudgetState::Denied {
             ActivityStatus::Paused {

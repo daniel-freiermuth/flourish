@@ -160,6 +160,17 @@
           <span class="status-icon error-icon">⚠</span>
           <b class="error">error</b> {store.summary.activity_status.detail}
         </div>
+      {:else if store.summary.activity_status.kind === "offline"}
+        {@const ss = store.summary.scheduler_state}
+        <div class="row">
+          <span class="status-icon paused-icon">⏸</span>
+          <b class="paused">offline</b> {store.summary.activity_status.detail}
+        </div>
+        {#if ss?.next_wake_at}
+          <div class="row dim sub-row">
+            next check ~{countdown(ss.next_wake_at)} ({ts(ss.next_wake_at)})
+          </div>
+        {/if}
       {:else if store.summary.activity_status.kind === "paused"}
         {@const nc = store.summary.activity_status.candidate}
         {@const ss = store.summary.scheduler_state}

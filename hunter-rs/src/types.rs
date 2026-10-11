@@ -345,11 +345,24 @@ pub struct NextCandidate {
 #[derive(Debug, Serialize, TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ActivityStatus {
-    Running { job: Box<Job> },
+    Running {
+        job: Box<Job>,
+    },
     Working,
-    Error { detail: String },
-    Paused { candidate: NextCandidate },
-    Ready { candidate: NextCandidate },
+    Error {
+        detail: String,
+    },
+    /// The last cycle was denied because a host its work needs is
+    /// unreachable; `detail` names it (`daemon::describe_cycle`).
+    Offline {
+        detail: String,
+    },
+    Paused {
+        candidate: NextCandidate,
+    },
+    Ready {
+        candidate: NextCandidate,
+    },
     Idle,
     WarmingUp,
 }
