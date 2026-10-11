@@ -756,7 +756,8 @@ async fn upgrading_points_each_work_item_at_its_checkpoint() {
              (14, 'engage', 1, 4, 'suspended', '/s/14.jsonl', NULL, 5), \
              (15, 'fix', 1, 5, 'suspended', '/s/15.jsonl', NULL, 6), \
              (16, 'hunt', 1, NULL, 'suspended', '/s/16.jsonl', NULL, 7), \
-             (17, 'engage', 1, 4, 'done', '/s/17.jsonl', NULL, 4);",
+             (17, 'engage', 1, 4, 'done', '/s/17.jsonl', NULL, 4); \
+         UPDATE jobs SET blocker = 'needs a rig' WHERE id = 15;",
     )
     .execute(&pool)
     .await
@@ -783,4 +784,153 @@ async fn upgrading_points_each_work_item_at_its_checkpoint() {
     );
 
     drop(store);
+}
+
+/// Before 025: finding 1 blocked on a worker's BLOCKED.md, finding 2 on a
+/// failure streak whose tree was never made, finding 3 an ordinary queued
+/// fix.
+async fn seed_blocked_fixes(pool: &SqlitePool) {
+    sqlx::query(
+        "INSERT INTO repos (id, name, url, path, forge, default_branch, added_at) \
+         VALUES (1, 'widget', 'https://e/w.git', '/wr/repos/repo-1', 'github', 'main', 1)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    // 1: a worker's BLOCKED.md. 2: a failure streak, its tree never made.
+    // 3: an ordinary queued fix. 4: blocked, but no attempt carries a
+    // report, only a suspended one 024 pointed at.
+    for (id, status) in [
+        (1, "blocked"),
+        (2, "blocked"),
+        (3, "queued"),
+        (4, "blocked"),
+    ] {
+        sqlx::query(
+            "INSERT INTO findings (id, type, repo_id, fingerprint, severity, confidence, \
+             summary, status, created_at, updated_at) \
+             VALUES (?1, 'bug', 1, 'fp-' || ?1, 'high', 0.9, 's', ?2, 1, 1)",
+        )
+        .bind(id)
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+    sqlx::raw_sql(
+        "INSERT INTO jobs (id, kind, repo_id, finding_id, state, session_file, blocker, \
+                           started_at, finished_at) VALUES \
+             (10, 'fix', 1, 1, 'suspended', '/s/10.jsonl', 'Needs Kotlin 2.2', 1, 5000), \
+             (20, 'fix', 1, 2, 'suspended', NULL, \
+              'stuck: 3 consecutive fix attempts hit the same failure: workspace not created\n\ngit: fatal', \
+              2, 6000), \
+             (40, 'fix', 1, 4, 'suspended', '/s/40.jsonl', NULL, 3, 7000); \
+         INSERT INTO finding_work (finding_id, kind, checkpoint_job_id) VALUES \
+             (1, 'fix', 10), (2, 'fix', 20), (4, 'fix', 40);",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Upgrading turns every `blocked` fix into a hold (WORK-MODEL.md §11.4).
+///
+/// The held job's report is the hold's detail, and its prefix says why: a
+/// failure streak's report is `stuck`, anything else a worker's
+/// `prerequisite`. The held job becomes the checkpoint only if a worker ran
+/// in it (it has a transcript); a hold whose tree was never made has
+/// nothing to continue. The finding goes back to `queued`, and `blocked`
+/// and `jobs.blocker` are gone.
+///
+/// Seeded at the state just before 025 so that rolling forward executes it.
+#[tokio::test]
+async fn upgrading_turns_blocked_fixes_into_holds() {
+    use hunter::domain::{FindingJobKind, HoldReason};
+
+    let (_dir, path) = scratch("mig-holds");
+
+    let before_025 = sqlx::migrate!("./migrations")
+        .iter()
+        .position(|m| m.version == 25)
+        .expect("migration 025 exists");
+    let pool = seed_state(&path, before_025).await;
+    seed_blocked_fixes(&pool).await;
+    pool.close().await;
+
+    let store = Store::connect(&path).await.expect("roll forward");
+
+    let holds: Vec<_> = store
+        .active_holds()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|h| {
+            (
+                h.finding_id,
+                h.kind,
+                h.reason,
+                h.held_at,
+                h.checkpoint_job_id,
+                h.status,
+            )
+        })
+        .collect();
+    assert_eq!(
+        holds,
+        vec![
+            (
+                4,
+                FindingJobKind::Fix,
+                HoldReason::Prerequisite,
+                1,
+                Some(40),
+                FindingStatus::Queued
+            ),
+            (
+                1,
+                FindingJobKind::Fix,
+                HoldReason::Prerequisite,
+                5000,
+                Some(10),
+                FindingStatus::Queued
+            ),
+            (
+                2,
+                FindingJobKind::Fix,
+                HoldReason::Stuck,
+                6000,
+                None,
+                FindingStatus::Queued
+            ),
+        ]
+    );
+    let details: Vec<String> = store
+        .active_holds()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|h| h.detail)
+        .collect();
+    assert_eq!(details[1], "Needs Kotlin 2.2");
+    assert!(
+        details[2].starts_with("stuck: 3 consecutive"),
+        "{details:?}"
+    );
+    assert_eq!(
+        details[0], "blocked before the upgrade; no report was kept",
+        "a hold says why it holds, even with no report to show"
+    );
+    assert_eq!(
+        store.get_finding(3).await.unwrap().unwrap().status,
+        FindingStatus::Queued
+    );
+    drop(store);
+    let pool = open(&path).await;
+    let blocker: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info('jobs') WHERE name = 'blocker'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(blocker, 0, "jobs.blocker is dropped");
+    pool.close().await;
 }

@@ -13,7 +13,7 @@
 mod support;
 
 use hunter::config::Config;
-use hunter::domain::{FindingJobKind, ForgeName};
+use hunter::domain::{FindingJobKind, ForgeName, HoldReason, ReleaseAction};
 use hunter::store::{FindingInsert, WorkStreak};
 use support::{GitRepo, ScriptedBackend, TempDir, fresh_store, git};
 
@@ -181,7 +181,7 @@ async fn a_cycle_runs_the_queued_fix() {
 /// (`blocked`). Left `queued` with nothing counted, `pick_next` (oldest queued
 /// first) would re-pick it every cycle and no other queued fix would run.
 #[tokio::test]
-async fn a_tree_that_can_never_be_made_ends_stuck_as_blocked() {
+async fn a_tree_that_can_never_be_made_ends_held_as_stuck() {
     use hunter::domain::FindingStatus;
 
     let f = fixture("fix-never-a-tree").await;
@@ -219,27 +219,27 @@ async fn a_tree_that_can_never_be_made_ends_stuck_as_blocked() {
         outcomes.push(summary.outcome.unwrap_or_default());
     }
 
-    assert_eq!(outcomes, ["requeued", "requeued", "blocked"]);
+    assert_eq!(outcomes, ["requeued", "requeued", "held"]);
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-    assert_eq!(finding.status, FindingStatus::Blocked);
-    let shown = shown_blocker(&f).await;
-    assert!(
-        shown.as_deref().is_some_and(|r| r.starts_with(
-            "stuck: 3 consecutive fix attempts hit the same failure: workspace not created"
-        ) && r.contains("no-such-branch")),
-        "{shown:?}"
+    assert_eq!(
+        finding.status,
+        FindingStatus::Queued,
+        "a hold keeps the status"
     );
-    // The operator's requeue: no worker ever ran, so there is no
-    // checkpoint to continue and the next attempt starts fresh.
-    f.store
-        .set_finding_status(f.fid, FindingStatus::Queued)
-        .await
-        .unwrap();
-    let jobs = f.store.list_resumable_jobs().await.unwrap();
+    let hold = held(&f).await.expect("held at the limit");
+    assert_eq!(hold.reason, HoldReason::Stuck);
     assert!(
-        jobs.iter().all(|j| j.finding_id != Some(f.fid)),
-        "a job that never had a tree is nothing to resume"
+        hold.detail.starts_with("workspace not created") && hold.detail.contains("no-such-branch"),
+        "{hold:?}"
     );
+    // No worker ever ran, so there is no checkpoint to continue: the
+    // operator can restart it, not continue it.
+    assert_eq!(hold.checkpoint_job_id, None);
+    assert!(
+        !hold.actions().contains(&ReleaseAction::Continue),
+        "{hold:?}"
+    );
+    assert!(hold.actions().contains(&ReleaseAction::Restart), "{hold:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -461,14 +461,15 @@ async fn verdict_after_selection_stops_the_fix_before_its_job() {
     );
 }
 
-/// Stage an implemented fix plus durable reports and its metered transcript.
-async fn blocked_fixture() -> (
+/// Stage an implemented fix plus durable reports and its metered transcript,
+/// whose worker then writes `BLOCKED.md`.
+async fn held_fixture() -> (
     Fixture,
     ScriptedBackend,
     hunter::scheduler::CycleSummary,
     String,
 ) {
-    let f = fixture("fix-blocked-checkpoint").await;
+    let f = fixture("fix-held-checkpoint").await;
     let reason = format!(
         "Missing supported compiler\n{}",
         "Build prerequisite detail\n".repeat(40)
@@ -501,23 +502,35 @@ async fn blocked_fixture() -> (
     (f, blocked, summary, expected_reason)
 }
 
-/// Blocked is not suppressed or automatically retried, and a sweep preserves
-/// its committed implementation and uncommitted verification reports. The
-/// report moves to the job row, so the tree holds no stale `BLOCKED.md`.
+/// A worker's `BLOCKED.md` holds the fix for the operator as a missing
+/// prerequisite. Not suppressed, not retried on its own, and the status
+/// stays `queued`: the hold is the work item's, not the finding's. The
+/// attempt is the checkpoint, the report the hold's detail, and the tree
+/// holds no stale `BLOCKED.md`; a sweep keeps the committed work.
 #[tokio::test]
-async fn blocked_fix_keeps_checkpoint_and_requeues_without_losing_commits() {
-    let (f, blocked, summary, expected_reason) = blocked_fixture().await;
-    assert_eq!(summary.outcome.as_deref(), Some("blocked"));
+async fn a_blocked_report_holds_the_fix_and_keeps_its_checkpoint() {
+    let (f, blocked, summary, expected_reason) = held_fixture().await;
+    assert_eq!(summary.outcome.as_deref(), Some("held"));
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-    assert_eq!(finding.status.as_str(), "blocked");
+    assert_eq!(finding.status.as_str(), "queued");
     let events = f.store.recent_events(20).await.unwrap();
     assert!(
-        events.iter().any(|e| e
-            .message
-            .starts_with(&format!("#{} blocked; checkpoint retained at", f.fid))),
+        events.iter().any(|e| e.message.starts_with(&format!(
+            "#{} held: prerequisite; checkpoint retained at",
+            f.fid
+        ))),
         "{events:?}"
     );
-    assert_eq!(shown_blocker(&f).await, Some(expected_reason.clone()));
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "hold" && e.finding_id == Some(f.fid)),
+        "{events:?}"
+    );
+    let hold = held(&f).await.expect("held");
+    assert_eq!(hold.reason, HoldReason::Prerequisite);
+    assert_eq!(hold.detail, expected_reason);
+    assert_eq!(hold.checkpoint_job_id, summary.job_id);
     assert_eq!(finding.verdict_reason, None, "the report is not copied");
     let tree = blocked.runs()[0].tree.clone();
     assert_eq!(
@@ -525,47 +538,55 @@ async fn blocked_fix_keeps_checkpoint_and_requeues_without_losing_commits() {
         "implemented fix\n"
     );
     assert!(!tree.join("BLOCKED.md").exists());
-    assert_eq!(
-        f.store
-            .job_blocker(summary.job_id.unwrap())
-            .await
-            .unwrap()
-            .as_deref(),
-        Some(expected_reason.as_str())
-    );
     assert!(tree.join("PR-DESCRIPTION.md").is_file());
     assert!(f.store.suppressions(1, "bug").await.unwrap().is_empty());
-    assert!(!matches!(
-        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
-            .await
-            .unwrap(),
-        Some(hunter::scheduler::Candidate::Resume { .. })
-    ));
+    let picked = hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        .await
+        .unwrap();
+    assert!(
+        !matches!(
+            picked,
+            Some(
+                hunter::scheduler::Candidate::Resume { .. }
+                    | hunter::scheduler::Candidate::Finding { .. }
+            )
+        ),
+        "held work is skipped: {picked:?}"
+    );
     hunter::workspace::sweep(&f.store, &f.cfg.work_root, hunter::util::now_ms())
         .await
         .unwrap();
-    assert!(tree.is_dir(), "blocked checkpoint must survive a sweep");
+    assert!(tree.is_dir(), "a held checkpoint must survive a sweep");
 }
 
-/// Requeue continues the original commits. Neither a budget denial nor a
-/// provider failure can erase the checkpoint or turn it into a rejection.
+/// `continue` resumes the checkpoint with the prerequisite in its prompt.
+/// A budget denial leaves the checkpoint, and a `BLOCKED.md` still in the
+/// tree is the old report, removed before it could read as this attempt's
+/// outcome. After that the chain is ordinary (WORK-MODEL.md §8): an attempt
+/// that fails is a counted failure, not held again on the spot.
 #[tokio::test]
-async fn requeued_blocked_fix_preserves_work_across_provider_failures() {
-    let (f, blocked, summary, expected_reason) = blocked_fixture().await;
+async fn a_continued_fix_resumes_its_checkpoint_and_is_ordinary_again() {
+    let (f, blocked, summary, expected_reason) = held_fixture().await;
     let tree = blocked.runs()[0].tree.clone();
-    let original_head = git(&tree, &["rev-parse", "HEAD"]);
-    f.store
-        .set_finding_status(f.fid, hunter::domain::FindingStatus::Queued)
-        .await
-        .unwrap();
+    support::release(
+        &f.store,
+        f.fid,
+        FindingJobKind::Fix,
+        ReleaseAction::Continue,
+    )
+    .await;
     let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
         hunter::scheduler::pick_next(&f.store, &f.cfg, None)
             .await
             .unwrap()
     else {
-        panic!("requeued blocked work must resume, not start cold");
+        panic!("continued work must resume, not start cold");
     };
     assert_eq!(plan.predecessor_id, summary.job_id.unwrap());
+    assert_eq!(
+        plan.after_hold,
+        Some((HoldReason::Prerequisite, expected_reason.clone()))
+    );
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let denied = ScriptedBackend::noop().denying_above(0);
     let result = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &denied, Some(&plan))
@@ -573,12 +594,12 @@ async fn requeued_blocked_fix_preserves_work_across_provider_failures() {
         .unwrap();
     assert!(result.denied.is_some());
     assert_eq!(
-        blocker_of(&f, Some(plan.predecessor_id)).await,
-        Some(expected_reason.clone()),
-        "budget denial must leave the blocker untouched"
+        checkpoint(&f).await,
+        summary.job_id,
+        "budget denial must leave the checkpoint"
     );
     // A report left in the tree by a daemon that died between recording it
-    // and deleting it is the old blocker, not this attempt's outcome.
+    // and deleting it is the old one, not this attempt's outcome.
     std::fs::write(tree.join("BLOCKED.md"), &expected_reason).unwrap();
 
     let provider_failure = ScriptedBackend::staged(|tree, session| {
@@ -597,75 +618,42 @@ async fn requeued_blocked_fix_preserves_work_across_provider_failures() {
         hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &provider_failure, Some(&plan))
             .await
             .unwrap();
-    assert_eq!(failed.outcome.as_deref(), Some("blocked"));
-    assert_eq!(
-        blocker_of(&f, failed.job_id).await,
-        Some(expected_reason.clone())
+    let prompt = &provider_failure.runs()[0].prompt;
+    assert!(
+        prompt.contains("Re-evaluate the prerequisite")
+            && prompt.contains("Missing supported compiler"),
+        "{prompt}"
     );
-    assert_eq!(shown_blocker(&f).await, Some(expected_reason.clone()));
-    assert_eq!(git(&tree, &["rev-parse", "HEAD"]), original_head);
-    f.store
-        .set_finding_status(f.fid, hunter::domain::FindingStatus::Queued)
-        .await
-        .unwrap();
-    let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
-        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
-            .await
-            .unwrap()
-    else {
-        panic!("a failed provider handoff must preserve the requeued checkpoint");
-    };
-    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-
-    let unblocked = ScriptedBackend::staged(move |tree, session| {
-        assert!(
-            session.is_some(),
-            "unblocked worker needs the paid-for transcript"
-        );
-        assert_eq!(git(tree, &["rev-parse", "HEAD"]), original_head);
-        assert_eq!(
-            std::fs::read_to_string(tree.join("candidate.txt")).unwrap(),
-            "implemented fix\n"
-        );
-        assert!(
-            !tree.join("BLOCKED.md").exists(),
-            "stale blocker must not override a new result"
-        );
-        // A new prerequisite is a new block, not a rejection or cold retry.
-        std::fs::write(tree.join("BLOCKED.md"), "External peer still missing").unwrap();
-        let mut result = support::done();
-        result.session_file = session.map(|path| path.to_string_lossy().into_owned());
-        result
-    });
-    let result = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &unblocked, Some(&plan))
-        .await
-        .unwrap();
-    assert_eq!(result.outcome.as_deref(), Some("blocked"));
+    assert_eq!(failed.outcome.as_deref(), Some("requeued"), "{failed:?}");
+    assert!(held(&f).await.is_none(), "not held again on the spot");
+    assert_eq!(fix_streak(&f).await.streak, 1);
     assert_eq!(
-        shown_blocker(&f).await.as_deref(),
-        Some("External peer still missing")
+        checkpoint(&f).await,
+        None,
+        "a failure below the limit clears the checkpoint (WORK-MODEL.md §6.3)"
     );
-    assert!(tree.is_dir());
 }
 
-/// A daemon that dies mid-resume must not lose the blocker: once startup
-/// reconciliation suspends the orphan, the next resume inherits it from the
-/// job row, and an attempt that fails without resolving the prerequisite
-/// holds the finding with the original report again.
+/// A daemon that dies during the attempt a `continue` started leaves an
+/// orphan that startup reconciliation suspends. Resuming it is an ordinary
+/// resume: the transcript already holds the post-release prompt, and the
+/// chain is bounded by the ceiling and the streak, not held again.
 #[tokio::test]
-async fn interrupted_blocked_resume_keeps_the_report_for_the_next_resume() {
-    let (f, blocked, _, expected_reason) = blocked_fixture().await;
-    let tree = blocked.runs()[0].tree.clone();
-    f.store
-        .set_finding_status(f.fid, hunter::domain::FindingStatus::Queued)
-        .await
-        .unwrap();
+async fn an_interrupted_continue_resumes_as_an_ordinary_resume() {
+    let (f, _, _, _) = held_fixture().await;
+    support::release(
+        &f.store,
+        f.fid,
+        FindingJobKind::Fix,
+        ReleaseAction::Continue,
+    )
+    .await;
     let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
         hunter::scheduler::pick_next(&f.store, &f.cfg, None)
             .await
             .unwrap()
     else {
-        panic!("requeued blocked work must resume");
+        panic!("continued work must resume");
     };
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
 
@@ -696,6 +684,7 @@ async fn interrupted_blocked_resume_keeps_the_report_for_the_next_resume() {
     else {
         panic!("the interrupted attempt must resume");
     };
+    assert_eq!(plan.after_hold, None, "an ordinary resume");
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let provider_failure = ScriptedBackend::staged(|_, session| {
         let mut result = support::done();
@@ -708,18 +697,15 @@ async fn interrupted_blocked_resume_keeps_the_report_for_the_next_resume() {
         hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &provider_failure, Some(&plan))
             .await
             .unwrap();
-    assert_eq!(failed.outcome.as_deref(), Some("blocked"));
-    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-    assert_eq!(finding.status.as_str(), "blocked");
-    assert_eq!(shown_blocker(&f).await, Some(expected_reason.clone()));
+    assert_eq!(failed.outcome.as_deref(), Some("requeued"));
     assert_eq!(
-        blocker_of(&f, failed.job_id).await,
-        Some(expected_reason.clone())
+        provider_failure.runs()[0].prompt,
+        "Continue the work you were doing in this session. You were interrupted; \
+         pick up where you left off."
     );
-    assert!(
-        !tree.join("BLOCKED.md").exists(),
-        "the restored report lives on the job row"
-    );
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(finding.status.as_str(), "queued");
+    assert!(held(&f).await.is_none());
 }
 
 /// The fixture finding's fix streak.
@@ -730,34 +716,40 @@ async fn fix_streak(f: &Fixture) -> WorkStreak {
         .unwrap()
 }
 
-/// The blocker recorded on `job`'s row.
-async fn blocker_of(f: &Fixture, job: Option<i64>) -> Option<String> {
-    f.store.job_blocker(job.unwrap()).await.unwrap()
+/// The fixture finding's active fix hold.
+async fn held(f: &Fixture) -> Option<hunter::store::WorkHold> {
+    support::hold_of(&f.store, f.fid, FindingJobKind::Fix).await
 }
 
-/// The report the API shows on the fixture finding's Blocked card.
-async fn shown_blocker(f: &Fixture) -> Option<String> {
-    f.store.held_fix_blockers().await.unwrap().remove(&f.fid)
+/// The fixture finding's fix checkpoint.
+async fn checkpoint(f: &Fixture) -> Option<i64> {
+    f.store
+        .checkpoint_job(f.fid, FindingJobKind::Fix)
+        .await
+        .unwrap()
+        .map(|j| j.id)
 }
 
-/// The inherited blocker is restored only for an attempt that ended with
-/// no outcome. A worker that finished (here without a PR description), or
-/// one that declined the finding even while failing, concluded something,
-/// and the old blocker must not override it.
+/// A continued fix that concludes ends like any other attempt: one that
+/// finished without a PR description is a counted failure, one that
+/// declined the finding takes the decline's status.
 #[tokio::test]
-async fn a_blocked_resume_that_concludes_is_not_blocked_again() {
+async fn a_continued_fix_that_concludes_ends_ordinarily() {
     for (case, expected) in [("finished", "requeued"), ("declined", "rejected")] {
-        let (f, _blocked, _, _) = blocked_fixture().await;
-        f.store
-            .set_finding_status(f.fid, hunter::domain::FindingStatus::Queued)
-            .await
-            .unwrap();
+        let (f, _blocked, _, _) = held_fixture().await;
+        support::release(
+            &f.store,
+            f.fid,
+            FindingJobKind::Fix,
+            ReleaseAction::Continue,
+        )
+        .await;
         let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
             hunter::scheduler::pick_next(&f.store, &f.cfg, None)
                 .await
                 .unwrap()
         else {
-            panic!("requeued blocked work must resume");
+            panic!("continued work must resume");
         };
         let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
         let worker = ScriptedBackend::staged(move |tree, session| {
@@ -782,19 +774,17 @@ async fn a_blocked_resume_that_concludes_is_not_blocked_again() {
         if case == "finished" {
             assert_eq!(summary.failure.as_deref(), Some("no PR-DESCRIPTION.md"));
         }
-        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-        assert_ne!(finding.status.as_str(), "blocked", "{case}");
+        assert!(held(&f).await.is_none(), "{case}");
     }
 }
 
 /// Identical failures are retried until the streak limit, then the work
-/// is held as blocked with its tree, rather than rejected.
+/// is held as stuck with its tree, rather than rejected.
 #[tokio::test]
-async fn repeated_identical_fix_failures_become_blocked_at_the_limit() {
+async fn repeated_identical_fix_failures_are_held_at_the_limit() {
     let f = fixture("fix-stuck").await;
     let empty = ScriptedBackend::noop();
     let mut outcomes = Vec::new();
-    let mut last_job = None;
     for _ in 0..3 {
         let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
         let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &empty, None)
@@ -802,38 +792,41 @@ async fn repeated_identical_fix_failures_become_blocked_at_the_limit() {
             .unwrap();
         assert_eq!(summary.failure.as_deref(), Some("no commits"));
         outcomes.push(summary.outcome.unwrap());
-        last_job = summary.job_id;
     }
-    assert_eq!(outcomes, ["requeued", "requeued", "blocked"]);
+    assert_eq!(outcomes, ["requeued", "requeued", "held"]);
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-    assert_eq!(finding.status.as_str(), "blocked");
+    assert_eq!(finding.status.as_str(), "queued");
     let tree = empty.runs()[2].tree.clone();
     assert!(
         !tree.join("BLOCKED.md").exists(),
-        "the report lives on the job row"
+        "the report lives on the hold"
     );
-    let shown = shown_blocker(&f).await;
-    assert!(
-        shown
-            .as_deref()
-            .is_some_and(|r| r.contains("3 consecutive fix attempts hit the same failure"))
+    let hold = held(&f).await.expect("held at the limit");
+    assert_eq!(hold.reason, HoldReason::Stuck);
+    assert!(hold.detail.starts_with("no commits"), "{hold:?}");
+    assert_eq!(
+        fix_streak(&f).await,
+        WorkStreak::default(),
+        "a hold ends the streak"
     );
-    assert_eq!(f.store.job_blocker(last_job.unwrap()).await.unwrap(), shown);
 }
 
-/// The prompt a requeued held fix resumes with: requeue it, resume its
-/// checkpoint once, and return what the worker was told.
+/// The prompt a held fix resumes with: continue it, resume its checkpoint
+/// once, and return what the worker was told.
 async fn resumed_hold_prompt(f: &Fixture) -> String {
-    f.store
-        .set_finding_status(f.fid, hunter::domain::FindingStatus::Queued)
-        .await
-        .unwrap();
+    support::release(
+        &f.store,
+        f.fid,
+        FindingJobKind::Fix,
+        ReleaseAction::Continue,
+    )
+    .await;
     let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
         hunter::scheduler::pick_next(&f.store, &f.cfg, None)
             .await
             .unwrap()
     else {
-        panic!("requeued held work must resume");
+        panic!("continued held work must resume");
     };
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let worker = ScriptedBackend::staged(|_, session| {
@@ -847,11 +840,12 @@ async fn resumed_hold_prompt(f: &Fixture) -> String {
     worker.runs()[0].prompt.clone()
 }
 
-/// A held fix resumes against what held it. A worker's `BLOCKED.md` names
-/// a prerequisite to re-evaluate. A failure streak names none, only what
-/// kept failing, so its resume asks the worker to finish: told to
-/// re-evaluate a prerequisite and recreate `BLOCKED.md`, it could hold
-/// the fix again over nothing, without any progress.
+/// A held fix resumes against what held it, chosen by the hold's reason
+/// rather than its text. A worker's `BLOCKED.md` names a prerequisite to
+/// re-evaluate. A failure streak names none, only what kept failing, so
+/// its resume asks the worker to finish: told to re-evaluate a
+/// prerequisite and recreate `BLOCKED.md`, it could hold the fix again
+/// over nothing, without any progress.
 #[tokio::test]
 async fn a_held_fix_resumes_against_what_held_it() {
     let f = fixture("fix-streak-resume").await;
@@ -875,12 +869,13 @@ async fn a_held_fix_resumes_against_what_held_it() {
             .await
             .unwrap();
     }
+    assert_eq!(held(&f).await.map(|h| h.reason), Some(HoldReason::Stuck));
     let streak = resumed_hold_prompt(&f).await;
-    let (reported, _, _, _) = blocked_fixture().await;
+    let (reported, _, _, _) = held_fixture().await;
     let report = resumed_hold_prompt(&reported).await;
 
     assert!(
-        streak.contains("3 consecutive fix attempts hit the same failure: no PR-DESCRIPTION.md"),
+        streak.contains("kept failing the same way") && streak.contains("no PR-DESCRIPTION.md"),
         "{streak}"
     );
     assert!(
@@ -939,46 +934,39 @@ async fn fix_resume_without_a_blocker_runs_the_plain_continuation() {
 
 /// A stale report in the tree that cannot be removed stops the resume
 /// before any successor exists (running on would let it read as this
-/// attempt's outcome), and holds the checkpoint blocked again: still the
-/// chain's resumable tip once the operator clears the obstacle.
+/// attempt's outcome), and gives the finding back to `queued` with the
+/// checkpoint still its resumable tip once the obstacle is cleared.
 #[tokio::test]
-async fn unremovable_stale_report_holds_the_checkpoint_blocked() {
-    let (f, blocked, _, _) = blocked_fixture().await;
+async fn an_unremovable_stale_report_stops_the_resume_before_its_job() {
+    let (f, blocked, _, _) = held_fixture().await;
     let tree = blocked.runs()[0].tree.clone();
-    f.store
-        .set_finding_status(f.fid, hunter::domain::FindingStatus::Queued)
-        .await
-        .unwrap();
+    support::release(
+        &f.store,
+        f.fid,
+        FindingJobKind::Fix,
+        ReleaseAction::Continue,
+    )
+    .await;
     let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
         hunter::scheduler::pick_next(&f.store, &f.cfg, None)
             .await
             .unwrap()
     else {
-        panic!("requeued blocked work must resume");
+        panic!("continued work must resume");
     };
     let jobs_before = f.store.jobs_by_finding(f.fid).await.unwrap().len();
     std::fs::create_dir(tree.join("BLOCKED.md")).unwrap();
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let never = ScriptedBackend::new(|_| panic!("must not run beside a stale report"));
-    let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &never, Some(&plan))
+    let err = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &never, Some(&plan))
         .await
-        .unwrap();
-    assert_eq!(summary.outcome.as_deref(), Some("blocked"), "{summary:?}");
-    assert_eq!(
-        summary.kind,
-        Some(hunter::domain::FindingJobKind::Fix.into())
-    );
-    assert_eq!(summary.finding_id, Some(f.fid));
-    assert_eq!(summary.state, Some(hunter::domain::JobState::Suspended));
+        .unwrap_err();
     assert!(
-        summary
-            .failure
-            .as_deref()
-            .is_some_and(|m| m.starts_with("cannot remove the stale ")),
-        "{summary:?}"
+        err.to_string().contains("cannot remove the stale "),
+        "{err}"
     );
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-    assert_eq!(finding.status.as_str(), "blocked");
+    assert_eq!(finding.status.as_str(), "queued");
     assert_eq!(
         f.store.jobs_by_finding(f.fid).await.unwrap().len(),
         jobs_before,
@@ -986,77 +974,83 @@ async fn unremovable_stale_report_holds_the_checkpoint_blocked() {
     );
 
     std::fs::remove_dir(tree.join("BLOCKED.md")).unwrap();
-    f.store
-        .set_finding_status(f.fid, hunter::domain::FindingStatus::Queued)
-        .await
-        .unwrap();
     let Some(hunter::scheduler::Candidate::Resume { plan: again, .. }) =
         hunter::scheduler::pick_next(&f.store, &f.cfg, None)
             .await
             .unwrap()
     else {
-        panic!("the held checkpoint must still resume");
+        panic!("the checkpoint must still resume");
     };
     assert_eq!(again.predecessor_id, plan.predecessor_id);
 }
 
-/// Rejecting a blocked fix ends its checkpoint: the verdict drops the
-/// pointer and the next sweep releases its tree, instead of holding it
-/// forever. The job row stays as it ended.
+/// Rejecting a held fix ends its work item: the release records the
+/// verdict, the finding leaves the tier, which drops the checkpoint, and
+/// the next sweep releases its tree instead of holding it forever. The job
+/// row stays as it ended.
 #[tokio::test]
-async fn rejecting_a_blocked_fix_lets_the_sweep_release_its_checkpoint() {
-    let (f, blocked, summary, _) = blocked_fixture().await;
+async fn rejecting_a_held_fix_lets_the_sweep_release_its_checkpoint() {
+    let (f, blocked, summary, _) = held_fixture().await;
     let tree = blocked.runs()[0].tree.clone();
     let job = summary.job_id.unwrap();
 
     hunter::workspace::sweep(&f.store, &f.cfg.work_root, hunter::util::now_ms())
         .await
         .unwrap();
-    assert!(tree.is_dir(), "a blocked checkpoint is held");
+    assert!(tree.is_dir(), "a held checkpoint is kept");
 
+    let by = support::operator(&f.store).await;
     f.store
-        .set_finding_verdict(
+        .release_hold(
             f.fid,
-            hunter::domain::FindingStatus::Rejected,
-            "not worth it",
+            FindingJobKind::Fix,
+            &hunter::store::HoldRelease {
+                action: ReleaseAction::Reject,
+                reason: Some("not worth it"),
+                classification: None,
+                by: &by,
+            },
         )
         .await
         .unwrap();
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(
+        (finding.status.as_str(), finding.verdict_reason.as_deref()),
+        ("rejected", Some("not worth it"))
+    );
     hunter::workspace::sweep(&f.store, &f.cfg.work_root, hunter::util::now_ms())
         .await
         .unwrap();
     assert!(!tree.exists(), "the rejected checkpoint's tree is released");
     let jobs = f.store.jobs_by_finding(f.fid).await.unwrap();
-    let held = jobs.iter().find(|j| j.id == job).unwrap();
-    assert_eq!(held.state, hunter::domain::JobState::Suspended);
-    assert_eq!(
-        f.store
-            .checkpoint_job(f.fid, FindingJobKind::Fix)
-            .await
-            .unwrap()
-            .map(|j| j.id),
-        None
-    );
+    let held_job = jobs.iter().find(|j| j.id == job).unwrap();
+    assert_eq!(held_job.state, hunter::domain::JobState::Done);
+    assert_eq!(checkpoint(&f).await, None);
+    assert!(held(&f).await.is_none());
 }
 
-/// A blocked resume whose backend fails before any worker runs leaves no
-/// transcript of its own. The checkpoint must still resume on the next
-/// requeue, continuing the predecessor's transcript, not start the fix cold.
+/// A continued fix whose backend fails before any worker runs has no
+/// attempt to show for it: its job is failed as unstarted and the
+/// checkpoint it was continuing still resumes, rather than the fix
+/// starting cold.
 #[tokio::test]
-async fn a_blocked_resume_whose_backend_fails_stays_resumable() {
-    let (f, blocked, summary, expected_reason) = blocked_fixture().await;
+async fn a_continued_fix_whose_backend_fails_stays_resumable() {
+    let (f, blocked, summary, _) = held_fixture().await;
     let tree = blocked.runs()[0].tree.clone();
     let transcript = tree.parent().unwrap().join("session/session.jsonl");
-    f.store
-        .set_finding_status(f.fid, hunter::domain::FindingStatus::Queued)
-        .await
-        .unwrap();
+    support::release(
+        &f.store,
+        f.fid,
+        FindingJobKind::Fix,
+        ReleaseAction::Continue,
+    )
+    .await;
     let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
         hunter::scheduler::pick_next(&f.store, &f.cfg, None)
             .await
             .unwrap()
     else {
-        panic!("requeued blocked work must resume");
+        panic!("continued work must resume");
     };
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let failing = ScriptedBackend::failing();
@@ -1065,13 +1059,8 @@ async fn a_blocked_resume_whose_backend_fails_stays_resumable() {
         .unwrap_err();
     assert!(err.to_string().contains("backend failed"), "{err}");
     let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
-    assert_eq!(after.status.as_str(), "blocked");
-    assert_eq!(shown_blocker(&f).await, Some(expected_reason));
+    assert_eq!(after.status.as_str(), "queued");
 
-    f.store
-        .set_finding_status(f.fid, hunter::domain::FindingStatus::Queued)
-        .await
-        .unwrap();
     let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
         hunter::scheduler::pick_next(&f.store, &f.cfg, None)
             .await
@@ -1079,11 +1068,7 @@ async fn a_blocked_resume_whose_backend_fails_stays_resumable() {
     else {
         panic!("the checkpoint must still resume after a failed backend");
     };
-    assert_ne!(
-        plan.predecessor_id,
-        summary.job_id.unwrap(),
-        "the failed attempt is the link"
-    );
+    assert_eq!(plan.predecessor_id, summary.job_id.unwrap());
     assert_eq!(plan.session_file, transcript);
     assert_eq!(
         git(&tree, &["log", "-1", "--format=%s"]).trim(),
@@ -1097,7 +1082,7 @@ async fn a_blocked_resume_whose_backend_fails_stays_resumable() {
 #[tokio::test]
 async fn a_report_that_is_not_utf8_still_counts() {
     for (file, expected, status) in [
-        ("BLOCKED.md", "blocked", "blocked"),
+        ("BLOCKED.md", "held", "queued"),
         ("NOT-A-BUG.md", "new", "new"),
     ] {
         let f = fixture("fix-non-utf8").await;
@@ -1113,7 +1098,7 @@ async fn a_report_that_is_not_utf8_still_counts() {
         let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
         assert_eq!(finding.status.as_str(), status, "{file}");
         let report = if file == "BLOCKED.md" {
-            f.store.job_blocker(summary.job_id.unwrap()).await.unwrap()
+            held(&f).await.map(|h| h.detail)
         } else {
             finding.verdict_reason
         };
@@ -1222,23 +1207,26 @@ async fn an_unreadable_report_returns_the_finding_to_queued() {
     assert_eq!(finding.status.as_str(), "queued");
 }
 
-/// A verdict given after `pick_next` wins over the stale-report hold too:
-/// the resume is skipped at the claim, and the finding keeps the
-/// operator's status instead of being forced back to `blocked`.
+/// A verdict given after `pick_next` wins over a stale report too: the
+/// resume is skipped at the claim, before the report is looked at, and
+/// the finding keeps the operator's status.
 #[tokio::test]
-async fn a_verdict_after_selection_wins_over_the_stale_report_hold() {
-    let (f, blocked, _, _) = blocked_fixture().await;
+async fn a_verdict_after_selection_wins_over_a_stale_report() {
+    let (f, blocked, _, _) = held_fixture().await;
     let tree = blocked.runs()[0].tree.clone();
-    f.store
-        .set_finding_status(f.fid, hunter::domain::FindingStatus::Queued)
-        .await
-        .unwrap();
+    support::release(
+        &f.store,
+        f.fid,
+        FindingJobKind::Fix,
+        ReleaseAction::Continue,
+    )
+    .await;
     let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
         hunter::scheduler::pick_next(&f.store, &f.cfg, None)
             .await
             .unwrap()
     else {
-        panic!("requeued blocked work must resume");
+        panic!("continued work must resume");
     };
     let picked = f.store.get_finding(f.fid).await.unwrap().unwrap();
     std::fs::create_dir(tree.join("BLOCKED.md")).unwrap();
@@ -1255,19 +1243,19 @@ async fn a_verdict_after_selection_wins_over_the_stale_report_hold() {
     assert_eq!(finding.status.as_str(), "rejected");
 }
 
-/// Recording a block can fail (a busy database); the transaction then
-/// leaves the finding at `fixing`, where nothing would pick it up again
+/// Recording a hold can fail (a busy database); the claim would then
+/// leave the finding at `fixing`, where nothing would pick it up again
 /// before a restart. The fix puts it back to `queued` instead.
 #[tokio::test]
-async fn a_block_that_cannot_be_recorded_returns_the_finding_to_queued() {
+async fn a_hold_that_cannot_be_recorded_returns_the_finding_to_queued() {
     let f = fixture("fix-block-not-recorded").await;
     let pool =
         sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
             .await
             .unwrap();
     sqlx::raw_sql(
-        "CREATE TRIGGER refuse_block BEFORE UPDATE OF blocker ON jobs \
-         WHEN NEW.blocker IS NOT NULL BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+        "CREATE TRIGGER refuse_hold BEFORE INSERT ON work_holds \
+         BEGIN SELECT RAISE(ABORT, 'injected'); END;",
     )
     .execute(&pool)
     .await

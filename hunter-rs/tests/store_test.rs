@@ -90,7 +90,6 @@ async fn status_counts_zero_fills_all_statuses() {
     assert_eq!(counts["queued"], 0);
     assert_eq!(counts["rechecking"], 0);
     assert_eq!(counts["fixing"], 0);
-    assert_eq!(counts["blocked"], 0);
     assert_eq!(counts["rejected"], 0);
     assert_eq!(counts["wontfix"], 0);
     assert_eq!(counts["note"], 0);
@@ -557,7 +556,7 @@ async fn a_handoff_harvest_is_accounted_apart_from_the_engage_it_continues() {
     let resumed = insert("harvest", "done", 5_000, Some(handoff)).await;
     let store = open_store(pool, &path).await;
 
-    let chain = store.resume_chain_stats(handoff).await.unwrap();
+    let chain = store.resume_chain_stats(handoff, None).await.unwrap();
     assert_eq!(
         (chain.total, chain.attempts, chain.max_single),
         (45_000, 2, 40_000),

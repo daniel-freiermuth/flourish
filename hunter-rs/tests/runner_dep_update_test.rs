@@ -860,3 +860,40 @@ async fn a_paused_fix_keeps_its_queued_update_from_being_refreshed() {
     );
     assert_eq!(fix_checkpoint(&rig, fp).await, Some(paused));
 }
+
+/// A queued update whose fix is held keeps it from the scan too, also when
+/// the hold has no checkpoint (its tree was never made, or it was a
+/// `blocked` fix migrated without a transcript): the hold is the
+/// operator's decision to make, and handing the finding over or rewriting
+/// its target would make it behind their back (WORK-MODEL.md G2).
+#[tokio::test]
+async fn a_held_fix_without_a_checkpoint_keeps_its_queued_update() {
+    let rig = Rig::new("depupd-held").await;
+    let fallback = "widget:dep:left-pad-non-major@1.2.0";
+    rig.seed_update(fallback, "left-pad", "minor", rig.repo.id)
+        .await;
+    rig.set_status(fallback, "queued", None).await;
+    let fid = rig.id_of(fallback).await;
+    assert!(
+        rig.store
+            .hold_work(
+                fid,
+                hunter::domain::FindingJobKind::Fix,
+                hunter::domain::HoldReason::Stuck,
+                "workspace not created",
+                None
+            )
+            .await
+            .unwrap()
+    );
+
+    let s = rig.scan(&left_pad("1.2.0", Some("1.3.0"))).await.unwrap();
+
+    assert_eq!(rig.state_of(fallback).await, ("queued".into(), None, None));
+    assert_eq!(s.ingest.as_ref().map(|i| i.refreshed), Some(0), "{s:?}");
+    assert_eq!(
+        rig.status_of("widget:dep:left-pad-1.x@1.2.0").await,
+        "new",
+        "the scan's own finding is not queued in its place"
+    );
+}

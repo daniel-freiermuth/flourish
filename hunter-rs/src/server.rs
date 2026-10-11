@@ -28,11 +28,14 @@ use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::auth::{self, CurrentUser};
 use crate::config::{Config, HostAllowList};
-use crate::domain::{BudgetOverride, FindingStatus, FindingType, ForgeName, Severity};
-use crate::store::{FindingFilter, RepoUpdate, Store, StoreWriteError};
+use crate::domain::{
+    BudgetOverride, ClosureClass, FindingJobKind, FindingStatus, FindingType, ForgeName,
+    ReleaseAction, Severity,
+};
+use crate::store::{FindingFilter, HoldRelease, RepoUpdate, Store, StoreWriteError};
 use crate::types::{
-    ActivityStatus, BudgetState, Event, Finding, FindingDetail, FindingOut, JobListEntry, Repo,
-    RepoBrief, Stats, Summary,
+    ActivityStatus, BudgetState, Event, Finding, FindingDetail, FindingOut, HoldOut, JobListEntry,
+    Repo, RepoBrief, Stats, Summary,
 };
 
 /// Handle to this process's scheduler loop.
@@ -260,6 +263,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/events", get(events))
         .route("/api/stats", get(stats))
         .route("/api/verdict", post(verdict))
+        .route("/api/hold/release", post(release_hold))
         .route("/api/cycle", post(cycle))
         .route("/api/scheduler", post(set_scheduler_paused))
         .route("/api/overdrive", post(set_scheduler_overdrive))
@@ -481,7 +485,17 @@ async fn findings(
     let ids: Vec<i64> = rows.iter().map(|f| f.id).collect();
     let mut timelines = store.events_by_finding(&ids).await?;
     let attention = store.pr_attention().await?;
-    let mut blockers = store.held_fix_blockers().await?;
+    let mut holds: HashMap<i64, Vec<HoldOut>> = HashMap::new();
+    for hold in store.active_holds().await? {
+        let actions = hold.actions();
+        holds.entry(hold.finding_id).or_default().push(HoldOut {
+            kind: hold.kind,
+            reason: hold.reason,
+            detail: hold.detail,
+            held_at: hold.held_at,
+            actions,
+        });
+    }
     let mut follow_up_of: HashMap<i64, i64> = HashMap::new();
     let mut follow_ups: HashMap<i64, Vec<i64>> = HashMap::new();
     for (source, follow_up) in store.follow_up_pairs(&ids).await? {
@@ -503,7 +517,7 @@ async fn findings(
                 None
             };
             FindingOut {
-                blocker: blockers.remove(&finding.id),
+                holds: holds.remove(&finding.id).unwrap_or_default(),
                 follow_up_of: follow_up_of.get(&finding.id).copied(),
                 follow_ups: follow_ups.remove(&finding.id).unwrap_or_default(),
                 finding,
@@ -839,7 +853,7 @@ async fn verdict(
     // /api/recheck and /api/unqueue.
     if !finding.status.awaits_verdict() || finding.status == status {
         return Err(ApiError::BadRequest(format!(
-            "finding #{fid} is '{}'; a verdict applies only to new, blocked, note or closed findings, \
+            "finding #{fid} is '{}'; a verdict applies only to new, note or closed findings, \
              and must change its status",
             finding.status
         )));
@@ -878,6 +892,80 @@ async fn verdict(
     let refreshed = fetch_finding(&state.store, fid).await?;
     // A verdict changes the queue (a queued or resumed fix, a finding taken
     // out of it): act on it now, not at the loop's next natural wake.
+    state.scheduler.wake.notify_one();
+    Ok(Json(json!({ "ok": true, "finding": refreshed })).into_response())
+}
+
+// -- POST /api/hold/release (WORK-MODEL.md §12) --------------------------------
+
+/// End a hold on one of a finding's work items (WORK-MODEL.md §9.3):
+/// `{ finding_id, kind, action, reason?, classification? }`. `reason` is the
+/// verdict's for `reject`, `wontfix` and `classify`; `classification` the
+/// closed PR's for `classify` (`superseded`, `duplicate`, `obsolete`,
+/// `wrong`, `unwanted`, `abandoned`). 409 when the hold is no longer active
+/// or the action does not apply to it as it stands.
+async fn release_hold(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> Result<Response, ApiError> {
+    post_gate(&headers)?;
+    let body = parse_object(&raw)?;
+    let fid = require_int(&body, "finding_id", "finding_id must be an integer")?;
+    let text = |key: &str| -> Result<Option<&str>, ApiError> {
+        match body.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) => Ok(Some(s.trim()).filter(|s| !s.is_empty())),
+            Some(_) => Err(ApiError::BadRequest(format!("{key} must be a string"))),
+        }
+    };
+    let kind = text("kind")?
+        .and_then(|k| k.parse::<FindingJobKind>().ok())
+        .ok_or_else(|| {
+            ApiError::BadRequest("kind must be one of recheck, fix, engage, harvest".to_owned())
+        })?;
+    let action = text("action")?
+        .and_then(|a| a.parse::<ReleaseAction>().ok())
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "action must be one of {}",
+                ReleaseAction::ALL.map(ReleaseAction::as_str).join(", ")
+            ))
+        })?;
+    let reason = text("reason")?;
+    let classification = match text("classification")? {
+        None => None,
+        Some(c) => Some(c.parse::<ClosureClass>().map_err(ApiError::BadRequest)?),
+    };
+    let needs_reason = matches!(
+        action,
+        ReleaseAction::Reject | ReleaseAction::Wontfix | ReleaseAction::Classify
+    );
+    if needs_reason && reason.is_none() {
+        return Err(ApiError::BadRequest(format!(
+            "reason required for {action}"
+        )));
+    }
+    if action == ReleaseAction::Classify && classification.is_none() {
+        return Err(ApiError::BadRequest(
+            "classification required for classify".to_owned(),
+        ));
+    }
+    fetch_finding(&state.store, fid).await?;
+    let release = HoldRelease {
+        action,
+        reason,
+        classification,
+        by: &user,
+    };
+    match state.store.release_hold(fid, kind, &release).await {
+        Ok(()) => {}
+        Err(StoreWriteError::Refused(msg)) => return Err(ApiError::Conflict(msg)),
+        Err(StoreWriteError::Db(e)) => return Err(e.into()),
+    }
+    let refreshed = fetch_finding(&state.store, fid).await?;
+    // Released work is the scheduler's again: act on it now.
     state.scheduler.wake.notify_one();
     Ok(Json(json!({ "ok": true, "finding": refreshed })).into_response())
 }

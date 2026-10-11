@@ -124,6 +124,42 @@ export function typeEmoji(t: string): string {
   }
 }
 
+/** Why a finding's work is held for the operator (`HoldReason`). */
+export function holdReasonLabel(r: string): string {
+  switch (r) {
+    case "prerequisite":
+      return "missing prerequisite";
+    case "stuck":
+      return "kept failing";
+    case "gave_up":
+      return "gave up";
+    default:
+      return r || "?";
+  }
+}
+
+/** The button for a way to release a hold (`ReleaseAction`). */
+export function releaseActionLabel(a: string): string {
+  switch (a) {
+    case "continue":
+      return "Continue";
+    case "restart":
+      return "Restart";
+    case "reject":
+      return "Reject";
+    case "wontfix":
+      return "Wontfix";
+    case "classify":
+      return "Classify";
+    case "mark_harvested":
+      return "Mark harvested";
+    case "dismiss":
+      return "Dismiss";
+    default:
+      return a || "?";
+  }
+}
+
 /**
  * Is this safe to put in an `href`?
  *

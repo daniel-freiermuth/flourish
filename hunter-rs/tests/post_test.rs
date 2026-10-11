@@ -240,7 +240,7 @@ impl tracing_subscriber::fmt::MakeWriter<'_> for LogSink {
     }
 }
 
-const POST_PATHS: [&str; 10] = [
+const POST_PATHS: [&str; 11] = [
     "/api/verdict",
     "/api/cycle",
     "/api/recheck",
@@ -251,6 +251,7 @@ const POST_PATHS: [&str; 10] = [
     "/api/repo/delete",
     "/api/repo/notes",
     "/api/repo/rehunt",
+    "/api/hold/release",
 ];
 
 // -- §0.1 Content-Type gate ---------------------------------------------------
@@ -351,8 +352,9 @@ async fn verdict_unknown_finding_404() {
     assert_eq!(body["error"], "no finding 999");
 }
 
-/// Unknown strings and the scheduler-owned statuses alike are not verdicts:
-/// `blocked` needs a held checkpoint, which only the scheduler makes.
+/// Unknown strings and the scheduler-owned statuses alike are not verdicts.
+/// `blocked` is no status at all any more: held work is released through
+/// `/api/hold/release`.
 #[tokio::test]
 async fn verdict_bad_status_400() {
     let state = test_state().await;
@@ -1849,6 +1851,7 @@ async fn every_api_route_needs_a_session() {
         ("POST", "/api/recheck"),
         ("POST", "/api/unqueue"),
         ("POST", "/api/override"),
+        ("POST", "/api/hold/release"),
         ("GET", "/api/me"),
         ("POST", "/api/logout"),
     ];
@@ -2163,14 +2166,18 @@ async fn verdict_reason_required_before_any_status_change() {
     );
 }
 
-/// A fix blocked by its worker is held, not suppressed, and the operator's
-/// `queued` verdict releases the very checkpoint the block retained.
-#[tokio::test]
-async fn blocked_fix_and_operator_queue_preserve_the_fix_checkpoint() {
-    use hunter::domain::{FindingJobKind, FindingStatus, JobState};
+/// Finding 1 queued, its fix held as a missing prerequisite after a job
+/// whose worker ran: the state, the job and the report.
+async fn held_fix_state() -> (TestState, i64, String) {
+    use hunter::domain::{FindingJobKind, FindingStatus, HoldReason, JobState};
     use hunter::store::JobOutcome;
 
     let state = test_state().await;
+    state
+        .store
+        .set_finding_status(1, FindingStatus::Queued)
+        .await
+        .unwrap();
     let job_id = state
         .store
         .create_job(
@@ -2178,7 +2185,7 @@ async fn blocked_fix_and_operator_queue_preserve_the_fix_checkpoint() {
             1,
             Some(1),
             Some(5000),
-            JobState::Suspended,
+            JobState::Running,
             Some(1000),
             None,
         )
@@ -2190,7 +2197,7 @@ async fn blocked_fix_and_operator_queue_preserve_the_fix_checkpoint() {
         .complete_job(
             job_id,
             &JobOutcome {
-                state: JobState::Suspended,
+                state: JobState::Done,
                 tokens_new: 900,
                 calls: 4,
                 exit_code: Some(0),
@@ -2208,81 +2215,30 @@ async fn blocked_fix_and_operator_queue_preserve_the_fix_checkpoint() {
         "Baseline verification is unavailable.\n{}\nDiagnostic tail",
         "x".repeat(800)
     );
-    state.store.block_fix_job(1, job_id, &reason).await.unwrap();
-    let body = json!({ "finding": state.store.get_finding(1).await.unwrap().unwrap() });
-    assert_eq!(body["finding"]["status"], "blocked");
-    assert_eq!(body["finding"]["verdict_reason"], Value::Null);
-    assert_eq!(
-        serde_json::from_value::<FindingStatus>(body["finding"]["status"].clone()).unwrap(),
-        FindingStatus::Blocked
-    );
-    assert_eq!(state.store.status_counts().await.unwrap()["blocked"], 1);
-    assert!(state.store.suppressions(1, "bug").await.unwrap().is_empty());
     assert!(
         state
             .store
-            .known_active(1, "bug")
+            .hold_work(
+                1,
+                FindingJobKind::Fix,
+                HoldReason::Prerequisite,
+                &reason,
+                Some(job_id)
+            )
             .await
             .unwrap()
-            .iter()
-            .any(|f| f.id == 1)
     );
-    assert!(state.store.list_resumable_jobs().await.unwrap().is_empty());
-
-    let (status, body) = post(
-        &state,
-        "/api/verdict",
-        json!({ "id": 1, "status": "queued" }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["finding"]["status"], "queued");
-    assert_eq!(body["finding"]["verdict_reason"], Value::Null);
-    let resumable = state.store.list_resumable_jobs().await.unwrap();
-    assert_eq!(
-        resumable.iter().map(|j| j.id).collect::<Vec<_>>(),
-        vec![job_id]
-    );
-    assert_eq!(resumable[0].state, JobState::Suspended);
-    assert_eq!(
-        resumable[0].session_file.as_deref(),
-        Some("/s/fix/session.jsonl")
-    );
-    assert_eq!(resumable[0].notes.as_deref(), Some("implemented fix"));
-    assert_eq!(resumable[0].tokens_new, Some(900));
-    assert_eq!(resumable[0].calls, Some(4));
-    assert_eq!(state.store.status_counts().await.unwrap()["blocked"], 0);
+    (state, job_id, reason)
 }
 
-/// The worker's report is stored once, on the held job, and `/api/findings`
-/// derives it: a blocked row carries `blocker`, while `verdict_reason` keeps
-/// its own value. Once the operator requeues, the key is gone, so the card
-/// can never show a stale report.
+/// A fix held for the operator stays `queued`, unsuppressed, its work
+/// item skipped; `/api/findings` shows the hold with the actions that can
+/// release it, and `POST /api/hold/release` with `continue` gives the
+/// scheduler back the very checkpoint the hold retained.
 #[tokio::test]
-async fn findings_show_the_held_jobs_blocker_only_while_blocked() {
-    use hunter::domain::{FindingJobKind, JobState};
-
-    let state = test_state().await;
-    let job = state
-        .store
-        .create_job(
-            FindingJobKind::Fix.into(),
-            1,
-            Some(1),
-            Some(5000),
-            JobState::Running,
-            Some(1000),
-            None,
-        )
-        .await
-        .unwrap()
-        .id;
-    let before = state.store.get_finding(1).await.unwrap().unwrap();
-    state
-        .store
-        .block_fix_job(1, job, "needs a hardware test rig")
-        .await
-        .unwrap();
+async fn a_held_fix_is_shown_and_released_through_the_hold_endpoint() {
+    let (state, job_id, reason) = held_fix_state().await;
+    assert!(state.store.suppressions(1, "bug").await.unwrap().is_empty());
     let row = |rows: &Value, id: i64| {
         rows.as_array()
             .unwrap()
@@ -2293,26 +2249,118 @@ async fn findings_show_the_held_jobs_blocker_only_while_blocked() {
     };
 
     let rows = get_json(&state, "/api/findings").await;
-    let blocked = row(&rows, 1);
-    assert_eq!(blocked["status"], "blocked");
-    assert_eq!(blocked["blocker"], "needs a hardware test rig");
-    assert_eq!(blocked["verdict_reason"], json!(before.verdict_reason));
-    assert!(row(&rows, 2).get("blocker").is_none());
+    let held = row(&rows, 1);
+    assert_eq!(held["status"], "queued");
+    assert_eq!(
+        held["verdict_reason"],
+        Value::Null,
+        "the report is not copied"
+    );
+    assert_eq!(held["holds"][0]["kind"], "fix");
+    assert_eq!(held["holds"][0]["reason"], "prerequisite");
+    assert_eq!(held["holds"][0]["detail"], reason.as_str());
+    assert_eq!(
+        held["holds"][0]["actions"],
+        json!(["continue", "restart", "reject", "wontfix"])
+    );
+    assert_eq!(row(&rows, 2)["holds"], json!([]));
 
-    let (status, _) = post(
+    for (body, expected) in [
+        (
+            json!({ "finding_id": 1, "kind": "fix", "action": "nope" }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({ "finding_id": 1, "kind": "fix", "action": "reject" }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({ "finding_id": 1, "kind": "fix", "action": "dismiss" }),
+            StatusCode::CONFLICT,
+        ),
+        (
+            json!({ "finding_id": 1, "kind": "recheck", "action": "continue" }),
+            StatusCode::CONFLICT,
+        ),
+    ] {
+        let (status, reply) = post(&state, "/api/hold/release", body.clone()).await;
+        assert_eq!(status, expected, "{body}: {reply}");
+    }
+
+    let (status, body) = post(
         &state,
-        "/api/verdict",
-        json!({ "id": 1, "status": "queued" }),
+        "/api/hold/release",
+        json!({ "finding_id": 1, "kind": "fix", "action": "continue" }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["finding"]["status"], "queued");
+    let resumable = state.store.list_resumable_jobs().await.unwrap();
+    assert_eq!(
+        resumable.iter().map(|j| j.id).collect::<Vec<_>>(),
+        vec![job_id]
+    );
+    assert_eq!(
+        resumable[0].session_file.as_deref(),
+        Some("/s/fix/session.jsonl")
+    );
     let rows = get_json(&state, "/api/findings").await;
-    assert!(row(&rows, 1).get("blocker").is_none());
+    assert_eq!(row(&rows, 1)["holds"], json!([]));
+    let events = state.store.recent_events(10).await.unwrap();
+    let released = events.iter().find(|e| e.kind == "release").unwrap();
+    assert_eq!(released.username.as_deref(), Some("tester"), "{released:?}");
+
+    let (status, body) = post(
+        &state,
+        "/api/hold/release",
+        json!({ "finding_id": 1, "kind": "fix", "action": "continue" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "no longer active: {body}");
+}
+
+/// `reject` and `wontfix` release a held fix into the operator's verdict,
+/// which needs its reason, as `/api/verdict` does.
+#[tokio::test]
+async fn rejecting_a_held_fix_through_the_hold_endpoint() {
+    use hunter::domain::{FindingJobKind, FindingStatus, HoldReason};
+
+    let state = test_state().await;
+    state
+        .store
+        .set_finding_status(1, FindingStatus::Queued)
+        .await
+        .unwrap();
+    assert!(
+        state
+            .store
+            .hold_work(
+                1,
+                FindingJobKind::Fix,
+                HoldReason::Stuck,
+                "no commits",
+                None
+            )
+            .await
+            .unwrap()
+    );
+
+    let (status, body) = post(
+        &state,
+        "/api/hold/release",
+        json!({ "finding_id": 1, "kind": "fix", "action": "wontfix", "reason": "out of scope" }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["finding"]["status"], "wontfix");
+    assert_eq!(body["finding"]["verdict_reason"], "out of scope");
+    assert_eq!(state.store.active_holds().await.unwrap(), []);
 }
 
 /// The operator gives a verdict only where the finding asks for one: on a
-/// `new`, `blocked`, `note` or `closed` finding, and only to change its
-/// status.
+/// `new`, `note` or `closed` finding, and only to change its status. Held
+/// work is released through `/api/hold/release` instead.
 /// Everywhere else a job or the forge owns the finding (`fixing`,
 /// `rechecking`, `pr_open`, ...), so the verdict is refused and the row is
 /// left exactly as it was.
@@ -2335,10 +2383,7 @@ async fn verdicts_follow_the_finding_state_machine() {
             let after = state.store.get_finding(1).await.unwrap().unwrap();
             let asks = matches!(
                 from,
-                FindingStatus::New
-                    | FindingStatus::Blocked
-                    | FindingStatus::Note
-                    | FindingStatus::Closed
+                FindingStatus::New | FindingStatus::Note | FindingStatus::Closed
             );
             if asks && from != to {
                 assert_eq!(status, StatusCode::OK, "{from} -> {to}: {body}");
@@ -2348,7 +2393,7 @@ async fn verdicts_follow_the_finding_state_machine() {
                 assert_eq!(
                     body["error"],
                     format!(
-                        "finding #1 is '{from}'; a verdict applies only to new, blocked, note or \
+                        "finding #1 is '{from}'; a verdict applies only to new, note or \
                          closed findings, and must change its status"
                     ),
                     "{from} -> {to}"

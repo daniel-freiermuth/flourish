@@ -136,6 +136,19 @@ function hasDistinctIds(row: Record<string, unknown>, key: string): boolean {
   return new Set(ids).size === ids.length;
 }
 
+/**
+ * `FindingCard` renders a finding's holds keyed by `hold.kind` (one active
+ * hold per kind) and each hold's buttons keyed by action.
+ */
+function hasKeyableHolds(finding: Record<string, unknown>): boolean {
+  // Absent when the daemon predates the field; the card reads it as `[]`.
+  if (finding.holds === undefined || finding.holds === null) return true;
+  return (
+    isKeyedList(finding.holds, "kind", "string") &&
+    finding.holds.every((h) => Array.isArray(h.actions) && hasDistinctIds(h, "actions"))
+  );
+}
+
 /** `FindingDetail` reads `detail.jobs.length` and keys each row by `job.id`. */
 export function isFindingDetail(v: unknown): v is FindingDetail {
   if (!isObject(v)) return false;
@@ -154,7 +167,7 @@ export function isFindingDetail(v: unknown): v is FindingDetail {
 export function isFindingList(v: unknown): v is FindingOut[] {
   return (
     isKeyedList(v, "id", "number") &&
-    v.every((f) => hasKeyableTimeline(f) && hasDistinctIds(f, "follow_ups"))
+    v.every((f) => hasKeyableTimeline(f) && hasDistinctIds(f, "follow_ups") && hasKeyableHolds(f))
   );
 }
 

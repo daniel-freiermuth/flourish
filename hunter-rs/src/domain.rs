@@ -22,12 +22,6 @@ pub enum FindingStatus {
     Rechecking,
     Queued,
     Fixing,
-    /// Valid work retained until an operator resolves a verification or
-    /// environment blocker and explicitly queues the fix to continue.
-    /// Not suppressed: inability to finish is not evidence of invalidity.
-    /// Set only by the scheduler (a worker's `BLOCKED.md`, or repeated
-    /// identical failures), never by a verdict: a hold needs a checkpoint.
-    Blocked,
     PrOpen,
     Merged,
     /// The PR was closed without merging and has not been harvested yet.
@@ -47,12 +41,11 @@ pub enum FindingStatus {
 }
 
 impl FindingStatus {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 11] = [
         Self::New,
         Self::Rechecking,
         Self::Queued,
         Self::Fixing,
-        Self::Blocked,
         Self::PrOpen,
         Self::Merged,
         Self::Closed,
@@ -68,7 +61,6 @@ impl FindingStatus {
             Self::Rechecking => "rechecking",
             Self::Queued => "queued",
             Self::Fixing => "fixing",
-            Self::Blocked => "blocked",
             Self::PrOpen => "pr_open",
             Self::Merged => "merged",
             Self::Closed => "closed",
@@ -89,14 +81,14 @@ impl FindingStatus {
     }
 
     /// Statuses at which a finding asks the operator for a verdict: `new`
-    /// (triage), `blocked` (resume or discard the held fix), `note` (act on
-    /// it after all) and `closed` (classify a closed PR, which the harvest
-    /// may give up on and then never revisits; a harvest still running
-    /// keeps the operator's verdict, see `Store::record_closed_harvest`).
-    /// Everywhere else a job or the forge owns the finding, and a verdict
-    /// would race it, so `/api/verdict` refuses.
+    /// (triage), `note` (act on it after all) and `closed` (classify a
+    /// closed PR; a harvest still running keeps the operator's verdict,
+    /// see `Store::record_closed_harvest`). Everywhere else a job or the
+    /// forge owns the finding, and a verdict would race it, so
+    /// `/api/verdict` refuses. Work held for the operator is released
+    /// through `/api/hold/release`, not by a verdict.
     pub fn awaits_verdict(self) -> bool {
-        matches!(self, Self::New | Self::Blocked | Self::Note | Self::Closed)
+        matches!(self, Self::New | Self::Note | Self::Closed)
     }
 
     /// Statuses that require a reason when set via verdict.
@@ -104,8 +96,8 @@ impl FindingStatus {
         matches!(self, Self::Rejected | Self::Wontfix)
     }
 
-    /// Suppressed statuses (feed the suppression corpus). `Blocked`,
-    /// `Closed`, and `Superseded` are left out on purpose: see their variants.
+    /// Suppressed statuses (feed the suppression corpus). `Closed` and
+    /// `Superseded` are left out on purpose: see their variants.
     pub fn is_suppressed(self) -> bool {
         matches!(self, Self::Rejected | Self::Wontfix)
     }
@@ -233,6 +225,117 @@ impl std::str::FromStr for ClosureClass {
 }
 
 // ---------------------------------------------------------------------------
+// Holds: work stopped for the operator (WORK-MODEL.md §9)
+// ---------------------------------------------------------------------------
+
+/// Why a work item is held (`work_holds.reason`). The resume prompt after a
+/// `continue` is chosen from this, never from the detail's text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type, TS)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(rename_all = "snake_case")]
+pub enum HoldReason {
+    /// The worker reported a missing prerequisite (`BLOCKED.md`).
+    Prerequisite,
+    /// The same failure `MAX_CONSECUTIVE_SAME_FAILURE` times in a row.
+    Stuck,
+    /// The give-up ceiling ended the chain, and that completed the streak.
+    GaveUp,
+}
+
+impl HoldReason {
+    pub const ALL: [Self; 3] = [Self::Prerequisite, Self::Stuck, Self::GaveUp];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Prerequisite => "prerequisite",
+            Self::Stuck => "stuck",
+            Self::GaveUp => "gave_up",
+        }
+    }
+}
+
+impl std::fmt::Display for HoldReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// How an operator ends a hold (`work_holds.release_action`, §9.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type, TS)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(rename_all = "snake_case")]
+pub enum ReleaseAction {
+    /// Resume from the checkpoint; the ceiling counts from now.
+    Continue,
+    /// Drop the checkpoint and start the work fresh.
+    Restart,
+    /// Reject the finding (a verdict, with a reason).
+    Reject,
+    /// Mark the finding won't-fix (a verdict, with a reason).
+    Wontfix,
+    /// Classify a closed PR by hand, as its harvest would have.
+    Classify,
+    /// Mark a merged PR harvested without a review.
+    MarkHarvested,
+    /// Mark the PR's current attention handled, as a no-op engage would.
+    Dismiss,
+}
+
+impl ReleaseAction {
+    pub const ALL: [Self; 7] = [
+        Self::Continue,
+        Self::Restart,
+        Self::Reject,
+        Self::Wontfix,
+        Self::Classify,
+        Self::MarkHarvested,
+        Self::Dismiss,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Continue => "continue",
+            Self::Restart => "restart",
+            Self::Reject => "reject",
+            Self::Wontfix => "wontfix",
+            Self::Classify => "classify",
+            Self::MarkHarvested => "mark_harvested",
+            Self::Dismiss => "dismiss",
+        }
+    }
+
+    /// Whether this action can release a hold of `kind`'s work (§9.3). A
+    /// harvest's `classify` and `mark_harvested` also depend on how its PR
+    /// ended, which only the finding knows: see `Store::release_hold`.
+    pub fn applies_to(self, kind: FindingJobKind) -> bool {
+        match self {
+            Self::Continue | Self::Restart => true,
+            Self::Reject | Self::Wontfix => {
+                matches!(kind, FindingJobKind::Recheck | FindingJobKind::Fix)
+            }
+            Self::Classify | Self::MarkHarvested => kind == FindingJobKind::Harvest,
+            Self::Dismiss => kind == FindingJobKind::Engage,
+        }
+    }
+}
+
+impl std::fmt::Display for ReleaseAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ReleaseAction {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|a| a.as_str() == s)
+            .ok_or_else(|| format!("unknown release action {s:?}"))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Job state
 // ---------------------------------------------------------------------------
 
@@ -249,9 +352,11 @@ pub enum JobState {
     /// started over. Either the worker hit the token bound, or it died
     /// after doing metered work (a provider error, a dead connection, the
     /// daemon going down under it), or a wallclock kill after doing
-    /// metered work. Completed fixes awaiting operator resolution of a
-    /// verification or environment blocker also retain their checkpoint here.
-    /// Resume chains are bounded by the give-up ceiling. See `scheduler::job_state`.
+    /// metered work. Only how the attempt ended: whether the work
+    /// continues from it is the work item's checkpoint pointer
+    /// (`finding_work.checkpoint_job_id`) for a finding's work, and for
+    /// repo-level work whether nothing continues it yet. Resume chains are
+    /// bounded by the give-up ceiling. See `scheduler::job_state`.
     Suspended,
     Denied,
 }
@@ -458,7 +563,9 @@ impl std::str::FromStr for RepoJobKind {
 // Finding job kinds (fix + PR lifecycle).
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type, TS)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, sqlx::Type, TS,
+)]
 #[serde(rename_all = "snake_case")]
 #[sqlx(rename_all = "snake_case")]
 #[ts(rename_all = "snake_case")]
