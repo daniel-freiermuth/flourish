@@ -499,7 +499,7 @@ All of them only left an event behind, and backfilling would mean parsing event 
 
 ## 13. Out of scope
 
-- **Repo-level work** (hunt, analysis scans, dep updates). It keeps its current mechanism: rotation timestamps, give-up bumps, and suspended rows as checkpoints. Holds are finding-only. This leaves two checkpoint mechanisms until repo work is moved over; see §15.
+- **Repo-level work** (hunt, analysis scans, dep updates). Its checkpoint is a pointer too, `repo_work.checkpoint_job_id` per `(repo, kind)`, so no job row of any kind is rewritten once it ends. It still keeps its rotation timestamps and give-up bumps, and holds are finding-only (#92).
 - **Scheduler-level waits:** budget denial, the disk gate, the network gate, operator pause, overdrive.
 - **PR sync errors** (an unparseable URL, a failed PR view): logged per cycle, as today.
 

@@ -787,6 +787,22 @@ pub async fn point_checkpoint(pool: &SqlitePool, fid: i64, kind: &str, job: i64)
     .unwrap();
 }
 
+/// Make job `job` the checkpoint of repo `repo`'s `kind` work item, as a
+/// repo-level job that ended paused does (`Store::complete_job`); `None`
+/// drops it. For tests that seed suspended hunt or scan rows by hand.
+pub async fn point_repo_checkpoint(pool: &SqlitePool, repo: i64, kind: &str, job: Option<i64>) {
+    sqlx::query(
+        "INSERT INTO repo_work (repo_id, kind, checkpoint_job_id) VALUES (?1, ?2, ?3) \
+         ON CONFLICT (repo_id, kind) DO UPDATE SET checkpoint_job_id = excluded.checkpoint_job_id",
+    )
+    .bind(repo)
+    .bind(kind)
+    .bind(job)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 /// The operator account `tester`, created on first use: who releases a
 /// hold in a test.
 pub async fn operator(store: &Store) -> hunter::auth::CurrentUser {

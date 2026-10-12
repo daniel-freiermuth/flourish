@@ -934,3 +934,67 @@ async fn upgrading_turns_blocked_fixes_into_holds() {
     assert_eq!(blocker, 0, "jobs.blocker is dropped");
     pool.close().await;
 }
+
+/// Upgrading points every repo work item at the checkpoint it had.
+///
+/// Until 026 a repo-level job's checkpoint was its newest `suspended`
+/// attempt that nothing continued; rows the give-up ceiling, a gone tree or
+/// fresh work retired were rewritten out of `suspended`. 026 turns exactly
+/// the live ones into `repo_work.checkpoint_job_id`, per (repo, kind), and
+/// points nothing at a retired row, a continued link or a finding's job.
+///
+/// Seeded at the state just before 026 so that rolling forward executes it.
+#[tokio::test]
+async fn upgrading_points_each_repo_work_item_at_its_checkpoint() {
+    use hunter::domain::RepoJobKind;
+
+    let (_dir, path) = scratch("mig-repo-checkpoints");
+
+    let before_026 = sqlx::migrate!("./migrations")
+        .iter()
+        .position(|m| m.version == 26)
+        .expect("migration 026 exists");
+    let pool = seed_state(&path, before_026).await;
+    sqlx::raw_sql(
+        "INSERT INTO repos (id, name, url, path, forge, default_branch, added_at) VALUES \
+             (1, 'widget', 'https://e/w.git', '/wr/repos/repo-1', 'github', 'main', 1), \
+             (2, 'gadget', 'https://e/g.git', '/wr/repos/repo-2', 'github', 'main', 1); \
+         INSERT INTO findings (id, type, repo_id, fingerprint, severity, confidence, summary, \
+                               status, created_at, updated_at) \
+             VALUES (1, 'bug', 1, 'fp-1', 'high', 0.9, 's', 'queued', 1, 1); \
+         INSERT INTO jobs (id, kind, repo_id, finding_id, state, killed_reason, session_file, \
+                           resumed_from, started_at) VALUES \
+             (10, 'hunt', 1, NULL, 'suspended', 'cap', '/s/10.jsonl', NULL, 1), \
+             (11, 'hunt', 1, NULL, 'suspended', 'cap', '/s/10.jsonl', 10, 2), \
+             (12, 'test_gap', 1, NULL, 'suspended', 'cap', '/s/12.jsonl', NULL, 3), \
+             (13, 'test_gap', 1, NULL, 'suspended', 'cap', '/s/13.jsonl', NULL, 4), \
+             (14, 'refactor', 1, NULL, 'failed', 'give-up', '/s/14.jsonl', NULL, 5), \
+             (15, 'standards', 2, NULL, 'suspended', 'wallclock', '/s/15.jsonl', NULL, 6), \
+             (16, 'fix', 1, 1, 'suspended', 'cap', '/s/16.jsonl', NULL, 7), \
+             (17, 'modernization', 2, NULL, 'killed', 'superseded', '/s/17.jsonl', NULL, 8);",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let store = Store::connect(&path).await.expect("roll forward");
+
+    let mut got = Vec::new();
+    for repo in 1..=2 {
+        for kind in RepoJobKind::ALL {
+            if let Some(job) = store.repo_checkpoint_job(repo, kind).await.unwrap() {
+                got.push((repo, kind, job.id));
+            }
+        }
+    }
+    assert_eq!(
+        got,
+        vec![
+            (1, RepoJobKind::Hunt, 11),
+            (1, RepoJobKind::TestGap, 13),
+            (2, RepoJobKind::Standards, 15),
+        ]
+    );
+    drop(store);
+}

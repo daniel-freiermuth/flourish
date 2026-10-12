@@ -345,8 +345,8 @@ after any of them it can never usefully be continued:
   a row from before per-chain workspaces fails by construction, its
   transcript and tree being in the old layout and its row carrying no
   pinned commit — so selection gives the checkpoint up when it reaches
-  it (a repo scan's attempt is marked `killed`, reason `workdir-gone`)
-  and moves on to the next candidate the same cycle.
+  it (the work item drops its pointer; the row stays as it ended) and
+  moves on to the next candidate the same cycle.
 - **Finding moved on.** A finding's work exists only while the finding
   is in that kind's tier (fix: `queued`/`fixing`, recheck: `rechecking`,
   engage: `pr_open`, harvest: `merged`/`closed` and not yet harvested).

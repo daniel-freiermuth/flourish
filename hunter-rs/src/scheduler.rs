@@ -878,7 +878,7 @@ async fn resume_plan(
                 workspace.root.display()
             );
             if mode == Pick::Run {
-                end_checkpoint(store, &job, JobState::Killed, "workdir-gone", &msg).await;
+                end_checkpoint(store, &job, &msg).await;
             }
             return Ok(Resumable::No);
         }
@@ -951,17 +951,17 @@ async fn resume_plan(
         // included: a hunt's watermark stays where it was, so the next
         // hunt reviews the same commits after the scan interval.
         //
-        // Bumped before the retirement: once retired, the chain is no
-        // longer resumable and nothing would retry a bump that failed,
-        // whereas a retirement that fails after a bump leaves the row
-        // suspended and the next selection runs both writes again.
+        // Bumped before the checkpoint is dropped: once dropped, the chain
+        // is no longer resumable and nothing would retry a bump that
+        // failed, whereas a drop that fails after a bump leaves the
+        // checkpoint and the next selection runs both writes again.
         if let JobKind::Repo(kind) = job.kind {
             let _ = store.set_last_kind_at(job.repo_id, kind).await;
         }
         // Best-effort: the candidate is skipped either way, so a failed
         // write only defers the record — and only a landed give-up is
         // reported as one, so the chain is counted once.
-        let retired = end_checkpoint(store, &job, JobState::Failed, "give-up", &msg).await;
+        let retired = end_checkpoint(store, &job, &msg).await;
         return Ok(if retired {
             Resumable::GaveUp(msg)
         } else {
@@ -1003,32 +1003,21 @@ async fn resume_plan(
 
 /// End the checkpoint `job` for good, logging `msg` as a `resume` event.
 ///
-/// A finding's work drops its checkpoint pointer and leaves the job row as
-/// it ended (WORK-MODEL.md §4). A repo-level job's suspended row is its
-/// checkpoint, so that row is retired `state` / `reason` instead. True when
-/// the write landed; a failed one leaves the checkpoint for the next
-/// selection to try again.
-async fn end_checkpoint(
-    store: &Store,
-    job: &Job,
-    state: JobState,
-    reason: &str,
-    msg: &str,
-) -> bool {
-    if let (JobKind::Finding(kind), Some(fid)) = (job.kind, job.finding_id) {
-        return store
-            .drop_checkpoint(fid, kind, job.id, msg)
-            .await
-            .unwrap_or(false);
-    }
-    let retired = store
-        .retire_suspended_job(job.id, state, Some(reason), msg)
-        .await
-        .is_ok();
-    let _ = store
-        .log_event("resume", msg, Some(job.id), job.finding_id)
-        .await;
-    retired
+/// The work item drops its checkpoint pointer, a finding's or a repo's, and
+/// the job row stays as it ended (WORK-MODEL.md §4). True when the write
+/// landed; a failed one, or a pointer that has moved on since, leaves the
+/// checkpoint for the next selection to try again.
+async fn end_checkpoint(store: &Store, job: &Job, msg: &str) -> bool {
+    let dropped = match (job.kind, job.finding_id) {
+        (JobKind::Finding(kind), Some(fid)) => store.drop_checkpoint(fid, kind, job.id, msg).await,
+        (JobKind::Repo(kind), _) => {
+            store
+                .drop_repo_checkpoint(job.repo_id, kind, job.id, msg)
+                .await
+        }
+        (JobKind::Finding(_), None) => return false,
+    };
+    dropped.unwrap_or(false)
 }
 
 /// Historical cost estimate for one (repo, kind): warm (finished a
@@ -1259,8 +1248,9 @@ pub async fn record_job(
         .await?;
 
     // The transcript this attempt was to continue is gone, so nothing
-    // ran. The predecessor is retired `killed`: leaving it `suspended`
-    // would offer the same missing session every cycle forever.
+    // ran. Nothing is retired: this attempt ended without pausing, so
+    // `complete_job` has already moved its work item off the checkpoint,
+    // and the predecessor's row stays as it ended. The event says so.
     //
     // Deliberately NOT restarting the work cold in this same cycle. omp
     // treats an unresolvable `--resume` path as permission to start a
@@ -1272,30 +1262,15 @@ pub async fn record_job(
     // knowing it.
     //
     // Not for a handoff: its predecessor was never suspended. It finished,
-    // and retiring it `killed` would rewrite a completed engage.
-    //
-    // A finding's work needs no retirement: this attempt ended without
-    // pausing, so `complete_job` has already moved its work item off the
-    // checkpoint, and the predecessor's row stays as it ended.
+    // and its work item is another kind's.
     if let Some(plan) = resume
         && !plan.handoff
         && rr.killed_reason.as_deref() == Some("resume-unavailable")
     {
-        let msg = if plan.kind.is_finding() {
-            format!(
-                "resume {} {}: session gone, checkpoint job {} given up",
-                plan.kind, plan.repo, plan.predecessor_id
-            )
-        } else {
-            let msg = format!(
-                "resume {} {}: session gone, predecessor job {} marked killed",
-                plan.kind, plan.repo, plan.predecessor_id
-            );
-            store
-                .retire_suspended_job(plan.predecessor_id, JobState::Killed, None, &msg)
-                .await?;
-            msg
-        };
+        let msg = format!(
+            "resume {} {}: session gone, checkpoint job {} given up",
+            plan.kind, plan.repo, plan.predecessor_id
+        );
         let _ = store
             .log_event("error", &msg, Some(job_id), plan.finding_id)
             .await;

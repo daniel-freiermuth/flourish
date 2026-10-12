@@ -252,12 +252,14 @@ async fn record_job_wallclock_kill_with_work_and_a_session_suspends() {
     let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
     let store = rw_store(&path).await;
+    // Two kinds: a second attempt at the same work would replace the
+    // first one's checkpoint, however it ended.
     let mut ids = Vec::new();
-    for _ in 0..2 {
+    for kind in [RepoJobKind::Hunt, RepoJobKind::TestGap] {
         ids.push(
             store
                 .create_job(
-                    RepoJobKind::Hunt.into(),
+                    kind.into(),
                     1,
                     None,
                     Some(50_000),
