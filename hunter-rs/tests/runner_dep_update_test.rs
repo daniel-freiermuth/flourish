@@ -441,8 +441,9 @@ async fn an_update_renovate_could_not_check_stays_open() {
 }
 
 /// A newer target that could not be saved fails the cycle like a failed
-/// insert: the cadence stays put so the next cycle retries, and nothing is
-/// retired on the strength of an answer that was not recorded.
+/// insert: the cadence stays put so the next cycle retries, nothing is
+/// retired on the strength of an answer that was not recorded, and the
+/// scan is counted as `invalid entries` on the repo's `dep_update` work.
 #[tokio::test]
 async fn a_failed_refresh_fails_the_cycle() {
     let rig = Rig::new("depupd-refresh-fails").await;
@@ -469,6 +470,16 @@ async fn a_failed_refresh_fails_the_cycle() {
         s.ingest.as_ref().map(|i| (i.refreshed, i.invalid)),
         Some((0, 1)),
         "{s:?}"
+    );
+    assert_eq!(s.outcome.as_deref(), Some("retry"), "{s:?}");
+    let streak = rig
+        .store
+        .repo_work_streak(rig.repo.id, hunter::domain::RepoWorkKind::DepUpdate)
+        .await
+        .unwrap();
+    assert_eq!(
+        (streak.streak, streak.last_failure.as_deref()),
+        (1, Some("invalid entries"))
     );
     let after = rig
         .store

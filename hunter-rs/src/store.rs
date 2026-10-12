@@ -28,7 +28,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use crate::auth::CurrentUser;
 use crate::domain::{
     BudgetOverride, BugClass, ClosureClass, FindingJobKind, FindingStatus, FindingType, ForgeName,
-    HoldReason, JobKind, JobState, ReleaseAction, RepoJobKind, Severity,
+    HoldReason, JobKind, JobState, ReleaseAction, RepoJobKind, RepoWorkKind, Severity,
 };
 use crate::types::{
     Event, Finding, Job, JobListEntry, PrState, Repo, SchedulerState, StatsByFinding, StatsByKind,
@@ -97,6 +97,70 @@ pub struct ResumeChainStats {
 pub struct WorkStreak {
     pub streak: i64,
     pub last_failure: Option<String>,
+}
+
+/// Every work item held for the operator, from the one query that answers
+/// "is this held?" ([`Store::held_work`]): finding work by `(finding,
+/// kind)`, repo work by `(repo, kind)`, `sync` included.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HeldWork {
+    pub findings: BTreeSet<(i64, FindingJobKind)>,
+    pub repos: BTreeSet<(i64, RepoWorkKind)>,
+}
+
+impl HeldWork {
+    /// Whether finding `fid`'s `kind` work is held.
+    pub fn finding(&self, fid: i64, kind: FindingJobKind) -> bool {
+        self.findings.contains(&(fid, kind))
+    }
+
+    /// Whether repo `rid`'s `sync` is held: then every kind of the repo
+    /// waits for the operator (WORK-MODEL.md §17).
+    pub fn repo_sync(&self, rid: i64) -> bool {
+        self.repos.contains(&(rid, RepoWorkKind::Sync))
+    }
+
+    /// Whether repo `rid`'s `kind` work waits for the operator: its own
+    /// hold, or the repo's `sync` hold.
+    pub fn repo(&self, rid: i64, kind: RepoJobKind) -> bool {
+        self.repo_sync(rid) || self.repos.contains(&(rid, kind.into()))
+    }
+}
+
+/// One active hold on a repo's work (`work_holds` with a `repo_id`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoHold {
+    pub id: i64,
+    pub repo_id: i64,
+    pub kind: RepoWorkKind,
+    pub reason: HoldReason,
+    pub detail: String,
+    pub held_at: i64,
+    /// The work item's checkpoint: `continue` needs one.
+    pub checkpoint_job_id: Option<i64>,
+}
+
+impl RepoHold {
+    /// The actions that can release this hold, in [`ReleaseAction::ALL`]'s
+    /// order.
+    pub fn actions(&self) -> Vec<ReleaseAction> {
+        ReleaseAction::ALL
+            .into_iter()
+            .filter(|a| {
+                a.applies_to_repo(self.kind)
+                    && (*a != ReleaseAction::Continue || self.checkpoint_job_id.is_some())
+            })
+            .collect()
+    }
+}
+
+/// A repo work item failing without a hold yet: its streak so far.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoStreak {
+    pub repo_id: i64,
+    pub kind: RepoWorkKind,
+    pub streak: i64,
+    pub last_failure: String,
 }
 
 /// One active hold (`work_holds`), with what its release depends on.
@@ -1226,6 +1290,14 @@ impl Store {
                  cannot delete without losing history; pause it instead"
             )));
         }
+        // Its work items and holds go with it (WORK-MODEL.md §17): a repo
+        // with no jobs can still have a failing or held `sync`.
+        sqlx::query!("DELETE FROM repo_work WHERE repo_id = ?1", id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query!("DELETE FROM work_holds WHERE repo_id = ?1", id)
+            .execute(&mut *tx)
+            .await?;
         // The name is released here, not at reap time: `repos.name` is
         // UNIQUE, so a flagged row would otherwise keep rejecting the name
         // of a repo the operator has already been told is gone. Suffixing
@@ -3829,19 +3901,35 @@ impl Store {
         Ok(())
     }
 
-    // -- holds (WORK-MODEL.md §9) ---------------------------------------------
+    // -- holds (WORK-MODEL.md §9, §17) -----------------------------------------
 
-    /// Every work item held for the operator: the one answer to "is this
-    /// held?", which every finding tier, the resume tier and the summary
-    /// preview all read (§9.5, invariant 3).
-    pub async fn held_work(&self) -> sqlx::Result<BTreeSet<(i64, FindingJobKind)>> {
+    /// Every work item held for the operator, a finding's or a repo's: the
+    /// one answer to "is this held?", which every finding tier, the resume
+    /// tier, the repo rotation and the summary preview all read (§9.5,
+    /// invariant 3). One statement, so the two halves cannot come from two
+    /// different moments.
+    pub async fn held_work(&self) -> sqlx::Result<HeldWork> {
         let rows = sqlx::query!(
-            r#"SELECT finding_id AS "finding_id!: i64", kind AS "kind!: FindingJobKind"
+            r#"SELECT finding_id, repo_id, kind AS "kind!: String"
                FROM work_holds WHERE released_at IS NULL"#
         )
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(|r| (r.finding_id, r.kind)).collect())
+        let mut held = HeldWork::default();
+        let bad = |e: String| sqlx::Error::Decode(e.into());
+        for r in rows {
+            match (r.finding_id, r.repo_id) {
+                (Some(fid), _) => {
+                    held.findings.insert((fid, r.kind.parse().map_err(bad)?));
+                }
+                (None, Some(rid)) => {
+                    held.repos.insert((rid, r.kind.parse().map_err(bad)?));
+                }
+                // The schema's CHECK rules this out.
+                (None, None) => {}
+            }
+        }
+        Ok(held)
     }
 
     /// Every active hold with the facts its release depends on, oldest
@@ -4070,6 +4158,285 @@ impl Store {
         if let Some((status, text)) = verdict {
             write_release_verdict(&mut tx, finding_id, action, status, &text, by.id, now).await?;
         }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    // -- repo work (WORK-MODEL.md §17) ----------------------------------------
+
+    /// The identical-failure streak of `repo_id`'s `kind` work: zero and no
+    /// key while the work item has no row.
+    pub async fn repo_work_streak(
+        &self,
+        repo_id: i64,
+        kind: RepoWorkKind,
+    ) -> sqlx::Result<WorkStreak> {
+        Ok(sqlx::query_as!(
+            WorkStreak,
+            r#"SELECT streak AS "streak!: i64", last_failure FROM repo_work
+               WHERE repo_id = ?1 AND kind = ?2"#,
+            repo_id,
+            kind
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or_default())
+    }
+
+    /// Count one failure of `repo_id`'s `kind` work under `key` and return
+    /// the streak it makes, as [`Self::record_work_failure`] does for a
+    /// finding's. The checkpoint is left alone: an attempt that ran has
+    /// moved it in `complete_job` already, and a failure without a new
+    /// attempt did no work that could replace it.
+    pub async fn record_repo_failure(
+        &self,
+        repo_id: i64,
+        kind: RepoWorkKind,
+        key: &str,
+    ) -> sqlx::Result<i64> {
+        sqlx::query_scalar!(
+            r#"INSERT INTO repo_work (repo_id, kind, streak, last_failure)
+               VALUES (?1, ?2, 1, ?3)
+               ON CONFLICT(repo_id, kind) DO UPDATE SET
+                 streak = CASE WHEN repo_work.last_failure IS excluded.last_failure
+                     THEN repo_work.streak + 1 ELSE 1 END,
+                 last_failure = excluded.last_failure
+               RETURNING streak AS "streak!: i64""#,
+            repo_id,
+            kind,
+            key
+        )
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// `repo_id`'s `kind` work succeeded (§6.3): its streak ends and its
+    /// checkpoint is cleared.
+    pub async fn repo_work_succeeded(&self, repo_id: i64, kind: RepoWorkKind) -> sqlx::Result<()> {
+        sqlx::query!(
+            "UPDATE repo_work SET streak = 0, last_failure = NULL, checkpoint_job_id = NULL \
+             WHERE repo_id = ?1 AND kind = ?2",
+            repo_id,
+            kind
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Every live repo's work item that is failing and not yet held: its
+    /// streak and the key it fails with, by repo then kind.
+    pub async fn repo_streaks(&self) -> sqlx::Result<Vec<RepoStreak>> {
+        sqlx::query_as!(
+            RepoStreak,
+            r#"SELECT w.repo_id AS "repo_id!: i64", w.kind AS "kind!: RepoWorkKind",
+                      w.streak AS "streak!: i64", w.last_failure AS "last_failure!: String"
+               FROM repo_work w
+               JOIN repos r ON r.id = w.repo_id
+               WHERE r.deleted_at IS NULL AND w.streak > 0 AND w.last_failure IS NOT NULL
+               ORDER BY w.repo_id, w.kind"#
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Every active hold on a live repo's work, with its checkpoint, oldest
+    /// first: for the API's repo `holds` and the needs-you list.
+    pub async fn active_repo_holds(&self) -> sqlx::Result<Vec<RepoHold>> {
+        sqlx::query_as!(
+            RepoHold,
+            r#"
+            SELECT h.id AS "id!: i64", h.repo_id AS "repo_id!: i64",
+                   h.kind AS "kind!: RepoWorkKind", h.reason AS "reason!: HoldReason",
+                   h.detail, h.held_at AS "held_at!: i64",
+                   w.checkpoint_job_id
+            FROM work_holds h
+            JOIN repos r ON r.id = h.repo_id
+            LEFT JOIN repo_work w ON w.repo_id = h.repo_id AND w.kind = h.kind
+            WHERE h.released_at IS NULL AND r.deleted_at IS NULL
+            ORDER BY h.held_at, h.id
+            "#
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Hold `repo_id`'s `kind` work for the operator, in one transaction
+    /// with its `hold` event, as [`Self::hold_work`] does for a finding's:
+    /// the streak ends, and the checkpoint becomes `job` if a worker ran in
+    /// it, else stays what it was. `false` when nothing was held: the repo
+    /// is gone, or the work item is already held.
+    pub async fn hold_repo_work(
+        &self,
+        repo_id: i64,
+        kind: RepoWorkKind,
+        reason: HoldReason,
+        detail: &str,
+        job: Option<i64>,
+    ) -> sqlx::Result<bool> {
+        let now = now_ms();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let held = sqlx::query!(
+            "INSERT INTO work_holds (repo_id, kind, reason, detail, held_at) \
+             SELECT ?1, ?2, ?3, ?4, ?5 \
+             WHERE EXISTS (SELECT 1 FROM repos WHERE id = ?1 AND deleted_at IS NULL) \
+             ON CONFLICT (repo_id, kind) WHERE released_at IS NULL DO NOTHING",
+            repo_id,
+            kind,
+            reason,
+            detail,
+            now
+        )
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+        if !held {
+            return Ok(false);
+        }
+        sqlx::query!(
+            "INSERT INTO repo_work (repo_id, kind, streak, last_failure, checkpoint_job_id) \
+             VALUES (?1, ?2, 0, NULL, \
+                     (SELECT id FROM jobs WHERE id = ?3 AND session_file IS NOT NULL)) \
+             ON CONFLICT (repo_id, kind) DO UPDATE SET \
+                 streak = 0, last_failure = NULL, \
+                 checkpoint_job_id = COALESCE(excluded.checkpoint_job_id, \
+                                              repo_work.checkpoint_job_id)",
+            repo_id,
+            kind,
+            job
+        )
+        .execute(&mut *tx)
+        .await?;
+        let first_line: String = detail
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .take(200)
+            .collect();
+        let name = sqlx::query_scalar!("SELECT name FROM repos WHERE id = ?1", repo_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let message = format!("{name} {kind} held ({reason}): {first_line}");
+        insert_event(&mut *tx, "hold", &message, job, None, None).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// When `repo_id`'s `kind` work was last released, if ever: the give-up
+    /// ceiling counts only what the scheduler did after that (§8).
+    pub async fn repo_last_release_at(
+        &self,
+        repo_id: i64,
+        kind: RepoJobKind,
+    ) -> sqlx::Result<Option<i64>> {
+        let kind = RepoWorkKind::from(kind);
+        sqlx::query_scalar!(
+            r#"SELECT MAX(released_at) AS "at?: i64" FROM work_holds
+               WHERE repo_id = ?1 AND kind = ?2"#,
+            repo_id,
+            kind
+        )
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// The hold an operator released with `continue` after checkpoint `job`
+    /// was made, if there is one, as [`Self::continued_hold`] answers for a
+    /// finding's work.
+    pub async fn repo_continued_hold(
+        &self,
+        repo_id: i64,
+        kind: RepoJobKind,
+        job: i64,
+    ) -> sqlx::Result<Option<(HoldReason, String)>> {
+        let kind = RepoWorkKind::from(kind);
+        let continue_ = ReleaseAction::Continue;
+        let row = sqlx::query!(
+            r#"SELECT h.reason AS "reason!: HoldReason", h.detail
+               FROM work_holds h
+               WHERE h.repo_id = ?1 AND h.kind = ?2 AND h.release_action = ?3
+                 AND h.released_at >= COALESCE(
+                     (SELECT finished_at FROM jobs WHERE id = ?4), 0)
+               ORDER BY h.released_at DESC, h.id DESC
+               LIMIT 1"#,
+            repo_id,
+            kind,
+            continue_,
+            job
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| (r.reason, r.detail)))
+    }
+
+    /// An operator's release of `repo_id`'s `kind` hold, in one transaction:
+    /// the hold row records who, when and how, the streak starts from zero
+    /// (§16), `restart` drops the checkpoint, and the `release` event is
+    /// logged as theirs. Refused when there is no active hold, when
+    /// `action` does not apply to the kind, or when `continue` has no
+    /// checkpoint to continue.
+    pub async fn release_repo_hold(
+        &self,
+        repo_id: i64,
+        kind: RepoWorkKind,
+        action: ReleaseAction,
+        by: &CurrentUser,
+    ) -> Result<(), StoreWriteError> {
+        let refuse = |msg: String| Err(StoreWriteError::Refused(msg));
+        if !action.applies_to_repo(kind) {
+            return refuse(format!(
+                "a repo's {kind} hold cannot be released with {action}"
+            ));
+        }
+        let now = now_ms();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let hold = sqlx::query!(
+            r#"SELECT h.id AS "id!: i64", w.checkpoint_job_id, r.name
+               FROM work_holds h
+               JOIN repos r ON r.id = h.repo_id
+               LEFT JOIN repo_work w ON w.repo_id = h.repo_id AND w.kind = h.kind
+               WHERE h.repo_id = ?1 AND h.kind = ?2 AND h.released_at IS NULL
+                 AND r.deleted_at IS NULL"#,
+            repo_id,
+            kind
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(hold) = hold else {
+            return refuse(format!("repo {repo_id} has no active {kind} hold"));
+        };
+        if action == ReleaseAction::Continue && hold.checkpoint_job_id.is_none() {
+            return refuse(format!(
+                "{}'s {kind} hold has no checkpoint to continue",
+                hold.name
+            ));
+        }
+        let released_by = by.username.as_str();
+        sqlx::query!(
+            "UPDATE work_holds SET released_at = ?1, released_by = ?2, release_action = ?3 \
+             WHERE id = ?4",
+            now,
+            released_by,
+            action,
+            hold.id
+        )
+        .execute(&mut *tx)
+        .await?;
+        let restart = action == ReleaseAction::Restart;
+        sqlx::query!(
+            "UPDATE repo_work SET streak = 0, last_failure = NULL, \
+                 checkpoint_job_id = CASE WHEN ?3 THEN NULL ELSE checkpoint_job_id END \
+             WHERE repo_id = ?1 AND kind = ?2",
+            repo_id,
+            kind,
+            restart
+        )
+        .execute(&mut *tx)
+        .await?;
+        let message = format!("{} {kind} hold released: {action}", hold.name);
+        insert_event(&mut *tx, "release", &message, None, None, Some(by.id)).await?;
         tx.commit().await?;
         Ok(())
     }

@@ -748,11 +748,14 @@ async fn the_sweep_removes_legacy_trees_no_live_job_uses() {
 // -- invariant 6: a tree that cannot be made ---------------------------------
 
 /// A cold job whose tree cannot be created is recorded `failed` with the
-/// reason, and leaves no workspace directory behind. Here the repo names a
-/// default branch origin does not have, so there is no commit to pin.
+/// reason, leaves no workspace directory behind, and is counted on its
+/// work item under the fixed key. Here `jobs/` is a file, so no chain
+/// directory can be made under it.
 #[tokio::test]
 async fn a_cold_job_whose_tree_cannot_be_made_fails_and_leaves_nothing() {
-    let f = fixture("ws-no-tree", "no-such-branch").await;
+    let f = fixture("ws-no-tree", "main").await;
+    std::fs::create_dir_all(&f.cfg.work_root).unwrap();
+    std::fs::write(f.cfg.work_root.join("jobs"), "not a directory").unwrap();
     let row = f.store.get_repo_by_id(1).await.unwrap().unwrap();
     let backend = ScriptedBackend::new(|_| panic!("nothing may run without a tree"));
 
@@ -773,9 +776,19 @@ async fn a_cold_job_whose_tree_cannot_be_made_fails_and_leaves_nothing() {
         "{notes:?}"
     );
     assert!(
-        !f.cfg.work_root.join("jobs").join(job.to_string()).exists(),
+        !f.cfg.work_root.join("jobs").join(job.to_string()).is_dir(),
         "no half-made workspace may be left"
     );
+    let streak = f
+        .store
+        .repo_work_streak(1, hunter::domain::RepoWorkKind::TestGap)
+        .await
+        .unwrap();
+    assert_eq!(
+        (streak.streak, streak.last_failure.as_deref()),
+        (1, Some("workspace not created"))
+    );
+    assert_eq!(summary.outcome.as_deref(), Some("retry"));
 }
 
 /// Creating a workspace that already exists is refused, and the existing

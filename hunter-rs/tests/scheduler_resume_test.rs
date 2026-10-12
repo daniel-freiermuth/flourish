@@ -595,10 +595,11 @@ async fn zero_spend_cap_kills_still_exhaust_the_attempt_limit() {
 /// This is the arm that actually fires in practice. A suspension that
 /// resumes, does a little, and suspends again never trips a spend
 /// threshold, so without a count the chain runs forever with every link
-/// looking individually reasonable. Falling through to normal selection
-/// is the other half: the cycle still does something useful.
+/// looking individually reasonable. The give-up is a failure of the hunt
+/// (`resume chain gave up`), and nothing else moves: the hunt is as stale
+/// as before, so the same selection starts it fresh (WORK-MODEL.md §17).
 #[tokio::test]
-async fn a_chain_out_of_attempts_is_retired_and_the_cycle_falls_through() {
+async fn a_chain_out_of_attempts_is_given_up_and_counted() {
     let (dir, path, pool) = fresh_db().await;
     seed_repo(&pool, &dir).await;
     seed_history(&pool).await;
@@ -611,14 +612,23 @@ async fn a_chain_out_of_attempts_is_retired_and_the_cycle_falls_through() {
 
     let picked = pick_next(&store, &cfg, None).await.unwrap();
 
-    // Normal selection, and not the abandoned hunt again: the chain's
-    // turn is over, so the rotation moves on to the repo's next scan.
     assert!(
         matches!(
             picked,
-            Some(Candidate::Repo { kind, .. }) if kind != RepoJobKind::Hunt
+            Some(Candidate::Repo {
+                kind: RepoJobKind::Hunt,
+                ..
+            })
         ),
-        "must fall through to normal selection past the hunt, got {picked:?}"
+        "the hunt starts over fresh, got {picked:?}"
+    );
+    let streak = store
+        .repo_work_streak(1, hunter::domain::RepoWorkKind::Hunt)
+        .await
+        .unwrap();
+    assert_eq!(
+        (streak.streak, streak.last_failure.as_deref()),
+        (1, Some("resume chain gave up"))
     );
     let why = assert_given_up(&pool, &store, newest).await;
     assert!(

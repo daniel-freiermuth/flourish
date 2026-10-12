@@ -1,6 +1,6 @@
 # WORK-MODEL.md: pausing, holding and giving up
 
-**Status: implemented** (#88), as described below, with the deviations listed in the PR that implemented it. This describes the model for how per-finding work gets paused, held for an operator, and given up; §1–§4 describe the problems it replaced. Repo-level work is not on it yet (#92).
+**Status: implemented** (#88), as described below, with the deviations listed in the PR that implemented it. This describes the model for how per-finding work gets paused, held for an operator, and given up; §1–§4 describe the problems it replaced. Repo-level work (hunt and the analysis scans) is on the same model since #92; §17 lists only what differs for it.
 
 It came out of the review of #56. That PR fixed one runaway loop, but it showed that "blocked", "suspended" and "stuck" are each represented differently for every kind of work, in places that don't agree.
 
@@ -329,7 +329,7 @@ What counts as the outcome and as a failure, per kind. Pauses never count as fai
 "Tree not made" means `open_workspace` failed. It is counted under the fixed key `workspace not created`, with git's reason as the detail. The reason can't be the key, because it quotes the job's own tree path, which differs on every attempt and would reset the streak each time (G9).
 
 Rules:
-- **Identical failures count.** As today, the failure key decides "identical". A different key resets the streak to 1.
+- **Identical failures count.** As today, the failure key decides "identical". A different key resets the streak to 1. Known limit: only identical failures are bounded; failures that vary are retried every cycle.
 - **One limit for every kind:** `MAX_CONSECUTIVE_SAME_FAILURE = 3`.
 - **A failure that can't be written ends nothing.** It is logged, and the work item stays as it was, as `record_*_failure` already does since #56.
 - **A ceiling give-up is a failure** with the key `resume chain gave up` and the reason as detail, as #56 introduced.
@@ -499,9 +499,9 @@ All of them only left an event behind, and backfilling would mean parsing event 
 
 ## 13. Out of scope
 
-- **Repo-level work** (hunt, analysis scans, dep updates). Its checkpoint is a pointer too, `repo_work.checkpoint_job_id` per `(repo, kind)`, so no job row of any kind is rewritten once it ends. It still keeps its rotation timestamps and give-up bumps, and holds are finding-only (#92).
 - **Scheduler-level waits:** budget denial, the disk gate, the network gate, operator pause, overdrive.
 - **PR sync errors** (an unparseable URL, a failed PR view): logged per cycle, as today.
+- **Pausing a repo** (`repos.enabled = 0`) is not a hold and not a release action. It keeps its meaning: it takes the repo out of the rotation. Its paused chains still resume, and its holds stay.
 
 ---
 
@@ -541,6 +541,52 @@ Steps 5–9 are independent of each other once step 4 is in. Step 3 fixes a prob
 
 ## 16. Decisions on former open questions
 
-- **Repo-level work** stays out of scope. It moves onto the same model later, tracked in #92.
-- **A released `stuck` hold starts its streak from zero.** After a `continue`, the work item gets the full `MAX_CONSECUTIVE_SAME_FAILURE` again before the next hold.
+- **Repo-level work** moved onto the same model in #92 (§17).
+- **A released hold starts its streak from zero**, a `stuck` one and a repo's alike. After a `continue`, the work item gets the full `MAX_CONSECUTIVE_SAME_FAILURE` again before the next hold.
 - **`mark_harvested` records only the release** (who, when, the action) on the hold row, no operator note.
+
+---
+
+## 17. Repo-level work
+
+Hunt and the analysis scans (`test_gap`, `dep_update`, `refactor`, `modernization`, `standards`) run on the same machine as finding work (§6.2). Where this section is silent, the finding rules apply unchanged: §4 facts vs. state, §6.3 transitions, §7 failures, §8 checkpoints and the ceiling since the last release, §9 holds and their invariants.
+
+### 17.1 Work items
+
+- **A work item is `(repo, kind)`** for each repo job kind, plus **`(repo, sync)`**: the clone, the fetch and resolving `origin/<branch>`, which every kind needs first. A work item is active while its repo exists. Deleting a repo removes its work items and holds in the same transaction; reaping it drops whatever is left (`ON DELETE CASCADE`).
+- **Storage.** `repo_work(repo_id, kind, streak, last_failure, checkpoint_job_id)`, the repo twin of `finding_work`; `sync` never has a checkpoint, which the schema enforces. Holds share `work_holds` with finding work: a hold's subject is exactly one of `finding_id` and `repo_id` (a `CHECK`), its `kind` is a finding kind for a finding and a repo kind or `sync` for a repo, and a second partial unique index keeps at most one active hold per repo and kind.
+- **One "held" query.** `Store::held_work` reads both subjects in one statement. Every finding tier, the resume tier, the repo rotation and the summary preview read it. A held `sync` holds every kind of its repo: the rotation skips the repo, the "an uncloned repo is always a hunt" branch included, and the resume tier skips its paused chains.
+
+### 17.2 Transitions and timestamps
+
+- **Success** resets the streak and clears the checkpoint. It is a `Done` worker whose output file has no invalid entry, the hunt's "no new commits" skip, or a Renovate scan that settled. Only success moves `last_<kind>_at` (and, for a hunt, the watermark and the full re-hunt bookkeeping), exactly as before.
+- **A failure does not move `last_<kind>_at`.** The work stays as stale as it was, so the rotation retries it at once, and three identical failures hold it instead of letting it use up its scan interval on each try. This replaces the cycle's starvation bump (`attempt_ended`) and its bump on an `Err`. Known limit, as in §7: only identical failures are bounded; failures that vary are retried every cycle. A scan that fails differently each time (`no findings file`, then `invalid entries`, then `worker killed`) is never held and keeps its repo at the head of the rotation.
+- **Pause** points the checkpoint at the suspended attempt and leaves the timestamp alone.
+- **A given-up chain** counts as the failure `resume chain gave up`, with the ceiling's reason as detail, where it used to bump the rotation timestamp. The same selection starts the work fresh; the third given-up chain in a row holds it as `gave_up`, with the chain as its checkpoint.
+- **Empty outcomes are failures:** a `Done` worker with no output file, or with invalid entries. A partly invalid ingest still files its valid entries; it just doesn't count as a success.
+
+### 17.3 Failure keys
+
+Fixed strings; git's or the worker's words go into the detail.
+
+| Work item | Keys |
+|---|---|
+| `(repo, sync)` | `clone failed`, `fetch failed`, `origin mismatch`, `branch not found`, `repo not cloned` |
+| `(repo, kind)` | `workspace not created`, `runner error`, `worker <state>` (not `Done`, without a pause), `no findings file`, `invalid entries`, `resume chain gave up` |
+
+**The network's failures count nothing (#95, layer 2).** Before a clone or fetch failure, a runner error, or a worker that failed without metered work is counted, the repo's hosts are probed again (`Backend::first_unreachable(&work_hosts(..))`). If one is unreachable, nothing is counted, the checkpoint stays, and the cycle ends as `offline_denial`. `origin mismatch`, `branch not found` and `repo not cloned` are local and always count.
+
+**Renovate (`dep_update` without a job).** A scan with invalid entries is the failure `invalid entries` and has no checkpoint. Renovate being unavailable is not a failure: the AI job it falls back to is counted like any other. A store error while settling the scan stays a cycle error.
+
+### 17.4 Holds and releases
+
+| Action | a kind | `sync` |
+|---|---|---|
+| `continue` | yes, with a checkpoint | – |
+| `restart` | yes: drop the checkpoint, start fresh | yes: retry now |
+
+Releasing resets the streak to zero, and the give-up ceiling counts from the release. The first attempt after a `continue` resumes with a prompt chosen by the hold's reason. A held hunt leaves a full re-hunt request pending, and while the hunt is held the request is not urgent: it neither starts the hunt nor puts the repo ahead of the rotation for its other kinds. Only a successful full-scope hunt settles it.
+
+### 17.5 Removed
+
+The repo arm of `list_resumable_jobs`, `create_job`'s `superseded` retirement, the `finding_id IS NULL` arms of `chain_status` and `live_jobs`, `retire_suspended_job`/`retire_job` and their callers in `end_checkpoint` and `record_job`, `resume_plan`'s `set_last_kind_at`, and `run_cycle_inner`'s bumps. A repo runner's `backend.run` error closes its job instead of leaving it `running`. No finished job row is rewritten for any kind.

@@ -340,6 +340,84 @@ async fn the_gate_switched_off_probes_nothing() {
     assert_eq!(backend.runs().len(), 1, "the worker ran");
 }
 
+/// The repo's streaks, `sync` and `test_gap`: what a failure would count.
+async fn repo_streaks(store: &Store) -> (i64, i64) {
+    use hunter::domain::RepoWorkKind;
+    (
+        store
+            .repo_work_streak(1, RepoWorkKind::Sync)
+            .await
+            .unwrap()
+            .streak,
+        store
+            .repo_work_streak(1, RepoWorkKind::TestGap)
+            .await
+            .unwrap()
+            .streak,
+    )
+}
+
+/// Layer 2 for repo work: a fetch that fails while the forge has become
+/// unreachable is the network's failure. The scan's runner is called
+/// directly, as a cycle that passed the gate a moment earlier would; it
+/// ends denied for the host and counts nothing on the repo's `sync`.
+#[tokio::test]
+async fn a_fetch_that_fails_while_offline_is_not_counted() {
+    let (dir, store, cfg) = fixture("net-fetch-offline", &forge_url(FORGE), true).await;
+    std::fs::remove_dir_all(dir.join("origin.git")).unwrap();
+    let repo = store.get_repo_by_id(1).await.unwrap().unwrap();
+    let backend = ScriptedBackend::new(|_| panic!("no worker may start offline")).offline(&[FORGE]);
+
+    let summary = hunter::scheduler::run_test_gap(&store, &cfg, &repo, &backend, None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        summary.denied.as_deref(),
+        Some("offline: forge.example unreachable"),
+        "{summary:?}"
+    );
+    assert_eq!(repo_streaks(&store).await, (0, 0));
+
+    // The same failure with the forge reachable is the repo's own.
+    let up = ScriptedBackend::new(|_| panic!("no worker may start without a fetch"));
+    let failed = hunter::scheduler::run_test_gap(&store, &cfg, &repo, &up, None).await;
+    assert!(failed.is_err(), "{failed:?}");
+    assert_eq!(repo_streaks(&store).await, (1, 0));
+}
+
+/// Layer 2 for repo work: a backend that cannot start the worker while the
+/// forge is unreachable closes the job and counts nothing.
+#[tokio::test]
+async fn a_runner_error_while_offline_is_not_counted() {
+    let (_dir, store, cfg) = fixture("net-runner-offline", &forge_url(FORGE), true).await;
+    let repo = store.get_repo_by_id(1).await.unwrap().unwrap();
+    let backend = ScriptedBackend::failing().offline(&[FORGE]);
+
+    let summary = hunter::scheduler::run_test_gap(&store, &cfg, &repo, &backend, None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        summary.denied.as_deref(),
+        Some("offline: forge.example unreachable"),
+        "{summary:?}"
+    );
+    let jobs = store.list_jobs(10).await.unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(
+        jobs[0].job.state,
+        hunter::domain::JobState::Failed,
+        "the job is closed, not left running"
+    );
+    assert_eq!(repo_streaks(&store).await, (0, 0));
+    assert_eq!(
+        (summary.job_id, summary.finding_id),
+        (Some(jobs[0].job.id), None),
+        "the denial names its job, and no finding: the work is the repo's"
+    );
+}
+
 /// A worker kind needs its forge and its provider; a local clone has no
 /// forge to reach.
 #[test]

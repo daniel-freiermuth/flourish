@@ -317,6 +317,21 @@ impl ReleaseAction {
             Self::Dismiss => kind == FindingJobKind::Engage,
         }
     }
+
+    /// Whether this action can release a hold of a repo's `kind` work
+    /// (WORK-MODEL.md §17): `continue` and `restart` for a kind, only
+    /// `restart` ("retry now") for `sync`, which runs no worker and so has
+    /// nothing to continue. `continue` also needs a checkpoint: see
+    /// `Store::release_repo_hold`.
+    pub fn applies_to_repo(self, kind: RepoWorkKind) -> bool {
+        match self {
+            Self::Continue => kind != RepoWorkKind::Sync,
+            Self::Restart => true,
+            Self::Reject | Self::Wontfix | Self::Classify | Self::MarkHarvested | Self::Dismiss => {
+                false
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for ReleaseAction {
@@ -559,6 +574,72 @@ impl std::str::FromStr for RepoJobKind {
             "standards" => Ok(Self::Standards),
             _ => Err(format!("unknown repo job kind: {s:?}")),
         }
+    }
+}
+
+/// A repo-level work item's kind (`repo_work.kind`, `work_holds.kind` of a
+/// repo hold): one per [`RepoJobKind`], plus `sync`, the clone, fetch and
+/// branch resolution every kind of the repo needs first. A failure there
+/// breaks all of them at once, so it is counted, and held, once for the
+/// repo (WORK-MODEL.md §17).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, sqlx::Type, TS,
+)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum RepoWorkKind {
+    Hunt,
+    TestGap,
+    DepUpdate,
+    Refactor,
+    Modernization,
+    Standards,
+    Sync,
+}
+
+impl RepoWorkKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sync => "sync",
+            Self::Hunt => RepoJobKind::Hunt.as_str(),
+            Self::TestGap => RepoJobKind::TestGap.as_str(),
+            Self::DepUpdate => RepoJobKind::DepUpdate.as_str(),
+            Self::Refactor => RepoJobKind::Refactor.as_str(),
+            Self::Modernization => RepoJobKind::Modernization.as_str(),
+            Self::Standards => RepoJobKind::Standards.as_str(),
+        }
+    }
+}
+
+impl From<RepoJobKind> for RepoWorkKind {
+    fn from(k: RepoJobKind) -> Self {
+        match k {
+            RepoJobKind::Hunt => Self::Hunt,
+            RepoJobKind::TestGap => Self::TestGap,
+            RepoJobKind::DepUpdate => Self::DepUpdate,
+            RepoJobKind::Refactor => Self::Refactor,
+            RepoJobKind::Modernization => Self::Modernization,
+            RepoJobKind::Standards => Self::Standards,
+        }
+    }
+}
+
+impl std::fmt::Display for RepoWorkKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for RepoWorkKind {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s == "sync" {
+            return Ok(Self::Sync);
+        }
+        s.parse::<RepoJobKind>()
+            .map(Self::from)
+            .map_err(|_| format!("unknown repo work kind: {s:?}"))
     }
 }
 
