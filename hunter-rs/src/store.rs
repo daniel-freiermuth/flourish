@@ -669,17 +669,6 @@ impl Store {
 
     // ── repo timestamp helpers (scheduler) ────────────────────────────
 
-    /// Clear `last_hunt_sha` (triggers a full re-hunt on next cycle).
-    pub async fn clear_last_hunt_sha(&self, repo_id: i64) -> sqlx::Result<()> {
-        sqlx::query!(
-            "UPDATE repos SET last_hunt_sha = NULL WHERE id = ?1",
-            repo_id
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
     /// Set `last_dep_update_at` to now.
     pub async fn set_last_dep_update(&self, repo_id: i64) -> sqlx::Result<()> {
         let now = now_ms();

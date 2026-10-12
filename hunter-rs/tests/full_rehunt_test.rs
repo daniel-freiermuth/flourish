@@ -403,9 +403,10 @@ async fn an_incremental_chain_neither_settles_nor_delays_a_request() {
     );
 }
 
-/// A requested hunt that fails is a turn taken: the request stops jumping
-/// the queue — a failing hunt is not retried back to back — but stays
-/// pending, so the repo's next hunt is still a full one.
+/// A requested hunt that fails is counted on the hunt's work item: the
+/// request stops jumping the queue — the hunt waits for its turn in the
+/// rotation like any other failing hunt — but stays pending, so the repo's
+/// next hunt is still a full one.
 #[tokio::test]
 async fn a_failed_requested_hunt_waits_for_the_next_hunt_turn() {
     let f = fixture(
@@ -435,6 +436,41 @@ async fn a_failed_requested_hunt_waits_for_the_next_hunt_turn() {
         .await
         .unwrap();
     assert_eq!(summary.full_rehunt, Some(true), "{summary:?}");
+}
+
+/// A full re-hunt that does not run keeps the repo's watermark: the scope
+/// is that hunt's alone, and only a hunt that succeeds moves the watermark.
+/// It used to be cleared before the budget gate, so a denied full hunt
+/// (or one that failed) lost it.
+#[tokio::test]
+async fn a_full_rehunt_that_is_denied_or_fails_keeps_the_watermark() {
+    let f = fixture(
+        "rehunt-keeps-watermark",
+        History::HuntedToTip {
+            last_full_hunt_at: 1_000,
+        },
+    )
+    .await;
+    let watermark = f.repo().await.last_hunt_sha;
+    assert!(watermark.is_some());
+
+    let denying = ScriptedBackend::new(|_| panic!("a denied hunt runs nothing")).denying_above(0);
+    let summary = run_hunt(&f.store, &f.cfg, &f.repo().await, &denying, None)
+        .await
+        .unwrap();
+    assert!(summary.denied.is_some(), "{summary:?}");
+    assert_eq!(f.repo().await.last_hunt_sha, watermark, "denied");
+
+    let failing = ScriptedBackend::new(|_| RunResult {
+        exit_code: Some(1),
+        ..done()
+    });
+    let summary = run_hunt(&f.store, &f.cfg, &f.repo().await, &failing, None)
+        .await
+        .unwrap();
+    assert_eq!(summary.full_rehunt, Some(true), "{summary:?}");
+    assert_eq!(summary.state, Some(JobState::Failed), "{summary:?}");
+    assert_eq!(f.repo().await.last_hunt_sha, watermark, "failed");
 }
 
 /// A never-hunted repo's request widens its first hunt from the bounded
