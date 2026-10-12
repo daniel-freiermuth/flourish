@@ -243,7 +243,8 @@ async fn resume_events(pool: &SqlitePool, id: i64) -> Vec<(String, Option<i64>)>
     .unwrap()
 }
 
-/// One suspended hunt on repo 1, with a transcript and a measured cost.
+/// One suspended hunt on repo 1, with a transcript and a measured cost:
+/// the checkpoint of the repo's hunt.
 async fn seed_suspension(pool: &SqlitePool, id: i64, session: &Path, tokens: i64) {
     sqlx::query(
         "INSERT INTO jobs \
@@ -257,15 +258,15 @@ async fn seed_suspension(pool: &SqlitePool, id: i64, session: &Path, tokens: i64
     .execute(pool)
     .await
     .unwrap();
+    support::point_repo_checkpoint(pool, 1, "hunt", Some(id)).await;
 }
 
 /// A chain of linked attempts at one piece of work, oldest first, with
 /// `tokens[i]` as each attempt's own cost. Returns the newest id.
 ///
-/// Only the newest is resumable: a predecessor that already has a
-/// successor row is being continued, and `list_resumable_jobs` filters
-/// it out. So this is exactly the shape `pick_resume` sees when it has
-/// to decide whether to continue a chain yet again.
+/// The newest is the repo's hunt checkpoint, as a chain whose every
+/// attempt paused leaves it. So this is exactly the shape `pick_resume`
+/// sees when it has to decide whether to continue a chain yet again.
 async fn seed_chain(pool: &SqlitePool, session: &Path, tokens: &[i64]) -> i64 {
     let mut id = 9_i64;
     let mut previous: Option<i64> = None;
@@ -286,6 +287,7 @@ async fn seed_chain(pool: &SqlitePool, session: &Path, tokens: &[i64]) -> i64 {
         .unwrap();
         previous = Some(id);
     }
+    support::point_repo_checkpoint(pool, 1, "hunt", Some(id)).await;
     id
 }
 
@@ -297,6 +299,37 @@ async fn job_row(pool: &SqlitePool, id: i64) -> (String, Option<String>, Option<
     .fetch_one(pool)
     .await
     .unwrap()
+}
+
+/// The job repo 1's hunt continues from, if any.
+async fn hunt_checkpoint(store: &Store) -> Option<i64> {
+    store
+        .repo_checkpoint_job(1, RepoJobKind::Hunt)
+        .await
+        .unwrap()
+        .map(|j| j.id)
+}
+
+/// The chain ending at `newest` was given up: the hunt's checkpoint is
+/// dropped, the row stays as it ended (`suspended` / `cap`), and the one
+/// `resume` event against it says why. Returns that message.
+async fn assert_given_up(pool: &SqlitePool, store: &Store, newest: i64) -> String {
+    assert_eq!(
+        hunt_checkpoint(store).await,
+        None,
+        "the checkpoint is dropped"
+    );
+    let (state, reason, _) = job_row(pool, newest).await;
+    assert_eq!(
+        (state.as_str(), reason.as_deref()),
+        ("suspended", Some("cap")),
+        "the given-up attempt's row is left as it ended"
+    );
+    let events = resume_events(pool, newest).await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    let (msg, _) = events.into_iter().next().unwrap();
+    assert!(msg.contains("giving up"), "{msg}");
+    msg
 }
 
 fn resume_plan_of(c: Option<Candidate>) -> ResumePlan {
@@ -553,9 +586,7 @@ async fn zero_spend_cap_kills_still_exhaust_the_attempt_limit() {
         !matches!(picked, Some(Candidate::Resume { .. })),
         "a chain of four cap kills must not be resumed again, got {picked:?}"
     );
-    let (state, reason, _) = job_row(&pool, newest).await;
-    assert_eq!(state, JobState::Failed.as_str());
-    assert_eq!(reason.as_deref(), Some("give-up"));
+    assert_given_up(&pool, &store, newest).await;
 }
 
 /// A chain that has been tried too many times is abandoned, however
@@ -589,17 +620,14 @@ async fn a_chain_out_of_attempts_is_retired_and_the_cycle_falls_through() {
         ),
         "must fall through to normal selection past the hunt, got {picked:?}"
     );
-    let (state, reason, notes) = job_row(&pool, newest).await;
-    assert_eq!(state, JobState::Failed.as_str());
-    assert_eq!(reason.as_deref(), Some("give-up"));
-    let notes = notes.unwrap();
+    let why = assert_given_up(&pool, &store, newest).await;
     assert!(
-        notes.contains("40000 tok") && notes.contains("4 attempts"),
-        "the record must name what the chain cost and how often it was tried, got {notes:?}"
+        why.contains("40000 tok") && why.contains("4 attempts"),
+        "the record must name what the chain cost and how often it was tried, got {why:?}"
     );
     assert!(
         store.list_resumable_jobs().await.unwrap().is_empty(),
-        "a retired chain must never be offered again"
+        "a given-up chain must never be offered again"
     );
 }
 
@@ -626,9 +654,7 @@ async fn a_chain_that_outspends_the_typical_outside_its_biggest_attempt_is_retir
         matches!(picked, Some(Candidate::Repo { .. })),
         "must fall through to normal selection, got {picked:?}"
     );
-    let (state, reason, _) = job_row(&pool, newest).await;
-    assert_eq!(state, JobState::Failed.as_str());
-    assert_eq!(reason.as_deref(), Some("give-up"));
+    assert_given_up(&pool, &store, newest).await;
 }
 
 /// A chain of ONE attempt is never retired, however expensive it was.
@@ -748,12 +774,12 @@ async fn a_queued_fix_outranks_a_resume_which_outranks_rotation() {
 ///
 /// A resumed worker continues a conversation, not a filesystem: its
 /// transcript refers to files in that tree, so no later cycle can
-/// continue it either. Skipping it left the row `suspended` forever —
-/// never resumed, never retired. Retiring at selection, in the same
-/// walk, still keeps it from being offered again, which matters because
-/// this tier outranks rotation.
+/// continue it either. Skipping it left it offered forever — never
+/// resumed, never ended. Dropping the checkpoint at selection, in the same
+/// walk, keeps it from being offered again, which matters because this
+/// tier outranks rotation. The row stays as the attempt ended.
 #[tokio::test]
-async fn a_suspension_whose_working_directory_is_gone_is_retired() {
+async fn a_suspension_whose_working_directory_is_gone_is_given_up() {
     let (dir, path, pool) = fresh_db().await;
     seed_repo(&pool, &dir).await;
     seed_history(&pool).await;
@@ -776,14 +802,16 @@ async fn a_suspension_whose_working_directory_is_gone_is_retired() {
         ),
         "a suspension with no tree falls through to rotation, got {picked:?}"
     );
-    let (state, reason, notes) = job_row(&pool, 10).await;
-    assert_eq!(state, JobState::Killed.as_str());
-    assert_eq!(reason.as_deref(), Some("workdir-gone"));
+    assert_eq!(hunt_checkpoint(&store).await, None);
+    let (state, reason, _) = job_row(&pool, 10).await;
+    assert_eq!(
+        (state.as_str(), reason.as_deref()),
+        ("suspended", Some("cap"))
+    );
     let msg = format!(
         "resume hunt alpha: job 10 given up, workspace {} is gone",
         workspace.display()
     );
-    assert_eq!(notes.as_deref(), Some(msg.as_str()));
     assert_eq!(resume_events(&pool, 10).await, vec![(msg, None)]);
 }
 
@@ -963,8 +991,8 @@ async fn fresh_work_on_a_finding_supersedes_its_suspended_attempt() {
     }
 }
 
-/// Starting a repo-level kind fresh retires that repo's suspended
-/// attempt at the same kind, and nothing else.
+/// Starting a repo-level kind fresh drops that repo's checkpoint at the
+/// same kind, and nothing else. The row it named stays as it ended.
 #[tokio::test]
 async fn fresh_work_on_a_repo_supersedes_its_suspended_attempt() {
     let (dir, path, pool) = fresh_db().await;
@@ -993,6 +1021,7 @@ async fn fresh_work_on_a_repo_supersedes_its_suspended_attempt() {
         .execute(&pool)
         .await
         .unwrap();
+        support::point_repo_checkpoint(&pool, repo, kind, Some(id)).await;
     }
     let store = rw_store(&path).await;
 
@@ -1010,16 +1039,23 @@ async fn fresh_work_on_a_repo_supersedes_its_suspended_attempt() {
         .unwrap()
         .id;
 
-    let (state, reason, notes) = job_row(&pool, 10).await;
-    assert_eq!(state, JobState::Killed.as_str());
-    assert_eq!(reason.as_deref(), Some("superseded"));
-    let msg = format!("resume hunt alpha: job 10 superseded by fresh job {fresh}");
-    assert_eq!(notes.as_deref(), Some(msg.as_str()));
+    assert_eq!(hunt_checkpoint(&store).await, None);
+    let (state, reason, _) = job_row(&pool, 10).await;
+    assert_eq!(
+        (state.as_str(), reason.as_deref()),
+        ("suspended", Some("cap")),
+        "the superseded checkpoint's row is left as it ended"
+    );
+    let msg = format!("resume hunt alpha: checkpoint job 10 superseded by fresh job {fresh}");
     assert_eq!(resume_events(&pool, 10).await, vec![(msg, None)]);
-    for other in [11, 12] {
+    for (other, repo, kind) in [(11, 1, RepoJobKind::TestGap), (12, 2, RepoJobKind::Hunt)] {
         assert_eq!(
-            job_row(&pool, other).await.0,
-            JobState::Suspended.as_str(),
+            store
+                .repo_checkpoint_job(repo, kind)
+                .await
+                .unwrap()
+                .map(|j| j.id),
+            Some(other),
             "job {other} is different work and must stay resumable"
         );
     }
@@ -1060,6 +1096,7 @@ async fn a_forced_cycle_resumes_only_the_forced_repos_suspension() {
     .execute(&pool)
     .await
     .unwrap();
+    support::point_repo_checkpoint(&pool, 2, "hunt", Some(20)).await;
     let store = rw_store(&path).await;
     let cfg = test_config(dir.path());
 
@@ -1100,16 +1137,16 @@ async fn a_resume_is_labelled_with_its_repos_name() {
 // -- the transcript that vanished --------------------------------------------
 
 /// When the resume source has gone, the attempt fails and the
-/// predecessor is retired.
+/// predecessor stops being the checkpoint.
 ///
 /// Nothing was spawned, so `failed` is the honest state for the attempt.
-/// The predecessor must leave `suspended`: leaving it there would offer
-/// the same missing session every cycle forever. Its own
-/// `killed_reason` is preserved — that attempt really did stop on `cap`,
-/// and overwriting it with the successor's problem would lose the only
-/// record of why the work stopped.
+/// The checkpoint must go: keeping it would offer the same missing
+/// session every cycle forever. The predecessor's row is not rewritten —
+/// that attempt really did stop on `cap`, and overwriting it with the
+/// successor's problem would lose the only record of why the work
+/// stopped. The event says what happened.
 #[tokio::test]
-async fn resume_unavailable_fails_the_attempt_and_retires_the_predecessor() {
+async fn resume_unavailable_fails_the_attempt_and_gives_up_the_checkpoint() {
     let (dir, path, pool) = fresh_db().await;
     seed_repo(&pool, &dir).await;
     let session = seed_session(&dir);
@@ -1175,14 +1212,23 @@ async fn resume_unavailable_fails_the_attempt_and_retires_the_predecessor() {
     let (attempt_state, _, _) = job_row(&pool, attempt).await;
     assert_eq!(attempt_state, JobState::Failed.as_str());
 
-    let (pred_state, pred_reason, pred_notes) = job_row(&pool, 10).await;
-    assert_eq!(pred_state, JobState::Killed.as_str());
+    let (pred_state, pred_reason, _) = job_row(&pool, 10).await;
     assert_eq!(
-        pred_reason.as_deref(),
-        Some("cap"),
-        "the predecessor's own reason for stopping is not rewritten"
+        (pred_state.as_str(), pred_reason.as_deref()),
+        ("suspended", Some("cap")),
+        "the predecessor's row is not rewritten"
     );
-    assert!(pred_notes.unwrap().contains("session gone"));
+    assert_eq!(hunt_checkpoint(&store).await, None);
+    let gone: Vec<String> =
+        sqlx::query_scalar("SELECT message FROM events WHERE kind = 'error' AND job_id = ?1")
+            .bind(attempt)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        gone,
+        ["resume hunt alpha: session gone, checkpoint job 10 given up"]
+    );
     assert!(
         store.list_resumable_jobs().await.unwrap().is_empty(),
         "a missing transcript must not be retried forever"

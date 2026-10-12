@@ -377,36 +377,15 @@ async fn insert_event<'e, E: sqlx::SqliteExecutor<'e>>(
     Ok(())
 }
 
-/// Move one job to a terminal `state` on `ex`; see
-/// [`Store::retire_suspended_job`] for why `killed_reason` is optional.
-async fn retire_job<'e, E: sqlx::SqliteExecutor<'e>>(
-    ex: E,
-    job_id: i64,
-    state: JobState,
-    killed_reason: Option<&str>,
-    notes: &str,
-) -> sqlx::Result<()> {
-    sqlx::query!(
-        "UPDATE jobs SET state = ?1, killed_reason = COALESCE(?2, killed_reason), \
-         notes = ?3 WHERE id = ?4",
-        state,
-        killed_reason,
-        notes,
-        job_id
-    )
-    .execute(ex)
-    .await?;
-    Ok(())
-}
-
 /// Move the checkpoint of the work item `job_id` belongs to: to `job_id`
 /// when `paused`, otherwise off it. An attempt that ended without pausing
 /// has consumed whatever its chain continued from, so nothing is left to
-/// resume. Only while the finding is in that kind's tier (`work_tiers`):
-/// work that has left it keeps no checkpoint. A repo-level job has no work
-/// item and matches nothing.
-async fn point_checkpoint<'e, E: sqlx::SqliteExecutor<'e>>(
-    ex: E,
+/// resume. A finding's work only while the finding is in that kind's tier
+/// (`work_tiers`): work that has left it keeps no checkpoint. A repo-level
+/// job's work item is `(repo, kind)` (`repo_work`), active while the repo
+/// exists.
+async fn point_checkpoint(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     job_id: i64,
     paused: bool,
 ) -> sqlx::Result<()> {
@@ -422,7 +401,21 @@ async fn point_checkpoint<'e, E: sqlx::SqliteExecutor<'e>>(
         job_id,
         paused
     )
-    .execute(ex)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query!(
+        "INSERT INTO repo_work (repo_id, kind, checkpoint_job_id) \
+         SELECT j.repo_id, j.kind, CASE WHEN ?2 THEN j.id END \
+         FROM jobs j \
+         WHERE j.id = ?1 AND j.finding_id IS NULL \
+           AND j.kind IN ('hunt', 'test_gap', 'dep_update', 'refactor', 'modernization', \
+                          'standards') \
+         ON CONFLICT (repo_id, kind) DO UPDATE SET \
+             checkpoint_job_id = excluded.checkpoint_job_id",
+        job_id,
+        paused
+    )
+    .execute(&mut **tx)
     .await?;
     Ok(())
 }
@@ -1939,12 +1932,9 @@ impl Store {
     /// defect — a suspension nothing has come back to for many cycles is
     /// stale work, and the scheduler's give-up ceiling ends it.
     ///
-    /// A checkpoint is a repo-level job's suspended row with no successor
-    /// (a successor row IS the record that a suspension has been picked
-    /// up, so without that clause one transcript would be resumed once per
-    /// cycle forever), or a finding work item's `checkpoint_job_id`. Three
-    /// more filters make "could be picked up again" true rather than
-    /// merely claimed:
+    /// A checkpoint is a work item's `checkpoint_job_id`: a repo's
+    /// (`repo_work`) or a finding's (`finding_work`). Three more filters
+    /// make "could be picked up again" true rather than merely claimed:
     /// - the repo must still be live, since a soft-deleted repo's clone
     ///   is being reaped and `create_job` would refuse the successor;
     /// - `session_file` must be present, because resume means handing
@@ -1952,13 +1942,12 @@ impl Store {
     ///   nothing to continue and would silently become a fresh run —
     ///   the implicit-resume behaviour that once re-cached an unrelated
     ///   290-call transcript for 508,709 tokens on a single call;
-    /// - a finding's work resumes only at the status its kind starts from:
-    ///   a fix at `queued`, not `fixing` (claimed), and not while an attempt
-    ///   continuing it still runs. Held work is still listed: whether it is
-    ///   held is the one shared query, [`Self::held_work`], which the
-    ///   scheduler applies to this list as to every tier.
+    /// - no attempt continuing it still runs, and a finding's work resumes
+    ///   only at the status its kind starts from: a fix at `queued`, not
+    ///   `fixing` (claimed). Held work is still listed: whether it is held
+    ///   is the one shared query, [`Self::held_work`], which the scheduler
+    ///   applies to this list as to every tier.
     pub async fn list_resumable_jobs(&self) -> sqlx::Result<Vec<Job>> {
-        let suspended = JobState::Suspended;
         let running = JobState::Running;
         let fix = JobKind::Finding(FindingJobKind::Fix);
         let queued = FindingStatus::Queued;
@@ -1983,22 +1972,21 @@ impl Store {
             JOIN repos r ON r.id = j.repo_id
             WHERE r.deleted_at IS NULL
               AND j.session_file IS NOT NULL
-              AND ((j.kind NOT IN (?2, ?4, ?6, ?8)
-                    AND j.state = ?1
-                    AND NOT EXISTS (SELECT 1 FROM jobs s WHERE s.resumed_from = j.id))
-                OR (NOT EXISTS (SELECT 1 FROM jobs s WHERE s.resumed_from = j.id AND s.state = ?11)
-                    AND EXISTS (
+              AND NOT EXISTS (SELECT 1 FROM jobs s WHERE s.resumed_from = j.id AND s.state = ?10)
+              AND (EXISTS (
+                  SELECT 1 FROM repo_work w
+                  WHERE w.checkpoint_job_id = j.id AND w.repo_id = j.repo_id AND w.kind = j.kind
+                ) OR EXISTS (
                   SELECT 1 FROM finding_work w JOIN findings f ON f.id = w.finding_id
                   WHERE w.checkpoint_job_id = j.id AND w.kind = j.kind AND (
-                      (j.kind = ?2 AND f.status = ?3)
-                      OR (j.kind = ?4 AND f.status = ?5)
-                      OR (j.kind = ?6 AND f.status = ?7)
-                      OR (j.kind = ?8 AND f.status IN (?9, ?10))
+                      (j.kind = ?1 AND f.status = ?2)
+                      OR (j.kind = ?3 AND f.status = ?4)
+                      OR (j.kind = ?5 AND f.status = ?6)
+                      OR (j.kind = ?7 AND f.status IN (?8, ?9))
                   )
-              )))
+              ))
             ORDER BY j.id DESC
             "#,
-            suspended,
             fix,
             queued,
             recheck,
@@ -2064,7 +2052,9 @@ impl Store {
         .await?
         .unwrap_or(false);
         if resumable {
-            point_checkpoint(&self.pool, job_id, true).await?;
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            point_checkpoint(&mut tx, job_id, true).await?;
+            tx.commit().await?;
         }
         Ok(())
     }
@@ -2117,6 +2107,71 @@ impl Store {
                 None,
             )
             .await?;
+        }
+        tx.commit().await?;
+        Ok(dropped)
+    }
+
+    /// The job `repo_id`'s `kind` work continues from, if it has a
+    /// checkpoint that can be continued (see [`Self::list_resumable_jobs`]).
+    pub async fn repo_checkpoint_job(
+        &self,
+        repo_id: i64,
+        kind: RepoJobKind,
+    ) -> sqlx::Result<Option<Job>> {
+        let kind = JobKind::Repo(kind);
+        let running = JobState::Running;
+        sqlx::query_as!(
+            Job,
+            r#"
+            SELECT j.id AS "id!", j.kind AS "kind!: JobKind", j.repo_id AS "repo_id!",
+                   j.finding_id, j.state AS "state!: JobState", j.pid, j.session_file,
+                   j.cap_tokens, j.tokens_new, j.calls, j.exit_code,
+                   j.killed_reason, j.notes, j.model, j.usage_delta,
+                   j.started_at, j.finished_at, r.name AS "repo_name!",
+                   NULL AS "finding_summary?: String",
+                   NULL AS "finding_fingerprint?: String"
+            FROM repo_work w
+            JOIN jobs j ON j.id = w.checkpoint_job_id
+            JOIN repos r ON r.id = j.repo_id
+            WHERE w.repo_id = ?1 AND w.kind = ?2
+              AND r.deleted_at IS NULL
+              AND j.session_file IS NOT NULL
+              AND NOT EXISTS (SELECT 1 FROM jobs s WHERE s.resumed_from = j.id AND s.state = ?3)
+            "#,
+            repo_id,
+            kind,
+            running
+        )
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// Give up `repo_id`'s `kind` checkpoint at `job_id`, logging `msg` as a
+    /// `resume` event in the same transaction, as [`Self::drop_checkpoint`]
+    /// does for a finding's work. The job row is left as it ended.
+    pub async fn drop_repo_checkpoint(
+        &self,
+        repo_id: i64,
+        kind: RepoJobKind,
+        job_id: i64,
+        msg: &str,
+    ) -> sqlx::Result<bool> {
+        let kind = JobKind::Repo(kind);
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let dropped = sqlx::query!(
+            "UPDATE repo_work SET checkpoint_job_id = NULL \
+             WHERE repo_id = ?1 AND kind = ?2 AND checkpoint_job_id = ?3",
+            repo_id,
+            kind,
+            job_id
+        )
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+        if dropped {
+            insert_event(&mut *tx, "resume", msg, Some(job_id), None, None).await?;
         }
         tx.commit().await?;
         Ok(dropped)
@@ -2283,33 +2338,6 @@ impl Store {
         .await
     }
 
-    /// Take a repo-level job's suspended attempt out of the resumable pool
-    /// for good. A finding's work drops its checkpoint pointer instead
-    /// ([`Self::drop_checkpoint`]) and leaves the job row as it ended.
-    ///
-    /// The ways a repo-level suspension ends without being continued: the
-    /// scheduler's give-up ceiling retires it `failed` / `give-up`; a
-    /// suspension whose working directory is gone is retired `killed` /
-    /// `workdir-gone`; fresh work at the same key retires it `killed` /
-    /// `superseded` ([`Self::create_job`]); and a resume that found the
-    /// transcript gone retires it `killed`. All are terminal states, so
-    /// [`Self::list_resumable_jobs`] stops offering the row.
-    ///
-    /// `killed_reason` is `Option` so the last case can leave the
-    /// original reason alone: that attempt really was killed for `cap`,
-    /// and overwriting that with the successor's problem would lose the
-    /// only record of why the work stopped. `notes` carries the new fact
-    /// instead.
-    pub async fn retire_suspended_job(
-        &self,
-        job_id: i64,
-        state: JobState,
-        killed_reason: Option<&str>,
-        notes: &str,
-    ) -> sqlx::Result<()> {
-        retire_job(&self.pool, job_id, state, killed_reason, notes).await
-    }
-
     // -- events / scheduler ----------------------------------------------------
 
     /// ORDER BY id DESC LIMIT ?.
@@ -2392,14 +2420,12 @@ impl Store {
     /// existed — which is what keeps the chain acyclic.
     ///
     /// Fresh work supersedes a checkpoint of the same work, in the same
-    /// transaction. For a finding kind the work item's checkpoint pointer
-    /// is cleared and the job it named is left as it ended. For a repo
-    /// kind, whose suspended rows are its checkpoints, a suspended job of
-    /// this kind and repo with no successor is retired `killed` /
-    /// `superseded`. Whatever path started the work over, the fresh attempt
-    /// now owns it, so the old checkpoint can never be resumed. Doing it
-    /// here rather than in selection is what covers every path that
-    /// creates a job.
+    /// transaction: the work item's checkpoint pointer is cleared, for a
+    /// finding kind (`finding_work`) and a repo kind (`repo_work`) alike,
+    /// and the job it named is left as it ended. Whatever path started the
+    /// work over, the fresh attempt now owns it, so the old checkpoint can
+    /// never be resumed. Doing it here rather than in selection is what
+    /// covers every path that creates a job.
     ///
     /// The retired ids are returned because their chains' working trees
     /// must be released before the fresh job builds its own: a fix chain
@@ -2486,33 +2512,33 @@ impl Store {
                 insert_event(&mut *tx, "resume", &msg, Some(old.id), Some(fid), None).await?;
                 retired.push(old.id);
             }
-        } else if resumed_from.is_none() && kind.is_repo() {
-            let suspended = JobState::Suspended;
-            let superseded = sqlx::query!(
+        } else if resumed_from.is_none() && finding_id.is_none() && kind.is_repo() {
+            let old = sqlx::query!(
                 r#"
-                SELECT j.id AS "id!", r.name AS "repo_name!"
-                FROM jobs j
+                SELECT w.checkpoint_job_id AS "id!: i64", r.name AS "repo_name!"
+                FROM repo_work w
+                JOIN jobs j ON j.id = w.checkpoint_job_id
                 JOIN repos r ON r.id = j.repo_id
-                WHERE j.state = ?1
-                  AND j.kind = ?2
-                  AND j.id != ?3
-                  AND j.repo_id = ?4
-                  AND NOT EXISTS (SELECT 1 FROM jobs s WHERE s.resumed_from = j.id)
-                ORDER BY j.id
+                WHERE w.repo_id = ?1 AND w.kind = ?2
                 "#,
-                suspended,
-                kind,
-                id,
-                repo_id
+                repo_id,
+                kind
             )
-            .fetch_all(&mut *tx)
+            .fetch_optional(&mut *tx)
             .await?;
-            for old in superseded {
+            if let Some(old) = old {
                 let msg = format!(
-                    "resume {kind} {}: job {} superseded by fresh job {id}",
+                    "resume {kind} {}: checkpoint job {} superseded by fresh job {id}",
                     old.repo_name, old.id
                 );
-                retire_job(&mut *tx, old.id, JobState::Killed, Some("superseded"), &msg).await?;
+                sqlx::query!(
+                    "UPDATE repo_work SET checkpoint_job_id = NULL \
+                     WHERE repo_id = ?1 AND kind = ?2",
+                    repo_id,
+                    kind
+                )
+                .execute(&mut *tx)
+                .await?;
                 insert_event(&mut *tx, "resume", &msg, Some(old.id), None, None).await?;
                 retired.push(old.id);
             }
@@ -2571,17 +2597,15 @@ impl Store {
     /// Depth-capped for the same reason [`Self::resume_chain_stats`] is.
     ///
     /// An attempt is live while it is `running`, or while it is a
-    /// checkpoint: a finding work item's `checkpoint_job_id`, or a
-    /// repo-level `suspended` attempt nothing continues yet. A resume
-    /// inserts its successor and never updates the attempt it continues,
-    /// so every link but the newest of a resumed chain stays `suspended`
-    /// for good; counting those would keep the tree of every chain that
-    /// was ever resumed forever. A finding kind's `suspended` row that no
-    /// work item points at is history: its work was given up, superseded,
-    /// or left its tier.
+    /// checkpoint: a work item's `checkpoint_job_id`, a finding's or a
+    /// repo's. A resume inserts its successor and never updates the attempt
+    /// it continues, so every link but the newest of a resumed chain stays
+    /// `suspended` for good; counting those would keep the tree of every
+    /// chain that was ever resumed forever. A `suspended` row that no work
+    /// item points at is history: its work was given up, superseded, or
+    /// left its tier.
     pub async fn chain_status(&self, origin_id: i64) -> sqlx::Result<ChainStatus> {
         let running = JobState::Running;
-        let suspended = JobState::Suspended;
         sqlx::query_as!(
             ChainStatus,
             r#"
@@ -2594,10 +2618,9 @@ impl Store {
             )
             SELECT COUNT(*) AS "attempts!: i64",
                    COALESCE(SUM(state = ?3
-                       OR (state = ?4
-                           AND finding_id IS NULL
-                           AND NOT EXISTS (SELECT 1 FROM jobs s WHERE s.resumed_from = jobs.id))
                        OR EXISTS (SELECT 1 FROM finding_work w
+                                  WHERE w.checkpoint_job_id = jobs.id)
+                       OR EXISTS (SELECT 1 FROM repo_work w
                                   WHERE w.checkpoint_job_id = jobs.id)), 0)
                        AS "live!: i64",
                    MAX(finished_at) AS "last_finished_at?: i64",
@@ -2607,8 +2630,7 @@ impl Store {
             "#,
             origin_id,
             RESUME_CHAIN_MAX_DEPTH,
-            running,
-            suspended
+            running
         )
         .fetch_one(&self.pool)
         .await
@@ -2619,18 +2641,16 @@ impl Store {
     /// sweep so that no directory a live job refers to is ever removed.
     pub async fn live_jobs(&self) -> sqlx::Result<Vec<LiveJob>> {
         let running = JobState::Running;
-        let suspended = JobState::Suspended;
         sqlx::query_as!(
             LiveJob,
             r#"
             SELECT id AS "id!", kind AS "kind!: JobKind", finding_id, session_file
             FROM jobs
             WHERE state = ?1
-               OR (state = ?2 AND finding_id IS NULL)
                OR EXISTS (SELECT 1 FROM finding_work w WHERE w.checkpoint_job_id = jobs.id)
+               OR EXISTS (SELECT 1 FROM repo_work w WHERE w.checkpoint_job_id = jobs.id)
             "#,
-            running,
-            suspended
+            running
         )
         .fetch_all(&self.pool)
         .await
@@ -2656,7 +2676,7 @@ impl Store {
 
     /// Record a completed job (all outcome fields set at once).
     ///
-    /// For a finding kind this also moves its work item's checkpoint, in
+    /// This also moves its work item's checkpoint, in
     /// the same transaction: to this attempt when it ended paused, and off
     /// whatever it was when it did not ([`point_checkpoint`]).
     pub async fn complete_job(&self, job_id: i64, outcome: &JobOutcome<'_>) -> sqlx::Result<()> {
@@ -2692,15 +2712,15 @@ impl Store {
         )
         .execute(&mut *tx)
         .await?;
-        point_checkpoint(&mut *tx, job_id, state == JobState::Suspended).await?;
+        point_checkpoint(&mut tx, job_id, state == JobState::Suspended).await?;
         tx.commit().await
     }
 
     /// Record an orphaned running job as `suspended`: the prior process
     /// died while its worker had done metered work, and the transcript is
     /// on disk for the resume tier to continue. `killed_reason` stays
-    /// `orphaned` so the row still says how the attempt ended. A finding
-    /// kind's work item now continues from it.
+    /// `orphaned` so the row still says how the attempt ended. Its work
+    /// item now continues from it.
     pub async fn suspend_orphan(
         &self,
         job_id: i64,
@@ -2724,7 +2744,7 @@ impl Store {
         )
         .execute(&mut *tx)
         .await?;
-        point_checkpoint(&mut *tx, job_id, true).await?;
+        point_checkpoint(&mut tx, job_id, true).await?;
         tx.commit().await
     }
 

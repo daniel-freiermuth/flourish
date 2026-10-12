@@ -1339,15 +1339,16 @@ async fn seed_second_repo(pool: &SqlitePool) {
 async fn insert_job_with_session(
     pool: &SqlitePool,
     id: i64,
-    repo_id: i64,
+    (repo_id, kind): (i64, &str),
     state: &str,
     session_file: Option<&str>,
 ) {
     sqlx::query(
         "INSERT INTO jobs (id, kind, repo_id, state, session_file, started_at, finished_at) \
-         VALUES (?1, 'hunt', ?2, ?3, ?4, 1, 2)",
+         VALUES (?1, ?2, ?3, ?4, ?5, 1, 2)",
     )
     .bind(id)
+    .bind(kind)
     .bind(repo_id)
     .bind(state)
     .bind(session_file)
@@ -1356,13 +1357,16 @@ async fn insert_job_with_session(
     .unwrap();
 }
 
+/// A suspended `kind` job on `repo_id`, made that work's checkpoint as a
+/// paused attempt makes itself.
 async fn insert_suspended_job(
     pool: &SqlitePool,
     id: i64,
-    repo_id: i64,
+    (repo_id, kind): (i64, &str),
     session_file: Option<&str>,
 ) {
-    insert_job_with_session(pool, id, repo_id, "suspended", session_file).await;
+    insert_job_with_session(pool, id, (repo_id, kind), "suspended", session_file).await;
+    support::point_repo_checkpoint(pool, repo_id, kind, Some(id)).await;
 }
 
 async fn set_tokens(pool: &SqlitePool, job_id: i64, tokens: i64) {
@@ -1374,19 +1378,41 @@ async fn set_tokens(pool: &SqlitePool, job_id: i64, tokens: i64) {
         .unwrap();
 }
 
-/// Only `suspended` is resumable, and the freshest suspension comes
-/// first. A killed job sits in the same table looking similar and must
-/// never appear here: `job_state` already decided it is not worth
-/// continuing.
+/// Only a work item's checkpoint is resumable, and the freshest comes
+/// first. A killed, a done or an older suspended attempt of the same work
+/// sits in the same table looking similar and must never appear here:
+/// only the pointer says which attempt the work continues from.
 #[tokio::test]
-async fn resumable_jobs_are_the_suspended_ones_newest_first() {
+async fn resumable_jobs_are_the_checkpoints_newest_first() {
     let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
-    insert_suspended_job(&pool, 10, 1, Some("/s/10/session.jsonl")).await;
-    insert_suspended_job(&pool, 11, 1, Some("/s/11/session.jsonl")).await;
-    // Both left a session behind, so only `state` can keep them out.
-    insert_job_with_session(&pool, 12, 1, "killed", Some("/s/12/session.jsonl")).await;
-    insert_job_with_session(&pool, 13, 1, "done", Some("/s/13/session.jsonl")).await;
+    insert_job_with_session(
+        &pool,
+        9,
+        (1, "hunt"),
+        "suspended",
+        Some("/s/9/session.jsonl"),
+    )
+    .await;
+    insert_suspended_job(&pool, 10, (1, "hunt"), Some("/s/10/session.jsonl")).await;
+    insert_suspended_job(&pool, 11, (1, "test_gap"), Some("/s/11/session.jsonl")).await;
+    // Both left a session behind, so only the pointer can keep them out.
+    insert_job_with_session(
+        &pool,
+        12,
+        (1, "refactor"),
+        "killed",
+        Some("/s/12/session.jsonl"),
+    )
+    .await;
+    insert_job_with_session(
+        &pool,
+        13,
+        (1, "standards"),
+        "done",
+        Some("/s/13/session.jsonl"),
+    )
+    .await;
     let store = rw_store(&path).await;
 
     let ids: Vec<i64> = store
@@ -1419,8 +1445,8 @@ async fn resumable_jobs_skip_a_soft_deleted_repo() {
     seed_second_repo(&pool).await;
     let store = rw_store(&path).await;
     store.soft_delete_repo(2).await.unwrap();
-    insert_suspended_job(&pool, 10, 1, Some("/s/10/session.jsonl")).await;
-    insert_suspended_job(&pool, 11, 2, Some("/s/11/session.jsonl")).await;
+    insert_suspended_job(&pool, 10, (1, "hunt"), Some("/s/10/session.jsonl")).await;
+    insert_suspended_job(&pool, 11, (2, "hunt"), Some("/s/11/session.jsonl")).await;
     let store = rw_store(&path).await;
 
     let ids: Vec<i64> = store
@@ -1438,8 +1464,8 @@ async fn resumable_jobs_skip_a_soft_deleted_repo() {
     );
 }
 
-/// Resuming means handing omp one exact session path. A suspended job
-/// with no path has nothing to continue, and a resume that falls back to
+/// Resuming means handing omp one exact session path. A checkpoint with
+/// no path has nothing to continue, and a resume that falls back to
 /// "the newest session for this cwd" is the behaviour that once
 /// re-cached an unrelated 290-call transcript for 508,709 tokens on a
 /// single call.
@@ -1447,8 +1473,8 @@ async fn resumable_jobs_skip_a_soft_deleted_repo() {
 async fn resumable_jobs_skip_a_suspension_with_no_session_file() {
     let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
-    insert_suspended_job(&pool, 10, 1, Some("/s/10/session.jsonl")).await;
-    insert_suspended_job(&pool, 11, 1, None).await;
+    insert_suspended_job(&pool, 10, (1, "hunt"), Some("/s/10/session.jsonl")).await;
+    insert_suspended_job(&pool, 11, (1, "test_gap"), None).await;
     let store = rw_store(&path).await;
 
     let ids: Vec<i64> = store
@@ -1466,12 +1492,11 @@ async fn resumable_jobs_skip_a_suspension_with_no_session_file() {
     );
 }
 
-/// A suspension that something already continues is not offered again.
+/// A checkpoint that a running attempt already continues is not offered
+/// again.
 ///
-/// The successor row IS the record that this work has been picked up,
-/// which is why no `resumed` state exists — a state flag beside the
-/// link would be a second copy of the same fact, free to disagree with
-/// it. Without this filter the scheduler would resume one transcript
+/// The running successor IS the record that this work has been picked
+/// up. Without this filter the scheduler would resume one transcript
 /// every cycle forever, each attempt paying to re-cache the same
 /// context: the loop this feature exists to end, rebuilt one level up.
 ///
@@ -1482,12 +1507,12 @@ async fn resumable_jobs_skip_a_suspension_with_no_session_file() {
 async fn resumable_jobs_skip_a_suspension_that_already_has_a_successor() {
     let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
-    insert_suspended_job(&pool, 10, 1, Some("/s/10/session.jsonl")).await;
-    insert_suspended_job(&pool, 11, 1, Some("/s/11/session.jsonl")).await;
+    insert_suspended_job(&pool, 10, (1, "hunt"), Some("/s/10/session.jsonl")).await;
+    insert_suspended_job(&pool, 11, (1, "test_gap"), Some("/s/11/session.jsonl")).await;
     let store = rw_store(&path).await;
     store
         .create_job(
-            RepoJobKind::Hunt.into(),
+            RepoJobKind::TestGap.into(),
             1,
             None,
             None,
@@ -1510,6 +1535,76 @@ async fn resumable_jobs_skip_a_suspension_that_already_has_a_successor() {
         ids,
         vec![10],
         "job 11 is already being continued and must not be handed out twice"
+    );
+}
+
+/// A resume does not supersede the checkpoint it continues: only fresh
+/// work does. A resumed attempt that never ran (its backend would not
+/// start it) leaves the work item continuing from where it was.
+#[tokio::test]
+async fn a_resume_that_never_ran_keeps_the_repo_checkpoint() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo(&pool).await;
+    insert_suspended_job(&pool, 10, (1, "hunt"), Some("/s/10/session.jsonl")).await;
+    let store = rw_store(&path).await;
+    let resumed = store
+        .create_job(
+            RepoJobKind::Hunt.into(),
+            1,
+            None,
+            None,
+            JobState::Running,
+            Some(250_000),
+            Some(10),
+        )
+        .await
+        .unwrap();
+    assert!(resumed.superseded.is_empty(), "{resumed:?}");
+
+    store
+        .fail_unstarted_job(resumed.id, "runner error: no backend")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .repo_checkpoint_job(1, RepoJobKind::Hunt)
+            .await
+            .unwrap()
+            .map(|j| j.id),
+        Some(10)
+    );
+}
+
+/// Dropping a repo checkpoint that has moved on since it was read drops
+/// nothing and says so: the caller must not count a give-up that did not
+/// land.
+#[tokio::test]
+async fn dropping_a_repo_checkpoint_that_moved_on_drops_nothing() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo(&pool).await;
+    insert_suspended_job(&pool, 10, (1, "hunt"), Some("/s/10/session.jsonl")).await;
+    insert_suspended_job(&pool, 11, (1, "hunt"), Some("/s/11/session.jsonl")).await;
+    let store = rw_store(&path).await;
+
+    assert!(
+        !store
+            .drop_repo_checkpoint(1, RepoJobKind::Hunt, 10, "stale")
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .drop_repo_checkpoint(1, RepoJobKind::Hunt, 11, "given up")
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .repo_checkpoint_job(1, RepoJobKind::Hunt)
+            .await
+            .unwrap()
+            .is_none()
     );
 }
 
@@ -1779,7 +1874,7 @@ async fn harvesting_a_pr_drops_its_harvest_checkpoint() {
 async fn finding_checkpoints_resume_only_at_their_actionable_status() {
     let (_dir, path, pool) = fresh_db().await;
     seed_repo_and_findings(&pool).await;
-    insert_suspended_job(&pool, 10, 1, Some("/s/10/session.jsonl")).await;
+    insert_suspended_job(&pool, 10, (1, "hunt"), Some("/s/10/session.jsonl")).await;
     for (id, kind) in [
         (11, "fix"),
         (12, "recheck"),

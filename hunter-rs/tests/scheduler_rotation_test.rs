@@ -262,12 +262,15 @@ async fn an_attempt_that_died_before_doing_any_work_stays_failed() {
     assert!(last_test_gap_at(&store).await > STALE_TEST_GAP);
 }
 
-/// Whether selection has abandoned a chain at the give-up ceiling.
+/// Whether selection has abandoned a chain at the give-up ceiling: the
+/// `resume` event that drops its checkpoint. The rows stay as they ended.
 async fn given_up(pool: &SqlitePool) -> bool {
-    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM jobs WHERE killed_reason = 'give-up'")
-        .fetch_one(pool)
-        .await
-        .unwrap()
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM events WHERE kind = 'resume' AND message LIKE '%giving up%'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
         > 0
 }
 

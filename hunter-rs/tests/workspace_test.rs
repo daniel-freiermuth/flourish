@@ -382,24 +382,24 @@ async fn made_workspace(f: &Fixture, id: i64, state: &str, finished_at: i64) -> 
     ws
 }
 
-/// The sweep keeps a suspended chain's tree, releases a terminal chain's
-/// tree but keeps its transcript, and removes the whole workspace once the
+/// The sweep keeps a checkpoint's tree, releases a terminal chain's tree
+/// but keeps its transcript, and removes the whole workspace once the
 /// chain finished more than the retention period ago.
 #[tokio::test]
 async fn the_sweep_releases_only_finished_chains_and_ages_out_their_sessions() {
     let f = fixture("ws-sweep", "main").await;
     let now = hunter::util::now_ms();
     let ws = made_workspace(&f, 10, "suspended", now - 1_000).await;
+    support::point_repo_checkpoint(&f.pool, 1, "hunt", Some(10)).await;
 
     workspace::sweep(&f.store, &f.cfg.work_root, now)
         .await
         .unwrap();
-    assert!(ws.tree.is_dir(), "a suspended chain's tree is its resume");
+    assert!(ws.tree.is_dir(), "a checkpoint's tree is its resume");
 
-    sqlx::query("UPDATE jobs SET state = 'killed' WHERE id = 10")
-        .execute(&f.pool)
-        .await
-        .unwrap();
+    // The work item lets go of it: given up, superseded, or the repo's
+    // work started over. The row stays `suspended`, as it ended.
+    support::point_repo_checkpoint(&f.pool, 1, "hunt", None).await;
     let report = workspace::sweep(&f.store, &f.cfg.work_root, now)
         .await
         .unwrap();
@@ -538,9 +538,10 @@ async fn the_sweep_ages_a_resumed_chain_by_its_newest_attempt() {
     assert!(!ws.root.exists(), "past retention the workspace goes");
 }
 
-/// The give-up ceiling retires only the newest link of a chain; every
-/// earlier link stays `suspended`, each continued by the next. The chain
-/// is still over, and its tree is released.
+/// A resume never rewrites the link it continues, so every link of a
+/// chain given up after several attempts reads `suspended`. Only the
+/// pointer says whether one is still a checkpoint: once the give-up drops
+/// it, the chain is over, and its tree is released.
 #[tokio::test]
 async fn a_chain_given_up_after_several_attempts_releases_its_tree() {
     let f = fixture("ws-giveup", "main").await;
@@ -549,6 +550,7 @@ async fn a_chain_given_up_after_several_attempts_releases_its_tree() {
     resumed_link(&f, 11, 10, "suspended", Some(now - 3_000)).await;
     resumed_link(&f, 12, 11, "suspended", Some(now - 2_000)).await;
     resumed_link(&f, 13, 12, "suspended", Some(now - 1_000)).await;
+    support::point_repo_checkpoint(&f.pool, 1, "hunt", Some(13)).await;
 
     let report = workspace::sweep(&f.store, &f.cfg.work_root, now)
         .await
@@ -556,10 +558,7 @@ async fn a_chain_given_up_after_several_attempts_releases_its_tree() {
     assert_eq!(report.trees_released, 0);
     assert!(ws.tree.is_dir(), "the newest suspension is still resumable");
 
-    f.store
-        .retire_suspended_job(13, JobState::Failed, Some("give-up"), "gave up")
-        .await
-        .unwrap();
+    support::point_repo_checkpoint(&f.pool, 1, "hunt", None).await;
     let status = f.store.chain_status(10).await.unwrap();
     assert_eq!((status.attempts, status.live), (4, 0), "{status:?}");
     assert!(
