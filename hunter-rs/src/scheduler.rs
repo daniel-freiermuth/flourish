@@ -2075,11 +2075,10 @@ pub async fn run_hunt(
     // than a decision.
     let rehunt_due = resume.is_none()
         && (requested || last_full.is_some_and(|lf| (now_ms() - lf) >= rehunt_interval_ms));
+    // The scope is this hunt's alone: the watermark stays in the repo row
+    // until a hunt succeeds and moves it. Clearing it here, as this used
+    // to, lost it to every full hunt the budget denied or that failed.
     let last = if rehunt_due {
-        log_write_failure(
-            store.clear_last_hunt_sha(rid).await,
-            format_args!("repo {rid}: clearing last-hunt sha for the full re-hunt"),
-        );
         let why = if requested {
             "requested".to_owned()
         } else {
@@ -2099,10 +2098,11 @@ pub async fn run_hunt(
     };
     // A resume keeps the scope its chain started with, which the chain's
     // jobs carry (`full_history`): the repo row that decided it may have
-    // changed since. For a chain from before that column: starting a full
-    // re-hunt is the only thing that clears the watermark of a repo that
-    // has had a full hunt, so a resume finding none there is continuing
-    // one.
+    // changed since, and its watermark is never cleared for a full chain,
+    // so a full chain's resume reads past it. For a chain from before that
+    // column: starting a full re-hunt used to clear the watermark of a repo
+    // that had had a full hunt, so a resume finding none there is
+    // continuing one.
     let resumed_full = match resume {
         Some(plan) => {
             store.job_full_history(plan.predecessor_id).await?
@@ -2110,6 +2110,7 @@ pub async fn run_hunt(
         }
         None => false,
     };
+    let last = if resumed_full { None } else { last };
     if resume.is_none() && last.as_deref() == Some(&head) {
         // The watermark is what makes the next pick move on; a skip that
         // failed to record it would be re-picked at once (a skipped cycle
