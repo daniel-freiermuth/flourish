@@ -587,6 +587,12 @@ Fixed strings; git's or the worker's words go into the detail.
 
 Releasing resets the streak to zero, and the give-up ceiling counts from the release. The first attempt after a `continue` resumes with a prompt chosen by the hold's reason. A held hunt leaves a full re-hunt request pending, and while the hunt is held the request is not urgent: it neither starts the hunt nor puts the repo ahead of the rotation for its other kinds. Only a successful full-scope hunt settles it.
 
-### 17.5 Removed
+### 17.5 Operator surface
+
+- **API.** The summary's `repos` and `/api/repos` carry each repo's `holds` (`kind`, `reason`, `detail`, `held_at`, `actions`) and `failing` (the current streak of each failing kind, `kind`, `streak`, `last_failure`). `POST /api/hold/release` takes `{ repo_id, kind, action }` as well as a finding's `{ finding_id, … }`, exactly one of the two.
+- **Repos page.** Each repo shows its `sync` hold and held kinds with the reason, the detail, the time and the allowed actions, and the streak of each kind that is failing.
+- **Needs you (Kanban).** Lists repo holds alongside finding holds.
+
+### 17.6 Removed
 
 The repo arm of `list_resumable_jobs`, `create_job`'s `superseded` retirement, the `finding_id IS NULL` arms of `chain_status` and `live_jobs`, `retire_suspended_job`/`retire_job` and their callers in `end_checkpoint` and `record_job`, `resume_plan`'s `set_last_kind_at`, and `run_cycle_inner`'s bumps. A repo runner's `backend.run` error closes its job instead of leaving it `running`. No finished job row is rewritten for any kind.

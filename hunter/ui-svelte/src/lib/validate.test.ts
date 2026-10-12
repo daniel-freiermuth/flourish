@@ -304,3 +304,32 @@ describe("isSummary repos entries", () => {
     expect(isSummary({ ...summary, repos: [{ id: "1" }] })).toBe(false);
   });
 });
+
+// RepoWork renders `{#each holds as hold (hold.kind)}`, each hold's
+// `{#each hold.actions as action (action)}`, and
+// `{#each failing as f (f.kind)}`.
+describe("isSummary repo work", () => {
+  const repo = (extra: Record<string, unknown>) => ({ id: 1, name: "a", ...extra });
+  const hold = (kind: unknown, actions: unknown) => ({ kind, actions });
+
+  it("accepts absent, empty and one hold or streak per kind", () => {
+    expect(isSummary({ ...summary, repos: [repo({})] })).toBe(true);
+    expect(isSummary({ ...summary, repos: [repo({ holds: [], failing: [] })] })).toBe(true);
+    expect(
+      isSummary({
+        ...summary,
+        repos: [repo({
+          holds: [hold("sync", ["restart"]), hold("hunt", ["continue", "restart"])],
+          failing: [{ kind: "test_gap", streak: 2, last_failure: "runner error" }],
+        })],
+      }),
+    ).toBe(true);
+  });
+
+  it("rejects a repeated kind and repeated or missing actions", () => {
+    expect(isSummary({ ...summary, repos: [repo({ holds: [hold("sync", []), hold("sync", [])] })] })).toBe(false);
+    expect(isSummary({ ...summary, repos: [repo({ holds: [hold("hunt", ["restart", "restart"])] })] })).toBe(false);
+    expect(isSummary({ ...summary, repos: [repo({ holds: [{ kind: "hunt" }] })] })).toBe(false);
+    expect(isSummary({ ...summary, repos: [repo({ failing: [{ kind: "hunt" }, { kind: "hunt" }] })] })).toBe(false);
+  });
+});

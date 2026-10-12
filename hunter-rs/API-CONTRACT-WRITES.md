@@ -387,7 +387,11 @@ Accounts are created by the operator (`hunter user add|passwd|disable <name>`, `
 
 ## 11. POST /api/hold/release — end a hold (Rust only)
 
-Ends the active hold on one kind of a finding's work (WORK-MODEL.md §9.3). Behind every gate.
+Ends the active hold on one kind of a finding's work (WORK-MODEL.md §9.3), or of a repo's (§17). Behind every gate.
+
+**Repo subject**: `{"repo_id": int, "kind": str, "action": str}`, `kind` one of `hunt`, `test_gap`, `dep_update`, `refactor`, `modernization`, `standards`, `sync`. Both `repo_id` and `finding_id` -> `400 {"error": "exactly one of finding_id and repo_id"}`; `repo_id` not an int, or `kind`/`action` unknown -> `400`; no such repo -> `404 {"error": "no repo <id>"}`; no active hold, an action other than `continue`/`restart`, `continue` on `sync`, or `continue` without a checkpoint -> `409`. Writes (one transaction, `Store::release_repo_hold`): the hold row gets `released_at`, `released_by` and `release_action`, the work item's streak is reset to zero, `restart` clears its checkpoint, and a `release` event is attributed to the account. `continue` keeps the checkpoint, and the give-up ceiling counts from the release. Success: `200 {"ok": true, "repo": RepoOut}` (the repo as `/api/repos` serves it), and the scheduler loop is woken.
+
+**Finding subject**:
 
 **Request**: `{"finding_id": int, "kind": str, "action": str, "reason"?: str, "classification"?: str}`. `kind` is `recheck`, `fix`, `engage` or `harvest`; `action` one of `continue`, `restart`, `reject`, `wontfix`, `classify`, `mark_harvested`, `dismiss`. `reason` is the verdict's for `reject`, `wontfix` and `classify`; `classification` the closed PR's for `classify` (`superseded`, `duplicate`, `obsolete`, `wrong`, `unwanted`, `abandoned`, as `CLOSE-REASON.json` spells it). Absent, null, empty and whitespace-only strings are absent.
 
@@ -427,6 +431,6 @@ Ends the active hold on one kind of a finding's work (WORK-MODEL.md §9.3). Behi
 | /api/repo/delete | 200 | `{"ok": true}` | — |
 | /api/repo/rehunt | 200 | `{"ok": true, "repo": Row}` | `get_repo_by_id` |
 | /api/repo/notes | 201 | `{"ok": true, "notes": str}` | `repo_notes` (store.py:731-745) |
-| /api/hold/release | 200 | `{"ok": true, "finding": Row}` | `get_finding` |
+| /api/hold/release | 200 | `{"ok": true, "finding": Row}`, or for a repo `{"ok": true, "repo": RepoOut}` | `get_finding` / `get_repo_by_id` |
 
 All finding/repo Rows are `SELECT *` full rows — shapes per round-1 `hunter-rs/API-CONTRACT.md`. **The Svelte UI reads none of them**, including `/api/repo/notes`' `notes` string (§9): every write path calls `store.refresh()` or re-GETs instead. They are soft contract with no consumer today; ship them for parity.

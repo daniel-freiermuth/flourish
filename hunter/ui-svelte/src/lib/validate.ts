@@ -99,7 +99,7 @@ export function isSummary(v: unknown): v is Summary {
   // pages read `r.id`/`r.name` for their repo-name maps — none of them
   // optionally. `repos: [null]` would pass an array check, reach the
   // store, and throw inside a `$derived`.
-  return isKeyedList(v.repos, "id", "number");
+  return isKeyedList(v.repos, "id", "number") && v.repos.every(hasKeyableRepoWork);
 }
 
 /** `StatsPage` maps `by_kind`/`by_finding` and reads `totals.jobs`. */
@@ -147,6 +147,20 @@ function hasKeyableHolds(finding: Record<string, unknown>): boolean {
     isKeyedList(finding.holds, "kind", "string") &&
     finding.holds.every((h) => Array.isArray(h.actions) && hasDistinctIds(h, "actions"))
   );
+}
+
+/**
+ * `RepoWork` renders a repo's holds and failing work keyed by `kind` (one
+ * of each per kind) and each hold's buttons keyed by action.
+ */
+function hasKeyableRepoWork(repo: Record<string, unknown>): boolean {
+  // Absent when the daemon predates the fields; the component reads `[]`.
+  const holds = repo.holds === undefined || repo.holds === null
+    || (isKeyedList(repo.holds, "kind", "string")
+      && repo.holds.every((h) => Array.isArray(h.actions) && hasDistinctIds(h, "actions")));
+  const failing = repo.failing === undefined || repo.failing === null
+    || isKeyedList(repo.failing, "kind", "string");
+  return holds && failing;
 }
 
 /** `FindingDetail` reads `detail.jobs.length` and keys each row by `job.id`. */

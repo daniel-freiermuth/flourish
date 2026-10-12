@@ -2540,3 +2540,136 @@ async fn queuing_a_rehunt_needs_an_existing_repo() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body, json!({ "error": "no repo 999" }));
 }
+
+/// Repo 1 with its `sync` and `hunt` held (no checkpoint) and its
+/// `test_gap` failing once.
+async fn held_repo_state() -> TestState {
+    use hunter::domain::{HoldReason, RepoWorkKind};
+
+    let state = test_state().await;
+    let store = &state.store;
+    for kind in [RepoWorkKind::Sync, RepoWorkKind::Hunt] {
+        assert!(
+            store
+                .hold_repo_work(1, kind, HoldReason::Stuck, "git fetch origin failed", None)
+                .await
+                .unwrap()
+        );
+    }
+    store
+        .record_repo_failure(1, RepoWorkKind::TestGap, "runner error")
+        .await
+        .unwrap();
+
+    state
+}
+
+/// A repo's held and failing work rides on the summary's `repos` and on
+/// `/api/repos` (WORK-MODEL.md §17).
+#[tokio::test]
+async fn a_repos_holds_and_failing_work_are_shown() {
+    let state = held_repo_state().await;
+    let summary = get_json(&state, "/api/summary").await;
+    let repo = summary["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == 1)
+        .unwrap()
+        .clone();
+    let holds: Vec<(Value, Value)> = repo["holds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| (h["kind"].clone(), h["actions"].clone()))
+        .collect();
+    assert_eq!(
+        holds,
+        [
+            (json!("sync"), json!(["restart"])),
+            (json!("hunt"), json!(["restart"])),
+        ],
+        "no checkpoint, so no continue: {repo}"
+    );
+    assert_eq!(
+        repo["failing"],
+        json!([{ "kind": "test_gap", "streak": 1, "last_failure": "runner error" }])
+    );
+    let repos = get_json(&state, "/api/repos").await;
+    let alpha = repos
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == 1)
+        .unwrap();
+    assert_eq!(alpha["holds"], repo["holds"], "{repos}");
+    assert_eq!(alpha["failing"], repo["failing"], "{repos}");
+}
+
+/// `POST /api/hold/release` with a `repo_id` releases a repo's hold with the
+/// actions its kind allows, and refuses everything else.
+#[tokio::test]
+async fn a_repos_hold_is_released_through_the_hold_endpoint() {
+    let state = held_repo_state().await;
+    for (body, expected) in [
+        (
+            json!({ "repo_id": 1, "finding_id": 1, "kind": "sync", "action": "restart" }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({ "repo_id": 1, "kind": "fix", "action": "restart" }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({ "repo_id": 999, "kind": "sync", "action": "restart" }),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            json!({ "repo_id": 1, "kind": "sync", "action": "continue" }),
+            StatusCode::CONFLICT,
+        ),
+        (
+            json!({ "repo_id": 1, "kind": "hunt", "action": "continue" }),
+            StatusCode::CONFLICT,
+        ),
+        (
+            json!({ "repo_id": 1, "kind": "test_gap", "action": "restart" }),
+            StatusCode::CONFLICT,
+        ),
+    ] {
+        let (status, reply) = post(&state, "/api/hold/release", body.clone()).await;
+        assert_eq!(status, expected, "{body}: {reply}");
+    }
+
+    let wake = Arc::clone(&state.scheduler.wake);
+    let (status, reply) = post(
+        &state,
+        "/api/hold/release",
+        json!({ "repo_id": 1, "kind": "sync", "action": "restart" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(reply["repo"]["id"], 1);
+    assert_eq!(
+        reply["repo"]["holds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["kind"].clone())
+            .collect::<Vec<_>>(),
+        [json!("hunt")]
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified())
+            .await
+            .is_ok(),
+        "released work wakes the scheduler"
+    );
+    let (status, _) = post(
+        &state,
+        "/api/hold/release",
+        json!({ "repo_id": 1, "kind": "sync", "action": "restart" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "a released hold is gone");
+}

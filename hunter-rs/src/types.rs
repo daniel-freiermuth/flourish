@@ -22,7 +22,7 @@
 
 use crate::domain::{
     BudgetOverride, BugClass, FindingJobKind, FindingStatus, FindingType, ForgeName, HoldReason,
-    JobKind, JobState, ReleaseAction, Severity,
+    JobKind, JobState, ReleaseAction, RepoWorkKind, Severity,
 };
 use serde::Serialize;
 use ts_rs::TS;
@@ -67,12 +67,13 @@ pub struct Repo {
     pub full_hunt_request_attempted: Option<i64>,
 }
 
-/// The 11-key repo object inside /api/summary (the 10 base columns plus
+/// The repo object inside /api/summary: the 10 base columns plus
 /// `full_hunt_requested_at`, which the Repos page shows as a queued
-/// re-hunt). The client does NOT require exactly these
-/// keys -- `isKeyedList` checks `id` is a number and the components read
-/// `url`, `added_at` and `name` off every entry, so extra keys pass and a
-/// missing one of those four blanks the page (validate.ts:83-96).
+/// re-hunt, and its work held for the operator or failing (WORK-MODEL.md
+/// §17). The client does NOT require exactly these keys -- `isKeyedList`
+/// checks `id` is a number and the components read `url`, `added_at` and
+/// `name` off every entry, so extra keys pass and a missing one of those
+/// four blanks the page (validate.ts:83-96).
 #[derive(Debug, Clone, Serialize, TS)]
 pub struct RepoBrief {
     pub id: i64,
@@ -86,10 +87,16 @@ pub struct RepoBrief {
     pub enabled: i64,
     pub added_at: i64,
     pub full_hunt_requested_at: Option<i64>,
+    /// The repo's work held for the operator, at most one per kind, oldest
+    /// first. Always present, [] when none.
+    pub holds: Vec<RepoHoldOut>,
+    /// The repo's work that is failing without a hold yet. Always
+    /// present, [] when none.
+    pub failing: Vec<RepoStreakOut>,
 }
 
-impl From<&Repo> for RepoBrief {
-    fn from(r: &Repo) -> Self {
+impl RepoBrief {
+    pub fn new(r: &Repo, work: RepoWorkOut) -> Self {
         Self {
             id: r.id,
             name: r.name.clone(),
@@ -102,8 +109,50 @@ impl From<&Repo> for RepoBrief {
             enabled: r.enabled,
             added_at: r.added_at,
             full_hunt_requested_at: r.full_hunt_requested_at,
+            holds: work.holds,
+            failing: work.failing,
         }
     }
+}
+
+/// One repo of GET /api/repos: the row, plus its held and failing work.
+#[derive(Debug, Clone, Serialize)]
+pub struct RepoOut {
+    #[serde(flatten)]
+    pub repo: Repo,
+    #[serde(flatten)]
+    pub work: RepoWorkOut,
+}
+
+/// A repo's work held for the operator and failing without a hold yet.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RepoWorkOut {
+    pub holds: Vec<RepoHoldOut>,
+    pub failing: Vec<RepoStreakOut>,
+}
+
+/// One active hold on a repo's work.
+#[derive(Debug, Clone, Serialize, TS)]
+pub struct RepoHoldOut {
+    /// A scan's job kind, or `sync`: then every kind of the repo waits.
+    pub kind: RepoWorkKind,
+    pub reason: HoldReason,
+    /// The failure and its output.
+    pub detail: String,
+    /// Epoch ms.
+    pub held_at: i64,
+    /// What `POST /api/hold/release` accepts for it right now: `continue`
+    /// only for a kind with a checkpoint, `restart` always.
+    pub actions: Vec<ReleaseAction>,
+}
+
+/// A repo work item failing without a hold yet: how many identical
+/// failures in a row, and the key they share.
+#[derive(Debug, Clone, Serialize, TS)]
+pub struct RepoStreakOut {
+    pub kind: RepoWorkKind,
+    pub streak: i64,
+    pub last_failure: String,
 }
 
 /// findings row, all 35 columns (38 from migrations/001 + `standard_section`
