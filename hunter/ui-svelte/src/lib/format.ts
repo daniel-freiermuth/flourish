@@ -124,7 +124,7 @@ export function typeEmoji(t: string): string {
   }
 }
 
-/** Why a finding's work is held for the operator (`HoldReason`). */
+/** Why a finding's or a repo's work is held for the operator (`HoldReason`). */
 export function holdReasonLabel(r: string): string {
   switch (r) {
     case "prerequisite":
@@ -136,6 +136,14 @@ export function holdReasonLabel(r: string): string {
     default:
       return r || "?";
   }
+}
+
+/**
+ * A repo's work item (`RepoWorkKind`): a scan by its job kind, or the
+ * repo's sync, whose failures stop every scan of the repo.
+ */
+export function repoWorkLabel(k: string): string {
+  return k === "sync" ? "sync (clone, fetch, branch)" : k || "?";
 }
 
 /** The button for a way to release a hold (`ReleaseAction`). */

@@ -30,12 +30,12 @@ use crate::auth::{self, CurrentUser};
 use crate::config::{Config, HostAllowList};
 use crate::domain::{
     BudgetOverride, ClosureClass, FindingJobKind, FindingStatus, FindingType, ForgeName,
-    ReleaseAction, Severity,
+    ReleaseAction, RepoWorkKind, Severity,
 };
 use crate::store::{FindingFilter, HoldRelease, RepoUpdate, Store, StoreWriteError};
 use crate::types::{
     ActivityStatus, BudgetState, Event, Finding, FindingDetail, FindingOut, HoldOut, JobListEntry,
-    Repo, RepoBrief, Stats, Summary,
+    Repo, RepoBrief, RepoHoldOut, RepoOut, RepoStreakOut, RepoWorkOut, Stats, Summary,
 };
 
 /// Handle to this process's scheduler loop.
@@ -304,6 +304,49 @@ fn param<'q>(params: &'q HashMap<String, String>, key: &str) -> Option<&'q str> 
         .filter(|v| !v.is_empty())
 }
 
+// -- repo work (WORK-MODEL.md §17) -------------------------------------------
+
+/// Every live repo's held and failing work, by repo id: what the summary's
+/// `repos` and `/api/repos` carry.
+async fn repo_work(store: &Store) -> Result<HashMap<i64, RepoWorkOut>, ApiError> {
+    let mut work: HashMap<i64, RepoWorkOut> = HashMap::new();
+    for hold in store.active_repo_holds().await? {
+        let actions = hold.actions();
+        work.entry(hold.repo_id)
+            .or_default()
+            .holds
+            .push(RepoHoldOut {
+                kind: hold.kind,
+                reason: hold.reason,
+                detail: hold.detail,
+                held_at: hold.held_at,
+                actions,
+            });
+    }
+    for s in store.repo_streaks().await? {
+        work.entry(s.repo_id)
+            .or_default()
+            .failing
+            .push(RepoStreakOut {
+                kind: s.kind,
+                streak: s.streak,
+                last_failure: s.last_failure,
+            });
+    }
+    Ok(work)
+}
+
+/// The summary's `repos`: every live repo with its held and failing work.
+async fn repo_briefs(store: &Store) -> Result<Vec<RepoBrief>, ApiError> {
+    let mut work = repo_work(store).await?;
+    Ok(store
+        .list_repos()
+        .await?
+        .iter()
+        .map(|r| RepoBrief::new(r, work.remove(&r.id).unwrap_or_default()))
+        .collect())
+}
+
 // -- /api/summary (contract §3) ---------------------------------------------
 
 async fn summary(State(state): State<AppState>) -> Result<Json<Summary>, ApiError> {
@@ -314,12 +357,7 @@ async fn summary(State(state): State<AppState>) -> Result<Json<Summary>, ApiErro
     let store = &state.store;
     let counts = store.status_counts().await?;
     let type_counts = store.type_counts().await?;
-    let repos: Vec<RepoBrief> = store
-        .list_repos()
-        .await?
-        .iter()
-        .map(RepoBrief::from)
-        .collect();
+    let repos = repo_briefs(store).await?;
     let last_cycle = store.last_cycle_event().await?;
     let current_job = store.current_job().await?;
     let scheduler_state = store.scheduler_state().await?;
@@ -560,8 +598,20 @@ async fn jobs(State(state): State<AppState>) -> Result<Json<Vec<JobListEntry>>, 
     Ok(Json(state.store.list_jobs(50).await?))
 }
 
-async fn repos(State(state): State<AppState>) -> Result<Json<Vec<Repo>>, ApiError> {
-    Ok(Json(state.store.list_repos().await?))
+async fn repos(State(state): State<AppState>) -> Result<Json<Vec<RepoOut>>, ApiError> {
+    let mut work = repo_work(&state.store).await?;
+    Ok(Json(
+        state
+            .store
+            .list_repos()
+            .await?
+            .into_iter()
+            .map(|repo| RepoOut {
+                work: work.remove(&repo.id).unwrap_or_default(),
+                repo,
+            })
+            .collect(),
+    ))
 }
 
 async fn events(State(state): State<AppState>) -> Result<Json<Vec<Event>>, ApiError> {
@@ -903,8 +953,11 @@ async fn verdict(
 /// `{ finding_id, kind, action, reason?, classification? }`. `reason` is the
 /// verdict's for `reject`, `wontfix` and `classify`; `classification` the
 /// closed PR's for `classify` (`superseded`, `duplicate`, `obsolete`,
-/// `wrong`, `unwanted`, `abandoned`). 409 when the hold is no longer active
-/// or the action does not apply to it as it stands.
+/// `wrong`, `unwanted`, `abandoned`). Or on one of a repo's (§17):
+/// `{ repo_id, kind, action }`, `kind` a repo job kind or `sync`, `action`
+/// `continue` or `restart`. Exactly one of `finding_id` and `repo_id`. 409
+/// when the hold is no longer active or the action does not apply to it as
+/// it stands.
 async fn release_hold(
     State(state): State<AppState>,
     Extension(user): Extension<CurrentUser>,
@@ -913,6 +966,15 @@ async fn release_hold(
 ) -> Result<Response, ApiError> {
     post_gate(&headers)?;
     let body = parse_object(&raw)?;
+    let present = |key: &str| body.get(key).is_some_and(|v| !v.is_null());
+    if present("repo_id") {
+        if present("finding_id") {
+            return Err(ApiError::BadRequest(
+                "exactly one of finding_id and repo_id".to_owned(),
+            ));
+        }
+        return release_repo_hold(&state, &user, &body).await;
+    }
     let fid = require_int(&body, "finding_id", "finding_id must be an integer")?;
     let text = |key: &str| -> Result<Option<&str>, ApiError> {
         match body.get(key) {
@@ -969,6 +1031,47 @@ async fn release_hold(
     // Released work is the scheduler's again: act on it now.
     state.scheduler.wake.notify_one();
     Ok(Json(json!({ "ok": true, "finding": refreshed })).into_response())
+}
+
+/// `POST /api/hold/release` for a repo's work: `{ repo_id, kind, action }`.
+async fn release_repo_hold(
+    state: &AppState,
+    user: &CurrentUser,
+    body: &Map<String, Value>,
+) -> Result<Response, ApiError> {
+    let rid = require_int(body, "repo_id", "repo_id must be an integer")?;
+    let text = |key: &str| body.get(key).and_then(Value::as_str).map(str::trim);
+    let kind = text("kind")
+        .and_then(|k| k.parse::<RepoWorkKind>().ok())
+        .ok_or_else(|| {
+            ApiError::BadRequest(
+                "kind must be one of hunt, test_gap, dep_update, refactor, modernization, \
+                 standards, sync"
+                    .to_owned(),
+            )
+        })?;
+    let action = text("action")
+        .and_then(|a| a.parse::<ReleaseAction>().ok())
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "action must be one of {}",
+                ReleaseAction::ALL.map(ReleaseAction::as_str).join(", ")
+            ))
+        })?;
+    fetch_repo(&state.store, rid).await?;
+    match state.store.release_repo_hold(rid, kind, action, user).await {
+        Ok(()) => {}
+        Err(StoreWriteError::Refused(msg)) => return Err(ApiError::Conflict(msg)),
+        Err(StoreWriteError::Db(e)) => return Err(e.into()),
+    }
+    let mut work = repo_work(&state.store).await?;
+    let repo = RepoOut {
+        work: work.remove(&rid).unwrap_or_default(),
+        repo: fetch_repo(&state.store, rid).await?,
+    };
+    // Released work is the scheduler's again: act on it now.
+    state.scheduler.wake.notify_one();
+    Ok(Json(json!({ "ok": true, "repo": repo })).into_response())
 }
 
 // -- POST /api/cycle (contract §2) --------------------------------------------

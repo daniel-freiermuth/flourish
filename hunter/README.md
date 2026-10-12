@@ -445,9 +445,9 @@ Served at `http://localhost:8377` (configurable). Left-nav pages:
 |---|---|
 | **Status** | Budget bars (used + available, per window), Run/Pause and Overdrive controls, what the scheduler is doing right now / why it isn't, and the recent event log |
 | **Inbox** | New findings awaiting triage, with per-type filters |
-| **Kanban / Pipeline** | Findings in flight, a separate Needs you section with held work (why it is held, the report, and its Continue/Restart/... controls), suppressed (rejected/wontfix), and informational (note) findings |
+| **Kanban / Pipeline** | Findings in flight, a separate Needs you section with held work, a finding's or a repo's (why it is held, the report, and its Continue/Restart/... controls), suppressed (rejected/wontfix), and informational (note) findings |
 | **All Findings** | Every finding, filterable by repo/type/status/severity, with full detail (jobs, PR state, timeline) on expand, and the actions its status allows (verdicts on new/note/closed, releases of held work, Recheck on new, Unqueue on queued, budget override while something will still pick it) |
-| **Repos** | Add/remove/pause repos; queue a full re-hunt (the next hunt reviews the repo's complete history instead of only new commits — the same scope as the periodic `hunt.rehuntDays` re-hunt — and the request stays pending until such a hunt finishes cleanly); per-repo notes (free-text context injected into every prompt for that repo — coding conventions, known false positives, anything worth a hunter remembering across runs) |
+| **Repos** | Add/remove/pause repos; each repo's held scans and failing sync with why and the way out (**Continue**, **Restart**; **Retry now** for a held sync), and the scans failing without a hold yet; queue a full re-hunt (the next hunt reviews the repo's complete history instead of only new commits — the same scope as the periodic `hunt.rehuntDays` re-hunt — and the request stays pending until such a hunt finishes cleanly); per-repo notes (free-text context injected into every prompt for that repo — coding conventions, known false positives, anything worth a hunter remembering across runs) |
 | **Stats** | Aggregate totals by kind and by finding type |
 | **Log** | Full job and event history |
 

@@ -6,6 +6,7 @@
   import { untrack } from "svelte";
   import type { RepoBrief } from "../lib/types";
   import { toast } from "../lib/toast.svelte";
+  import RepoWork from "../components/RepoWork.svelte";
 
   // Add-repo form state
   let newName = $state("");
@@ -426,6 +427,9 @@
                 </button>
               </div>
             </div>
+
+            <!-- Work held for you, and work failing without a hold yet -->
+            <RepoWork {repo} />
 
             <!-- Notes panel (collapsible) -->
             {#if expandedNotes.has(repo.id)}

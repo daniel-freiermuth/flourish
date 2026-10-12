@@ -3,9 +3,12 @@
   import { store, post } from "../lib/api.svelte";
   import { navigation } from "../lib/navigation.svelte";
   import { filterFindings } from "../lib/findingFilter";
+  import { Filter } from "../lib/filter.svelte";
+  import { readSelection } from "../lib/filterUrl";
   import type { FindingOut } from "../lib/types";
   import FilterBar from "../components/FilterBar.svelte";
   import FindingCard from "../components/FindingCard.svelte";
+  import RepoWork from "../components/RepoWork.svelte";
 
   const repoNames = $derived(new Map((store.summary?.repos ?? []).map((r) => [r.id, r.name])));
 
@@ -45,7 +48,15 @@
   );
 
   const held = $derived(filtered.filter(isHeld));
-  const hasHeld = $derived(store.findings.some(isHeld));
+  // A repo's held scans (WORK-MODEL.md §17) wait beside held findings,
+  // under the same repo filter. Absent from a daemon that predates the
+  // field.
+  const reposWithHolds = $derived(
+    (store.summary?.repos ?? []).filter((r) => (r.holds ?? []).length > 0)
+  );
+  const repoFilter = $derived(new Filter(readSelection(navigation.route.params, "repo")));
+  const heldRepos = $derived(reposWithHolds.filter((r) => repoFilter.accepts(r.name)));
+  const hasHeld = $derived(store.findings.some(isHeld) || reposWithHolds.length > 0);
 
   // Suppressed (rejected + wontfix) and notes — below the pipeline
   const suppressed = $derived(
@@ -130,11 +141,21 @@
     <section class="held-section" aria-labelledby="held-heading">
       <h3 id="held-heading" class="held-heading">
         Needs you
-        <span class="section-count">{held.length}</span>
+        <!-- One per card below: a held finding, or a repo with held work. -->
+        <span class="section-count">{held.length + heldRepos.length}</span>
       </h3>
       <p class="held-help">Work stopped for you: a missing prerequisite, a failure that kept repeating, or a chain that ran out of budget. Continue resumes the retained work with a fresh budget; restart starts it over.</p>
+      {#if heldRepos.length > 0}
+        <div class="section-body" data-scroll-list="held-repos">
+          {#each heldRepos as repo (repo.id)}
+            <RepoWork {repo} showFailing={false} />
+          {/each}
+        </div>
+      {/if}
       {#if held.length === 0}
-        <p class="held-help">No held work matches the current filters.</p>
+        {#if heldRepos.length === 0}
+          <p class="held-help">No held work matches the current filters.</p>
+        {/if}
       {:else}
         <div class="section-body" data-scroll-list="held">
           {#each held as finding (finding.id)}
