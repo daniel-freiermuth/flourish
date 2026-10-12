@@ -1994,7 +1994,7 @@ async fn holding_work_keeps_the_status_and_a_checkpoint_only_with_a_transcript()
             .held_work()
             .await
             .unwrap()
-            .contains(&(2, FindingJobKind::Fix))
+            .finding(2, FindingJobKind::Fix)
     );
     assert!(store.suppressions(1, "bug").await.unwrap().is_empty());
     let events = store.recent_events(10).await.unwrap();
@@ -2094,7 +2094,10 @@ async fn releasing_a_hold_records_the_operator_and_applies_the_action() {
         .await
         .unwrap();
     assert_eq!(fix_hold(&store, 2).await, None);
-    assert!(store.held_work().await.unwrap().is_empty());
+    assert_eq!(
+        store.held_work().await.unwrap(),
+        hunter::store::HeldWork::default()
+    );
     assert_eq!(
         store
             .checkpoint_job(2, FindingJobKind::Fix)
@@ -2618,4 +2621,146 @@ async fn counting_a_failure_keeps_the_checkpoint() {
             .map(|j| j.id),
         Some(10)
     );
+}
+
+// -- repo work (WORK-MODEL.md §17) -------------------------------------------
+
+/// A hold's subject is a finding or a repo, never both and never neither:
+/// the schema refuses either row.
+#[tokio::test]
+async fn a_hold_has_exactly_one_subject() {
+    let (_dir, _path, pool) = fresh_db().await;
+    seed_repo_and_findings(&pool).await;
+    for (finding, repo, kind) in [(Some(1), Some(1), "fix"), (None, None, "hunt")] {
+        let inserted = sqlx::query(
+            "INSERT INTO work_holds (finding_id, repo_id, kind, reason, detail, held_at) \
+             VALUES (?1, ?2, ?3, 'stuck', 'd', 1)",
+        )
+        .bind(finding)
+        .bind(repo)
+        .bind(kind)
+        .execute(&pool)
+        .await;
+        assert!(inserted.is_err(), "{finding:?}/{repo:?} was accepted");
+    }
+    // And a repo's kind is a repo kind: `fix` is a finding's.
+    let fix_on_repo = sqlx::query(
+        "INSERT INTO work_holds (repo_id, kind, reason, detail, held_at) \
+         VALUES (1, 'fix', 'stuck', 'd', 1)",
+    )
+    .execute(&pool)
+    .await;
+    assert!(fix_on_repo.is_err());
+}
+
+/// A repo's work is held once per kind, read through the one shared query
+/// (`sync` holding every kind), released by the operator with the actions
+/// its kind allows, and gone with its repo.
+#[tokio::test]
+async fn repo_holds_are_held_once_released_and_go_with_their_repo() {
+    use hunter::domain::RepoWorkKind;
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo(&pool).await;
+    insert_suspended_job(&pool, 10, (1, "hunt"), Some("/s/10/session.jsonl")).await;
+    let store = rw_store(&path).await;
+
+    assert!(
+        store
+            .hold_repo_work(1, RepoWorkKind::Hunt, HoldReason::GaveUp, "chain", Some(10))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .hold_repo_work(1, RepoWorkKind::Hunt, HoldReason::Stuck, "again", None)
+            .await
+            .unwrap(),
+        "at most one active hold per repo and kind"
+    );
+    assert!(
+        store
+            .hold_repo_work(
+                1,
+                RepoWorkKind::Sync,
+                HoldReason::Stuck,
+                "fetch failed",
+                None
+            )
+            .await
+            .unwrap()
+    );
+    let held = store.held_work().await.unwrap();
+    assert!(held.repo(1, RepoJobKind::Hunt));
+    assert!(
+        held.repo(1, RepoJobKind::Standards),
+        "a held sync holds every kind"
+    );
+    let actions: Vec<_> = store
+        .active_repo_holds()
+        .await
+        .unwrap()
+        .iter()
+        .map(|h| (h.kind, h.actions()))
+        .collect();
+    assert_eq!(
+        actions,
+        [
+            (
+                RepoWorkKind::Hunt,
+                vec![ReleaseAction::Continue, ReleaseAction::Restart]
+            ),
+            (RepoWorkKind::Sync, vec![ReleaseAction::Restart]),
+        ]
+    );
+
+    let by = support::operator(&store).await;
+    for (kind, action) in [
+        (RepoWorkKind::Sync, ReleaseAction::Continue),
+        (RepoWorkKind::Hunt, ReleaseAction::Dismiss),
+        (RepoWorkKind::TestGap, ReleaseAction::Restart),
+    ] {
+        assert!(
+            store.release_repo_hold(1, kind, action, &by).await.is_err(),
+            "{kind} {action} must be refused"
+        );
+    }
+    store
+        .release_repo_hold(1, RepoWorkKind::Hunt, ReleaseAction::Restart, &by)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .repo_checkpoint_job(1, RepoJobKind::Hunt)
+            .await
+            .unwrap()
+            .map(|j| j.id),
+        None,
+        "restart drops the checkpoint"
+    );
+    assert!(
+        store
+            .repo_last_release_at(1, RepoJobKind::Hunt)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // A repo with jobs cannot be deleted; one whose only state is a held
+    // sync can, and the hold goes with it.
+    sqlx::query("DELETE FROM jobs")
+        .execute(&pool)
+        .await
+        .unwrap();
+    store.soft_delete_repo(1).await.unwrap();
+    assert_eq!(
+        store.held_work().await.unwrap(),
+        hunter::store::HeldWork::default()
+    );
+    let left: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM work_holds) + (SELECT COUNT(*) FROM repo_work)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(left, 0);
 }

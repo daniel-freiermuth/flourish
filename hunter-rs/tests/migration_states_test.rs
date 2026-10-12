@@ -998,3 +998,121 @@ async fn upgrading_points_each_repo_work_item_at_its_checkpoint() {
     );
     drop(store);
 }
+
+/// Upgrading gives `work_holds` its repo subject without touching a hold.
+///
+/// 027 rebuilds the table, so every finding hold, active or released,
+/// keeps its id and every column; the triggers that release a finding's
+/// hold when it leaves its tier still do; and the new rows it allows are
+/// repo holds, one active per repo and kind.
+///
+/// Seeded at the state just before 027 so that rolling forward executes it.
+#[tokio::test]
+async fn upgrading_keeps_every_hold_and_adds_the_repo_subject() {
+    use hunter::domain::{FindingJobKind, HoldReason, RepoWorkKind};
+
+    let (_dir, path) = scratch("mig-repo-holds");
+
+    let before_027 = sqlx::migrate!("./migrations")
+        .iter()
+        .position(|m| m.version == 27)
+        .expect("migration 027 exists");
+    let pool = seed_state(&path, before_027).await;
+    sqlx::raw_sql(
+        "INSERT INTO repos (id, name, url, path, forge, default_branch, added_at) \
+             VALUES (1, 'widget', 'https://e/w.git', '/wr/repos/repo-1', 'github', 'main', 1); \
+         INSERT INTO findings (id, type, repo_id, fingerprint, severity, confidence, summary, \
+                               status, created_at, updated_at) VALUES \
+             (1, 'bug', 1, 'fp-1', 'high', 0.9, 's', 'queued', 1, 1), \
+             (2, 'bug', 1, 'fp-2', 'high', 0.9, 's', 'rechecking', 1, 1); \
+         INSERT INTO work_holds (id, finding_id, kind, reason, detail, held_at, released_at, \
+                                 released_by, release_action) VALUES \
+             (7, 1, 'fix', 'prerequisite', 'needs a rig', 100, NULL, NULL, NULL), \
+             (8, 2, 'recheck', 'stuck', 'no verdict', 200, NULL, NULL, NULL), \
+             (9, 1, 'fix', 'stuck', 'older', 50, 60, 'tester', 'restart');",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let store = Store::connect(&path).await.expect("roll forward");
+
+    let holds: Vec<_> = store
+        .active_holds()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|h| (h.id, h.finding_id, h.kind, h.reason, h.detail, h.held_at))
+        .collect();
+    assert_eq!(
+        holds,
+        [
+            (
+                7,
+                1,
+                FindingJobKind::Fix,
+                HoldReason::Prerequisite,
+                "needs a rig".to_owned(),
+                100
+            ),
+            (
+                8,
+                2,
+                FindingJobKind::Recheck,
+                HoldReason::Stuck,
+                "no verdict".to_owned(),
+                200
+            ),
+        ]
+    );
+    // The released row is kept as it was.
+    drop(store);
+    let pool = open(&path).await;
+    let released: (i64, String, String) = sqlx::query_as(
+        "SELECT released_at, released_by, release_action FROM work_holds WHERE id = 9",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(released, (60, "tester".to_owned(), "restart".to_owned()));
+    pool.close().await;
+
+    // The tier trigger still releases a hold whose finding moves on.
+    let store = Store::connect(&path).await.unwrap();
+    store
+        .set_finding_status(2, FindingStatus::Rejected)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .active_holds()
+            .await
+            .unwrap()
+            .iter()
+            .map(|h| h.id)
+            .collect::<Vec<_>>(),
+        [7]
+    );
+
+    // And a repo's work can now be held, once per kind.
+    assert!(
+        store
+            .hold_repo_work(
+                1,
+                RepoWorkKind::Sync,
+                HoldReason::Stuck,
+                "fetch failed",
+                None
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .hold_repo_work(1, RepoWorkKind::Sync, HoldReason::Stuck, "again", None)
+            .await
+            .unwrap()
+    );
+    drop(store);
+}

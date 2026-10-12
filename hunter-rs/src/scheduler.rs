@@ -13,7 +13,7 @@ use anyhow::Context as _;
 use crate::config::Config;
 use crate::domain::{
     BudgetOverride, ClosureClass, FindingJobKind, FindingStatus, FindingType, HoldReason, JobKind,
-    JobState, RepoJobKind, Severity,
+    JobState, RepoJobKind, RepoWorkKind, Severity,
 };
 use crate::store::{CreatedJob, FindingFilter, JobOutcome, Store, StoreWriteError, SyncPrData};
 use crate::types::{Finding, Job, Repo};
@@ -250,8 +250,9 @@ async fn list_engage(store: &Store) -> sqlx::Result<(Vec<Finding>, BTreeSet<i64>
 /// The scheduler's own selection. On the way it ends checkpoints that
 /// can never be continued — a chain past the give-up ceiling, or one
 /// whose working directory is gone — which [`resume_plan`] does as it
-/// skips over them ([`end_checkpoint`]), and counts a finding tier's
-/// given-up chain as a failed attempt ([`count_given_up_chain`]).
+/// skips over them ([`end_checkpoint`]), and counts a given-up chain as a
+/// failed attempt at its work ([`count_given_up_chain`],
+/// [`count_given_up_repo_chain`]).
 /// [`preview_next`] makes the same selection and writes nothing.
 pub async fn pick_next(
     store: &Store,
@@ -265,9 +266,8 @@ pub async fn pick_next(
 /// without any of its writes.
 ///
 /// The dashboard polls this, scheduler paused or not, and a poll must not
-/// do the scheduler's work: ending a chain, bumping a rotation
-/// timestamp, or counting a given-up chain against its finding, which can
-/// send the finding to the inbox, hold it for the operator or give its PR up. A
+/// do the scheduler's work: ending a chain, or counting a given-up chain
+/// against its work, which can hold that work for the operator. A
 /// checkpoint the scheduler would end is only skipped here, so the
 /// preview names the fresh start a given-up chain makes way for, even
 /// where the scheduler's count ends that work instead.
@@ -317,11 +317,12 @@ async fn select(
         pending_harvest.retain(|f| f.repo_id == rid);
         queued.retain(|f| f.repo_id == rid);
     }
-    // Held work waits for the operator: every tier skips it, through the
-    // one shared query (WORK-MODEL.md §9.5, invariant 3).
+    // Held work waits for the operator: every tier, the resume tier and the
+    // repo rotation skip it, through the one shared query (WORK-MODEL.md
+    // §9.5, invariant 3; §17).
     let held = store.held_work().await?;
     let held_ref = &held;
-    let not_held = |kind: FindingJobKind| move |f: &Finding| !held_ref.contains(&(f.id, kind));
+    let not_held = |kind: FindingJobKind| move |f: &Finding| !held_ref.finding(f.id, kind);
     rechecking.retain(not_held(FindingJobKind::Recheck));
     attention.retain(not_held(FindingJobKind::Engage));
     pending_harvest.retain(not_held(FindingJobKind::Harvest));
@@ -377,14 +378,22 @@ async fn select(
     // re-cache ratio 1.00 across 112 production events) where restarting
     // costs a flat ~37,000-token session floor plus every token already
     // spent, and advances no watermark to show for it.
-    if let Some(c) = pick_resume(store, cfg, force_id, &held, mode).await? {
-        return Ok(Some(c));
+    match pick_resume(store, cfg, force_id, &held, mode).await? {
+        Picked::Work(c) => return Ok(Some(c)),
+        // A repo chain given up there was counted as a failure, which may
+        // have held its work: select again, from the top.
+        Picked::Ended => return Box::pin(select(store, cfg, force_repo, mode)).await,
+        Picked::Nothing => {}
     }
 
     // (7) Repo rotation: enabled repos in staleness order — a repo with an
     // urgent full re-hunt request first, then never-hunted, then oldest
     // last_hunt_at first; ties keep list_repos' name order (Python
-    // sorted() and Vec::sort_by_key are both stable).
+    // sorted() and Vec::sort_by_key are both stable). Held work is
+    // skipped: a held `sync` takes the whole repo out of the rotation, a
+    // held kind only that kind. A request whose hunt is held is not
+    // urgent: it waits for the hunt's release without putting the repo's
+    // other kinds ahead of every other repo.
     let mut repos: Vec<Repo> = store
         .list_repos()
         .await?
@@ -399,7 +408,7 @@ async fn select(
         .collect();
     repos.sort_by_key(|r| {
         (
-            !full_hunt_urgent(r),
+            !full_hunt_urgent(r) || held.repo(r.id, RepoJobKind::Hunt),
             r.last_hunt_at.is_some(),
             r.last_hunt_at.unwrap_or(0),
         )
@@ -407,18 +416,25 @@ async fn select(
 
     let now = now_ms();
     for target in &repos {
+        if held.repo_sync(target.id) {
+            continue;
+        }
+        let hunt_held = held.repo(target.id, RepoJobKind::Hunt);
         if !Path::new(&target.path).exists() {
             // Not cloned yet -> hunt does the clone (`scheduler.pick_next`).
+            if hunt_held {
+                continue;
+            }
             return Ok(Some(repo_candidate(RepoJobKind::Hunt, target)));
         }
 
         // An operator asked for a full re-hunt: that hunt goes ahead of
         // the repo's other scans and of the scan interval.
-        if full_hunt_urgent(target) {
+        if full_hunt_urgent(target) && !hunt_held {
             return Ok(Some(repo_candidate(RepoJobKind::Hunt, target)));
         }
 
-        if let Some(kind) = rotation_kind(cfg, target, now) {
+        if let Some(kind) = rotation_kind(cfg, target, now, |k| held.repo(target.id, k)) {
             return Ok(Some(repo_candidate(kind, target)));
         }
         // All scan types ran within their intervals for this repo.
@@ -427,33 +443,53 @@ async fn select(
     Ok(None)
 }
 
-/// The rotation scan `target` is due for at `now`, if any.
-fn rotation_kind(cfg: &Config, target: &Repo, now: i64) -> Option<RepoJobKind> {
+/// The rotation scan `target` is due for at `now`, if any, among the kinds
+/// that are not `held`.
+fn rotation_kind(
+    cfg: &Config,
+    target: &Repo,
+    now: i64,
+    held: impl Fn(RepoJobKind) -> bool,
+) -> Option<RepoJobKind> {
     let scan_interval_ms = (cfg.scan_interval_days * 86_400_000.0) as i64;
     let mod_interval_ms = cfg.modernization_interval_days * 86_400_000;
+    let std_interval_ms = cfg.standards_interval_days * 86_400_000;
 
     // Eligible job types with their last-run timestamps, in
     // RepoJobKind::ALL insertion order (mirrors Python's dict).
     let mut job_times: Vec<(RepoJobKind, i64)> = Vec::with_capacity(RepoJobKind::ALL.len());
-    for (kind, last) in [
-        (RepoJobKind::Hunt, target.last_hunt_at),
-        (RepoJobKind::TestGap, target.last_test_gap_at),
-        (RepoJobKind::DepUpdate, target.last_dep_update_at),
-        (RepoJobKind::Refactor, target.last_refactor_at),
+    for (kind, last, interval_ms) in [
+        (RepoJobKind::Hunt, target.last_hunt_at, scan_interval_ms),
+        (
+            RepoJobKind::TestGap,
+            target.last_test_gap_at,
+            scan_interval_ms,
+        ),
+        (
+            RepoJobKind::DepUpdate,
+            target.last_dep_update_at,
+            scan_interval_ms,
+        ),
+        (
+            RepoJobKind::Refactor,
+            target.last_refactor_at,
+            scan_interval_ms,
+        ),
+        (
+            RepoJobKind::Modernization,
+            target.last_modernization_at,
+            mod_interval_ms,
+        ),
+        (
+            RepoJobKind::Standards,
+            target.last_standards_at,
+            std_interval_ms,
+        ),
     ] {
         let last = last.unwrap_or(0);
-        if last == 0 || (now - last) >= scan_interval_ms {
+        if !held(kind) && (last == 0 || (now - last) >= interval_ms) {
             job_times.push((kind, last));
         }
-    }
-    let last_modernization = target.last_modernization_at.unwrap_or(0);
-    if last_modernization == 0 || (now - last_modernization) >= mod_interval_ms {
-        job_times.push((RepoJobKind::Modernization, last_modernization));
-    }
-    let last_standards = target.last_standards_at.unwrap_or(0);
-    let std_interval_ms = cfg.standards_interval_days * 86_400_000;
-    if last_standards == 0 || (now - last_standards) >= std_interval_ms {
-        job_times.push((RepoJobKind::Standards, last_standards));
     }
 
     // never-run beats stale-run; both tie-break on JOB_TYPE_PRIORITY,
@@ -475,9 +511,10 @@ fn rotation_kind(cfg: &Config, target: &Repo, now: i64) -> Option<RepoJobKind> {
 /// hunt already running when the request landed nor one prepared from a
 /// repo row read before it takes the request's place in the queue. Once a
 /// hunt has attempted the request, it stops jumping the queue — a failing
-/// hunt is retried after the scan interval, not back to back — but stays
-/// pending, so the repo's next hunt is still a full one. Asking again
-/// makes it urgent again.
+/// hunt takes its place in the rotation like any other, bounded by its
+/// failure streak — but stays pending, so the repo's next hunt is still a
+/// full one, and a held hunt leaves it pending until a full-scope hunt
+/// succeeds. Asking again makes it urgent again.
 fn full_hunt_urgent(repo: &Repo) -> bool {
     repo.full_hunt_requested_at.is_some()
         && repo.full_hunt_requested_at != repo.full_hunt_request_attempted
@@ -568,21 +605,24 @@ const MAX_RESUME_ATTEMPTS: i64 = 4;
 const RESUME_PROMPT: &str = "Continue the work you were doing in this session. You were interrupted; \
      pick up where you left off.";
 
-/// The prompt a resumed recheck, engage or harvest gets: [`RESUME_PROMPT`],
-/// or, for the first attempt after the operator continued its hold, one
-/// chosen by the hold's reason (WORK-MODEL.md §9.1), with the hold's detail
-/// as context. Short like [`RESUME_PROMPT`], for the same reason: the
-/// session holds the playbook. A fix's comes with its updated playbook
-/// instead ([`fix_prompt`]).
-fn resume_prompt(kind: FindingJobKind, plan: &ResumePlan) -> String {
+/// The prompt a resumed recheck, engage, harvest, hunt or scan gets:
+/// [`RESUME_PROMPT`], or, for the first attempt after the operator
+/// continued its hold, one chosen by the hold's reason (WORK-MODEL.md
+/// §9.1), with the hold's detail as context. Short like [`RESUME_PROMPT`],
+/// for the same reason: the session holds the playbook. A fix's comes with
+/// its updated playbook instead ([`fix_prompt`]).
+fn resume_prompt(kind: JobKind, plan: &ResumePlan) -> String {
     let Some((reason, detail)) = &plan.after_hold else {
         return RESUME_PROMPT.to_owned();
     };
     let (work, deliverable) = match kind {
-        FindingJobKind::Recheck => ("recheck", "your verdict file"),
-        FindingJobKind::Engage => ("PR engagement", "PR-REPLY.md, or WITHDRAW.md"),
-        FindingJobKind::Fix => ("fix", "PR-DESCRIPTION.md"),
-        FindingJobKind::Harvest => ("PR review", "what the playbook asks for"),
+        JobKind::Finding(FindingJobKind::Recheck) => ("recheck", "your verdict file"),
+        JobKind::Finding(FindingJobKind::Engage) => {
+            ("PR engagement", "PR-REPLY.md, or WITHDRAW.md")
+        }
+        JobKind::Finding(FindingJobKind::Fix) => ("fix", "PR-DESCRIPTION.md"),
+        JobKind::Finding(FindingJobKind::Harvest) => ("PR review", "what the playbook asks for"),
+        JobKind::Repo(_) => ("scan", "the findings file your playbook names"),
     };
     match reason {
         HoldReason::Stuck | HoldReason::GaveUp => format!(
@@ -647,37 +687,53 @@ pub async fn candidate_reservation(
 }
 
 /// The resume tier of [`pick_next`]: the newest suspension that is still
-/// worth continuing, or `None`.
+/// worth continuing.
 ///
 /// Candidates are walked newest-first; [`resume_plan`] decides each one
 /// and ends those that can never be continued, so the walk moves on to
 /// the next in the same cycle — which is what "fall through to normal
-/// selection" means.
+/// selection" means. Held work is skipped, a repo's whole work while its
+/// `sync` is held. A repo chain the give-up ceiling ends is counted as a
+/// failure of its work ([`count_given_up_repo_chain`]): [`Picked::Ended`].
+/// A finding's is counted by its own tier ([`finding_pick`]).
 async fn pick_resume(
     store: &Store,
     cfg: &Config,
     force_id: Option<i64>,
-    held: &BTreeSet<(i64, FindingJobKind)>,
+    held: &crate::store::HeldWork,
     mode: Pick,
-) -> anyhow::Result<Option<Candidate>> {
+) -> anyhow::Result<Picked> {
     for job in store.list_resumable_jobs().await? {
         if force_id.is_some_and(|rid| job.repo_id != rid) {
             continue;
         }
-        if let (Some(fid), Some(kind)) = (job.finding_id, job.kind.as_finding())
-            && held.contains(&(fid, kind))
-        {
+        let is_held = match (job.kind, job.finding_id) {
+            (JobKind::Finding(kind), Some(fid)) => held.finding(fid, kind),
+            (JobKind::Repo(kind), _) => held.repo(job.repo_id, kind),
+            (JobKind::Finding(_), None) => false,
+        };
+        if is_held {
             continue;
         }
-        if let Resumable::Yes(plan) = resume_plan(store, cfg, job, mode).await? {
-            return Ok(Some(Candidate::Resume {
-                label: (!plan.repo.is_empty()).then(|| plan.repo.clone()),
-                budget_override: None,
-                plan,
-            }));
+        let (kind, repo, job_id) = (job.kind, (job.repo_id, job.repo_name.clone()), job.id);
+        match resume_plan(store, cfg, job, mode).await? {
+            Resumable::Yes(plan) => {
+                return Ok(Picked::Work(Candidate::Resume {
+                    label: (!plan.repo.is_empty()).then(|| plan.repo.clone()),
+                    budget_override: None,
+                    plan,
+                }));
+            }
+            Resumable::GaveUp(why) => {
+                if let JobKind::Repo(kind) = kind {
+                    count_given_up_repo_chain(store, (repo.0, &repo.1), kind, job_id, &why).await;
+                    return Ok(Picked::Ended);
+                }
+            }
+            Resumable::No => {}
         }
     }
-    Ok(None)
+    Ok(Picked::Nothing)
 }
 
 /// A finding tier's pick: continue the work item's checkpoint when it has
@@ -733,19 +789,45 @@ async fn finding_pick(
     })
 }
 
-/// What [`finding_pick`] made of one finding of a tier.
+/// What [`finding_pick`] made of one finding of a tier, or [`pick_resume`]
+/// of the resume tier.
 enum Picked {
     /// Run this.
     Work(Candidate),
-    /// Its work ended here (a given-up chain was counted); the selection
+    /// Work ended here (a given-up chain was counted); the selection
     /// starts over, since what that wrote can change every tier.
     Ended,
     /// Nothing to do for it, and nothing changed.
     Nothing,
 }
 
-/// The failure a given-up chain records in its finding's streak.
+/// The failure a given-up chain records in its work item's streak.
 const CHAIN_GAVE_UP: &str = "resume chain gave up";
+
+/// Count a repo chain the give-up ceiling ended (`why`) as one failed
+/// attempt at its work, the failure [`CHAIN_GAVE_UP`] (WORK-MODEL.md §17).
+/// It replaces the rotation bump that used to end the chain's turn: the
+/// work stays as stale as it was, so the rotation starts it fresh at once,
+/// and three given-up chains in a row hold it as `gave_up`, with the chain
+/// as its checkpoint for a `continue`.
+async fn count_given_up_repo_chain(
+    store: &Store,
+    (repo_id, name): (i64, &str),
+    kind: RepoJobKind,
+    job: i64,
+    why: &str,
+) {
+    let detail = format!("{CHAIN_GAVE_UP}: {why}");
+    record_repo_failure(
+        store,
+        (repo_id, name),
+        (kind.into(), Some(job)),
+        CHAIN_GAVE_UP,
+        &detail,
+        HoldReason::GaveUp,
+    )
+    .await;
+}
 
 /// Count a chain of this finding tier's work that the give-up ceiling
 /// ended (`why`) as one failed attempt at that work.
@@ -899,7 +981,11 @@ async fn resume_plan(
             store.last_release_at(fid, kind).await?,
             store.continued_hold(fid, kind, job.id).await?,
         ),
-        _ => (None, None),
+        (JobKind::Repo(kind), _) => (
+            store.repo_last_release_at(job.repo_id, kind).await?,
+            store.repo_continued_hold(job.repo_id, kind, job.id).await?,
+        ),
+        (JobKind::Finding(_), None) => (None, None),
     };
     let own = if released_at.is_some() {
         store.resume_chain_stats(job.id, released_at).await?
@@ -943,24 +1029,12 @@ async fn resume_plan(
         if mode == Pick::Preview {
             return Ok(Resumable::No);
         }
-        // The chain's turn is over. Every attempt in it was a suspension,
-        // which the cycle's starvation bump leaves alone, so a rotation
-        // kind's timestamp is still as old as before the chain started:
-        // rotation would pick the same work fresh in this very selection
-        // and repeat the whole chain, while everything else waited. Hunts
-        // included: a hunt's watermark stays where it was, so the next
-        // hunt reviews the same commits after the scan interval.
-        //
-        // Bumped before the checkpoint is dropped: once dropped, the chain
-        // is no longer resumable and nothing would retry a bump that
-        // failed, whereas a drop that fails after a bump leaves the
-        // checkpoint and the next selection runs both writes again.
-        if let JobKind::Repo(kind) = job.kind {
-            let _ = store.set_last_kind_at(job.repo_id, kind).await;
-        }
-        // Best-effort: the candidate is skipped either way, so a failed
-        // write only defers the record — and only a landed give-up is
-        // reported as one, so the chain is counted once.
+        // The chain's end counts as a failure of its work, where its tier
+        // or the resume tier caught it ([`count_given_up_chain`],
+        // [`count_given_up_repo_chain`]); nothing else moves. Best-effort:
+        // the candidate is skipped either way, so a failed write only
+        // defers the record — and only a landed give-up is reported as
+        // one, so the chain is counted once.
         let retired = end_checkpoint(store, &job, &msg).await;
         return Ok(if retired {
             Resumable::GaveUp(msg)
@@ -1390,20 +1464,33 @@ fn run_cmd_sync(argv: &[&str], timeout_s: u64) -> (i32, String) {
     crate::util::run_cmd(argv, timeout_s)
 }
 
+/// Why a repo could not be synced: the fixed key its `sync` work item's
+/// streak counts (WORK-MODEL.md §17), git's words as the detail, and
+/// whether the network can cause it (a clone or a fetch), so that a host
+/// that is unreachable right now makes it the network's failure instead.
+#[derive(Debug)]
+struct SyncFailure {
+    key: &'static str,
+    detail: String,
+    network: bool,
+}
+
+/// The `sync` failure keys. Fixed strings, so one broken clone counts as
+/// identical failures however git words it.
+const CLONE_FAILED: &str = "clone failed";
+const FETCH_FAILED: &str = "fetch failed";
+const ORIGIN_MISMATCH: &str = "origin mismatch";
+const BRANCH_NOT_FOUND: &str = "branch not found";
+const REPO_NOT_CLONED: &str = "repo not cloned";
+
 /// Clone the repo if it is not cloned yet, then fetch.
 ///
 /// Fetch only — never checkout or pull. The clone is the object store
 /// every chain's worktree is added from, not a working tree anyone runs
 /// in: moving its HEAD would do nothing for the trees, and moving the
 /// trees is exactly what must never happen under a suspended chain.
-/// Returns Ok(()) on success, Err with an error summary on failure.
-async fn sync_repo(
-    store: &Store,
-    repo_url: &str,
-    rpath: &Path,
-    log_prefix: &str,
-    finding_id: Option<i64>,
-) -> Result<(), String> {
+/// Logs nothing: the caller says whose work failed.
+async fn sync_repo(repo_url: &str, rpath: &Path) -> Result<(), SyncFailure> {
     if rpath.exists() {
         // The directory already exists, so the clone is skipped -- which is
         // only safe if it is a clone of *this* repo. `repos/repo-<id>` is
@@ -1428,16 +1515,16 @@ async fn sync_repo(
         .unwrap_or((127, "spawn error".to_owned()));
         let origin = out.trim();
         if rc != 0 || origin != repo_url {
-            let msg = format!(
-                "{} exists but its origin is {} -- expected {repo_url}; \
-                 refusing to work in a clone of a different repository",
-                rpath.display(),
-                if rc == 0 { origin } else { "unreadable" }
-            );
-            let _ = store
-                .log_event("error", &format!("{log_prefix}: {msg}"), None, finding_id)
-                .await;
-            return Err(msg);
+            return Err(SyncFailure {
+                key: ORIGIN_MISMATCH,
+                detail: format!(
+                    "{} exists but its origin is {} -- expected {repo_url}; \
+                     refusing to work in a clone of a different repository",
+                    rpath.display(),
+                    if rc == 0 { origin } else { "unreadable" }
+                ),
+                network: false,
+            });
         }
     } else {
         if let Some(parent) = rpath.parent() {
@@ -1453,16 +1540,11 @@ async fn sync_repo(
         .await
         .unwrap_or((127, "spawn error".to_owned()));
         if rc != 0 {
-            let tail = crate::util::tail(&out, 300);
-            let _ = store
-                .log_event(
-                    "error",
-                    &format!("{log_prefix}: clone failed: {tail}"),
-                    None,
-                    finding_id,
-                )
-                .await;
-            return Err(format!("clone failed: {tail}"));
+            return Err(SyncFailure {
+                key: CLONE_FAILED,
+                detail: format!("clone failed: {}", crate::util::tail(&out, 300)),
+                network: true,
+            });
         }
     }
     let rps = rpath.to_string_lossy().to_string();
@@ -1472,18 +1554,133 @@ async fn sync_repo(
     .await
     .unwrap_or((127, "spawn error".to_owned()));
     if rc != 0 {
-        let tail = crate::util::tail(&out, 300);
-        let _ = store
-            .log_event(
-                "error",
-                &format!("{log_prefix}: git fetch origin failed: {tail}"),
-                None,
-                finding_id,
-            )
-            .await;
-        return Err(format!("git fetch origin failed: {tail}"));
+        return Err(SyncFailure {
+            key: FETCH_FAILED,
+            detail: format!("git fetch origin failed: {}", crate::util::tail(&out, 300)),
+            network: true,
+        });
     }
     Ok(())
+}
+
+/// Sync `repo`'s clone ([`sync_repo`]) and resolve the tip of its default
+/// branch: everything every kind of the repo needs before it can start.
+/// Success ends the `sync` work item's streak.
+async fn sync_to_tip(store: &Store, repo: &Repo) -> Result<String, SyncFailure> {
+    let rpath = PathBuf::from(&repo.path);
+    sync_repo(&repo.url, &rpath).await?;
+    let rev = format!("origin/{}", repo.default_branch);
+    let tip = tokio::task::spawn_blocking(move || crate::workspace::resolve(&rpath, &rev))
+        .await
+        .ok()
+        .flatten();
+    let Some(tip) = tip else {
+        return Err(SyncFailure {
+            key: BRANCH_NOT_FOUND,
+            detail: format!("origin/{} does not resolve", repo.default_branch),
+            network: false,
+        });
+    };
+    log_write_failure(
+        store.repo_work_succeeded(repo.id, RepoWorkKind::Sync).await,
+        format_args!("repo {}: ending the sync streak", repo.id),
+    );
+    Ok(tip)
+}
+
+/// A repo's `kind` work that could not start because the repo could not be
+/// synced: counted once for the repo, on its `sync` work item, which every
+/// kind needs (WORK-MODEL.md §17). A clone or fetch failure while a host
+/// the repo needs is unreachable is the network's: nothing is counted and
+/// the cycle ends denied for the host (#95). Otherwise the error ends the
+/// cycle as it always did.
+async fn repo_sync_failed(
+    store: &Store,
+    (cfg, backend): (&Config, &dyn Backend),
+    repo: &Repo,
+    kind: RepoJobKind,
+    failure: SyncFailure,
+) -> anyhow::Result<CycleSummary> {
+    if failure.network
+        && let Some(host) = unreachable_now(cfg, &repo.url, backend).await
+    {
+        return Ok(offline_denial(store, kind.into(), None, None, host).await);
+    }
+    record_repo_failure(
+        store,
+        (repo.id, &repo.name),
+        (RepoWorkKind::Sync, None),
+        failure.key,
+        &failure.detail,
+        HoldReason::Stuck,
+    )
+    .await;
+    Err(anyhow::anyhow!("{}", failure.detail))
+}
+
+/// Count one failure of `repo`'s `kind` work under `key`, `detail`
+/// describing it, in the work item's streak, as [`record_harvest_failure`]
+/// does for a finding's. The [`MAX_CONSECUTIVE_SAME_FAILURE`]th identical
+/// failure holds the work for the operator as `at_limit`
+/// ([`Store::hold_repo_work`]), with `job` as its checkpoint if a worker
+/// ran in it. A failure does not move `last_<kind>_at`, so the work is
+/// retried as soon as the rotation reaches it again (WORK-MODEL.md §17).
+///
+/// True when the work is now held. A count or a hold that could not be
+/// recorded is reported as such and ends nothing.
+async fn record_repo_failure(
+    store: &Store,
+    (repo_id, repo): (i64, &str),
+    (kind, job): (RepoWorkKind, Option<i64>),
+    key: &str,
+    detail: &str,
+    at_limit: HoldReason,
+) -> bool {
+    let log = |message: String| async move {
+        let _ = store.log_event("error", &message, job, None).await;
+    };
+    let streak = match store.record_repo_failure(repo_id, kind, key).await {
+        Ok(streak) => streak,
+        Err(e) => {
+            log(format!(
+                "{kind} {repo}: {detail}, will retry (not counted: {e})"
+            ))
+            .await;
+            return false;
+        }
+    };
+    if streak < MAX_CONSECUTIVE_SAME_FAILURE {
+        log(format!("{kind} {repo}: {detail}, will retry")).await;
+        return false;
+    }
+    match store
+        .hold_repo_work(repo_id, kind, at_limit, detail, job)
+        .await
+    {
+        Ok(true) => {
+            log(format!(
+                "{kind} {repo}: held after {streak} identical failures ({detail})"
+            ))
+            .await;
+            true
+        }
+        Ok(false) => {
+            log(format!(
+                "{kind} {repo}: {streak} identical failures ({detail}), but the repo is gone \
+                 or already held; nothing held"
+            ))
+            .await;
+            false
+        }
+        Err(e) => {
+            log(format!(
+                "{kind} {repo}: {streak} identical failures ({detail}), but holding it \
+                 failed: {e}; will retry"
+            ))
+            .await;
+            false
+        }
+    }
 }
 
 /// Budget gate: check with backend, return the grant or a denied summary.
@@ -1669,29 +1866,99 @@ fn log_write_failure<T, E: std::fmt::Display>(
         .ok()
 }
 
-/// Fetch `repo`'s clone and return the tip of its default branch: where a
-/// cold hunt's chain is pinned.
-async fn fetch_tip(store: &Store, repo: &Repo) -> anyhow::Result<String> {
-    let rname = &repo.name;
-    let db = &repo.default_branch;
-    let rpath = PathBuf::from(&repo.path);
-    sync_repo(store, &repo.url, &rpath, &format!("hunt {rname}"), None)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let rev = format!("origin/{db}");
-    let tip = tokio::task::spawn_blocking(move || crate::workspace::resolve(&rpath, &rev)).await?;
-    let Some(tip) = tip else {
-        let _ = store
-            .log_event(
-                "error",
-                &format!("hunt {rname}: origin/{db} does not resolve"),
-                None,
-                None,
-            )
-            .await;
-        anyhow::bail!("origin/{db} does not resolve");
-    };
-    Ok(tip)
+/// The failure keys of a hunt's or scan's worker run (WORK-MODEL.md §17).
+/// A worker that did not finish is counted as `worker <state>`.
+const NO_FINDINGS_FILE: &str = "no findings file";
+const INVALID_ENTRIES: &str = "invalid entries";
+
+/// What a hunt's or scan's attempt amounts to for its work item: a pause,
+/// the work's outcome, or a failure with its key and detail. The outcome is
+/// a worker that finished and wrote its output file with no invalid entry.
+/// An empty outcome is a failure: no file, or a file with invalid entries,
+/// whose valid entries are still filed.
+enum RepoAttempt {
+    Paused,
+    Succeeded,
+    Failed { key: String, detail: String },
+}
+
+fn repo_attempt(
+    state: JobState,
+    ingest: Option<&IngestResult>,
+    out_path: &Path,
+    rr: &RunResult,
+) -> RepoAttempt {
+    match (state, ingest) {
+        (JobState::Suspended, _) => RepoAttempt::Paused,
+        (JobState::Done, Some(counts)) if counts.invalid == 0 => RepoAttempt::Succeeded,
+        (JobState::Done, Some(counts)) => RepoAttempt::Failed {
+            key: INVALID_ENTRIES.to_owned(),
+            detail: format!("{}: {} invalid entries", out_path.display(), counts.invalid),
+        },
+        (JobState::Done, None) => RepoAttempt::Failed {
+            key: NO_FINDINGS_FILE.to_owned(),
+            detail: format!("the worker finished without writing {}", out_path.display()),
+        },
+        (state, _) => RepoAttempt::Failed {
+            key: format!("worker {state}"),
+            detail: format!(
+                "worker {state}\n\n{}",
+                crate::util::tail(&rr.stdout_tail, 500)
+            ),
+        },
+    }
+}
+
+/// Count a hunt's or scan's failed attempt `job` on its work item, and say
+/// so in the cycle's summary: held at the limit, else retried.
+async fn count_repo_attempt(
+    store: &Store,
+    repo: &Repo,
+    (kind, job): (RepoJobKind, i64),
+    (key, detail): (&str, &str),
+    summary: &mut CycleSummary,
+) {
+    let held = record_repo_failure(
+        store,
+        (repo.id, &repo.name),
+        (kind.into(), Some(job)),
+        key,
+        detail,
+        HoldReason::Stuck,
+    )
+    .await;
+    summary.failure = Some(detail.to_owned());
+    summary.outcome = Some(if held { "held" } else { "retry" }.into());
+}
+
+/// Count a hunt or scan whose tree could not be made ([`open_workspace`]
+/// has failed its job and logged why) as a failure of its work under the
+/// fixed [`TREE_NOT_MADE`], git's reason as the detail, as for every
+/// finding kind (WORK-MODEL.md §7, G9).
+async fn count_unmade_repo_tree(
+    store: &Store,
+    repo: &Repo,
+    (kind, job): (RepoJobKind, i64),
+    mut summary: CycleSummary,
+) -> CycleSummary {
+    let note = summary.failure.take().unwrap_or_default();
+    count_repo_attempt(
+        store,
+        repo,
+        (kind, job),
+        (TREE_NOT_MADE, &note),
+        &mut summary,
+    )
+    .await;
+    summary
+}
+
+/// `repo`'s `kind` work succeeded: its streak ends.
+async fn repo_succeeded(store: &Store, repo: &Repo, kind: RepoJobKind) {
+    log_write_failure(
+        store.repo_work_succeeded(repo.id, kind.into()).await,
+        format_args!("repo {}: ending the {kind} streak", repo.id),
+    );
 }
 
 /// The findings a cold repo-level prompt hands its worker: those of each
@@ -1769,9 +2036,9 @@ pub async fn run_hunt(
     let head = if let Some(plan) = resume {
         plan.pinned_sha.clone()
     } else {
-        match fetch_tip(store, repo).await {
+        match sync_to_tip(store, repo).await {
             Ok(tip) => tip,
-            Err(e) => {
+            Err(failure) => {
                 // The attempt is over before it had a job. It still answers
                 // the request's place in the queue, or a fetch that keeps
                 // failing would put this hunt first in every cycle.
@@ -1781,7 +2048,8 @@ pub async fn run_hunt(
                         format_args!("repo {rid}: marking full-hunt request {r} attempted"),
                     );
                 }
-                return Err(e);
+                return repo_sync_failed(store, (cfg, backend), repo, RepoJobKind::Hunt, failure)
+                    .await;
             }
         }
     };
@@ -1847,6 +2115,8 @@ pub async fn run_hunt(
         // failed to record it would be re-picked at once (a skipped cycle
         // restarts immediately), so the failure goes to the error path.
         store.set_last_hunt(rid, &head).await?;
+        // Nothing to review is the hunt's outcome too.
+        repo_succeeded(store, repo, RepoJobKind::Hunt).await;
         let _ = store
             .log_event(
                 "hunt",
@@ -2017,7 +2287,9 @@ pub async fn run_hunt(
     .await?
     {
         Ok(opened) => opened,
-        Err(failed) => return Ok(failed),
+        Err(failed) => {
+            return Ok(count_unmade_repo_tree(store, repo, (RepoJobKind::Hunt, job), failed).await);
+        }
     };
     // A resumed worker is still writing to the path its ORIGINAL prompt
     // named, so the attempt that ingests has to look there. Using this
@@ -2033,7 +2305,7 @@ pub async fn run_hunt(
     let suppressions = crate::suppression::suppression_list(repo, suppressed, &pinned).await;
     let repo_notes = Store::repo_notes(&cfg.work_root, rid);
     let prompt = match resume {
-        Some(_) => RESUME_PROMPT.to_owned(),
+        Some(plan) => resume_prompt(RepoJobKind::Hunt.into(), plan),
         None => playbooks::build_hunt_prompt(
             &cfg.root,
             repo,
@@ -2048,7 +2320,7 @@ pub async fn run_hunt(
         )?,
     };
     let model = cfg.model_for("hunt");
-    let rr = backend
+    let rr = match backend
         .run(
             &ws,
             &prompt,
@@ -2057,7 +2329,21 @@ pub async fn run_hunt(
             JobClass::Hunt,
             resume.map(|r| r.session_file.as_path()),
         )
-        .await?;
+        .await
+    {
+        Ok(rr) => rr,
+        Err(e) => {
+            let ran = (WorkOf::Repo(RepoJobKind::Hunt, repo), job);
+            let denied = runner_failed(store, (cfg, backend, &repo.url), ran, &e).await;
+            close_workspace(store, &ws).await;
+            return denied.ok_or(e);
+        }
+    };
+    let ran = (WorkOf::Repo(RepoJobKind::Hunt, repo), job);
+    if let Some(denied) = unmetered_offline(store, cfg, backend, &repo.url, ran, &rr).await {
+        close_workspace(store, &ws).await;
+        return Ok(denied);
+    }
     let state = log_write_failure(
         record_job(store, job, &rr, model, resume).await,
         format_args!("job {job}: recording outcome"),
@@ -2076,7 +2362,7 @@ pub async fn run_hunt(
         ..Default::default()
     };
 
-    if out_path.exists() {
+    let counts = if out_path.exists() {
         let counts = ingest_scan_findings(
             store,
             rid,
@@ -2101,7 +2387,23 @@ pub async fn run_hunt(
                 None,
             )
             .await;
-        if state == JobState::Done && counts.invalid == 0 {
+        Some(counts)
+    } else {
+        let _ = store
+            .log_event(
+                "hunt",
+                &format!(
+                    "{rname}: job {job} {state}, no findings file ({} tok)",
+                    rr.tokens_new
+                ),
+                Some(job),
+                None,
+            )
+            .await;
+        None
+    };
+    match repo_attempt(state, counts.as_ref(), &out_path, &rr) {
+        RepoAttempt::Succeeded => {
             // The chain's pinned commit, never the clone's current tip:
             // see where `head` is resolved.
             log_write_failure(
@@ -2120,21 +2422,21 @@ pub async fn run_hunt(
                     format_args!("repo {rid}: settling full-hunt request for job {job}"),
                 );
             }
+            repo_succeeded(store, repo, RepoJobKind::Hunt).await;
         }
-        summary.ingest = Some(counts);
-    } else {
-        let _ = store
-            .log_event(
-                "hunt",
-                &format!(
-                    "{rname}: job {job} {state}, no findings file ({} tok)",
-                    rr.tokens_new
-                ),
-                Some(job),
-                None,
+        RepoAttempt::Failed { key, detail } => {
+            count_repo_attempt(
+                store,
+                repo,
+                (RepoJobKind::Hunt, job),
+                (&key, &detail),
+                &mut summary,
             )
             .await;
+        }
+        RepoAttempt::Paused => {}
     }
+    summary.ingest = counts;
     crate::suppression::apply_reconfirmations(
         store,
         repo,
@@ -2303,16 +2605,18 @@ pub async fn run_recheck(
     let rpath = PathBuf::from(&repo.path);
     // Never on a resume: a resumed chain continues in its own tree, and
     // nothing is fetched for it.
-    if resume.is_none() {
-        sync_repo(
-            store,
-            &repo.url,
-            &rpath,
-            &format!("recheck #{fid}"),
-            Some(fid),
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if resume.is_none()
+        && let Err(failure) = sync_repo(&repo.url, &rpath).await
+    {
+        let _ = store
+            .log_event(
+                "error",
+                &format!("recheck #{fid}: {}", failure.detail),
+                None,
+                Some(fid),
+            )
+            .await;
+        anyhow::bail!("{}", failure.detail);
     }
 
     let override_mode = finding.budget_override;
@@ -2406,7 +2710,7 @@ pub async fn run_recheck(
 
     let repo_notes = Store::repo_notes(&cfg.work_root, repo.id);
     let prompt = match resume {
-        Some(plan) => resume_prompt(FindingJobKind::Recheck, plan),
+        Some(plan) => resume_prompt(FindingJobKind::Recheck.into(), plan),
         None => playbooks::build_recheck_prompt(
             &cfg.root,
             finding,
@@ -2430,13 +2734,13 @@ pub async fn run_recheck(
     {
         Ok(rr) => rr,
         Err(e) => {
-            let ran = (FindingJobKind::Recheck, fid, job);
+            let ran = (WorkOf::Finding(FindingJobKind::Recheck, fid), job);
             let denied = runner_failed(store, (cfg, backend, &repo.url), ran, &e).await;
             close_workspace(store, &ws).await;
             return denied.ok_or(e);
         }
     };
-    let ran = (FindingJobKind::Recheck, fid, job);
+    let ran = (WorkOf::Finding(FindingJobKind::Recheck, fid), job);
     if let Some(denied) = unmetered_offline(store, cfg, backend, &repo.url, ran, &rr).await {
         close_workspace(store, &ws).await;
         return Ok(denied);
@@ -2799,22 +3103,19 @@ async fn run_analysis_job(
     let kind = spec.kind;
 
     if !rpath.exists() {
-        let _ = store
-            .log_event(
-                "error",
-                &format!("{kind} {rname}: repo not cloned"),
-                None,
-                None,
-            )
-            .await;
-        anyhow::bail!("repo not cloned");
+        let failure = SyncFailure {
+            key: REPO_NOT_CLONED,
+            detail: format!("{} is not cloned", rpath.display()),
+            network: false,
+        };
+        return repo_sync_failed(store, (cfg, backend), repo, kind, failure).await;
     }
     // Never on a resume: a resumed chain continues in its own tree, and
     // nothing is fetched for it.
-    if resume.is_none() {
-        sync_repo(store, &repo.url, &rpath, &format!("{kind} {rname}"), None)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if resume.is_none()
+        && let Err(failure) = sync_to_tip(store, repo).await
+    {
+        return repo_sync_failed(store, (cfg, backend), repo, kind, failure).await;
     }
 
     let types: Vec<&str> = std::iter::once(&spec.finding_type)
@@ -2876,7 +3177,7 @@ async fn run_analysis_job(
     .await?
     {
         Ok(opened) => opened,
-        Err(failed) => return Ok(failed),
+        Err(failed) => return Ok(count_unmade_repo_tree(store, repo, (kind, job), failed).await),
     };
     // The continuing worker still writes the path its original prompt
     // named; see `run_hunt`.
@@ -2890,7 +3191,7 @@ async fn run_analysis_job(
     let suppressions = crate::suppression::suppression_list(repo, suppressed, &pinned).await;
     let repo_notes = Store::repo_notes(&cfg.work_root, rid);
     let prompt = match resume {
-        Some(_) => RESUME_PROMPT.to_owned(),
+        Some(plan) => resume_prompt(kind.into(), plan),
         None => (spec.prompt_builder)(
             &cfg.root,
             repo,
@@ -2904,7 +3205,7 @@ async fn run_analysis_job(
         )?,
     };
     let model = cfg.model_for("hunt");
-    let rr = backend
+    let rr = match backend
         .run(
             &ws,
             &prompt,
@@ -2913,7 +3214,21 @@ async fn run_analysis_job(
             JobClass::Hunt,
             resume.map(|r| r.session_file.as_path()),
         )
-        .await?;
+        .await
+    {
+        Ok(rr) => rr,
+        Err(e) => {
+            let ran = (WorkOf::Repo(kind, repo), job);
+            let denied = runner_failed(store, (cfg, backend, &repo.url), ran, &e).await;
+            close_workspace(store, &ws).await;
+            return denied.ok_or(e);
+        }
+    };
+    let ran = (WorkOf::Repo(kind, repo), job);
+    if let Some(denied) = unmetered_offline(store, cfg, backend, &repo.url, ran, &rr).await {
+        close_workspace(store, &ws).await;
+        return Ok(denied);
+    }
     let state = log_write_failure(
         record_job(store, job, &rr, model, resume).await,
         format_args!("job {job}: recording outcome"),
@@ -2928,7 +3243,7 @@ async fn run_analysis_job(
         ..Default::default()
     };
 
-    if out_path.exists() {
+    let counts = if out_path.exists() {
         let counts = ingest_scan_findings(store, rid, &out_path, spec.entry_types(), job).await;
         let _ = store
             .log_event(
@@ -2945,14 +3260,7 @@ async fn run_analysis_job(
                 None,
             )
             .await;
-        if state == JobState::Done && counts.invalid == 0 {
-            // Update last_{kind}_at timestamp
-            log_write_failure(
-                store.set_last_kind_at(rid, kind).await,
-                format_args!("repo {rid}: recording last {kind} run"),
-            );
-        }
-        summary.ingest = Some(counts);
+        Some(counts)
     } else {
         let _ = store
             .log_event(
@@ -2965,7 +3273,22 @@ async fn run_analysis_job(
                 None,
             )
             .await;
+        None
+    };
+    match repo_attempt(state, counts.as_ref(), &out_path, &rr) {
+        RepoAttempt::Succeeded => {
+            log_write_failure(
+                store.set_last_kind_at(rid, kind).await,
+                format_args!("repo {rid}: recording last {kind} run"),
+            );
+            repo_succeeded(store, repo, kind).await;
+        }
+        RepoAttempt::Failed { key, detail } => {
+            count_repo_attempt(store, repo, (kind, job), (&key, &detail), &mut summary).await;
+        }
+        RepoAttempt::Paused => {}
     }
+    summary.ingest = counts;
     crate::suppression::apply_reconfirmations(store, repo, &types, &out_path, &pinned).await;
     close_workspace(store, &ws).await;
     Ok(summary)
@@ -3084,20 +3407,18 @@ pub async fn run_dep_update(
     }
     let rpath = std::path::PathBuf::from(&repo.path);
     if !rpath.exists() {
-        let _ = store
-            .log_event(
-                "error",
-                &format!("dep_update {}: repo not cloned", repo.name),
-                None,
-                None,
-            )
-            .await;
-        anyhow::bail!("repo not cloned");
+        let failure = SyncFailure {
+            key: REPO_NOT_CLONED,
+            detail: format!("{} is not cloned", rpath.display()),
+            network: false,
+        };
+        let kind = RepoJobKind::DepUpdate;
+        return repo_sync_failed(store, (cfg, backend), repo, kind, failure).await;
     }
-
-    sync_repo(store, &repo.url, &rpath, "dep_update", None)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if let Err(failure) = sync_to_tip(store, repo).await {
+        let kind = RepoJobKind::DepUpdate;
+        return repo_sync_failed(store, (cfg, backend), repo, kind, failure).await;
+    }
 
     // Try Renovate (zero tokens). Its answer is authoritative even when it
     // is "nothing to update"; only an unavailable scan falls back to AI.
@@ -3166,21 +3487,42 @@ pub async fn run_dep_update(
         )
         .await;
 
-    // Only advance timestamp after successful ingestion (no invalid entries)
+    Ok(renovate_outcome(store, repo, counts).await)
+}
+
+/// What a Renovate scan amounts to for the repo's `dep_update` work: one
+/// that settled is its outcome, and only then does its timestamp move. One
+/// with invalid entries filed its valid ones and failed; it has no job, so
+/// nothing to continue from.
+async fn renovate_outcome(store: &Store, repo: &Repo, counts: IngestResult) -> CycleSummary {
+    let mut summary = CycleSummary {
+        kind: Some(RepoJobKind::DepUpdate.into()),
+        repo: Some(repo.name.clone()),
+        state: Some(JobState::Done),
+        ..Default::default()
+    };
     if counts.invalid == 0 {
         log_write_failure(
             store.set_last_dep_update(repo.id).await,
             format_args!("repo {}: recording last dep_update run", repo.id),
         );
+        repo_succeeded(store, repo, RepoJobKind::DepUpdate).await;
+    } else {
+        let detail = format!("renovate scan: {} invalid entries", counts.invalid);
+        let held = record_repo_failure(
+            store,
+            (repo.id, &repo.name),
+            (RepoWorkKind::DepUpdate, None),
+            INVALID_ENTRIES,
+            &detail,
+            HoldReason::Stuck,
+        )
+        .await;
+        summary.failure = Some(detail);
+        summary.outcome = Some(if held { "held" } else { "retry" }.into());
     }
-
-    Ok(CycleSummary {
-        kind: Some(RepoJobKind::DepUpdate.into()),
-        repo: Some(repo.name.clone()),
-        state: Some(JobState::Done),
-        ingest: Some(counts),
-        ..Default::default()
-    })
+    summary.ingest = Some(counts);
+    summary
 }
 pub async fn run_refactor(
     store: &Store,
@@ -3825,15 +4167,38 @@ async fn count_unmade_engage_tree(
     summary
 }
 
-/// The failure a finding's work records when the backend could not run its
+/// The failure a work item records when the backend could not run its
 /// worker at all (`Backend::run` returned an error). The error follows it
 /// in the detail; it is not the key, which must stay the same for one
 /// outage to count as identical failures.
 const RUNNER_ERROR: &str = "runner error";
 
-/// Count a finding's work whose backend failed before any worker ran
-/// (WORK-MODEL.md §7). The job is closed `failed` as unstarted rather than
-/// left `running`, and the failure goes through the kind's own streak, so
+/// Whose work an attempt was: a finding's, or a repo's.
+#[derive(Clone, Copy)]
+enum WorkOf<'a> {
+    Finding(FindingJobKind, i64),
+    Repo(RepoJobKind, &'a Repo),
+}
+
+impl WorkOf<'_> {
+    fn job_kind(self) -> JobKind {
+        match self {
+            Self::Finding(kind, _) => kind.into(),
+            Self::Repo(kind, _) => kind.into(),
+        }
+    }
+
+    fn finding_id(self) -> Option<i64> {
+        match self {
+            Self::Finding(_, fid) => Some(fid),
+            Self::Repo(..) => None,
+        }
+    }
+}
+
+/// Count work whose backend failed before any worker ran (WORK-MODEL.md
+/// §7). The job is closed `failed` as unstarted rather than left
+/// `running`, and the failure goes through the work item's own streak, so
 /// a backend that keeps failing ends in a hold instead of the same work
 /// being picked again every cycle. The caller releases what it holds (a
 /// fix's claim, the tree) and returns the error, which fails the cycle as
@@ -3847,7 +4212,7 @@ const RUNNER_ERROR: &str = "runner error";
 async fn runner_failed(
     store: &Store,
     (cfg, backend, repo_url): (&Config, &dyn Backend, &str),
-    (kind, fid, job): (FindingJobKind, i64, i64),
+    (work, job): (WorkOf<'_>, i64),
     err: &anyhow::Error,
 ) -> Option<CycleSummary> {
     if let Some(host) = unreachable_now(cfg, repo_url, backend).await {
@@ -3860,7 +4225,9 @@ async fn runner_failed(
                 .await,
             format_args!("job {job}: failing unstarted"),
         );
-        return Some(offline_denial(store, kind.into(), Some(fid), Some(job), host).await);
+        return Some(
+            offline_denial(store, work.job_kind(), work.finding_id(), Some(job), host).await,
+        );
     }
     let detail = format!("{RUNNER_ERROR}: {err}");
     log_write_failure(
@@ -3868,6 +4235,21 @@ async fn runner_failed(
         format_args!("job {job}: failing unstarted"),
     );
     let mut summary = CycleSummary::default();
+    let (kind, fid) = match work {
+        WorkOf::Finding(kind, fid) => (kind, fid),
+        WorkOf::Repo(kind, repo) => {
+            record_repo_failure(
+                store,
+                (repo.id, &repo.name),
+                (kind.into(), Some(job)),
+                RUNNER_ERROR,
+                &detail,
+                HoldReason::Stuck,
+            )
+            .await;
+            return None;
+        }
+    };
     match kind {
         FindingJobKind::Recheck => {
             handle_recheck_failure(
@@ -4292,14 +4674,14 @@ pub async fn run_fix(
         Err(e) => {
             // Counted while the claim still holds the finding, as a
             // worker's failure is.
-            let ran = (FindingJobKind::Fix, fid, start.job);
+            let ran = (WorkOf::Finding(FindingJobKind::Fix, fid), start.job);
             let denied = runner_failed(store, (cfg, backend, &start.repo.url), ran, &e).await;
             release_claim(store, fid).await;
             close_workspace(store, &start.ws).await;
             return denied.ok_or(e);
         }
     };
-    let ran = (FindingJobKind::Fix, fid, start.job);
+    let ran = (WorkOf::Finding(FindingJobKind::Fix, fid), start.job);
     if let Some(denied) = unmetered_offline(store, cfg, backend, &start.repo.url, ran, &rr).await {
         release_claim(store, fid).await;
         close_workspace(store, &start.ws).await;
@@ -5506,7 +5888,7 @@ fn engage_prompt(
     let Some(pr) = &start.pr else {
         return Ok(resume.map_or_else(
             || RESUME_PROMPT.to_owned(),
-            |plan| resume_prompt(FindingJobKind::Engage, plan),
+            |plan| resume_prompt(FindingJobKind::Engage.into(), plan),
         ));
     };
     let repo_notes = Store::repo_notes(&cfg.work_root, start.repo.id);
@@ -5553,13 +5935,13 @@ pub async fn run_engage(
     {
         Ok(rr) => rr,
         Err(e) => {
-            let ran = (FindingJobKind::Engage, fid, start.job);
+            let ran = (WorkOf::Finding(FindingJobKind::Engage, fid), start.job);
             let denied = runner_failed(store, (cfg, backend, &start.repo.url), ran, &e).await;
             close_workspace(store, &start.ws).await;
             return denied.ok_or(e);
         }
     };
-    let ran = (FindingJobKind::Engage, fid, start.job);
+    let ran = (WorkOf::Finding(FindingJobKind::Engage, fid), start.job);
     if let Some(denied) = unmetered_offline(store, cfg, backend, &start.repo.url, ran, &rr).await {
         close_workspace(store, &start.ws).await;
         return Ok(denied);
@@ -6168,7 +6550,7 @@ pub async fn run_harvest(
         // playbook, so it gets the short prompt.
         None => resume.map_or_else(
             || RESUME_PROMPT.to_owned(),
-            |plan| resume_prompt(FindingJobKind::Harvest, plan),
+            |plan| resume_prompt(FindingJobKind::Harvest.into(), plan),
         ),
         Some(pr) if closed => playbooks::build_harvest_closed_prompt(
             &cfg.root,
@@ -6221,14 +6603,14 @@ pub async fn run_harvest(
                 );
                 None
             } else {
-                let ran = (FindingJobKind::Harvest, fid, job);
+                let ran = (WorkOf::Finding(FindingJobKind::Harvest, fid), job);
                 runner_failed(store, (cfg, backend, &repo.url), ran, &e).await
             };
             close_workspace(store, &ws).await;
             return denied.ok_or(e);
         }
     };
-    let ran = (FindingJobKind::Harvest, fid, job);
+    let ran = (WorkOf::Finding(FindingJobKind::Harvest, fid), job);
     if let Some(denied) = unmetered_offline(store, cfg, backend, &repo.url, ran, &rr).await {
         close_workspace(store, &ws).await;
         return Ok(denied);
@@ -6670,10 +7052,10 @@ async fn offline_denial(
     }
 }
 
-/// A finding's worker that failed without doing any metered work, while a
-/// host its work needs is unreachable: it never got to the work, so its
-/// failure is not counted. Its job is closed `failed` as unstarted, which
-/// leaves the checkpoint it was continuing in place, and the cycle ends as
+/// A worker that failed without doing any metered work, while a host its
+/// work needs is unreachable: it never got to the work, so its failure is
+/// not counted. Its job is closed `failed` as unstarted, which leaves the
+/// checkpoint it was continuing in place, and the cycle ends as
 /// [`offline_denial`]. `None` for any other run: one that did metered work
 /// failed at the work, and is counted as before.
 async fn unmetered_offline(
@@ -6681,7 +7063,7 @@ async fn unmetered_offline(
     cfg: &Config,
     backend: &dyn Backend,
     repo_url: &str,
-    (kind, fid, job): (FindingJobKind, i64, i64),
+    (work, job): (WorkOf<'_>, i64),
     rr: &RunResult,
 ) -> Option<CycleSummary> {
     if !matches!(job_state(rr), JobState::Failed | JobState::Killed) || rr.tokens_new > 0 {
@@ -6697,7 +7079,7 @@ async fn unmetered_offline(
             .await,
         format_args!("job {job}: failing unstarted"),
     );
-    Some(offline_denial(store, kind.into(), Some(fid), Some(job), host).await)
+    Some(offline_denial(store, work.job_kind(), work.finding_id(), Some(job), host).await)
 }
 
 /// The host `candidate` needs that cannot be reached, if any; always
@@ -6739,21 +7121,6 @@ pub async fn run_cycle(
             }
         }
     }
-}
-
-/// Whether a rotation scan's attempt ran to an end — done, killed or
-/// failed — and so took that scan's turn. (One that crashed is an `Err`
-/// from its runner, which the cycle bumps on its own.)
-///
-/// Whether it succeeded does not matter here: a clean success has its
-/// runner advance `last_{kind}_at` to now already, so bumping it again
-/// changes nothing. Suspended and denied attempts did not end: the first
-/// is continued by the resume tier, the second never started.
-fn attempt_ended(result: &CycleSummary) -> bool {
-    matches!(
-        result.state,
-        Some(JobState::Done | JobState::Killed | JobState::Failed)
-    )
 }
 
 /// Run the picked candidate through its kind's executor.
@@ -6926,54 +7293,12 @@ async fn run_cycle_inner(
         });
     }
 
-    let dispatched = dispatch(store, cfg, backend, &candidate).await;
-    // Starvation prevention for rotation kinds: a scan whose attempt ended
-    // has its `last_{kind}_at` bumped, so it is retried after its interval
-    // instead of being re-picked at once. The runners only advance that
-    // timestamp (and, for hunt, the `last_hunt_sha` watermark) on a clean
-    // success — done, an output file, no invalid entry — so without this
-    // an attempt that keeps failing would be the stalest work in the
-    // rotation forever: re-run every cycle, and every other repo's scans
-    // starved behind it. The bump records the attempt, not success; the
-    // hunt watermark stays where it was, so the retry reviews the same
-    // commits again.
-    //
-    // Suspended is deliberately absent. A cap kill is a pause, and
-    // re-selecting that work is no longer this bump's job: the resume
-    // tier claims it by id at a priority above rotation. Were it bumped
-    // here it would be counted as a turn taken, while the work itself had
-    // not finished. A chain that never finishes is retired by the give-up
-    // ceiling, which bumps the timestamp itself (`resume_plan`): that is
-    // where the chain's turn ends.
-    //
-    // A resumed attempt counts exactly like a fresh one. When it ends
-    // killed or failed the chain is over and the resume tier has nothing
-    // left to claim, so without the bump rotation would start the same
-    // work fresh.
-    let rotation = match candidate.job_kind() {
-        JobKind::Repo(kind) => Some((candidate.repo_id(), kind)),
-        JobKind::Finding(_) => None,
-    };
-    let mut result = match dispatched {
-        Ok(result) => result,
-        Err(e) => {
-            if let Some((repo_id, kind)) = rotation {
-                log_write_failure(
-                    store.set_last_kind_at(repo_id, kind).await,
-                    format_args!("repo {repo_id}: recording last {kind} run"),
-                );
-            }
-            return Err(e);
-        }
-    };
-    if let Some((repo_id, kind)) = rotation
-        && attempt_ended(&result)
-    {
-        log_write_failure(
-            store.set_last_kind_at(repo_id, kind).await,
-            format_args!("repo {repo_id}: recording last {kind} run"),
-        );
-    }
+    // A repo kind's `last_{kind}_at` moves only when its runner succeeds.
+    // A failure is counted on its work item and leaves the timestamp
+    // alone, so the work is retried as soon as the rotation reaches it and
+    // is held after three identical failures (WORK-MODEL.md §17), where it
+    // used to be bumped here and wait out its interval each time.
+    let mut result = dispatch(store, cfg, backend, &candidate).await?;
 
     if sync.is_some() {
         result.sync = sync;

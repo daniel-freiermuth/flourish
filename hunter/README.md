@@ -289,31 +289,35 @@ positive. An absent or zero estimate is not a zero-token allowance;
 the attempt ceiling and provider budget still bound the run.
 
 A rotation scan (tier 7) that does not succeed — the worker fails or is
-killed, the job crashes, or it finishes without output or with any invalid
-entry — still counts as that scan's turn: its `last_<kind>_at` moves to now,
-so it is retried after its interval instead of being picked again at once
-and starving every other repo. A failed hunt leaves its watermark where it
-was, so the retry reviews the same commits. A suspended attempt is not a
-turn taken; tier 6 continues it, and a chain abandoned at the give-up
-ceiling counts as one.
+killed, its backend or tree fails, or it finishes without output or with
+any invalid entry — is a failure of that scan: its `last_<kind>_at` stays
+where it was, so it is retried as soon as the rotation reaches it, and the
+third identical failure in a row holds it for you. A failed hunt leaves its
+watermark where it was, so the retry reviews the same commits. A failure
+that breaks the whole repo (the clone or fetch fails, the clone's origin is
+another repository, `origin/<branch>` does not resolve) is counted once,
+on the repo's **sync**; while that is held, nothing of the repo runs. A
+held scan is skipped and the turn passes on. A suspended attempt is not a
+failure; tier 6 continues it, and a chain abandoned at the give-up ceiling
+counts as one failure.
 
-A repeatedly-failing item (same failure reason, consecutive attempts) gives
-up after a bounded streak rather than looping forever — this applies
-uniformly to fix retries, recheck retries, and harvest retries. A resume
+A repeatedly-failing item (same failure reason, consecutive attempts) is
+held for you after a bounded streak rather than looping forever — this
+applies uniformly to every finding kind and every repo scan. A resume
 chain has the same kind of ceiling, on either of two counts: once it has
 made four useful-work attempts, or once — after at least one resume —
 everything it spent *besides its single largest attempt* is past three
 times what that kind of job typically costs. Whichever fires, the
-suspension is marked `failed` (reason `give-up`) instead of being
-continued again. A chain
+work item drops the suspension as its checkpoint (the job row stays as it
+ended) instead of continuing it again. A chain
 that has never been resumed is never retired: one attempt's spend is by
 definition at least its own cap, and the largest attempt is discounted
 because one enormous attempt says the job is big, not that the chain is
-stuck. For every finding kind (recheck, fix, engage, harvest) a given-up
-chain is one failed attempt in that finding's streak, so three given-up
+stuck. For every kind, finding work and repo scans alike, a given-up
+chain is one failed attempt in that work's streak, so three given-up
 chains in a row hold the work like three identical failures; otherwise a
-worker that suspends on every attempt would have its finding's tier start
-it fresh forever. The ceiling bounds what
+worker that suspends on every attempt would have its work started fresh
+forever. The ceiling bounds what
 the scheduler continues on its own, so it counts only the attempts since
 you last released the work: **Continue** on a held fix gives its chain a
 fresh budget, and after that it is bounded like any other.
@@ -333,8 +337,8 @@ after any of them it can never usefully be continued:
   for engage/harvest/recheck/fix, same repo and kind for hunt and the
   analysis scans — ends the checkpoint in the same transaction that
   creates the fresh job, whichever path started it: a finding's work
-  item drops its pointer, a repo scan's suspended attempt is marked
-  `killed` (reason `superseded`).
+  item drops its pointer, finding work and repo scans alike; the old
+  attempt's row stays as it ended.
 - **Working directory gone.** Every kind runs in its chain's own
   workspace, `<work_root>/jobs/<origin_id>/`, and the transcript is full
   of absolute paths into it — `tree/`, the git worktree of the repo's

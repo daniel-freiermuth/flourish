@@ -1773,6 +1773,11 @@ async fn a_runner_error_while_the_provider_is_unreachable_counts_nothing() {
         .expect("the network's failure ends the cycle denied, not failed");
 
     assert_eq!(denied.unreachable.as_deref(), Some(provider));
+    assert_eq!(
+        denied.finding_id,
+        Some(f.fid),
+        "the denial names its finding"
+    );
     assert!(denied.retry_at.is_some(), "{denied:?}");
     assert_eq!(fix_streak(&f).await.streak, 0);
     assert_eq!(held(&f).await, None, "nothing counted, nothing held");
