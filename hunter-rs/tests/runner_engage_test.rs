@@ -1687,12 +1687,16 @@ fn pr_with_comments(bins: &FakeBins, comments: &[(&str, String)]) {
     );
 }
 
-/// Run a reply-only engage against a PR showing no feedback, then sync the
-/// PR as it reads afterwards; the attention that sync leaves.
-async fn attention_after_reply(label: &str, afterwards: &[(&str, String)]) -> Option<String> {
+/// Run a reply-only engage against a PR showing `shown`, then sync the PR
+/// as it reads afterwards; the attention that sync leaves.
+async fn attention_after_reply(
+    label: &str,
+    shown: &[(&str, String)],
+    afterwards: &[(&str, String)],
+) -> Option<String> {
     let f = fixture(label).await;
     let bins = FakeBins::acquire(label);
-    bins.ok("gh", PR_VIEW_JSON);
+    pr_with_comments(&bins, shown);
     push_to(&f, None).await;
     let backend = ScriptedBackend::writing("PR-REPLY.md", "answered");
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
@@ -1715,6 +1719,7 @@ async fn attention_after_reply(label: &str, afterwards: &[(&str, String)]) -> Op
 async fn feedback_posted_while_an_engage_runs_is_new_after_its_reply() {
     let attention = attention_after_reply(
         "engage-feedback-mid-run",
+        &[],
         &[
             ("lead", "one more thing".to_owned()),
             ("lead", hunter::forge::mark_own("answered")),
@@ -1722,6 +1727,21 @@ async fn feedback_posted_while_an_engage_runs_is_new_after_its_reply() {
     )
     .await;
     assert_eq!(attention.as_deref(), Some("new_comments"));
+}
+
+/// What the worker was shown is what its reply answers: that feedback is
+/// not raised again, though the engage did not run at the time it was
+/// posted.
+#[tokio::test]
+async fn feedback_the_worker_was_shown_is_answered_by_its_reply() {
+    let asked = ("lead", "please rename it".to_owned());
+    let attention = attention_after_reply(
+        "engage-feedback-shown",
+        std::slice::from_ref(&asked),
+        &[asked.clone(), ("lead", hunter::forge::mark_own("renamed"))],
+    )
+    .await;
+    assert_eq!(attention, None);
 }
 
 /// Hunter may post as the operator, so its reply and the operator's
@@ -1735,7 +1755,7 @@ async fn hunters_own_reply_is_not_new_feedback_but_the_operators_comment_is() {
         ("answered".to_owned(), Some("new_comments")),
     ] {
         let label = format!("engage-own-reply-{}", flagged.is_some());
-        let attention = attention_after_reply(&label, &[("lead", body.clone())]).await;
+        let attention = attention_after_reply(&label, &[], &[("lead", body.clone())]).await;
         assert_eq!(attention.as_deref(), flagged, "{body:?}");
     }
 }
@@ -1784,6 +1804,29 @@ async fn feedback_posted_while_an_engage_was_suspended_is_new_after_it_resumes()
     let result = hunter::scheduler::sync_prs(&f.store, &f.cfg).await;
     assert_eq!(result.errors, 0, "{result:?}");
     assert_eq!(f.attention().await.as_deref(), Some("new_comments"));
+}
+
+/// A resume inherits what its chain's first attempt was shown, so the
+/// reply it finally posts answers that feedback even though the resumed
+/// attempt never reads the PR.
+#[tokio::test]
+async fn feedback_a_resumed_worker_was_shown_is_answered_by_its_reply() {
+    let f = fixture("engage-feedback-shown-resumed").await;
+    let bins = FakeBins::acquire("engage-feedback-shown-resumed");
+    let asked = ("lead", "please rename it".to_owned());
+    pr_with_comments(&bins, std::slice::from_ref(&asked));
+    push_to(&f, None).await;
+
+    let summary = suspend_and_resume(&f, suspend_then_reply(), || {}).await;
+    assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
+
+    pr_with_comments(
+        &bins,
+        &[asked, ("lead", hunter::forge::mark_own("renamed"))],
+    );
+    let result = hunter::scheduler::sync_prs(&f.store, &f.cfg).await;
+    assert_eq!(result.errors, 0, "{result:?}");
+    assert_eq!(f.attention().await, None);
 }
 
 /// A push that fails leaves the engage incomplete: no reply is posted, the
