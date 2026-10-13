@@ -1,0 +1,12 @@
+-- The newest feedback an engage chain's worker was shown (epoch ms).
+--
+-- Set by the chain's first attempt from the PR it read before building
+-- the prompt. A resumed attempt copies it from the attempt it continues at
+-- INSERT, as with pinned_sha: a resume is prompted only to carry on, so
+-- feedback that arrived while the chain was suspended was never shown to
+-- the worker, and the PR's engagement watermark must stop at what was.
+-- Advancing it to "now" instead hid every comment posted during the run.
+--
+-- NULL for every non-engage job, and for every row written before this
+-- column existed; such a chain falls back to the PR's last synced activity.
+ALTER TABLE jobs ADD COLUMN seen_activity_at INTEGER;

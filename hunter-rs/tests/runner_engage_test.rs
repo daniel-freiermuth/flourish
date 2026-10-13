@@ -695,8 +695,8 @@ async fn pushed_commits_land_on_the_branch_and_clear_the_addressed_state() {
     assert_eq!(row.addressed_head_sha, None);
     assert_eq!(
         row.last_engaged_activity_at,
-        Some(1),
-        "without a reply the watermark is the PR's own last activity"
+        Some(0),
+        "the watermark is the newest feedback the worker was shown: none"
     );
     assert!(
         !bins.called_with("gh", "comment"),
@@ -727,7 +727,7 @@ async fn a_no_op_engage_marks_the_attention_addressed_and_touches_nothing() {
     let row = f.pr_row().await;
     assert_eq!(row.addressed_fingerprint.as_deref(), Some("af-1"));
     assert_eq!(row.addressed_head_sha.as_deref(), Some("deadbeef"));
-    assert_eq!(row.last_engaged_activity_at, Some(1));
+    assert_eq!(row.last_engaged_activity_at, Some(0));
     assert!(
         f.events("engage")
             .await
@@ -1568,10 +1568,10 @@ fn committing_and_replying() -> ScriptedBackend {
 }
 
 /// A finished engage publishes its commits to the PR branch and its reply
-/// on the PR, then records the engagement: the PR counts as answered from
-/// a moment after now (so the reply itself is not new activity), the
-/// attention reason is not marked addressed (the push changed the PR), and
-/// a one-shot budget override is spent.
+/// on the PR, then records the engagement: the PR counts as answered up to
+/// the newest feedback the worker was shown (none here), the attention
+/// reason is not marked addressed (the push changed the PR), and a one-shot
+/// budget override is spent.
 #[tokio::test]
 async fn a_finished_engage_pushes_replies_and_records_it() {
     let f = fixture("engage-publish").await;
@@ -1585,11 +1585,9 @@ async fn a_finished_engage_pushes_replies_and_records_it() {
     let backend = committing_and_replying();
 
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-    let before = hunter::util::now_ms();
     let summary = hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &backend, None)
         .await
         .unwrap();
-    let after = hunter::util::now_ms();
 
     assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
     assert_eq!(
@@ -1604,12 +1602,6 @@ async fn a_finished_engage_pushes_replies_and_records_it() {
     assert_eq!(
         support::git(&origin, &["log", "-1", "--format=%s", BRANCH]).trim(),
         "address review"
-    );
-    let ps = f.store.get_pr_state(f.fid).await.unwrap().unwrap();
-    let engaged = ps.last_engaged_activity_at.unwrap();
-    assert!(
-        (before + 3_000..=after + 3_000).contains(&engaged),
-        "{engaged} not 3 s after [{before}, {after}]"
     );
     assert_eq!(f.addressed_fp().await, None);
     let events = f.store.recent_events(20).await.unwrap();
@@ -1660,6 +1652,138 @@ async fn a_reply_only_engage_marks_the_attention_addressed() {
         finding.budget_override,
         Some(hunter::domain::BudgetOverride::Exempt)
     );
+}
+
+// -- what counts as new feedback after an engage ------------------------------
+
+/// Script `gh` as the PR now reads: open, nothing else wrong with it, and
+/// `comments` (login, body) a day apart. `lead` can push, nobody else.
+fn pr_with_comments(bins: &FakeBins, comments: &[(&str, String)]) {
+    let comments: Vec<String> = comments
+        .iter()
+        .enumerate()
+        .map(|(i, (login, body))| {
+            format!(
+                r#"{{"id":"IC_{i}","author":{{"login":"{login}"}},"body":{},"createdAt":"2026-01-0{}T00:00:00Z"}}"#,
+                serde_json::to_string(body).unwrap(),
+                i + 2
+            )
+        })
+        .collect();
+    bins.script(
+        "gh",
+        &format!(
+            "case \"$*\" in\n\
+             \x20 *collaborators/lead/permission*) echo true; exit 0 ;;\n\
+             \x20 *permission*) echo false; exit 0 ;;\n\
+             esac\n\
+             cat <<'__PR_EOF__'\n\
+             {{\"state\":\"OPEN\",\"mergeable\":\"MERGEABLE\",\"reviewDecision\":\"\",\"statusCheckRollup\":[],\
+             \"updatedAt\":\"2026-01-09T00:00:00Z\",\"headRefName\":\"{BRANCH}\",\"headRefOid\":\"deadbeef\",\
+             \"title\":\"a fix\",\"body\":\"because\",\"reviews\":[],\"comments\":[{}]}}\n\
+             __PR_EOF__\nexit 0",
+            comments.join(",")
+        ),
+    );
+}
+
+/// Run a reply-only engage against a PR showing no feedback, then sync the
+/// PR as it reads afterwards; the attention that sync leaves.
+async fn attention_after_reply(label: &str, afterwards: &[(&str, String)]) -> Option<String> {
+    let f = fixture(label).await;
+    let bins = FakeBins::acquire(label);
+    bins.ok("gh", PR_VIEW_JSON);
+    push_to(&f, None).await;
+    let backend = ScriptedBackend::writing("PR-REPLY.md", "answered");
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let summary = hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &backend, None)
+        .await
+        .unwrap();
+    assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
+
+    pr_with_comments(&bins, afterwards);
+    let result = hunter::scheduler::sync_prs(&f.store, &f.cfg).await;
+    assert_eq!(result.errors, 0, "{result:?}");
+    f.attention().await
+}
+
+/// Feedback posted while the worker ran -- after it read the PR, before
+/// its reply landed -- was never answered, so the next sync raises it.
+/// The engagement used to be stamped "now" on a reply, which buried every
+/// such comment for good.
+#[tokio::test]
+async fn feedback_posted_while_an_engage_runs_is_new_after_its_reply() {
+    let attention = attention_after_reply(
+        "engage-feedback-mid-run",
+        &[
+            ("lead", "one more thing".to_owned()),
+            ("lead", hunter::forge::mark_own("answered")),
+        ],
+    )
+    .await;
+    assert_eq!(attention.as_deref(), Some("new_comments"));
+}
+
+/// Hunter may post as the operator, so its reply and the operator's
+/// comment can share a login: the mark `comment_pr` leaves on the reply is
+/// what keeps hunter from answering itself, while the operator's comment
+/// under the same login still counts.
+#[tokio::test]
+async fn hunters_own_reply_is_not_new_feedback_but_the_operators_comment_is() {
+    for (body, flagged) in [
+        (hunter::forge::mark_own("answered"), None),
+        ("answered".to_owned(), Some("new_comments")),
+    ] {
+        let label = format!("engage-own-reply-{}", flagged.is_some());
+        let attention = attention_after_reply(&label, &[("lead", body.clone())]).await;
+        assert_eq!(attention.as_deref(), flagged, "{body:?}");
+    }
+}
+
+/// An engage worker stopped at the cap with a transcript; continued, it
+/// replies on the PR.
+fn suspend_then_reply() -> ScriptedBackend {
+    ScriptedBackend::staged(|tree, resume_from| match resume_from {
+        None => {
+            let session = tree.parent().unwrap().join("session").join("engage.jsonl");
+            std::fs::write(&session, format!("{USAGE}\n")).unwrap();
+            hunter::types::RunResult {
+                exit_code: None,
+                killed_reason: Some("cap".to_owned()),
+                session_file: Some(session.to_string_lossy().into_owned()),
+                ..support::done()
+            }
+        }
+        Some(file) => {
+            std::fs::write(tree.join("PR-REPLY.md"), "answered").unwrap();
+            hunter::types::RunResult {
+                session_file: Some(file.to_string_lossy().into_owned()),
+                ..support::done()
+            }
+        }
+    })
+}
+
+/// A resumed worker is only told to carry on, so feedback that arrived
+/// while its chain was suspended never reached it. Its reply must leave
+/// that feedback new.
+#[tokio::test]
+async fn feedback_posted_while_an_engage_was_suspended_is_new_after_it_resumes() {
+    let f = fixture("engage-feedback-suspended").await;
+    let bins = FakeBins::acquire("engage-feedback-suspended");
+    bins.ok("gh", PR_VIEW_JSON);
+    push_to(&f, None).await;
+
+    let summary = suspend_and_resume(&f, suspend_then_reply(), || {
+        pr_with_comments(&bins, &[("lead", "one more thing".to_owned())]);
+    })
+    .await;
+    assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
+    assert!(bins.called_with("gh", "comment"), "{:?}", bins.calls());
+
+    let result = hunter::scheduler::sync_prs(&f.store, &f.cfg).await;
+    assert_eq!(result.errors, 0, "{result:?}");
+    assert_eq!(f.attention().await.as_deref(), Some("new_comments"));
 }
 
 /// A push that fails leaves the engage incomplete: no reply is posted, the
@@ -1817,9 +1941,9 @@ fn rewrite_then_suspend() -> ScriptedBackend {
 /// scheduler would; `meanwhile` runs between the two.
 async fn suspend_and_resume(
     f: &Fixture,
+    backend: ScriptedBackend,
     meanwhile: impl FnOnce(),
 ) -> hunter::scheduler::CycleSummary {
-    let backend = rewrite_then_suspend();
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let first = hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &backend, None)
         .await
@@ -1865,7 +1989,7 @@ async fn a_resumed_engage_keeps_commits_pushed_while_it_was_suspended() {
     let reviewer = TempDir::new("engage-resume-lease-reviewer");
     let checkout = reviewer.join("checkout");
 
-    let summary = suspend_and_resume(&f, || {
+    let summary = suspend_and_resume(&f, rewrite_then_suspend(), || {
         support::git(
             reviewer.path(),
             &[
@@ -1910,7 +2034,7 @@ async fn a_resumed_engage_publishes_its_rewritten_history() {
     bins.ok("gh", PR_VIEW_JSON);
     let origin = push_to(&f, None).await;
 
-    let summary = suspend_and_resume(&f, || {}).await;
+    let summary = suspend_and_resume(&f, rewrite_then_suspend(), || {}).await;
 
     assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
     let head = support::git(&origin, &["log", "-1", "--format=%s", BRANCH]);

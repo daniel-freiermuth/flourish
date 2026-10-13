@@ -2493,9 +2493,10 @@ impl Store {
     /// holds its branch checked out, and git refuses to check one branch
     /// out in two worktrees.
     ///
-    /// A resumed attempt copies `pinned_sha` from the attempt it continues,
-    /// here in the INSERT, so every link of a chain names the commit its
-    /// shared tree was created at.
+    /// A resumed attempt copies `pinned_sha` and `seen_activity_at` from the
+    /// attempt it continues, here in the INSERT, so every link of a chain
+    /// names the commit its shared tree was created at and the newest PR
+    /// feedback an engage chain's worker was shown.
     pub async fn create_job(
         &self,
         kind: JobKind,
@@ -2513,9 +2514,10 @@ impl Store {
         let result = sqlx::query!(
             "INSERT INTO jobs \
              (kind, repo_id, finding_id, cap_tokens, state, started_at, estimated_tokens, \
-              resumed_from, pinned_sha, full_history, full_hunt_request) \
+              resumed_from, pinned_sha, seen_activity_at, full_history, full_hunt_request) \
              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, \
                     (SELECT p.pinned_sha FROM jobs p WHERE p.id = ?8), \
+                    (SELECT p.seen_activity_at FROM jobs p WHERE p.id = ?8), \
                     COALESCE((SELECT p.full_history FROM jobs p WHERE p.id = ?8), 0), \
                     (SELECT p.full_hunt_request FROM jobs p WHERE p.id = ?8) \
              WHERE EXISTS (SELECT 1 FROM repos WHERE id = ?2 AND deleted_at IS NULL)",
@@ -2650,6 +2652,29 @@ impl Store {
         )
     }
 
+    /// Record the newest PR feedback (epoch ms) a cold engage attempt's
+    /// worker was shown. Resumes inherit it ([`Self::create_job`]) instead.
+    pub async fn set_seen_activity(&self, job_id: i64, at_ms: i64) -> sqlx::Result<()> {
+        sqlx::query!(
+            "UPDATE jobs SET seen_activity_at = ?1 WHERE id = ?2",
+            at_ms,
+            job_id
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The newest PR feedback `job_id`'s engage chain was shown, if its
+    /// first attempt recorded it ([`Self::set_seen_activity`]).
+    pub async fn seen_activity(&self, job_id: i64) -> sqlx::Result<Option<i64>> {
+        Ok(
+            sqlx::query_scalar!("SELECT seen_activity_at FROM jobs WHERE id = ?1", job_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .flatten(),
+        )
+    }
     /// Whether the chain rooted at `origin_id` still needs its working
     /// tree, and how long ago it last did anything.
     ///

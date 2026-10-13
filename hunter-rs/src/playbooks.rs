@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::hash::BuildHasher;
 use std::path::Path;
 
-use crate::forge::{PrView, Voice};
+use crate::forge::{GhAuthor, OWN_MARK, PrView, Voice};
 use crate::types::{Finding, PrState, Repo};
 
 /// `PLAYBOOK_DIR` = <`project_root>/playbooks` (types.py `PLAYBOOK_DIR`).
@@ -204,36 +204,39 @@ fn notes_or_default(repo_notes: &str, default: &str) -> String {
 /// Chronological comments + reviews by `voice`; oldest dropped past ~cap
 /// chars. Port of playbooks.py _`feedback_blocks`, split by [`Voice`] so
 /// bots' reviews reach the worker under their own heading and guidance.
+///
+/// Hunter's own comments ([`Voice::Own`]) run with the maintainers', as
+/// the conversation they answer, labelled as hunter's and without their
+/// mark.
 fn feedback_blocks(pr: &PrView, voice: Voice, cap: usize) -> String {
     let mut items: Vec<(String, String, String)> = Vec::new();
+    let shown = |v: Voice| v == voice || (voice == Voice::Maintainer && v == Voice::Own);
+    let who = |author: Option<&GhAuthor>, v: Voice| {
+        let login = author.map_or("?", |a| a.login.as_str());
+        if v == Voice::Own {
+            format!("{login} (hunter's own earlier reply)")
+        } else {
+            login.to_owned()
+        }
+    };
+    let unmarked = |body: &str| body.trim().trim_end_matches(OWN_MARK).trim_end().to_owned();
 
-    for c in pr.comments.iter().filter(|c| c.voice == voice) {
+    for c in pr.comments.iter().filter(|c| shown(c.voice)) {
         let ts = c.created_at.clone();
-        let who = c
-            .author
-            .as_ref()
-            .map_or("?", |a| a.login.as_str())
-            .to_owned();
-        let body = c.body.trim().to_owned();
-        items.push((ts, who, body));
+        items.push((ts, who(c.author.as_ref(), c.voice), unmarked(&c.body)));
     }
 
-    for r in pr.reviews.iter().filter(|r| r.voice == voice) {
+    for r in pr.reviews.iter().filter(|r| shown(r.voice)) {
         let state = &r.state;
-        let raw_body = r.body.trim();
+        let raw_body = unmarked(&r.body);
         let body = if !state.is_empty() && state != "COMMENTED" {
             format!("[review: {state}] {raw_body}").trim().to_owned()
         } else {
-            raw_body.to_owned()
+            raw_body
         };
         if !body.is_empty() {
             let ts = r.submitted_at.clone();
-            let who = r
-                .author
-                .as_ref()
-                .map_or("?", |a| a.login.as_str())
-                .to_owned();
-            items.push((ts, who, body));
+            items.push((ts, who(r.author.as_ref(), r.voice), body));
         }
     }
 
@@ -254,7 +257,7 @@ fn feedback_blocks(pr: &PrView, voice: Voice, cap: usize) -> String {
 
     if blocks.is_empty() {
         match voice {
-            Voice::Maintainer => "(no comments or reviews)".to_owned(),
+            Voice::Maintainer | Voice::Own => "(no comments or reviews)".to_owned(),
             Voice::Bot => "(no bot reviews)".to_owned(),
         }
     } else {
