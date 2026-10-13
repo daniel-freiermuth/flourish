@@ -762,6 +762,26 @@ async fn an_abandoned_hunt_chain_is_held_on_the_third() {
     assert_eq!(held.reason, HoldReason::GaveUp);
 }
 
+/// A hunt that errors before its worker runs, here on a playbook typo the
+/// prompt cannot be rendered past, is counted like any other failure: three
+/// in a row hold the hunt, and the turn passes on instead of the same hunt
+/// being picked again every cycle.
+#[tokio::test]
+async fn a_hunt_that_errors_before_its_worker_is_held_and_passes_the_turn_on() {
+    let (dir, store, cfg) = two_hunts_due("rotation-hunt-error").await;
+    std::fs::write(
+        dir.join("playbooks").join("hunt.md"),
+        "hunt {{REPO_PATH}} {{NO_SUCH_SLOT}}\n",
+    )
+    .unwrap();
+    let backend = ScriptedBackend::noop();
+
+    let held = hold_alpha_then_beta(&store, &cfg, &backend, RepoWorkKind::Hunt).await;
+
+    assert!(backend.runs().is_empty(), "no worker may have been launched");
+    assert!(held.detail.contains("NO_SUCH_SLOT"), "{held:?}");
+}
+
 /// A hunt whose fetch fails never gets as far as a job. The failure is the
 /// repo's, not the hunt's: it is counted on `(alpha, sync)`, and once that
 /// is held no kind of `alpha` is picked, while `beta` still is.
