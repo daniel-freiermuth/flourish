@@ -11,8 +11,9 @@ Hunter posts its reply only after the job finishes, and its replies were
 not marked then, so a comment created inside an engage chain's window
 (first attempt's `started_at` .. the finishing attempt's `finished_at`) is
 not hunter's. Every such comment on a still-open PR that the current
-watermark covers is listed, with the UPDATE that re-raises it: the next
-sync then flags `new_comments` and an engage answers it.
+watermark covers, and that no later engage chain read the PR after, is
+listed with the UPDATE that re-raises it: the next sync then flags
+`new_comments` and an engage answers it.
 
 Read-only: the database is opened `mode=ro` and nothing is changed; review
 the list and run the UPDATEs you agree with. Authors are not screened --
@@ -37,11 +38,32 @@ def iso_ms(ts: str) -> int:
     return int(datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp() * 1000)
 
 
+FORGE_TIMEOUT_S = 120
+
+
 def run(argv: list[str]) -> str:
-    out = subprocess.run(argv, capture_output=True, text=True, check=False)
+    try:
+        out = subprocess.run(
+            argv, capture_output=True, text=True, check=False, timeout=FORGE_TIMEOUT_S
+        )
+    except subprocess.TimeoutExpired as err:
+        raise RuntimeError(f"{' '.join(argv[:3])} timed out after {FORGE_TIMEOUT_S}s") from err
     if out.returncode != 0:
         raise RuntimeError(f"{' '.join(argv[:3])} failed: {out.stderr.strip()}")
     return out.stdout
+
+
+def pages(argv: list[str]) -> list[dict]:
+    """Every item of a `--paginate`d REST list. Both CLIs print one JSON
+    array per page, back to back, so the output is a stream of arrays."""
+    text, items, decoder, pos = run(argv), [], json.JSONDecoder(), 0
+    while True:
+        while pos < len(text) and text[pos].isspace():
+            pos += 1
+        if pos == len(text):
+            return items
+        page, pos = decoder.raw_decode(text, pos)
+        items.extend(page)
 
 
 def repo_path(url: str) -> tuple[str, str]:
@@ -56,34 +78,31 @@ def repo_path(url: str) -> tuple[str, str]:
 
 
 def feedback(forge: str, url: str, number: int) -> list[tuple[str, str, str]]:
-    """(created_at, author, body) of every comment and review on the PR."""
+    """(created_at, author, body) of every comment and review on the PR,
+    all pages: a missed comment can sit anywhere in a long thread."""
     host, path = repo_path(url)
+    project = quote(path, safe="")
     if forge == "gitlab":
-        argv = [
-            "glab", "api",
-            f"projects/{quote(path, safe='')}/merge_requests/{number}/notes?per_page=100&sort=desc",
-        ]
+        argv = ["glab", "api", "--paginate",
+                f"projects/{project}/merge_requests/{number}/notes?per_page=100"]
         if host != "gitlab.com":
             argv += ["--hostname", host]
-        notes = json.loads(run(argv))
         return [
             (n.get("created_at") or n.get("updated_at", ""),
              (n.get("author") or {}).get("username", "?"),
-             n.get("body", ""))
-            for n in notes
+             n.get("body") or "")
+            for n in pages(argv)
             if not n.get("system")
         ]
-    repo = path if host in ("", "github.com") else f"{host}/{path}"
-    view = json.loads(
-        run(["gh", "pr", "view", str(number), "-R", repo, "--json", "comments,reviews"])
-    )
+    host_flag = [] if host in ("", "github.com") else ["--hostname", host]
+    api = ["gh", "api", "--paginate", *host_flag]
     items = [
-        (c.get("createdAt", ""), (c.get("author") or {}).get("login", "?"), c.get("body", ""))
-        for c in view.get("comments", [])
+        (c.get("created_at", ""), (c.get("user") or {}).get("login", "?"), c.get("body") or "")
+        for c in pages([*api, f"repos/{path}/issues/{number}/comments?per_page=100"])
     ]
     items += [
-        (r.get("submittedAt", ""), (r.get("author") or {}).get("login", "?"), r.get("body", ""))
-        for r in view.get("reviews", [])
+        (r.get("submitted_at") or "", (r.get("user") or {}).get("login", "?"), r.get("body") or "")
+        for r in pages([*api, f"repos/{path}/pulls/{number}/reviews?per_page=100"])
     ]
     return items
 
@@ -139,6 +158,8 @@ def main() -> int:
             at = iso_ms(ts)
             if at > pr["mark"]:
                 continue  # already newer than the watermark: the daemon flags it
+            if any(start > at for _, start, _ in windows):
+                continue  # a later engage chain read the PR after it, so saw it
             job = next((j for j, start, end in windows if start <= at <= end), None)
             if job is not None:
                 missed.append((at, ts, author, body, job))
