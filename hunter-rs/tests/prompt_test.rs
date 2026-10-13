@@ -176,7 +176,7 @@ fn section<'a>(prompt: &'a str, name: &str) -> &'a str {
 }
 
 /// A screened PR thread: one maintainer comment and review, one bot
-/// comment.
+/// comment, and hunter's own reply posted under the maintainer's login.
 fn screened_thread() -> PrView {
     let author = |login: &str| {
         Some(GhAuthor {
@@ -191,6 +191,13 @@ fn screened_thread() -> PrView {
                 body: "please add a test".to_owned(),
                 created_at: "2026-01-01T00:00:00Z".to_owned(),
                 voice: Voice::Maintainer,
+            },
+            GhComment {
+                id: String::new(),
+                author: author("lead"),
+                body: hunter::forge::mark_own("added the test"),
+                created_at: "2026-01-01T12:00:00Z".to_owned(),
+                voice: Voice::Own,
             },
             GhComment {
                 id: String::new(),
@@ -215,7 +222,8 @@ fn screened_thread() -> PrView {
 /// Bots' reviews reach the worker under their own heading, where the
 /// playbooks tell it to verify rather than obey them, and never mixed in
 /// with what maintainers asked for -- in every prompt that carries a
-/// PR's discussion.
+/// PR's discussion. Hunter's own replies stay in the maintainers' thread
+/// they answer, labelled as its own and without the mark that tells them.
 #[test]
 fn pr_prompts_keep_bot_reviews_apart_from_maintainer_feedback() {
     let dir = TempDir::new("prompt-voices");
@@ -280,6 +288,16 @@ fn pr_prompts_keep_bot_reviews_apart_from_maintainer_feedback() {
         assert!(maint.contains("please add a test"), "{name}: {prompt}");
         assert!(maint.contains("and document it"), "{name}: {prompt}");
         assert!(!maint.contains("rename everything"), "{name}: {prompt}");
+        assert!(
+            maint.contains(
+                "### lead (hunter's own earlier reply) at 2026-01-01T12:00:00Z\nadded the test"
+            ),
+            "{name}: {prompt}"
+        );
+        assert!(
+            !prompt.contains(hunter::forge::OWN_MARK),
+            "{name}: {prompt}"
+        );
         assert!(bots.contains("### coderabbitai"), "{name}: {prompt}");
         assert!(bots.contains("rename everything"), "{name}: {prompt}");
         assert!(!bots.contains("lead"), "{name}: {prompt}");

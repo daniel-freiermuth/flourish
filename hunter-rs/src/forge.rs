@@ -273,6 +273,21 @@ pub enum Voice {
     /// A review bot the operator listed in `feedback.bots`: acted on, but
     /// read critically, and never mistaken for a maintainer's decision.
     Bot,
+    /// Hunter itself: a comment carrying [`OWN_MARK`]. Told apart by its
+    /// body, not its author, because hunter may post under the operator's
+    /// own login. Never new activity -- it is hunter's answer, not
+    /// feedback -- but kept, so a later engage sees what it already said.
+    Own,
+}
+
+/// Appended to every comment hunter posts ([`mark_own`]): an HTML comment,
+/// so it does not render, and both forges return it verbatim in the raw
+/// body they hand back.
+pub const OWN_MARK: &str = "<!-- posted by hunter -->";
+
+/// `body` as hunter posts it, with [`OWN_MARK`] on a line of its own.
+pub fn mark_own(body: &str) -> String {
+    format!("{body}\n\n{OWN_MARK}")
 }
 
 /// The review bots whose feedback is let through (`feedback.bots`).
@@ -321,6 +336,10 @@ fn normalize_login(login: &str) -> String {
 /// `can_push` is asked at most once per distinct login. An error fails
 /// the whole screen: guessing either way would drop a maintainer's
 /// request or hand a stranger's text to the worker.
+///
+/// A maintainer's item that ends in [`OWN_MARK`] is hunter's own
+/// ([`Voice::Own`]). Only a maintainer's: the mark is plain text anyone
+/// can type, so it must not let a stranger's comment through.
 fn screen_feedback(
     pr: &mut PrView,
     bots: &ReviewBots,
@@ -344,23 +363,37 @@ fn screen_feedback(
         };
         Ok(maintainer.then_some(Voice::Maintainer))
     };
+    let own = |voice: Voice, body: &str| {
+        if voice == Voice::Maintainer && is_own(body) {
+            Voice::Own
+        } else {
+            voice
+        }
+    };
     let mut comments = Vec::with_capacity(pr.comments.len());
     for mut c in std::mem::take(&mut pr.comments) {
         if let Some(voice) = voice_of(&c.id, c.author.as_ref())? {
-            c.voice = voice;
+            c.voice = own(voice, &c.body);
             comments.push(c);
         }
     }
     let mut reviews = Vec::with_capacity(pr.reviews.len());
     for mut r in std::mem::take(&mut pr.reviews) {
         if let Some(voice) = voice_of(&r.id, r.author.as_ref())? {
-            r.voice = voice;
+            r.voice = own(voice, &r.body);
             reviews.push(r);
         }
     }
     pr.comments = comments;
     pr.reviews = reviews;
     Ok(())
+}
+
+/// Whether `body` is one hunter posted: its last line is exactly
+/// [`OWN_MARK`], as [`mark_own`] leaves it. A reply quoting hunter's
+/// comment carries the mark only behind a `> `, so it stays the quoter's.
+fn is_own(body: &str) -> bool {
+    body.trim_end().lines().next_back().map(str::trim) == Some(OWN_MARK)
 }
 
 /// How long a lookup answer is reused. `sync_prs` screens every open PR
@@ -694,7 +727,8 @@ pub trait Forge: Send + Sync {
     /// never reach the default branch, so this is the only place a worker
     /// reviewing it can read them.
     fn pr_diff(&self, url: &str, pr_number: i64) -> anyhow::Result<String>;
-    /// Post a comment on a PR/MR.
+    /// Post a comment on a PR/MR, marked as hunter's own ([`mark_own`]) so
+    /// that screening never reads it back as feedback.
     fn comment_pr(&self, url: &str, pr_number: i64, body: &str) -> anyhow::Result<()>;
     /// Close a PR/MR with a comment explaining why.
     fn close_pr(&self, url: &str, pr_number: i64, comment: &str) -> anyhow::Result<()>;
@@ -1197,7 +1231,16 @@ impl Forge for GitHubForge {
         let slug = format!("{owner}/{repo}");
         let num = pr_number.to_string();
         let (rc, out) = run_cmd(
-            &["gh", "pr", "comment", &num, "-R", &slug, "--body", body],
+            &[
+                "gh",
+                "pr",
+                "comment",
+                &num,
+                "-R",
+                &slug,
+                "--body",
+                &mark_own(body),
+            ],
             60,
         );
         if rc != 0 {
@@ -1439,7 +1482,8 @@ impl Forge for GitLabForge {
             .ok_or_else(|| anyhow::anyhow!("cannot parse GitLab URL: {url}"))?;
         let enc = path.replace('/', "%2F");
         let api_path = format!("projects/{enc}/merge_requests/{pr_number}/notes");
-        let (rc, out) = gitlab_api(url, &api_path, Some("POST"), &[("body", body)]);
+        let body = mark_own(body);
+        let (rc, out) = gitlab_api(url, &api_path, Some("POST"), &[("body", &body)]);
         if rc != 0 {
             anyhow::bail!("glab api POST notes failed (rc={rc}): {out}");
         }

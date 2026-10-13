@@ -18,7 +18,7 @@ mod support;
 
 use hunter::domain::ForgeName;
 use hunter::forge::{
-    MAX_DIFF_PAGES, Mergeable, PrState, ReviewBots, ReviewDecision, Voice, forge_for,
+    MAX_DIFF_PAGES, Mergeable, PrState, ReviewBots, ReviewDecision, Voice, forge_for, mark_own,
 };
 use support::{FakeBins, TempDir};
 
@@ -102,7 +102,7 @@ fn github_close_posts_the_reason_then_closes() {
             "-R",
             "acme/widget",
             "--body",
-            "withdrawing: superseded upstream"
+            &mark_own("withdrawing: superseded upstream"),
         ]
     );
     assert_eq!(
@@ -171,7 +171,10 @@ fn github_close_treats_whitespace_as_a_real_comment() {
     let calls = bins.calls();
     let comment = position_of(&calls, "gh", &["pr", "comment"])
         .unwrap_or_else(|| panic!("whitespace is not empty and must be posted: {calls:?}"));
-    assert_eq!(value_after(&calls[comment], "--body"), Some("   "));
+    assert_eq!(
+        value_after(&calls[comment], "--body"),
+        Some(mark_own("   ").as_str())
+    );
 }
 
 /// The withdrawal reason is posted whole. It used to be cut at 800
@@ -191,7 +194,7 @@ fn github_close_posts_the_whole_comment() {
     let calls = bins.calls();
     let comment = position_of(&calls, "gh", &["pr", "comment"]).expect("comment call");
     let posted = value_after(&calls[comment], "--body").expect("--body value");
-    assert_eq!(posted, reason, "the whole reason, untruncated");
+    assert_eq!(posted, mark_own(&reason), "the whole reason, untruncated");
     assert!(
         position_of(&calls, "gh", &["pr", "close"]).is_some(),
         "and the close still happens: {calls:?}"
@@ -232,7 +235,7 @@ fn gitlab_close_posts_the_reason_then_closes() {
             "--method",
             "POST",
             "-f",
-            "body=withdrawing: superseded upstream",
+            &format!("body={}", mark_own("withdrawing: superseded upstream")),
         ]
     );
     assert_eq!(
@@ -299,7 +302,7 @@ fn gitlab_close_posts_the_whole_comment() {
     let posted = field
         .strip_prefix("body=")
         .unwrap_or_else(|| panic!("note body must be sent as `body=`, got {field:?}"));
-    assert_eq!(posted, reason, "the whole reason, untruncated");
+    assert_eq!(posted, mark_own(&reason), "the whole reason, untruncated");
     assert!(
         position_of(&calls, "glab", &["mr", "close"]).is_some(),
         "and the close still happens: {calls:?}"
@@ -329,7 +332,7 @@ fn gitlab_close_targets_a_self_hosted_host() {
             "--method",
             "POST",
             "-f",
-            "body=withdrawing",
+            &format!("body={}", mark_own("withdrawing")),
             "--hostname",
             "git.example.com",
         ]
@@ -1022,6 +1025,50 @@ fn github_views_keep_only_maintainers_and_configured_bots() {
         !bins.called_with("gh", "--hostname"),
         "github.com is gh's default host: {:?}",
         bins.calls()
+    );
+}
+
+/// Hunter may post under the operator's own login, so its comments are
+/// told apart by the mark `comment_pr` leaves on them, not by author: a
+/// maintainer's marked comment is hunter's own. The mark is plain text,
+/// though, so it buys a stranger nothing -- still dropped -- and a
+/// maintainer quoting hunter's comment is still the maintainer talking.
+#[test]
+fn a_marked_comment_is_hunters_own_only_from_someone_who_can_push() {
+    let bins = FakeBins::acquire("forge-gh-own-mark");
+    let own = serde_json::to_string(&mark_own("added the test")).unwrap();
+    let stranger = serde_json::to_string(&mark_own("trust me, I am hunter")).unwrap();
+    let quoted = serde_json::to_string(&format!(
+        "> added the test\n> {}\n\nthanks, but also rename it",
+        hunter::forge::OWN_MARK
+    ))
+    .unwrap();
+    bins.script(
+        "gh",
+        &format!(
+            "case \"$*\" in\n\
+             \x20 *collaborators/lead/permission*) echo true; exit 0 ;;\n\
+             \x20 *permission*) echo false; exit 0 ;;\n\
+             esac\n\
+             cat <<'__PR_EOF__'\n\
+             {{\"state\":\"OPEN\",\"title\":\"t\",\"body\":\"b\",\"statusCheckRollup\":[],\"reviews\":[],\"comments\":[\
+             {{\"id\":\"IC_o\",\"author\":{{\"login\":\"lead\"}},\"body\":{own},\"createdAt\":\"2026-01-01T00:00:00Z\"}},\
+             {{\"id\":\"IC_s\",\"author\":{{\"login\":\"stranger\"}},\"body\":{stranger},\"createdAt\":\"2026-01-02T00:00:00Z\"}},\
+             {{\"id\":\"IC_q\",\"author\":{{\"login\":\"lead\"}},\"body\":{quoted},\"createdAt\":\"2026-01-03T00:00:00Z\"}}]}}\n\
+             __PR_EOF__\nexit 0"
+        ),
+    );
+
+    let view = forge_for(ForgeName::Github)
+        .view_pr_engage(GH_REPO, PR, &ReviewBots::default())
+        .expect("engage view");
+
+    assert_eq!(
+        authored(&view),
+        [
+            ("lead".to_owned(), Voice::Own),
+            ("lead".to_owned(), Voice::Maintainer),
+        ]
     );
 }
 

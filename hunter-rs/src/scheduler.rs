@@ -4812,10 +4812,20 @@ fn civil_to_days(y: i64, m: u32, d: u32) -> i64 {
 ///
 /// Over screened feedback only (`forge::screen_feedback`): a comment from
 /// someone who cannot push, and is not a configured bot, never raises
-/// `new_comments`, so it cannot start an engage run.
+/// `new_comments`, so it cannot start an engage run. Neither does hunter's
+/// own ([`Voice::Own`](forge::Voice::Own)): its reply answers the feedback.
 fn latest_activity_ms(pr: &PrView) -> i64 {
-    let comment_stamps = pr.comments.iter().map(|c| iso_ms(&c.created_at));
-    let review_stamps = pr.reviews.iter().map(|r| iso_ms(&r.submitted_at));
+    let theirs = |v: forge::Voice| v != forge::Voice::Own;
+    let comment_stamps = pr
+        .comments
+        .iter()
+        .filter(|c| theirs(c.voice))
+        .map(|c| iso_ms(&c.created_at));
+    let review_stamps = pr
+        .reviews
+        .iter()
+        .filter(|r| theirs(r.voice))
+        .map(|r| iso_ms(&r.submitted_at));
     comment_stamps.chain(review_stamps).max().unwrap_or(0)
 }
 
@@ -5032,14 +5042,14 @@ pub async fn sync_prs(store: &Store, cfg: &Config) -> SyncResult {
         let last_activity = latest_activity_ms(&pr);
         let (checks, failing, failing_names) = checks_summary(&pr.status_check_rollup);
 
-        // Baseline the engaged watermark on first sync so we don't
-        // flag our own PR-creation chatter.
-        let engaged: i64 = if let Some(e) = prev.as_ref().and_then(|p| p.last_engaged_activity_at) {
-            e
-        } else {
-            let updated_ms = iso_ms(&pr.updated_at);
-            std::cmp::max(updated_ms, last_activity)
-        };
+        // A PR never engaged has answered nothing: every screened item on
+        // it is new. Hunter's own comments are not activity, so nothing
+        // has to be baselined away -- doing so hid the reviews that land
+        // on a PR before its first sync.
+        let engaged: i64 = prev
+            .as_ref()
+            .and_then(|p| p.last_engaged_activity_at)
+            .unwrap_or(0);
 
         // Suppression: don't re-flag a static reason identical to the
         // one an engage cycle already declined (same fingerprint AND
@@ -5258,6 +5268,22 @@ struct EngageStart {
     ws: Workspace,
     pinned: String,
     cap: Option<i64>,
+    /// The newest feedback the chain's worker was shown: read from the PR
+    /// by a cold attempt, inherited by a resume (which is only told to
+    /// carry on). None for a chain started before this was recorded.
+    seen_activity: Option<i64>,
+}
+
+impl EngageStart {
+    /// The engagement watermark a finished attempt leaves: the newest
+    /// feedback its worker saw, so anything posted since -- while it ran,
+    /// or while the chain was suspended -- is new activity at the next
+    /// sync. Never lowered: a chain with nothing recorded keeps the mark
+    /// it started with, which can only re-raise feedback, never hide it.
+    fn engaged_watermark(&self) -> i64 {
+        let before = self.ps.last_engaged_activity_at.unwrap_or(0);
+        self.seen_activity.map_or(before, |seen| seen.max(before))
+    }
 }
 
 /// The PR as the forge shows it, for a fresh engage's playbook. Only a
@@ -5391,6 +5417,17 @@ async fn start_engage(
             .await));
         }
     };
+    // Only a fresh attempt reads the PR, and its playbook shows the worker
+    // exactly that view; a resume inherits what its chain was shown.
+    let seen_activity = if let Some(pr) = &pr {
+        let seen = latest_activity_ms(pr);
+        // Unrecorded, a resume of this chain falls back to the mark the
+        // chain started with: a re-raised comment, never a hidden one.
+        let _ = store.set_seen_activity(created.id, seen).await;
+        Some(seen)
+    } else {
+        store.seen_activity(created.id).await.ok().flatten()
+    };
     Ok(Ok(EngageStart {
         repo,
         ps,
@@ -5401,6 +5438,7 @@ async fn start_engage(
         ws,
         pinned,
         cap,
+        seen_activity,
     }))
 }
 
@@ -5683,11 +5721,9 @@ async fn record_engage(
             summary.failure = Some(fail);
         }
         Ok((pushed, replied)) => {
-            let engaged_mark = if replied {
-                now_ms() + 3_000
-            } else {
-                ps.last_activity_at.unwrap_or_else(now_ms)
-            };
+            // What the worker saw, not "now": feedback that arrived while
+            // it ran stays new. Its own reply is no activity (`OWN_MARK`).
+            let engaged_mark = start.engaged_watermark();
             let addressed_fp = if pushed {
                 None
             } else {

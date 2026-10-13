@@ -230,11 +230,17 @@ impl FakeBins {
     }
 
     /// Install `name` as an executable running `body` (POSIX sh). The script
-    /// appends its argv to the invocation log before running `body`.
+    /// appends its argv to the invocation log before running `body`, one
+    /// line per call with tab-separated arguments. Backslashes, tabs and
+    /// newlines inside an argument are escaped (`\\`, `\t`, `\n`) and
+    /// [`Self::calls`] undoes that, so a multi-line `--body` is recorded
+    /// as the one argument it was, not split into bogus calls.
     pub fn script(&self, name: &str, body: &str) {
         let path = self.dir.join(name);
+        // `x` survives command substitution's trailing-newline strip.
+        let escape = r#"e=$(printf '%sx' "$a" | sed -e ':a' -e '$!N' -e '$!ba' -e 's/\\/\\\\/g' -e 's/\t/\\t/g' -e 's/\n/\\n/g')"#;
         let contents = format!(
-            "#!/bin/sh\nprintf '%s' \"{name}\" >> '{log}'\nfor a in \"$@\"; do printf '\\t%s' \"$a\" >> '{log}'; done\nprintf '\\n' >> '{log}'\n{body}\n",
+            "#!/bin/sh\nprintf '%s' \"{name}\" >> '{log}'\nfor a in \"$@\"; do {escape}; printf '\\t%s' \"${{e%x}}\" >> '{log}'; done\nprintf '\\n' >> '{log}'\n{body}\n",
             name = name,
             log = self.log.display(),
         );
@@ -283,7 +289,7 @@ impl FakeBins {
             .unwrap_or_default()
             .lines()
             .filter(|l| !l.is_empty())
-            .map(|l| l.split('\t').map(str::to_owned).collect())
+            .map(|l| l.split('\t').map(unescape_arg).collect())
             .collect()
     }
 
@@ -301,6 +307,25 @@ impl FakeBins {
             .iter()
             .any(|c| c.iter().any(|a| a == arg))
     }
+}
+
+/// Undo the fake binaries' argument escaping (see [`FakeBins::script`]).
+fn unescape_arg(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 impl Drop for FakeBins {

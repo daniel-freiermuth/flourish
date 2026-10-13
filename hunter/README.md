@@ -437,6 +437,18 @@ same-looking situation after a real push is never mistaken for
 time-based backoff, which would have kept re-poking an unfixable problem
 every N minutes forever on a long-running unattended daemon.
 
+New comments are tracked by a per-PR engagement watermark: a screened
+comment or review newer than it flags `new_comments`. A finished engage
+moves the watermark only to the newest feedback its worker was shown —
+read once, when the chain starts, and carried through every resume
+(`jobs.seen_activity_at`), since a resumed worker is only told to carry
+on — so anything posted while the worker ran or sat suspended is still
+flagged at the next sync. Hunter may post under the operator's own
+login, so its own comments are recognised by the hidden
+`<!-- posted by hunter -->` line `comment_pr` appends, not by author:
+from someone who can push, such a comment is never new activity, and
+engage prompts show it in the thread as hunter's own earlier reply.
+
 ## Web UI
 
 Served at `http://localhost:8377` (configurable). Left-nav pages:

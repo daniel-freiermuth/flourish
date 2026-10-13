@@ -334,51 +334,38 @@ async fn a_finding_whose_repo_is_gone_is_an_error_and_stays_pr_open() {
 // The engaged watermark
 // ---------------------------------------------------------------------------
 
-/// The first sync has no watermark yet. Everything already on the PR —
-/// the bot's own description comment, a review left before we ever
-/// looked — is the baseline, not news.
+/// The first sync has no watermark yet, and nothing has answered what is
+/// already on the PR: a review left before we ever looked is new. Hunter's
+/// own comments carry its mark and are no activity at all, so none has to
+/// be baselined away -- doing that hid such reviews for good.
 #[tokio::test]
-async fn the_first_sync_baselines_the_watermark_past_existing_activity() {
+async fn the_first_sync_flags_feedback_already_on_the_pr() {
     let f = fixture("sync-first-baseline").await;
     let bins = FakeBins::acquire("sync-first-baseline");
     serve_pr(
         &bins,
         &pr(&json!({
-            "comments": comment_at("2026-01-02T04:00:00Z"),
-            "reviews": [{ "body": "", "state": "COMMENTED", "submittedAt": "2026-01-02T03:30:00Z" }],
+            "comments": [{
+                "author": { "login": "reviewer" },
+                "body": hunter::forge::mark_own("hunter's description"),
+                "createdAt": "2026-01-02T04:00:00Z",
+            }],
+            "reviews": [{
+                "author": { "login": "reviewer" },
+                "body": "",
+                "state": "COMMENTED",
+                "submittedAt": "2026-01-02T03:30:00Z",
+            }],
         })),
     );
 
     let result = f.sync().await;
 
-    assert_eq!((result.synced, result.attention), (1, 0), "{result:?}");
+    assert_eq!((result.synced, result.attention), (1, 1), "{result:?}");
     let ps = f.pr_state().await;
-    assert_eq!(ps.last_activity_at, Some(LATER_MS));
-    assert_eq!(ps.last_engaged_activity_at, Some(LATER_MS));
-    assert_eq!(ps.needs_attention, None);
-    assert_eq!(ps.attention_since, None);
-}
-
-/// `updatedAt` also moves on pushes and label changes; when it is the
-/// latest thing on the PR the baseline is it, not the older comment.
-#[tokio::test]
-async fn the_first_sync_baseline_takes_updated_at_when_it_is_latest() {
-    let f = fixture("sync-first-updated").await;
-    let bins = FakeBins::acquire("sync-first-updated");
-    serve_pr(
-        &bins,
-        &pr(&json!({
-            "updatedAt": "2026-01-02T04:00:00Z",
-            "comments": comment_at(UPDATED),
-        })),
-    );
-
-    f.sync().await;
-
-    let ps = f.pr_state().await;
-    assert_eq!(ps.last_activity_at, Some(UPDATED_MS));
-    assert_eq!(ps.last_engaged_activity_at, Some(LATER_MS));
-    assert_eq!(ps.needs_attention, None);
+    assert_eq!(ps.last_activity_at, Some(LATER_MS - 30 * 60 * 1000));
+    assert_eq!(ps.last_engaged_activity_at, Some(0));
+    assert_eq!(ps.needs_attention.as_deref(), Some("new_comments"));
 }
 
 #[tokio::test]
