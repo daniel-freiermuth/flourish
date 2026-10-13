@@ -103,7 +103,9 @@ pub struct GhAuthor {
     pub login: String,
 }
 
-/// Comment from GitHub's `pr.comments` array.
+/// Comment from GitHub's `pr.comments` array, or one left on a line of
+/// the diff (GitHub's review comments, GitLab's `DiffNote`s), which
+/// carries its [`CodeLocation`].
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GhComment {
@@ -117,9 +119,23 @@ pub struct GhComment {
     pub body: String,
     #[serde(default)]
     pub created_at: String,
+    /// Where in the diff it was left; `None` for the PR's conversation.
+    #[serde(skip)]
+    pub location: Option<CodeLocation>,
     /// Set by [`screen_feedback`]; never read from the forge.
     #[serde(skip)]
     pub voice: Voice,
+}
+
+/// The file and line an inline comment was left on.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CodeLocation {
+    pub path: String,
+    /// `None` for a comment on the whole file.
+    pub line: Option<i64>,
+    /// The line is in a version of the file the PR has since changed:
+    /// the comment may no longer apply where it says.
+    pub outdated: bool,
 }
 
 /// Review from GitHub's `pr.reviews` array.
@@ -180,6 +196,98 @@ pub struct GlNote {
     pub system: bool,
     #[serde(default, rename = "type")]
     pub note_type: Option<String>,
+    /// Where a `DiffNote` sits in the diff.
+    #[serde(default)]
+    pub position: Option<GlPosition>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GlPosition {
+    #[serde(default)]
+    pub new_path: Option<String>,
+    #[serde(default)]
+    pub old_path: Option<String>,
+    /// `None` on a removed line, which only `old_line` numbers.
+    #[serde(default)]
+    pub new_line: Option<i64>,
+    #[serde(default)]
+    pub old_line: Option<i64>,
+}
+
+impl GlPosition {
+    fn location(&self) -> CodeLocation {
+        CodeLocation {
+            path: self
+                .new_path
+                .clone()
+                .or_else(|| self.old_path.clone())
+                .unwrap_or_default(),
+            line: self.new_line.or(self.old_line),
+            outdated: false,
+        }
+    }
+}
+
+/// One element of GitHub's `pulls/{n}/comments`: a comment on a line of
+/// the diff, which `gh pr view` does not return at all.
+#[derive(Debug, Default, Deserialize)]
+struct GhReviewComment {
+    #[serde(default)]
+    node_id: String,
+    #[serde(default)]
+    user: Option<GhAuthor>,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    created_at: String,
+    #[serde(default)]
+    path: String,
+    /// Null once the commented line is gone from the PR's head.
+    #[serde(default)]
+    line: Option<i64>,
+    #[serde(default)]
+    original_line: Option<i64>,
+}
+
+impl From<GhReviewComment> for GhComment {
+    fn from(c: GhReviewComment) -> Self {
+        Self {
+            id: c.node_id,
+            author: c.user,
+            body: c.body,
+            created_at: c.created_at,
+            location: Some(CodeLocation {
+                path: c.path,
+                line: c.line.or(c.original_line),
+                outdated: c.line.is_none() && c.original_line.is_some(),
+            }),
+            voice: Voice::default(),
+        }
+    }
+}
+
+/// Every inline comment on GitHub PR `pr_number` of the repo at `url`,
+/// oldest first, unscreened.
+fn github_review_comments(url: &str, pr_number: i64) -> anyhow::Result<Vec<GhComment>> {
+    let (host, path) =
+        url_host_path(url).ok_or_else(|| anyhow::anyhow!("cannot parse owner/repo from {url}"))?;
+    let path = path.trim_end_matches('/').trim_end_matches(".git");
+    let api = format!("repos/{path}/pulls/{pr_number}/comments?per_page=100");
+    // `--jq` runs per page, so `.[]` turns every page into one stream of
+    // objects rather than `--paginate`'s concatenated arrays.
+    let mut argv = vec!["gh", "api", "--paginate", &api, "--jq", ".[]"];
+    if !host.eq_ignore_ascii_case("github.com") {
+        argv.extend(["--hostname", host]);
+    }
+    let (rc, out) = run_cmd(&argv, 60);
+    if rc != 0 {
+        anyhow::bail!("gh api {api} failed (rc={rc}): {out}");
+    }
+    serde_json::Deserializer::from_str(&out)
+        .into_iter::<GhReviewComment>()
+        .map(|c| Ok(c?.into()))
+        .collect::<Result<_, serde_json::Error>>()
+        .map_err(|e| anyhow::anyhow!("gh api {api}: unparseable review comments: {e}"))
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -649,7 +757,7 @@ fn github_screen(url: &str, pr: &mut PrView, bots: &ReviewBots) -> anyhow::Resul
     )
 }
 
-/// A GitLab MR's notes as screened (comments, reviews): see
+/// A GitLab MR's notes as screened comments: see
 /// [`screen_feedback`]. Membership is looked up by user id, which the
 /// notes carry and the normalised Gh types do not.
 ///
@@ -662,16 +770,14 @@ fn gitlab_feedback(
     project: &str,
     notes: &[GlNote],
     bots: &ReviewBots,
-) -> anyhow::Result<(Vec<GhComment>, Vec<GhReview>)> {
+) -> anyhow::Result<Vec<GhComment>> {
     let ids: HashMap<&str, i64> = notes
         .iter()
         .filter_map(|n| n.author.as_ref())
         .filter_map(|a| Some((a.username.as_str(), a.id?)))
         .collect();
-    let (comments, reviews) = gitlab_split_notes(notes);
     let mut view = PrView {
-        comments,
-        reviews,
+        comments: gitlab_split_notes(notes),
         ..PrView::default()
     };
     let host = gitlab_host_path(url)
@@ -693,7 +799,7 @@ fn gitlab_feedback(
             })
         },
     )?;
-    Ok((view.comments, view.reviews))
+    Ok(view.comments)
 }
 
 pub trait Forge: Send + Sync {
@@ -715,8 +821,11 @@ pub trait Forge: Send + Sync {
     /// Lightweight PR view for `sync_prs` (state, checks, mergeable), its
     /// feedback screened ([`screen_feedback`]).
     fn view_pr_sync(&self, url: &str, pr_number: i64, bots: &ReviewBots) -> anyhow::Result<PrView>;
-    /// Heavier PR view for engage (includes title/body), its feedback
-    /// screened ([`screen_feedback`]).
+    /// Heavier PR view for engage and harvest: title/body, and every
+    /// inline comment (with its [`CodeLocation`]) among `comments`, its
+    /// feedback screened ([`screen_feedback`]). Sync does without GitHub's
+    /// inline comments: each belongs to a review, whose timestamp already
+    /// raises `new_comments`.
     fn view_pr_engage(
         &self,
         url: &str,
@@ -1003,43 +1112,28 @@ fn gitlab_norm_pipeline(mr: &GlMergeRequest) -> Vec<GhCheckRun> {
     }]
 }
 
-/// Split GitLab notes into (comments, reviews) normalized to Gh types.
-fn gitlab_split_notes(notes: &[GlNote]) -> (Vec<GhComment>, Vec<GhReview>) {
-    let mut comments = Vec::new();
-    let mut reviews = Vec::new();
-    for n in notes {
-        if n.system {
-            continue;
-        }
-        let ts = if n.created_at.is_empty() {
-            &n.updated_at
-        } else {
-            &n.created_at
-        };
-        let author = n.author.as_ref().map(|a| GhAuthor {
-            login: a.username.clone(),
-        });
-        if n.note_type.as_deref() == Some("DiffNote") {
-            reviews.push(GhReview {
-                // Only GitHub screening asks by item; see `gitlab_feedback`.
-                id: String::new(),
-                submitted_at: ts.clone(),
-                body: n.body.clone(),
-                author,
-                state: String::new(),
-                voice: Voice::default(),
-            });
-        } else {
-            comments.push(GhComment {
-                id: String::new(),
-                created_at: ts.clone(),
-                body: n.body.clone(),
-                author,
-                voice: Voice::default(),
-            });
-        }
-    }
-    (comments, reviews)
+/// GitLab notes normalized to comments, oldest first. A `DiffNote` keeps
+/// where in the diff it was left; GitLab has no review bodies to speak of.
+fn gitlab_split_notes(notes: &[GlNote]) -> Vec<GhComment> {
+    notes
+        .iter()
+        .filter(|n| !n.system)
+        .map(|n| GhComment {
+            // Only GitHub screening asks by item; see `gitlab_feedback`.
+            id: String::new(),
+            created_at: if n.created_at.is_empty() {
+                n.updated_at.clone()
+            } else {
+                n.created_at.clone()
+            },
+            body: n.body.clone(),
+            author: n.author.as_ref().map(|a| GhAuthor {
+                login: a.username.clone(),
+            }),
+            location: n.position.as_ref().map(GlPosition::location),
+            voice: Voice::default(),
+        })
+        .collect()
 }
 
 /// Fetch GitLab MR + notes via `glab api`, returning typed structs.
@@ -1204,6 +1298,9 @@ impl Forge for GitHubForge {
             pr_number,
             "title,body,comments,reviews,statusCheckRollup,headRefName,headRefOid",
         )?;
+        // Engage acts on what reviewers said about specific lines, and
+        // `gh pr view` returns only the conversation and review summaries.
+        pr.comments.extend(github_review_comments(url, pr_number)?);
         github_screen(url, &mut pr, bots)?;
         Ok(pr)
     }
@@ -1391,7 +1488,7 @@ impl Forge for GitLabForge {
         let (_, path) = gitlab_host_path(url)
             .ok_or_else(|| anyhow::anyhow!("cannot parse GitLab URL: {url}"))?;
         let (mr, notes) = gitlab_fetch_mr(url, path, pr_number)?;
-        let (comments, reviews) = gitlab_feedback(url, path, &notes, bots)?;
+        let comments = gitlab_feedback(url, path, &notes, bots)?;
         let state = gitlab_norm_state(&mr.state);
         let mergeable = gitlab_norm_mergeable(&mr);
         let status_check_rollup = gitlab_norm_pipeline(&mr);
@@ -1406,7 +1503,7 @@ impl Forge for GitLabForge {
             body: String::new(),
             status_check_rollup,
             comments,
-            reviews,
+            reviews: Vec::new(),
         })
     }
 
@@ -1419,7 +1516,7 @@ impl Forge for GitLabForge {
         let (_, path) = gitlab_host_path(url)
             .ok_or_else(|| anyhow::anyhow!("cannot parse GitLab URL: {url}"))?;
         let (mr, notes) = gitlab_fetch_mr(url, path, pr_number)?;
-        let (comments, reviews) = gitlab_feedback(url, path, &notes, bots)?;
+        let comments = gitlab_feedback(url, path, &notes, bots)?;
         let state = gitlab_norm_state(&mr.state);
         let mergeable = gitlab_norm_mergeable(&mr);
         let status_check_rollup = gitlab_norm_pipeline(&mr);
@@ -1434,7 +1531,7 @@ impl Forge for GitLabForge {
             body: mr.description,
             status_check_rollup,
             comments,
-            reviews,
+            reviews: Vec::new(),
         })
     }
 
