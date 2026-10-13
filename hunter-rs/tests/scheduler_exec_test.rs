@@ -927,30 +927,45 @@ async fn a_hunt_whose_suppressions_cannot_be_read_is_refused() {
     );
 }
 
-/// The same refusal for the shared repo-level analysis body.
+/// The same refusal for the shared repo-level analysis body, through each
+/// runner that wraps it: the error names the runner's own kind, so each
+/// runs its own spec.
 #[tokio::test]
 async fn an_analysis_job_whose_suppressions_cannot_be_read_is_refused() {
-    let dir = TempDir::new("refactor-bad-suppressions");
-    let (_path, store, row, cfg) =
-        repo_with_an_undecodable_finding(&dir, RepoJobKind::Refactor.as_str()).await;
-    let backend = ScriptedBackend::noop();
+    for kind in [
+        RepoJobKind::Refactor,
+        RepoJobKind::Modernization,
+        RepoJobKind::Standards,
+    ] {
+        let dir = TempDir::new("analysis-bad-suppressions");
+        let (_path, store, row, cfg) = repo_with_an_undecodable_finding(&dir, kind.as_str()).await;
+        let backend = ScriptedBackend::noop();
 
-    let err = hunter::scheduler::run_refactor(&store, &cfg, &row, &backend, None)
-        .await
-        .expect_err("an unreadable suppression list must refuse the job");
+        let result = match kind {
+            RepoJobKind::Refactor => {
+                hunter::scheduler::run_refactor(&store, &cfg, &row, &backend, None).await
+            }
+            RepoJobKind::Modernization => {
+                hunter::scheduler::run_modernize(&store, &cfg, &row, &backend, None).await
+            }
+            _ => hunter::scheduler::run_standards(&store, &cfg, &row, &backend, None).await,
+        };
+        let err = result.expect_err("an unreadable suppression list must refuse the job");
 
-    assert!(
-        format!("{err:#}").contains("refactor widget: loading suppressed refactor findings"),
-        "the error must say which read failed for which job: {err:#}"
-    );
-    assert!(
-        backend.runs().is_empty(),
-        "no worker may have been launched"
-    );
-    assert!(
-        store.list_jobs(10).await.unwrap().is_empty(),
-        "no job row may have been written"
-    );
+        let expected = format!("{kind} widget: loading suppressed {kind} findings");
+        assert!(
+            format!("{err:#}").contains(&expected),
+            "the error must say which read failed for which job: {err:#}"
+        );
+        assert!(
+            backend.runs().is_empty(),
+            "no worker may have been launched"
+        );
+        assert!(
+            store.list_jobs(10).await.unwrap().is_empty(),
+            "no job row may have been written"
+        );
+    }
 }
 
 /// A `test_gap` job also hands its worker the repo's bug findings, since it
