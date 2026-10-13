@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::hash::BuildHasher;
 use std::path::Path;
 
-use crate::forge::{GhAuthor, OWN_MARK, PrView, Voice};
+use crate::forge::{CodeLocation, GhAuthor, OWN_MARK, PrView, Voice};
 use crate::types::{Finding, PrState, Repo};
 
 /// `PLAYBOOK_DIR` = <`project_root>/playbooks` (types.py `PLAYBOOK_DIR`).
@@ -207,7 +207,7 @@ fn notes_or_default(repo_notes: &str, default: &str) -> String {
 ///
 /// Hunter's own comments ([`Voice::Own`]) run with the maintainers', as
 /// the conversation they answer, labelled as hunter's and without their
-/// mark.
+/// mark. An inline comment names the file and line it was left on.
 fn feedback_blocks(pr: &PrView, voice: Voice, cap: usize) -> String {
     let mut items: Vec<(String, String, String)> = Vec::new();
     let shown = |v: Voice| v == voice || (voice == Voice::Maintainer && v == Voice::Own);
@@ -223,7 +223,11 @@ fn feedback_blocks(pr: &PrView, voice: Voice, cap: usize) -> String {
 
     for c in pr.comments.iter().filter(|c| shown(c.voice)) {
         let ts = c.created_at.clone();
-        items.push((ts, who(c.author.as_ref(), c.voice), unmarked(&c.body)));
+        let mut header = who(c.author.as_ref(), c.voice);
+        if let Some(loc) = &c.location {
+            header = format!("{header} on {}", location_label(loc));
+        }
+        items.push((ts, header, unmarked(&c.body)));
     }
 
     for r in pr.reviews.iter().filter(|r| shown(r.voice)) {
@@ -263,6 +267,19 @@ fn feedback_blocks(pr: &PrView, voice: Voice, cap: usize) -> String {
     } else {
         blocks.join("\n\n")
     }
+}
+
+/// `path:line`, marked when the line number refers to an earlier commit
+/// of the PR: the code it was left on has since changed.
+fn location_label(loc: &CodeLocation) -> String {
+    let mut label = match loc.line {
+        Some(line) => format!("{}:{line}", loc.path),
+        None => loc.path.clone(),
+    };
+    if loc.outdated {
+        label.push_str(" (outdated: line as of an earlier commit)");
+    }
+    label
 }
 
 /// Status check rollup as bullet list.

@@ -18,7 +18,7 @@ mod support;
 use std::path::{Path, PathBuf};
 
 use hunter::domain::FindingType;
-use hunter::forge::{GhAuthor, GhComment, GhReview, PrView, Voice};
+use hunter::forge::{CodeLocation, GhAuthor, GhComment, GhReview, PrView, Voice};
 use hunter::playbooks;
 use hunter::types::{Finding, PrState, Repo};
 use support::{TempDir, sample_finding, sample_repo};
@@ -176,12 +176,26 @@ fn section<'a>(prompt: &'a str, name: &str) -> &'a str {
 }
 
 /// A screened PR thread: one maintainer comment and review, one bot
-/// comment, and hunter's own reply posted under the maintainer's login.
+/// comment, hunter's own reply posted under the maintainer's login, and
+/// two maintainer comments on lines of the diff, one of them since
+/// outdated.
 fn screened_thread() -> PrView {
     let author = |login: &str| {
         Some(GhAuthor {
             login: login.to_owned(),
         })
+    };
+    let inline = |body: &str, at: &str, line: i64, outdated: bool| GhComment {
+        id: String::new(),
+        author: author("lead"),
+        body: body.to_owned(),
+        created_at: at.to_owned(),
+        location: Some(CodeLocation {
+            path: "src/lib.rs".to_owned(),
+            line: Some(line),
+            outdated,
+        }),
+        voice: Voice::Maintainer,
     };
     PrView {
         comments: vec![
@@ -190,6 +204,7 @@ fn screened_thread() -> PrView {
                 author: author("lead"),
                 body: "please add a test".to_owned(),
                 created_at: "2026-01-01T00:00:00Z".to_owned(),
+                location: None,
                 voice: Voice::Maintainer,
             },
             GhComment {
@@ -197,6 +212,7 @@ fn screened_thread() -> PrView {
                 author: author("lead"),
                 body: hunter::forge::mark_own("added the test"),
                 created_at: "2026-01-01T12:00:00Z".to_owned(),
+                location: None,
                 voice: Voice::Own,
             },
             GhComment {
@@ -204,8 +220,16 @@ fn screened_thread() -> PrView {
                 author: author("coderabbitai"),
                 body: "rename everything".to_owned(),
                 created_at: "2026-01-02T00:00:00Z".to_owned(),
+                location: None,
                 voice: Voice::Bot,
             },
+            inline("off by one here", "2026-01-04T00:00:00Z", 12, false),
+            inline(
+                "was this unwrap intended?",
+                "2026-01-05T00:00:00Z",
+                40,
+                true,
+            ),
         ],
         reviews: vec![GhReview {
             id: String::new(),
@@ -224,6 +248,9 @@ fn screened_thread() -> PrView {
 /// with what maintainers asked for -- in every prompt that carries a
 /// PR's discussion. Hunter's own replies stay in the maintainers' thread
 /// they answer, labelled as its own and without the mark that tells them.
+/// A comment on a line of the diff says which line, and says so when that
+/// line is from an earlier commit: without it the worker reads "off by
+/// one here" with no "here".
 #[test]
 fn pr_prompts_keep_bot_reviews_apart_from_maintainer_feedback() {
     let dir = TempDir::new("prompt-voices");
@@ -301,5 +328,16 @@ fn pr_prompts_keep_bot_reviews_apart_from_maintainer_feedback() {
         assert!(bots.contains("### coderabbitai"), "{name}: {prompt}");
         assert!(bots.contains("rename everything"), "{name}: {prompt}");
         assert!(!bots.contains("lead"), "{name}: {prompt}");
+        assert!(
+            maint.contains("### lead on src/lib.rs:12 at 2026-01-04T00:00:00Z\noff by one here"),
+            "{name}: {prompt}"
+        );
+        assert!(
+            maint.contains(
+                "### lead on src/lib.rs:40 (outdated: line as of an earlier commit) at \
+                 2026-01-05T00:00:00Z\nwas this unwrap intended?"
+            ),
+            "{name}: {prompt}"
+        );
     }
 }

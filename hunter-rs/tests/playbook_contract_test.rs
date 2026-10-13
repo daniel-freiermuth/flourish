@@ -249,6 +249,7 @@ fn sample_pr_view() -> PrView {
                 }),
                 body: "please rename this".to_owned(),
                 created_at: "2026-01-02T03:00:00Z".to_owned(),
+                location: None,
                 voice: Voice::Maintainer,
             },
             GhComment {
@@ -258,6 +259,7 @@ fn sample_pr_view() -> PrView {
                 }),
                 body: "consider extracting a helper".to_owned(),
                 created_at: "2026-01-02T03:02:00Z".to_owned(),
+                location: None,
                 voice: Voice::Bot,
             },
         ],
