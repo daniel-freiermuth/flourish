@@ -102,12 +102,22 @@ impl Fixture {
 
     /// Continue `session_file` instead of starting cold.
     fn resume(&self, session_file: &std::path::Path) -> RunResult {
+        self.resume_bounded(session_file, Some(1_000_000), 30)
+    }
+
+    /// `resume` with the caller's own cap and wall-clock limit.
+    fn resume_bounded(
+        &self,
+        session_file: &std::path::Path,
+        cap_tokens: Option<i64>,
+        max_wall_s: i64,
+    ) -> RunResult {
         harness::run_worker(
             &self.cfg,
             &self.ws,
             PROMPT,
-            Some(1_000_000),
-            30,
+            cap_tokens,
+            max_wall_s,
             None,
             Some(session_file),
         )
@@ -781,4 +791,177 @@ fn a_resume_that_did_not_take_is_reported() {
         second.stdout_tail
     );
     assert_eq!(second.tokens_new, 1000, "still metered, just not continued");
+}
+
+/// A cold run that leaves the 1250-token, one-call transcript every resume
+/// test below continues.
+fn predecessor(fx: &Fixture) -> PathBuf {
+    fx.bins.script(
+        "omp",
+        &format!("{ledger}exit 0", ledger = ledger_sh(&[(1000, 200, 50)])),
+    );
+    let first = fx.run(Some(1_000_000), 30);
+    assert_eq!(first.killed_reason, None, "{:?}", first.stdout_tail);
+    PathBuf::from(first.session_file.expect("first run wrote a ledger"))
+}
+
+/// The resume sibling of `worker_without_a_ledger_is_flagged_unmetered_despite_exit_zero`.
+///
+/// The run directory already holds the predecessor's ledger, so the cold
+/// "no ledger found" test would pass this run as metered — and record a
+/// clean, free success for an attempt whose spend nobody saw. On a resume
+/// the signal is "this attempt recorded no call".
+#[test]
+fn a_resumed_worker_that_adds_no_call_is_flagged_unmetered() {
+    let fx = Fixture::new("resume-no-call");
+    let ledger = predecessor(&fx);
+    fx.bins.script("omp", "printf 'nothing metered\\n'\nexit 0");
+
+    let res = fx.resume(&ledger);
+
+    assert_eq!(
+        res.killed_reason.as_deref(),
+        Some("unmetered"),
+        "an inherited ledger is not a measurement of this attempt"
+    );
+    assert_eq!(res.exit_code, Some(0), "the worker really did exit cleanly");
+    assert_eq!((res.tokens_new, res.calls), (0, 0));
+}
+
+/// The resume sibling of `hanging_worker_without_a_ledger_is_killed_as_unmetered`.
+///
+/// With the cold watchdog the predecessor's ledger would count as "a
+/// ledger exists" from the first tick, and a resumed worker that never
+/// records a call would run unmetered until `max_wall_s`.
+#[test]
+fn a_hanging_resumed_worker_is_not_metered_by_the_ledger_it_inherited() {
+    let mut fx = Fixture::new("resume-hang");
+    let ledger = predecessor(&fx);
+    fx.cfg.session_grace_s = 1;
+    fx.bins.script("omp", "sleep 30");
+
+    let started = std::time::Instant::now();
+    // max_wall_s is far larger, so a pass cannot be the wall-clock branch.
+    let res = fx.resume_bounded(&ledger, Some(1_000_000), 300);
+
+    assert_eq!(res.killed_reason.as_deref(), Some("unmetered"));
+    assert_eq!(res.tokens_new, 0);
+    assert!(
+        started.elapsed().as_secs() < 20,
+        "must be killed at the grace period, not left to run: {:?}",
+        started.elapsed()
+    );
+}
+
+/// The other side of the test above: once this attempt has recorded a
+/// call it is metered, and outliving the grace period is not a reason to
+/// kill it.
+#[test]
+fn a_resumed_worker_that_has_recorded_a_call_outlives_the_grace_period() {
+    let mut fx = Fixture::new("resume-past-grace");
+    let ledger = predecessor(&fx);
+    fx.cfg.session_grace_s = 1;
+    fx.bins.script(
+        "omp",
+        &format!(
+            "{ledger}sleep 3\nexit 0",
+            ledger = ledger_sh(&[(400, 50, 10)])
+        ),
+    );
+
+    let res = fx.resume_bounded(&ledger, Some(1_000_000), 300);
+
+    assert_eq!(res.killed_reason, None, "{:?}", res.stdout_tail);
+    assert_eq!(res.exit_code, Some(0));
+    assert_eq!((res.tokens_new, res.calls), (460, 1));
+    assert!(
+        res.duration_s >= 2.0,
+        "the worker must have run past the 1 s grace period: {}s",
+        res.duration_s
+    );
+}
+
+/// A resumed attempt's cap bounds what that attempt spends, not the
+/// transcript it inherited — and it is still armed.
+///
+/// The cap is this attempt's ramp headroom. Comparing it with the whole
+/// file would kill a continuation for spend its predecessor already paid
+/// for; a chain whose history alone exceeds the cap could then never
+/// resume at all.
+#[test]
+fn a_resumed_runs_cap_counts_only_this_attempts_tokens() {
+    let fx = Fixture::new("resume-cap");
+    let ledger = predecessor(&fx);
+    let cap = 2000;
+
+    // 1250 inherited + 1000 new crosses the cap; 1000 alone does not. The
+    // sleep keeps the worker alive across watchdog ticks, so a cap check
+    // against the whole file would have fired.
+    fx.bins.script(
+        "omp",
+        &format!(
+            "{ledger}sleep 1\nexit 0",
+            ledger = ledger_sh(&[(1000, 0, 0)])
+        ),
+    );
+    let under = fx.resume_bounded(&ledger, Some(cap), 30);
+    assert_eq!(under.killed_reason, None, "{:?}", under.stdout_tail);
+    assert_eq!(under.tokens_new, 1000);
+
+    // This attempt alone crosses the cap.
+    fx.bins.script(
+        "omp",
+        &format!("{ledger}sleep 10", ledger = ledger_sh(&[(2500, 0, 0)])),
+    );
+    let over = fx.resume_bounded(&ledger, Some(cap), 30);
+    assert_eq!(over.killed_reason.as_deref(), Some("cap"));
+    assert_eq!(
+        over.tokens_new, 2500,
+        "this attempt's spend, not the file's"
+    );
+    assert!(
+        over.duration_s < 5.0,
+        "killed on crossing the cap, not after the worker's own sleep: {}s",
+        over.duration_s
+    );
+}
+
+/// `a_missing_resume_source_is_refused_rather_than_restarted` runs with no
+/// session directory at all. A directory that survived while the file in
+/// it did not is refused the same way.
+#[test]
+fn a_missing_resume_source_in_a_live_session_directory_is_refused() {
+    let fx = Fixture::new("resume-file-gone");
+    std::fs::create_dir_all(&fx.ws.session).expect("create the session dir");
+    fx.bins.script("omp", "printf 'should not run\\n'\nexit 0");
+
+    let res = fx.resume(&fx.ws.session.join("session-01.jsonl"));
+
+    assert_eq!(res.killed_reason.as_deref(), Some("resume-unavailable"));
+    assert_eq!(res.exit_code, None, "nothing was spawned");
+    assert!(
+        fx.bins.calls_to("omp").is_empty(),
+        "a refused resume must not spend a session floor finding out"
+    );
+}
+
+/// An empty source is refused like a missing one: omp treats an
+/// unreadable `--resume` file as "start fresh here", which is exactly the
+/// silent restart the refusal exists to prevent.
+#[test]
+fn an_empty_resume_source_is_refused() {
+    let fx = Fixture::new("resume-empty");
+    std::fs::create_dir_all(&fx.ws.session).expect("create the session dir");
+    let empty = fx.ws.session.join("session-01.jsonl");
+    std::fs::write(&empty, b"").expect("write an empty transcript");
+    fx.bins.script("omp", "printf 'should not run\\n'\nexit 0");
+
+    let res = fx.resume(&empty);
+
+    assert_eq!(res.killed_reason.as_deref(), Some("resume-unavailable"));
+    assert_eq!(res.exit_code, None, "nothing was spawned");
+    assert!(
+        fx.bins.calls_to("omp").is_empty(),
+        "a refused resume must not spend a session floor finding out"
+    );
 }
