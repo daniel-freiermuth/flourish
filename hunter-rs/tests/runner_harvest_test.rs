@@ -58,6 +58,16 @@ impl Fixture {
         let row: Option<(Option<i64>,)> = sqlx::query_as(sql).fetch_optional(&pool).await.unwrap();
         row.and_then(|r| r.0)
     }
+
+    /// A raw write, for states the Store API never produces.
+    async fn exec(&self, sql: &'static str) {
+        let pool = sqlx::SqlitePool::connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new().filename(&self.db),
+        )
+        .await
+        .unwrap();
+        sqlx::query(sql).execute(&pool).await.unwrap();
+    }
 }
 
 /// A repo with a finding whose PR #7 closed without merging, unharvested,
@@ -1800,4 +1810,114 @@ async fn a_suspended_harvest_that_wrote_blocked_is_held() {
     );
     let ps = f.store.get_pr_state(f.fid).await.unwrap().unwrap();
     assert_eq!(ps.harvested_at, None, "not stamped harvested");
+}
+
+/// `gh pr view` calls made for PR `number`.
+fn views_of(bins: &FakeBins, number: &str) -> usize {
+    bins.calls_to("gh")
+        .iter()
+        .filter(|c| {
+            c.get(1).map(String::as_str) == Some("pr")
+                && c.get(2).map(String::as_str) == Some("view")
+                && c.iter().any(|a| a == number)
+        })
+        .count()
+}
+
+/// A `pr_state` row that lost its number is repaired from the finding's
+/// PR URL, and the harvest reviews the PR that number names.
+#[tokio::test]
+async fn a_missing_pr_number_is_recovered_from_the_pr_url() {
+    let bins = FakeBins::acquire("harvest-self-heal");
+    gh_default(&bins);
+    let f = fixture("harvest-self-heal", FindingStatus::Merged).await;
+    f.store.mark_pr_merged(f.fid, 7, 2).await.unwrap();
+    f.store
+        .set_finding_pr_open(f.fid, "https://github.com/acme/widget/pull/42")
+        .await
+        .unwrap();
+    f.store
+        .set_finding_status(f.fid, FindingStatus::Merged)
+        .await
+        .unwrap();
+    f.exec("UPDATE pr_state SET pr_number = NULL").await;
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let backend = ScriptedBackend::noop();
+
+    let summary = run_harvest(&f.store, &f.cfg, &finding, &backend, None)
+        .await
+        .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("harvested"), "{summary:?}");
+    let ps = f.store.get_pr_state(f.fid).await.unwrap().unwrap();
+    assert_eq!(ps.pr_number, Some(42), "the row is repaired from the URL");
+    assert!(ps.harvested_at.is_some(), "the recovered PR is harvested");
+    assert_eq!(views_of(&bins, "42"), 1, "{:?}", bins.calls_to("gh"));
+    assert_eq!(backend.runs().len(), 1);
+}
+
+/// With no number and no URL to recover one from, the harvest refuses
+/// before any forge call, job or worker, and says why in the event log.
+#[tokio::test]
+async fn a_missing_pr_number_without_a_parseable_url_bails() {
+    let bins = FakeBins::acquire("harvest-no-pr-number");
+    gh_default(&bins);
+    let f = fixture("harvest-no-pr-number", FindingStatus::Merged).await;
+    f.store.mark_pr_merged(f.fid, 7, 2).await.unwrap();
+    f.exec("UPDATE pr_state SET pr_number = NULL").await;
+    f.exec("UPDATE findings SET pr_url = 'not a pr url'").await;
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let never_runs = ScriptedBackend::new(|_| panic!("no worker without a PR number"));
+
+    let err = run_harvest(&f.store, &f.cfg, &finding, &never_runs, None)
+        .await
+        .expect_err("a harvest with no PR number must refuse");
+
+    assert_eq!(err.to_string(), "no pr_number");
+    let events = f.store.recent_events(50).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "error" && e.message.contains("no parseable pr_url")),
+        "{events:?}"
+    );
+    assert_eq!(f.scalar("SELECT COUNT(*) FROM jobs").await, Some(0));
+    assert!(bins.calls_to("gh").is_empty(), "{:?}", bins.calls());
+    let ps = f.store.get_pr_state(f.fid).await.unwrap().unwrap();
+    assert_eq!((ps.pr_number, ps.harvested_at), (None, None));
+}
+
+/// A harvest the budget denies ends before the forge and the tree: no
+/// job, no view, no worktree, nothing counted against it, and the PR
+/// stays pending for a window with room.
+#[tokio::test]
+async fn a_denied_harvest_leaves_the_pr_pending() {
+    let bins = FakeBins::acquire("harvest-denied");
+    gh_default(&bins);
+    let f = fixture("harvest-denied", FindingStatus::Merged).await;
+    f.store.mark_pr_merged(f.fid, 7, 2).await.unwrap();
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let denying = ScriptedBackend::new(|_| panic!("no worker once denied")).denying_above(0);
+
+    let summary = run_harvest(&f.store, &f.cfg, &finding, &denying, None)
+        .await
+        .unwrap();
+
+    assert!(summary.denied.is_some(), "{summary:?}");
+    assert_eq!(f.scalar("SELECT COUNT(*) FROM jobs").await, Some(0));
+    assert!(bins.calls_to("gh").is_empty(), "{:?}", bins.calls());
+    let trees: Vec<_> = std::fs::read_dir(&f.cfg.work_root)
+        .map(|d| d.map(|e| e.unwrap().path()).collect())
+        .unwrap_or_default();
+    assert!(trees.is_empty(), "no worktree may be left: {trees:?}");
+    assert_eq!(harvest_streak(&f).await, 0);
+    let pending: Vec<i64> = f
+        .store
+        .list_pending_harvest()
+        .await
+        .unwrap()
+        .iter()
+        .map(|p| p.id)
+        .collect();
+    assert_eq!(pending, [f.fid]);
 }
