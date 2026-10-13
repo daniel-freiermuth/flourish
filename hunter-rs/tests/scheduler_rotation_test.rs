@@ -778,7 +778,10 @@ async fn a_hunt_that_errors_before_its_worker_is_held_and_passes_the_turn_on() {
 
     let held = hold_alpha_then_beta(&store, &cfg, &backend, RepoWorkKind::Hunt).await;
 
-    assert!(backend.runs().is_empty(), "no worker may have been launched");
+    assert!(
+        backend.runs().is_empty(),
+        "no worker may have been launched"
+    );
     assert!(held.detail.contains("NO_SUCH_SLOT"), "{held:?}");
 }
 
