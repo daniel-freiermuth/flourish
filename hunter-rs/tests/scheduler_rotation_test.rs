@@ -593,7 +593,9 @@ async fn a_clean_scan_moves_its_timestamp_and_ends_the_streak() {
 }
 
 /// A backend that cannot start the worker closes its job, which is not
-/// left `running`, and is counted as `runner error`.
+/// left `running`, and is counted as `runner error`. The error reaches the
+/// operator as it was raised, cause and all, though the runner has marked
+/// it counted.
 #[tokio::test]
 async fn a_runner_error_closes_the_job_and_is_counted() {
     let (_dir, path, cfg) = fixture("rotation-runner-error").await;
@@ -607,7 +609,21 @@ async fn a_runner_error_closes_the_job_and_is_counted() {
     )
     .await;
 
-    assert!(summary.error.is_some(), "{summary:?}");
+    assert_eq!(
+        summary.error.as_deref(),
+        Some("test: the backend failed before the worker ran"),
+        "{summary:?}"
+    );
+    let events = store.recent_events(10).await.unwrap();
+    let crash = events
+        .iter()
+        .find(|e| e.message.starts_with("cycle crashed: "))
+        .expect("a cycle crashed event");
+    assert!(
+        crash.message.contains("test: the blocking task panicked"),
+        "the cause must be logged too: {}",
+        crash.message
+    );
     let jobs = store.list_jobs(10).await.unwrap();
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].job.state, JobState::Failed, "{:?}", jobs[0]);
