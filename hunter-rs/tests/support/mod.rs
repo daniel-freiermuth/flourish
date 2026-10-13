@@ -693,7 +693,10 @@ impl Backend for ScriptedBackend {
         };
         self.runs.lock().unwrap().push(run.clone());
         if self.fails {
-            anyhow::bail!("test: the backend failed before the worker ran");
+            // With a cause under it, so a test can see whether the whole
+            // chain reaches the operator or only the outermost message.
+            return Err(anyhow::anyhow!("test: the blocking task panicked")
+                .context("test: the backend failed before the worker ran"));
         }
         let mut result = (self.run)(&run);
         if self.usage_delta.is_some() {
