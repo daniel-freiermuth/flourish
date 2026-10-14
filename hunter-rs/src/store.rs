@@ -34,6 +34,7 @@ use crate::domain::{
 use crate::recovery::{
     DaemonLock, Owner, RecordedJob, Recovery, StrandedClaim, StrandedJob, Unreconciled,
 };
+use crate::transition::{Moved, Record, ReleaseVerdict, Transition, Unclaimed, decline_status};
 use crate::types::{
     Event, Finding, Job, JobListEntry, PrState, Repo, SchedulerState, StatsByFinding, StatsByKind,
     StatsTotals,
@@ -499,13 +500,13 @@ async fn point_checkpoint(
     Ok(())
 }
 
-/// The verdict a release writes, if its action is one: `(status, reason)`.
+/// The verdict a release writes, if its action is one, with its reason.
 /// Refused when it lacks its reason, or `classify` its classification.
 fn release_verdict(
     action: ReleaseAction,
     reason: Option<&str>,
     classification: Option<ClosureClass>,
-) -> Result<Option<(FindingStatus, String)>, StoreWriteError> {
+) -> Result<Option<(ReleaseVerdict, String)>, StoreWriteError> {
     let reason = reason.map(str::trim).filter(|r| !r.is_empty());
     let refuse = |msg: String| Err(StoreWriteError::Refused(msg));
     Ok(match action {
@@ -513,19 +514,19 @@ fn release_verdict(
             let Some(reason) = reason else {
                 return refuse(format!("{action} needs a reason"));
             };
-            let status = if action == ReleaseAction::Reject {
-                FindingStatus::Rejected
+            let verdict = if action == ReleaseAction::Reject {
+                ReleaseVerdict::Rejected
             } else {
-                FindingStatus::Wontfix
+                ReleaseVerdict::Wontfix
             };
-            Some((status, reason.chars().take(500).collect()))
+            Some((verdict, reason.chars().take(500).collect()))
         }
         ReleaseAction::Classify => {
             let (Some(class), Some(reason)) = (classification, reason) else {
                 return refuse("classify needs a classification and a reason".to_owned());
             };
             Some((
-                class.status(),
+                ReleaseVerdict::Classified(class),
                 format!("{class}: {reason}").chars().take(500).collect(),
             ))
         }
@@ -534,7 +535,8 @@ fn release_verdict(
 }
 
 /// Write a release's verdict inside [`Store::release_hold`]'s transaction,
-/// with its `verdict` event as the operator's. The verdict moves the
+/// with its `verdict` event as the operator's. `from` is the finding's
+/// status read with the hold in that transaction. The verdict moves the
 /// finding out of the tier, which ends the work item (migration 024's
 /// trigger); the hold is already released, so it is not released again as
 /// `finding-left-tier`. A `classify` also stamps the closed PR harvested,
@@ -542,28 +544,30 @@ fn release_verdict(
 async fn write_release_verdict(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     finding_id: i64,
-    action: ReleaseAction,
-    status: FindingStatus,
+    from: FindingStatus,
+    verdict: ReleaseVerdict,
     text: &str,
     user_id: i64,
     now: i64,
-) -> sqlx::Result<()> {
-    sqlx::query!(
-        "UPDATE findings SET status = ?1, verdict_reason = ?2, updated_at = ?3 WHERE id = ?4",
-        status,
-        text,
-        now,
-        finding_id
-    )
-    .execute(&mut **tx)
-    .await?;
-    sqlx::query!(
-        "DELETE FROM verdict_anchors WHERE finding_id = ?1",
-        finding_id
-    )
-    .execute(&mut **tx)
-    .await?;
-    if action == ReleaseAction::Classify {
+) -> Result<(), StoreWriteError> {
+    let Ok(from) = Unclaimed::try_from(from) else {
+        return Err(StoreWriteError::Refused(format!(
+            "#{finding_id} is claimed by a fix; a release cannot move it"
+        )));
+    };
+    let release = Transition::HoldReleased {
+        from,
+        verdict,
+        reason: text,
+    };
+    if let Moved::Conflict { now } = Store::apply_transition(tx, finding_id, &release).await? {
+        // `from` was read in this transaction, so this is a store fault.
+        return Err(StoreWriteError::Refused(format!(
+            "#{finding_id} moved from {from} to {now:?} inside its release"
+        )));
+    }
+    let to = release.to();
+    if matches!(verdict, ReleaseVerdict::Classified(_)) {
         sqlx::query!(
             "UPDATE pr_state SET harvested_at = ?1 WHERE finding_id = ?2",
             now,
@@ -572,7 +576,7 @@ async fn write_release_verdict(
         .execute(&mut **tx)
         .await?;
     }
-    let message = format!("finding {finding_id} -> {status}: {text}");
+    let message = format!("finding {finding_id} -> {to}: {text}");
     insert_event(
         &mut **tx,
         "verdict",
@@ -581,7 +585,8 @@ async fn write_release_verdict(
         Some(finding_id),
         Some(user_id),
     )
-    .await
+    .await?;
+    Ok(())
 }
 
 /// The effect of releasing a hold with `action` on the work item and the
@@ -898,11 +903,14 @@ impl Store {
         .await
     }
 
-    /// Plain finding status transition (new, queued, rechecking, merged).
+    /// Set a finding's status whatever it was: a fixture write for tests
+    /// that start from a given status. Only in a `test-support` build: the
+    /// daemon moves a finding only through [`Self::transition`] or a fix
+    /// claim's holder.
     ///
     /// Never to `fixing`: that claim has an owner that releases it if its
-    /// fix does not, which only [`CycleScope::claim_fix`](crate::recovery::CycleScope::claim_fix) records. Refused,
-    /// as [`Self::claim_in_progress`] refuses it.
+    /// fix does not, which only [`CycleScope::claim_fix`](crate::recovery::CycleScope::claim_fix) records.
+    #[cfg(feature = "test-support")]
     pub async fn set_finding_status(
         &self,
         finding_id: i64,
@@ -925,9 +933,8 @@ impl Store {
         Ok(())
     }
 
-    /// Status transition with a verdict reason (rejected, wontfix). Any
-    /// anchor an earlier verdict left is removed in the same transaction:
-    /// it described that verdict, not this one.
+    /// [`Self::set_anchored_verdict`] without an anchor: a fixture write.
+    #[cfg(feature = "test-support")]
     pub async fn set_finding_verdict(
         &self,
         finding_id: i64,
@@ -938,9 +945,10 @@ impl Store {
             .await
     }
 
-    /// [`Self::set_finding_verdict`] for a worker's verdict, recording what
-    /// it was judged against (`anchor`) in the same transaction, or
-    /// removing the previous verdict's anchor when there is none.
+    /// A verdict whatever the status was, recording `anchor` (or removing
+    /// the previous verdict's): a fixture write, only in a `test-support`
+    /// build, as [`Self::set_finding_status`].
+    #[cfg(feature = "test-support")]
     pub async fn set_anchored_verdict(
         &self,
         finding_id: i64,
@@ -948,12 +956,161 @@ impl Store {
         reason: &str,
         anchor: Option<&VerdictAnchor>,
     ) -> sqlx::Result<()> {
-        self.write_verdict(finding_id, None, status, reason, anchor)
-            .await
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let now = now_ms();
+        sqlx::query!(
+            "UPDATE findings SET status = ?1, verdict_reason = ?2, updated_at = ?3 WHERE id = ?4",
+            status,
+            reason,
+            now,
+            finding_id
+        )
+        .execute(&mut *tx)
+        .await?;
+        Self::write_anchor(&mut tx, finding_id, anchor).await?;
+        tx.commit().await
     }
 
-    /// [`Self::set_anchored_verdict`] for a fix the worker declined, applied
-    /// only while the finding is still `fixing`, anchor included.
+    /// Make `transition` on `finding_id`, only while the finding is still
+    /// at one of the transition's sources. One transaction: the status, and
+    /// what the transition records with it (a verdict's reason and anchor,
+    /// or an analysis), land together or not at all. [`Moved::Conflict`]
+    /// names where the finding is instead.
+    pub async fn transition(
+        &self,
+        finding_id: i64,
+        transition: &Transition<'_>,
+    ) -> sqlx::Result<Moved> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let moved = Self::apply_transition(&mut tx, finding_id, transition).await?;
+        tx.commit().await?;
+        Ok(moved)
+    }
+
+    /// [`Self::transition`] inside a writer's own transaction, for an edge
+    /// that lands with other writes (a hold's release, a harvest's stamp,
+    /// the other half of a dep-update handover).
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one guarded UPDATE per kind of record: `query!` takes one literal each, so \
+                  the arms cannot share their SQL"
+    )]
+    async fn apply_transition(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        finding_id: i64,
+        transition: &Transition<'_>,
+    ) -> sqlx::Result<Moved> {
+        let (from_a, from_b) = transition.from().pair();
+        let to = FindingStatus::from(transition.to());
+        let now = now_ms();
+        let applied = match transition.record() {
+            Record::StatusOnly => {
+                sqlx::query!(
+                    "UPDATE findings SET status = ?1, updated_at = ?2 \
+                 WHERE id = ?3 AND status IN (?4, ?5)",
+                    to,
+                    now,
+                    finding_id,
+                    from_a,
+                    from_b
+                )
+                .execute(&mut **tx)
+                .await?
+                .rows_affected()
+                    > 0
+            }
+            Record::Rescan(row) => {
+                let symbol = row.symbol.as_deref();
+                let detail = row.detail.as_deref();
+                let evidence_plan = row.evidence_plan.as_deref();
+                let set = sqlx::query!(
+                    "UPDATE findings SET status = ?1, verdict_reason = NULL, symbol = ?2, \
+                     line = ?3, severity = ?4, confidence = ?5, summary = ?6, detail = ?7, \
+                     evidence_plan = ?8, updated_at = ?9 \
+                     WHERE id = ?10 AND status IN (?11, ?12)",
+                    to,
+                    symbol,
+                    row.line,
+                    row.severity,
+                    row.confidence,
+                    row.summary,
+                    detail,
+                    evidence_plan,
+                    now,
+                    finding_id,
+                    from_a,
+                    from_b
+                )
+                .execute(&mut **tx)
+                .await?
+                .rows_affected()
+                    > 0;
+                if set {
+                    Self::write_anchor(tx, finding_id, None).await?;
+                }
+                set
+            }
+            Record::Verdict { reason, anchor } => {
+                let set = sqlx::query!(
+                    "UPDATE findings SET status = ?1, verdict_reason = ?2, updated_at = ?3 \
+                     WHERE id = ?4 AND status IN (?5, ?6)",
+                    to,
+                    reason,
+                    now,
+                    finding_id,
+                    from_a,
+                    from_b
+                )
+                .execute(&mut **tx)
+                .await?
+                .rows_affected()
+                    > 0;
+                if set {
+                    Self::write_anchor(tx, finding_id, anchor).await?;
+                }
+                set
+            }
+            Record::InheritOverride { from_id } => {
+                let exempt = BudgetOverride::Exempt;
+                sqlx::query!(
+                    "UPDATE findings SET status = ?1, updated_at = ?2, \
+                     budget_override = CASE \
+                         WHEN budget_override = ?3 \
+                           OR (SELECT budget_override FROM findings WHERE id = ?4) = ?3 \
+                         THEN ?3 \
+                         ELSE COALESCE(budget_override, \
+                             (SELECT budget_override FROM findings WHERE id = ?4)) \
+                     END \
+                     WHERE id = ?5 AND status IN (?6, ?7)",
+                    to,
+                    now,
+                    exempt,
+                    from_id,
+                    finding_id,
+                    from_a,
+                    from_b
+                )
+                .execute(&mut **tx)
+                .await?
+                .rows_affected()
+                    > 0
+            }
+        };
+        if applied {
+            return Ok(Moved::Applied);
+        }
+        let now = sqlx::query_scalar!(
+            r#"SELECT status AS "status!: FindingStatus" FROM findings WHERE id = ?1"#,
+            finding_id
+        )
+        .fetch_optional(&mut **tx)
+        .await?;
+        Ok(Moved::Conflict { now })
+    }
+
+    /// The verdict of a fix the worker declined, its classification's
+    /// status ([`decline_status`]) with the anchor, applied only while the
+    /// finding is still `fixing`.
     /// Takes an [`Owner`], which only `crate::recovery` makes, inside
     /// [`FixClaim::conclude`](crate::recovery::FixClaim::conclude): only the
     /// claim's holder moves a finding out of `fixing`.
@@ -961,41 +1118,21 @@ impl Store {
         &self,
         _owner: &Owner,
         finding_id: i64,
-        status: FindingStatus,
+        class: Option<ClosureClass>,
         reason: &str,
         anchor: Option<&VerdictAnchor>,
     ) -> sqlx::Result<()> {
-        self.write_verdict(
-            finding_id,
-            Some(FindingStatus::Fixing),
-            status,
-            reason,
-            anchor,
-        )
-        .await
-    }
-
-    /// The verdict write behind [`Self::set_anchored_verdict`] and
-    /// [`Self::conclude_fixing`]: guarded by `from` when given, the anchor
-    /// replaced only when the status was written.
-    async fn write_verdict(
-        &self,
-        finding_id: i64,
-        from: Option<FindingStatus>,
-        status: FindingStatus,
-        reason: &str,
-        anchor: Option<&VerdictAnchor>,
-    ) -> sqlx::Result<()> {
+        let (now, fixing) = (now_ms(), FindingStatus::Fixing);
+        let status = FindingStatus::from(decline_status(class));
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let now = now_ms();
         let set = sqlx::query!(
             "UPDATE findings SET status = ?1, verdict_reason = ?2, updated_at = ?3 \
-             WHERE id = ?4 AND (?5 IS NULL OR status = ?5)",
+             WHERE id = ?4 AND status = ?5",
             status,
             reason,
             now,
             finding_id,
-            from
+            fixing
         )
         .execute(&mut *tx)
         .await?
@@ -1006,41 +1143,6 @@ impl Store {
         }
         tx.commit().await?;
         Ok(())
-    }
-
-    /// [`Self::set_finding_verdict`], applied only while the finding is
-    /// still at `from` (the status the caller just checked). `false` when
-    /// something else moved it in between: the operator's verdict loses to
-    /// a job that claimed the finding meanwhile. An operator's verdict has
-    /// no tree to be anchored to, so it removes any anchor an earlier one
-    /// left.
-    pub async fn set_verdict_if(
-        &self,
-        finding_id: i64,
-        from: FindingStatus,
-        status: FindingStatus,
-        reason: &str,
-    ) -> sqlx::Result<bool> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let now = now_ms();
-        let set = sqlx::query!(
-            "UPDATE findings SET status = ?1, verdict_reason = ?2, updated_at = ?3 \
-             WHERE id = ?4 AND status = ?5",
-            status,
-            reason,
-            now,
-            finding_id,
-            from
-        )
-        .execute(&mut *tx)
-        .await?
-        .rows_affected()
-            > 0;
-        if set {
-            Self::write_anchor(&mut tx, finding_id, None).await?;
-        }
-        tx.commit().await?;
-        Ok(set)
     }
 
     /// Replace `finding_id`'s verdict anchor with `anchor`, or remove it.
@@ -1156,53 +1258,6 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(())
-    }
-
-    /// Reopen a suppressed finding that a scan filed again: back to `new`
-    /// with the scan's analysis, its verdict and anchor gone. Only from a
-    /// suppressed status, so a finding something else moved meanwhile
-    /// keeps that. The caller decides whether the verdict had lapsed
-    /// ([`crate::suppression::reopen_if_changed`]). `true` when reopened.
-    pub async fn reopen_suppressed(
-        &self,
-        finding_id: i64,
-        row: &FindingInsert,
-    ) -> sqlx::Result<bool> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let now = now_ms();
-        let new = FindingStatus::New;
-        let s1 = FindingStatus::Rejected;
-        let s2 = FindingStatus::Wontfix;
-        let symbol = row.symbol.as_deref();
-        let detail = row.detail.as_deref();
-        let evidence_plan = row.evidence_plan.as_deref();
-        let reopened = sqlx::query!(
-            "UPDATE findings SET status = ?1, verdict_reason = NULL, symbol = ?2, line = ?3, \
-             severity = ?4, confidence = ?5, summary = ?6, detail = ?7, evidence_plan = ?8, \
-             updated_at = ?9 \
-             WHERE id = ?10 AND status IN (?11, ?12)",
-            new,
-            symbol,
-            row.line,
-            row.severity,
-            row.confidence,
-            row.summary,
-            detail,
-            evidence_plan,
-            now,
-            finding_id,
-            s1,
-            s2
-        )
-        .execute(&mut *tx)
-        .await?
-        .rows_affected()
-            > 0;
-        if reopened {
-            Self::write_anchor(&mut tx, finding_id, None).await?;
-        }
-        tx.commit().await?;
-        Ok(reopened)
     }
 
     /// Set finding status to `pr_open` with PR URL, whatever it was: a
@@ -3483,16 +3538,43 @@ impl Store {
     /// landed. Not a `queued` one whose fix has a checkpoint or is held: a
     /// worker is part way to the old target, and resuming it against a rewritten one
     /// would mix the two (WORK-MODEL.md G2). `true` when anything changed.
+    /// The revival's edge cannot conflict, since its status is read in this
+    /// transaction: a conflict is a store fault, and is refused.
     pub async fn refresh_dep_update(
         &self,
         finding_id: i64,
         row: &FindingInsert,
-    ) -> sqlx::Result<bool> {
+    ) -> Result<bool, StoreWriteError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let open = sqlx::query!(
+            r#"SELECT f.status AS "status!: FindingStatus", f.verdict_reason
+               FROM findings f
+               WHERE f.id = ?1 AND f.type = 'dep_update'
+                 AND NOT EXISTS (SELECT 1 FROM finding_work w WHERE w.finding_id = f.id
+                     AND w.kind = 'fix' AND w.checkpoint_job_id IS NOT NULL)
+                 AND NOT EXISTS (SELECT 1 FROM work_holds h WHERE h.finding_id = f.id
+                     AND h.kind = 'fix' AND h.released_at IS NULL)"#,
+            finding_id
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(open) = open else {
+            return Ok(false);
+        };
+        let revived = open.status == FindingStatus::Superseded
+            && open.verdict_reason.as_deref() == Some(DEP_UNPROPOSED_REASON);
+        if revived
+            && let Moved::Conflict { now } =
+                Self::apply_transition(&mut tx, finding_id, &Transition::Reproposed).await?
+        {
+            return Err(StoreWriteError::Refused(format!(
+                "#{finding_id} moved from {} to {now:?} inside its refresh",
+                Transition::Reproposed.from()
+            )));
+        }
         let now = now_ms();
         let new = FindingStatus::New;
         let queued = FindingStatus::Queued;
-        let superseded = FindingStatus::Superseded;
-        let unproposed = DEP_UNPROPOSED_REASON;
         let file = &row.file;
         let severity = row.severity;
         let confidence = row.confidence;
@@ -3504,22 +3586,13 @@ impl Store {
         let latest_version = row.latest_version.as_deref();
         let update_type = row.update_type.as_deref();
         let security_advisory = row.security_advisory.as_deref();
-        // SQLite evaluates every SET expression against the old row, so the
-        // two CASEs both see the status before this update.
-        let done = sqlx::query!(
+        let rewritten = sqlx::query!(
             "UPDATE findings SET file = ?1, severity = ?2, confidence = ?3, summary = ?4, \
              detail = ?5, ecosystem = ?6, package = ?7, current_version = ?8, \
              latest_version = ?9, update_type = ?10, security_advisory = ?11, \
-             status = CASE WHEN status = ?12 THEN ?13 ELSE status END, \
-             verdict_reason = CASE WHEN status = ?12 THEN NULL ELSE verdict_reason END, \
-             updated_at = ?14 \
-             WHERE id = ?15 AND type = 'dep_update' \
-               AND (status IN (?13, ?16) OR (status = ?12 AND verdict_reason = ?17)) \
-               AND NOT EXISTS (SELECT 1 FROM finding_work w WHERE w.finding_id = ?15 \
-                   AND w.kind = 'fix' AND w.checkpoint_job_id IS NOT NULL) \
-               AND NOT EXISTS (SELECT 1 FROM work_holds h WHERE h.finding_id = ?15 \
-                   AND h.kind = 'fix' AND h.released_at IS NULL) \
-               AND (status = ?12 OR file IS NOT ?1 OR severity IS NOT ?2 \
+             updated_at = ?12 \
+             WHERE id = ?13 AND status IN (?14, ?15) \
+               AND (?16 OR file IS NOT ?1 OR severity IS NOT ?2 \
                     OR confidence IS NOT ?3 OR summary IS NOT ?4 OR detail IS NOT ?5 \
                     OR ecosystem IS NOT ?6 OR package IS NOT ?7 \
                     OR current_version IS NOT ?8 OR latest_version IS NOT ?9 \
@@ -3535,16 +3608,18 @@ impl Store {
             latest_version,
             update_type,
             security_advisory,
-            superseded,
-            new,
             now,
             finding_id,
+            new,
             queued,
-            unproposed
+            revived
         )
-        .execute(&self.pool)
-        .await?;
-        Ok(done.rows_affected() > 0)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+        tx.commit().await?;
+        Ok(revived || rewritten)
     }
 
     /// Retire the repo's `new` `dep_update` findings that a Renovate scan
@@ -3554,35 +3629,44 @@ impl Store {
     /// dependencies it skipped or failed to look up, whose findings stay.
     /// A group finding is matched by its group name, not its members.
     /// Anything a worker or the operator has taken up is left alone.
-    /// Returns how many were retired.
+    /// Returns how many were retired. Each edge's status is read in this
+    /// transaction, so a conflict is a store fault: refused, and nothing is
+    /// retired.
     pub async fn supersede_unproposed_dep_updates(
         &self,
         repo_id: i64,
         proposed: &[String],
         unchecked: &[String],
-    ) -> sqlx::Result<u64> {
-        let now = now_ms();
+    ) -> Result<u64, StoreWriteError> {
         let new = FindingStatus::New;
-        let superseded = FindingStatus::Superseded;
-        let unproposed = DEP_UNPROPOSED_REASON;
         let proposed = serde_json::to_string(proposed).unwrap_or_else(|_| "[]".to_owned());
         let unchecked = serde_json::to_string(unchecked).unwrap_or_else(|_| "[]".to_owned());
-        let done = sqlx::query!(
-            "UPDATE findings SET status = ?1, verdict_reason = ?2, updated_at = ?3 \
-             WHERE repo_id = ?4 AND type = 'dep_update' AND status = ?5 \
-               AND fingerprint NOT IN (SELECT value FROM json_each(?6)) \
-               AND package NOT IN (SELECT value FROM json_each(?7))",
-            superseded,
-            unproposed,
-            now,
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let unproposed = sqlx::query_scalar!(
+            r#"SELECT id AS "id!: i64" FROM findings
+               WHERE repo_id = ?1 AND type = 'dep_update' AND status = ?2
+                 AND fingerprint NOT IN (SELECT value FROM json_each(?3))
+                 AND package NOT IN (SELECT value FROM json_each(?4))"#,
             repo_id,
             new,
             proposed,
             unchecked
         )
-        .execute(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
-        Ok(done.rows_affected())
+        let retire = Transition::Unproposed {
+            reason: DEP_UNPROPOSED_REASON,
+        };
+        for &id in &unproposed {
+            if let Moved::Conflict { now } = Self::apply_transition(&mut tx, id, &retire).await? {
+                return Err(StoreWriteError::Refused(format!(
+                    "#{id} moved from {} to {now:?} inside its retirement",
+                    retire.from()
+                )));
+            }
+        }
+        tx.commit().await?;
+        Ok(unproposed.len() as u64)
     }
 
     /// Move the queue onto the scan's own findings: a `queued` `dep_update`
@@ -3613,11 +3697,8 @@ impl Store {
         repo_id: i64,
         moves: &[ProposedMove],
     ) -> sqlx::Result<u64> {
-        let now = now_ms();
         let new = FindingStatus::New;
         let queued = FindingStatus::Queued;
-        let superseded = FindingStatus::Superseded;
-        let exempt = BudgetOverride::Exempt;
         let moves = serde_json::to_string(moves).unwrap_or_else(|_| "[]".to_owned());
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         // JSON booleans extract as 1/0, the same as the comparison on q.
@@ -3650,45 +3731,19 @@ impl Store {
         .await?;
         let mut handed = 0;
         for pair in pairs {
+            // Both read in this transaction: the scan's finding at `new`,
+            // or queued by an earlier pair, so both edges apply.
             let reason = format!("replaced by #{} from the dependency scan", pair.to_id);
-            let from = sqlx::query!(
-                "UPDATE findings SET status = ?1, verdict_reason = ?2, updated_at = ?3 \
-                 WHERE id = ?4 AND status = ?5",
-                superseded,
-                reason,
-                now,
-                pair.from_id,
-                queued
-            )
-            .execute(&mut *tx)
-            .await?;
-            if from.rows_affected() == 0 {
+            let gives = Transition::HandedOver { reason: &reason };
+            if Self::apply_transition(&mut tx, pair.from_id, &gives).await? != Moved::Applied {
                 continue;
             }
-            // Several queued findings can hand over to one group: keep the
-            // strongest override any of them (or the group) carries. `once`
-            // is cleared after the next attempt, `exempt` only by hand, so a
-            // `once` that arrived first must not displace a later `exempt`.
-            sqlx::query!(
-                "UPDATE findings SET status = ?1, updated_at = ?2, \
-                 budget_override = CASE \
-                     WHEN budget_override = ?6 \
-                       OR (SELECT budget_override FROM findings WHERE id = ?3) = ?6 \
-                     THEN ?6 \
-                     ELSE COALESCE(budget_override, \
-                         (SELECT budget_override FROM findings WHERE id = ?3)) \
-                 END \
-                 WHERE id = ?4 AND status IN (?5, ?1)",
-                queued,
-                now,
-                pair.from_id,
-                pair.to_id,
-                new,
-                exempt
-            )
-            .execute(&mut *tx)
-            .await?;
-            handed += 1;
+            let takes = Transition::TakesOver {
+                from_id: pair.from_id,
+            };
+            if Self::apply_transition(&mut tx, pair.to_id, &takes).await? == Moved::Applied {
+                handed += 1;
+            }
         }
         tx.commit().await?;
         Ok(handed)
@@ -3893,28 +3948,19 @@ impl Store {
     pub async fn record_closed_harvest(
         &self,
         finding_id: i64,
-        status: FindingStatus,
+        class: ClosureClass,
         reason: &str,
         anchor: Option<&VerdictAnchor>,
         harvested_at: i64,
     ) -> sqlx::Result<bool> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let now = now_ms();
-        let classified = sqlx::query!(
-            "UPDATE findings SET status = ?1, verdict_reason = ?2, updated_at = ?3 \
-             WHERE id = ?4 AND status = 'closed'",
-            status,
+        let classify = Transition::Classified {
+            class,
             reason,
-            now,
-            finding_id
-        )
-        .execute(&mut *tx)
-        .await?
-        .rows_affected()
-            > 0;
-        if classified {
-            Self::write_anchor(&mut tx, finding_id, anchor).await?;
-        }
+            anchor,
+        };
+        let classified =
+            Self::apply_transition(&mut tx, finding_id, &classify).await? == Moved::Applied;
         sqlx::query!(
             "UPDATE pr_state SET harvested_at = ?1 WHERE finding_id = ?2",
             harvested_at,
@@ -4383,8 +4429,9 @@ impl Store {
         )
         .await?;
         apply_release(&mut tx, finding_id, kind, action, now).await?;
-        if let Some((status, text)) = verdict {
-            write_release_verdict(&mut tx, finding_id, action, status, &text, by.id, now).await?;
+        if let Some((verdict, text)) = verdict {
+            write_release_verdict(&mut tx, finding_id, hold.status, verdict, &text, by.id, now)
+                .await?;
         }
         tx.commit().await?;
         Ok(())
@@ -4669,31 +4716,9 @@ impl Store {
         Ok(())
     }
 
-    /// Move a finding from `from` to `to` only if it is still at `from`;
-    /// `false` when something else (an operator verdict) changed it since
-    /// the caller read it. Undo with [`Self::finalize_in_progress`].
-    ///
-    /// Neither to nor from `fixing`: that claim is held by a
-    /// [`FixClaim`](crate::recovery::FixClaim), which alone takes it
-    /// ([`CycleScope::claim_fix`](crate::recovery::CycleScope::claim_fix)) and
-    /// moves the finding on. Refused.
-    pub async fn claim_in_progress(
-        &self,
-        finding_id: i64,
-        from: FindingStatus,
-        to: FindingStatus,
-    ) -> Result<bool, StoreWriteError> {
-        if to == FindingStatus::Fixing || from == FindingStatus::Fixing {
-            return Err(StoreWriteError::Refused(format!(
-                "finding #{finding_id}: a fix claim is taken and released by its holder \
-                 (CycleScope::claim_fix, FixClaim)"
-            )));
-        }
-        Ok(self.move_if_at(finding_id, from, to).await?)
-    }
-
-    /// The guarded UPDATE behind [`Self::claim_in_progress`] and
-    /// [`CycleScope::claim_fix`](crate::recovery::CycleScope::claim_fix).
+    /// The guarded UPDATE behind a fix claim's take and release
+    /// ([`CycleScope::claim_fix`](crate::recovery::CycleScope::claim_fix),
+    /// [`FixClaim::release`](crate::recovery::FixClaim::release)).
     async fn move_if_at(
         &self,
         finding_id: i64,
@@ -4732,21 +4757,6 @@ impl Store {
     ) -> sqlx::Result<bool> {
         self.move_if_at(finding_id, FindingStatus::Fixing, FindingStatus::Queued)
             .await
-    }
-
-    /// If finding is still at `expected_status`, reset to `fallback`. One
-    /// guarded UPDATE, so a verdict landing between a read and a write here
-    /// cannot be overwritten. Neither to nor from `fixing`, as
-    /// [`Self::claim_in_progress`].
-    pub async fn finalize_in_progress(
-        &self,
-        finding_id: i64,
-        expected_status: FindingStatus,
-        fallback: FindingStatus,
-    ) -> Result<(), StoreWriteError> {
-        self.claim_in_progress(finding_id, expected_status, fallback)
-            .await
-            .map(drop)
     }
 
     // -- stats -----------------------------------------------------------------

@@ -55,7 +55,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use crate::domain::{FindingStatus, JobKind, JobState};
+use crate::domain::{ClosureClass, FindingStatus, JobKind, JobState};
 use crate::store::{JobOutcome, Store, StoreWriteError, VerdictAnchor};
 use crate::types::Job;
 use crate::workspace::{Workspace, tree_in_use};
@@ -567,18 +567,21 @@ impl FixClaim {
         }
     }
 
-    /// `fixing` → the verdict `status` with `reason` and its `anchor`, if
-    /// the finding is still `fixing`. On an error the claim is handed
-    /// back, still held.
+    /// `fixing` → the status the decline's classification gives (`None`,
+    /// unclassified: back to triage, as an `abandoned` closure), with
+    /// `reason` and its `anchor`, if the finding is still `fixing`. A
+    /// classification is the only thing a decline can say, so no other
+    /// exit from `fixing` can be written here. On an error the claim is
+    /// handed back, still held.
     pub async fn conclude(
         mut self,
-        status: FindingStatus,
+        class: Option<ClosureClass>,
         reason: &str,
         anchor: Option<&VerdictAnchor>,
     ) -> Result<(), (Self, sqlx::Error)> {
         match self
             .store
-            .conclude_fixing(&Owner(()), self.finding_id, status, reason, anchor)
+            .conclude_fixing(&Owner(()), self.finding_id, class, reason, anchor)
             .await
         {
             Ok(()) => {

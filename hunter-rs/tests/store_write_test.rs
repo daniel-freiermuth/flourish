@@ -1050,7 +1050,7 @@ async fn record_closed_harvest_keeps_the_finding_pending_when_the_stamp_fails() 
     let err = store
         .record_closed_harvest(
             1,
-            FindingStatus::Superseded,
+            hunter::domain::ClosureClass::Superseded,
             "superseded: by #9",
             None,
             5000,
@@ -1087,7 +1087,7 @@ async fn record_closed_harvest_keeps_the_finding_pending_when_the_stamp_fails() 
     let classified = store
         .record_closed_harvest(
             1,
-            FindingStatus::Superseded,
+            hunter::domain::ClosureClass::Superseded,
             "superseded: by #9",
             None,
             5000,
@@ -1126,7 +1126,7 @@ async fn record_closed_harvest_keeps_a_verdict_a_human_set_meanwhile() {
     let classified = store
         .record_closed_harvest(
             1,
-            FindingStatus::Superseded,
+            hunter::domain::ClosureClass::Superseded,
             "superseded: by #9",
             None,
             5000,
@@ -1151,7 +1151,7 @@ async fn record_closed_harvest_keeps_a_verdict_a_human_set_meanwhile() {
 /// caller is told nothing was reopened, so ingest neither counts nor logs
 /// a reopen that did not happen.
 #[tokio::test]
-async fn reopen_suppressed_leaves_a_finding_that_moved_on() {
+async fn a_reopen_leaves_a_finding_that_moved_on() {
     let (_dir, path, pool) = fresh_db().await;
     seed_repo_and_findings(&pool).await;
     let store = rw_store(&path).await;
@@ -1175,7 +1175,13 @@ async fn reopen_suppressed_leaves_a_finding_that_moved_on() {
         summary: "filed again".to_owned(),
         ..Default::default()
     };
-    assert!(!store.reopen_suppressed(1, &refiled).await.unwrap());
+    let reopen = hunter::transition::Transition::Reopened { scan: &refiled };
+    assert!(matches!(
+        store.transition(1, &reopen).await.unwrap(),
+        hunter::transition::Moved::Conflict {
+            now: Some(FindingStatus::Queued)
+        }
+    ));
 
     let after = store.get_finding(1).await.unwrap().unwrap();
     assert_eq!(after.status, FindingStatus::Queued);

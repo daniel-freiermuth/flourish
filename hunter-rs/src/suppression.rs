@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use crate::domain::FindingStatus;
 use crate::playbooks::{Changed, Suppression};
 use crate::store::{FindingInsert, Store, VerdictAnchor};
+use crate::transition::{Moved, Transition};
 use crate::types::{Finding, Repo};
 
 /// Longest `holds_while` kept: one sentence, shown in every later prompt.
@@ -264,7 +265,13 @@ pub async fn reopen_if_changed(
     if !lapsed {
         return Ok(false);
     }
-    store.reopen_suppressed(fid, row).await
+    // Only from a suppressed status, so a finding something else moved
+    // since the read above keeps that.
+    let reopened = Transition::Reopened { scan: row };
+    Ok(matches!(
+        store.transition(fid, &reopened).await?,
+        Moved::Applied
+    ))
 }
 
 /// Where a scan writing its findings to `out_path` records the CHANGED

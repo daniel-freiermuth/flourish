@@ -17,6 +17,7 @@ use crate::domain::{
     HoldReason, JobKind, JobState, RepoJobKind, RepoWorkKind, Severity,
 };
 use crate::store::{FindingFilter, JobOutcome, Store, StoreWriteError, SyncPrData};
+use crate::transition::{Moved, Transition, Unclaimed};
 use crate::types::{Finding, Job, Repo};
 use crate::util::now_ms;
 
@@ -1871,6 +1872,41 @@ fn log_write_failure<T, E: std::fmt::Display>(
         .ok()
 }
 
+/// Make `transition` on `fid` for a job or the PR sync, which continues
+/// whatever the outcome; `true` when it was made. A failed write is logged
+/// as [`log_write_failure`] logs one. A conflict, the finding no longer
+/// being where the change starts, is logged as a `kind` event: it records
+/// that something else decided the finding in between, and that decision
+/// stands.
+async fn make_transition(
+    store: &Store,
+    fid: i64,
+    job: Option<i64>,
+    kind: &str,
+    transition: &Transition<'_>,
+) -> bool {
+    let (from, to) = (transition.from(), transition.to());
+    match store.transition(fid, transition).await {
+        Ok(Moved::Applied) => true,
+        Ok(Moved::Conflict { now }) => {
+            let now = now.map_or_else(|| "gone".to_owned(), |s| format!("'{s}'"));
+            let _ = store
+                .log_event(
+                    kind,
+                    &format!("#{fid} not moved {from} -> {to}: it is {now} now"),
+                    job,
+                    Some(fid),
+                )
+                .await;
+            false
+        }
+        Err(e) => {
+            log_write_failure::<(), _>(Err(e), format_args!("#{fid}: status {from} -> {to}"));
+            false
+        }
+    }
+}
+
 /// The failure keys of a hunt's or scan's worker run (WORK-MODEL.md §17).
 /// A worker that did not finish is counted as `worker <state>`.
 const NO_FINDINGS_FILE: &str = "no findings file";
@@ -2880,7 +2916,10 @@ pub async fn run_recheck(
     let reason: String = reason_owned.chars().take(500).collect();
     let reason = reason.as_str();
 
-    let verdict_str = match outcome {
+    // Declared out here: the transition borrows what each arm builds.
+    let verdict_reason;
+    let anchor;
+    let (transition, verdict_str) = match outcome {
         RecheckOutcome::Confirmed => {
             // The worker's spelling is not stored: the column is decoded as
             // a `Severity` by every whole-list read of the repo, so one
@@ -2908,76 +2947,37 @@ pub async fn run_recheck(
                 store.update_finding_analysis(fid, &update).await,
                 format_args!("#{fid}: recording recheck analysis"),
             );
-            log_write_failure(
-                store.set_finding_status(fid, FindingStatus::New).await,
-                format_args!("#{fid}: status -> new"),
-            );
-            let _ = store
-                .log_event(
-                    "recheck",
-                    &format!("#{fid} confirmed: {reason}"),
-                    Some(job),
-                    Some(fid),
-                )
-                .await;
-            summary.outcome = Some("confirmed".into());
-            "confirmed"
+            (Transition::RecheckConfirmed, "confirmed")
         }
         RecheckOutcome::Stale => {
             // Superseded, not suppressed: the code moved on and took the
             // bug with it, which says nothing against the finding. As
             // `wontfix` it told every later scan not to report the bug
             // again, should the rewritten code bring it back.
-            log_write_failure(
-                store
-                    .set_finding_verdict(
-                        fid,
-                        FindingStatus::Superseded,
-                        &format!("recheck: {reason}"),
-                    )
-                    .await,
-                format_args!("#{fid}: verdict -> superseded"),
-            );
-            let _ = store
-                .log_event(
-                    "recheck",
-                    &format!("#{fid} stale: {reason}"),
-                    Some(job),
-                    Some(fid),
-                )
-                .await;
-            summary.outcome = Some("stale".into());
-            "stale"
+            verdict_reason = format!("recheck: {reason}");
+            (
+                Transition::RecheckStale {
+                    reason: &verdict_reason,
+                },
+                "stale",
+            )
         }
         RecheckOutcome::Invalid => {
-            let anchor = crate::suppression::verdict_anchor(
+            anchor = crate::suppression::verdict_anchor(
                 FindingStatus::Rejected,
                 &pinned,
                 finding,
                 verdict_obj.holds_while.as_deref(),
                 &verdict_obj.depends_on,
             );
-            log_write_failure(
-                store
-                    .set_anchored_verdict(
-                        fid,
-                        FindingStatus::Rejected,
-                        &format!("recheck: {reason}"),
-                        anchor.as_ref(),
-                    )
-                    .await,
-                format_args!("#{fid}: verdict -> rejected"),
-            );
-            let _ = store
-                .log_event(
-                    "recheck",
-                    &format!("#{fid} invalid: {reason}"),
-                    Some(job),
-                    Some(fid),
-                )
-                .await;
-            summary.outcome = Some("invalid".into());
-            "invalid"
+            verdict_reason = format!("recheck: {reason}");
+            (
+                Transition::RecheckInvalid {
+                    reason: &verdict_reason,
+                    anchor: anchor.as_ref(),
+                },
+                "invalid",
+            )
         }
         // Unknown already handled above — included for exhaustiveness
         RecheckOutcome::Unknown(raw) => {
@@ -2997,10 +2997,20 @@ pub async fn run_recheck(
             return Ok(summary);
         }
     };
-    // A verdict ends the recheck: its tree is no checkpoint.
-    close_workspace(store, &ws).await;
+    make_transition(store, fid, Some(job), "recheck", &transition).await;
+    let _ = store
+        .log_event(
+            "recheck",
+            &format!("#{fid} {verdict_str}: {reason}"),
+            Some(job),
+            Some(fid),
+        )
+        .await;
+    summary.outcome = Some(verdict_str.into());
     summary.verdict = Some(verdict_str.to_owned());
     summary.reason = Some(reason.to_owned());
+    // A verdict ends the recheck: its tree is no checkpoint.
+    close_workspace(store, &ws).await;
     if override_mode == Some(BudgetOverride::Once) {
         log_write_failure(
             store.set_budget_override(fid, None).await,
@@ -4551,16 +4561,16 @@ async fn record_declined_fix(
         depends_on,
     } = decline;
     let reason = reason.as_str();
-    let status = class.map_or(FindingStatus::New, ClosureClass::status);
+    let status = crate::transition::decline_status(class);
     let anchor = crate::suppression::verdict_anchor(
-        status,
+        status.into(),
         &start.pinned,
         finding,
         holds_while.as_deref(),
         &depends_on,
     );
     // A claim whose verdict could not be written goes back to `queued`.
-    if let Err((claim, e)) = claim.conclude(status, reason, anchor.as_ref()).await {
+    if let Err((claim, e)) = claim.conclude(class, reason, anchor.as_ref()).await {
         log_write_failure(Err::<(), _>(e), format_args!("#{fid}: verdict -> {status}"));
         release_claim(claim).await;
     }
@@ -4576,7 +4586,7 @@ async fn record_declined_fix(
         }
     };
     let _ = fix_event(store, "fix", fid, job, message).await;
-    summary.outcome = Some(status.as_str().into());
+    summary.outcome = Some(FindingStatus::from(status).as_str().into());
 }
 
 /// Write a fix outcome: the finding's status, the event, and the summary.
@@ -4978,14 +4988,12 @@ pub async fn sync_prs(store: &Store, cfg: &Config) -> SyncResult {
                     finding_id = fid,
                     "pr_open finding has no pr_url — requeueing"
                 );
-                log_write_failure(
-                    store.set_finding_status(fid, FindingStatus::Queued).await,
-                    format_args!("#{fid}: status -> queued"),
-                );
-                let _ = store.log_event(
-                    "fix", &format!("#{fid} requeued: pr_open with no pr_url (prior fix failed before PR creation)"),
-                    None, Some(fid),
-                ).await;
+                if make_transition(store, fid, None, "fix", &Transition::PrMissing).await {
+                    let _ = store.log_event(
+                        "fix", &format!("#{fid} requeued: pr_open with no pr_url (prior fix failed before PR creation)"),
+                        None, Some(fid),
+                    ).await;
+                }
                 continue;
             }
         };
@@ -5032,10 +5040,12 @@ pub async fn sync_prs(store: &Store, cfg: &Config) -> SyncResult {
 
         match pr.state {
             forge::PrState::Merged => {
-                log_write_failure(
-                    store.set_finding_status(fid, FindingStatus::Merged).await,
-                    format_args!("#{fid}: status -> merged"),
-                );
+                // Not moved, the PR's record waits too: a failed write
+                // leaves the finding pr_open for the next sync to retry
+                // both, and a conflict leaves it to what moved it.
+                if !make_transition(store, fid, None, "ship", &Transition::PrMerged).await {
+                    continue;
+                }
                 log_write_failure(
                     store.mark_pr_merged(fid, pr_number, now_ms()).await,
                     format_args!("#{fid}: recording PR #{pr_number} merged"),
@@ -5070,16 +5080,12 @@ pub async fn sync_prs(store: &Store, cfg: &Config) -> SyncResult {
                     summary.errors += 1;
                     continue;
                 }
-                log_write_failure(
-                    store
-                        .set_finding_verdict(
-                            fid,
-                            FindingStatus::Closed,
-                            "PR closed without merge; awaiting harvest",
-                        )
-                        .await,
-                    format_args!("#{fid}: verdict -> closed"),
-                );
+                let closed = Transition::PrClosed {
+                    reason: "PR closed without merge; awaiting harvest",
+                };
+                if !make_transition(store, fid, None, "verdict", &closed).await {
+                    continue;
+                }
                 let _ = store
                     .log_event(
                         "verdict",
@@ -5590,30 +5596,7 @@ async fn withdraw_pr(
                 Some(fid),
             )
             .await;
-    } else if let Err(err) = store
-        .set_finding_verdict(fid, FindingStatus::Closed, &reason_short)
-        .await
-    {
-        // pr_state reads CLOSED but the finding is still pr_open, so no
-        // handoff: the harvest would take pr_open for a human's verdict,
-        // keep it, and mark the PR harvested, and the finding the next
-        // sync sets `closed` would never be harvested. sync_prs revisits
-        // pr_open findings, takes its Closed branch (mark_pr_closed is an
-        // UPSERT, so the row already reading CLOSED is fine), sets the
-        // finding `closed`, and the cold harvest follows.
-        tracing::warn!(finding = fid, pr = pr_number, error = %err, "closed verdict failed");
-        let _ = store
-            .log_event(
-                "error",
-                &format!(
-                    "#{fid} PR #{pr_number} withdrawn but the finding was not set closed: \
-                     {err} (the next PR sync sets it)"
-                ),
-                Some(job),
-                Some(fid),
-            )
-            .await;
-    } else {
+    } else if set_withdrawn_closed(store, fid, job, pr_number, &reason_short).await {
         closed_on_forge = forge_closed;
     }
     let first_line: String = reason
@@ -5631,6 +5614,63 @@ async fn withdraw_pr(
         .await;
     summary.outcome = Some("withdrawn".into());
     closed_on_forge
+}
+
+/// Record a withdrawn PR's finding `closed` (after its `pr_state` already
+/// reads CLOSED); `true` when it was.
+async fn set_withdrawn_closed(
+    store: &Store,
+    fid: i64,
+    job: i64,
+    pr_number: i64,
+    reason: &str,
+) -> bool {
+    match store
+        .transition(fid, &Transition::PrClosed { reason })
+        .await
+    {
+        Ok(Moved::Applied) => true,
+        // Something moved the finding off pr_open since the engage read it,
+        // and that decision owns the finding now: no handoff, the harvest
+        // it would start is that decision's to start.
+        Ok(Moved::Conflict { now }) => {
+            let now = now.map_or_else(|| "gone".to_owned(), |s| format!("'{s}'"));
+            let _ = store
+                .log_event(
+                    "verdict",
+                    &format!(
+                        "#{fid} PR #{pr_number} withdrawn, but the finding is {now} now: \
+                         left as it is"
+                    ),
+                    Some(job),
+                    Some(fid),
+                )
+                .await;
+            false
+        }
+        Err(err) => {
+            // pr_state reads CLOSED but the finding is still pr_open, so no
+            // handoff: the harvest would take pr_open for a human's verdict,
+            // keep it, and mark the PR harvested, and the finding the next
+            // sync sets `closed` would never be harvested. sync_prs revisits
+            // pr_open findings, takes its Closed branch (mark_pr_closed is an
+            // UPSERT, so the row already reading CLOSED is fine), sets the
+            // finding `closed`, and the cold harvest follows.
+            tracing::warn!(finding = fid, pr = pr_number, error = %err, "closed verdict failed");
+            let _ = store
+                .log_event(
+                    "error",
+                    &format!(
+                        "#{fid} PR #{pr_number} withdrawn but the finding was not set closed: \
+                         {err} (the next PR sync sets it)"
+                    ),
+                    Some(job),
+                    Some(fid),
+                )
+                .await;
+            false
+        }
+    }
 }
 
 /// Push the worker's commits to the PR branch and post its `PR-REPLY.md`:
@@ -6877,7 +6917,7 @@ pub async fn run_harvest(
     // `record_closed_harvest`: see there for why neither may land alone,
     // and why a verdict a human set in the meantime is kept.
     let reviewed = if let Some(Ok(verdict)) = &closure {
-        let status = verdict.class.status();
+        let status = FindingStatus::from(Unclaimed::from(verdict.class));
         // The verdict is about the default branch. A cold harvest's tree is
         // at its tip; a continued one's tree is the PR's head, so the tip
         // is read from the clone instead.
@@ -6900,7 +6940,13 @@ pub async fn run_harvest(
             &verdict.depends_on,
         );
         match store
-            .record_closed_harvest(fid, status, &verdict.reason, anchor.as_ref(), now_ms())
+            .record_closed_harvest(
+                fid,
+                verdict.class,
+                &verdict.reason,
+                anchor.as_ref(),
+                now_ms(),
+            )
             .await
         {
             Err(e) => {

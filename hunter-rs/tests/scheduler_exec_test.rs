@@ -627,7 +627,7 @@ async fn a_downgrade_fails_the_recorded_job_and_no_other() {
 /// write, not past it.
 #[tokio::test]
 async fn a_conclusion_leaves_a_verdict_written_past_the_claim() {
-    use hunter::domain::FindingStatus::{Rejected, Wontfix};
+    use hunter::domain::FindingStatus::Rejected;
     use hunter::store::VerdictAnchor;
     let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
@@ -650,7 +650,11 @@ async fn a_conclusion_leaves_a_verdict_written_past_the_claim() {
     };
 
     let concluded = claim
-        .conclude(Wontfix, "worker: not worth it", Some(&worker))
+        .conclude(
+            Some(hunter::domain::ClosureClass::Unwanted),
+            "worker: not worth it",
+            Some(&worker),
+        )
         .await;
 
     assert!(concluded.is_ok(), "the write itself succeeds");
@@ -823,9 +827,9 @@ async fn a_job_dropped_unended_is_owed_to_the_next_settle() {
 }
 
 /// `fixing` is taken only through `claim_fix`, and left only through the
-/// `FixClaim` it returns: taking or releasing the claim any other way is
-/// refused, so no claim exists that nothing would release, and none is
-/// released by code that does not hold it.
+/// `FixClaim` it returns: no status write reaches it otherwise (no
+/// `Transition` names it), and even the fixture write refuses it, so no
+/// test builds a claim that nothing would release.
 #[tokio::test]
 async fn a_fix_claim_without_an_owner_is_refused() {
     use hunter::domain::FindingStatus::{Fixing, Queued};
@@ -834,20 +838,11 @@ async fn a_fix_claim_without_an_owner_is_refused() {
     seed_findings(&pool).await;
     let store = rw_store(&path).await;
 
-    let claimed = store.claim_in_progress(2, Queued, Fixing).await;
-    let finalized = store.finalize_in_progress(2, Queued, Fixing).await;
     let set = store.set_finding_status(2, Fixing).await;
-    // #3 is seeded `fixing`: only its claim's holder may move it on.
-    let released = store.finalize_in_progress(3, Fixing, Queued).await;
 
-    assert!(claimed.is_err(), "{claimed:?}");
-    assert!(finalized.is_err(), "{finalized:?}");
     assert!(set.is_err(), "{set:?}");
-    assert!(released.is_err(), "{released:?}");
-    for (fid, expected) in [(2, Queued), (3, Fixing)] {
-        let status = store.get_finding(fid).await.unwrap().unwrap().status;
-        assert_eq!(status, expected, "finding #{fid}");
-    }
+    let status = store.get_finding(2).await.unwrap().unwrap().status;
+    assert_eq!(status, Queued);
 }
 
 // -- 4. ingest_findings: valid inserted, duplicates skipped, invalid counted -
@@ -954,37 +949,43 @@ async fn ingest_findings_test_gap_type() {
     assert_eq!(result.invalid, 1); // missing_tests not a list
 }
 
-// -- 5. finalize_in_progress ------------------------------------------------
+// -- 5. Store::transition ----------------------------------------------------
 
-/// A recheck's claim (`rechecking`) goes back only while it is unchanged:
-/// a finding something else moved on meanwhile is left where it is. A fix
-/// claim is released through its `FixClaim` instead
-/// (`a_fix_claim_without_an_owner_is_refused`).
+/// A transition is made only from its source status. A finding something
+/// else moved on meanwhile keeps its status and its verdict, and the
+/// conflict names where it is.
 #[tokio::test]
-async fn finalize_in_progress_resets_when_unchanged() {
-    use hunter::domain::FindingStatus::{New, PrOpen, Rechecking};
+async fn a_transition_applies_only_from_its_source_status() {
+    use hunter::domain::FindingStatus::{PrOpen, Rechecking};
+    use hunter::transition::{Moved, Transition};
     let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
     seed_findings(&pool).await;
     let store = rw_store(&path).await;
 
-    // Finding #1 is "new"; claim it for a recheck, then give it back.
-    assert!(store.claim_in_progress(1, New, Rechecking).await.unwrap());
-    store
-        .finalize_in_progress(1, Rechecking, New)
-        .await
-        .unwrap();
-    let f = store.get_finding(1).await.unwrap().unwrap();
-    assert_eq!(f.status, New);
+    // Finding #1 is "new".
+    let requested = store.transition(1, &Transition::RecheckRequested).await;
+    assert_eq!(requested.unwrap(), Moved::Applied);
+    assert_eq!(
+        store.get_finding(1).await.unwrap().unwrap().status,
+        Rechecking
+    );
 
-    // If status is different, no-op
-    store.set_finding_status(2, PrOpen).await.unwrap(); // not rechecking
     store
-        .finalize_in_progress(2, Rechecking, New)
+        .set_finding_verdict(2, PrOpen, "operator's reason")
         .await
         .unwrap();
+    let stale = Transition::RecheckStale {
+        reason: "recheck: code moved",
+    };
+    let moved = store.transition(2, &stale).await.unwrap();
+    assert_eq!(moved, Moved::Conflict { now: Some(PrOpen) });
     let f2 = store.get_finding(2).await.unwrap().unwrap();
-    assert_eq!(f2.status, PrOpen); // untouched
+    assert_eq!(f2.status, PrOpen);
+    assert_eq!(f2.verdict_reason.as_deref(), Some("operator's reason"));
+
+    let gone = store.transition(99, &Transition::Unqueued).await.unwrap();
+    assert_eq!(gone, Moved::Conflict { now: None });
 }
 
 // -- 6. upsert_finding + suppressions + known_active -------------------------
