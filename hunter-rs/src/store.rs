@@ -355,7 +355,8 @@ pub struct FindingInsert {
     pub standard_section: Option<String>,
 }
 
-/// Typed update for finding analysis fields after worker recheck.
+/// A confirmed recheck's revised analysis, written with its
+/// `rechecking → new` move ([`crate::transition::Transition::RecheckConfirmed`]).
 #[derive(Debug, Clone, Default)]
 pub struct FindingAnalysisUpdate {
     pub summary: Option<String>,
@@ -1010,6 +1011,32 @@ impl Store {
                  WHERE id = ?3 AND status IN (?4, ?5)",
                     to,
                     now,
+                    finding_id,
+                    from_a,
+                    from_b
+                )
+                .execute(&mut **tx)
+                .await?
+                .rows_affected()
+                    > 0
+            }
+            Record::Analysis(fields) => {
+                let summary = fields.summary.as_deref();
+                let detail = fields.detail.as_deref();
+                let severity = fields.severity;
+                sqlx::query!(
+                    "UPDATE findings SET status = ?1, updated_at = ?2, \
+                     summary = COALESCE(?3, summary), \
+                     detail = COALESCE(?4, detail), \
+                     confidence = COALESCE(?5, confidence), \
+                     severity = COALESCE(?6, severity) \
+                     WHERE id = ?7 AND status IN (?8, ?9)",
+                    to,
+                    now,
+                    summary,
+                    detail,
+                    fields.confidence,
+                    severity,
                     finding_id,
                     from_a,
                     from_b
@@ -4028,37 +4055,6 @@ impl Store {
         )
         .fetch_all(&self.pool)
         .await
-    }
-
-    /// UPDATE finding's analysis fields (summary, detail, etc.) after a
-    /// worker recheck.  Uses COALESCE to skip NULL fields.
-    pub async fn update_finding_analysis(
-        &self,
-        finding_id: i64,
-        fields: &FindingAnalysisUpdate,
-    ) -> sqlx::Result<()> {
-        let now = now_ms();
-        let summary = fields.summary.as_deref();
-        let detail = fields.detail.as_deref();
-        let severity = fields.severity;
-        sqlx::query!(
-            "UPDATE findings SET \
-             updated_at = ?1, \
-             summary = COALESCE(?2, summary), \
-             detail = COALESCE(?3, detail), \
-             confidence = COALESCE(?4, confidence), \
-             severity = COALESCE(?5, severity) \
-             WHERE id = ?6",
-            now,
-            summary,
-            detail,
-            fields.confidence,
-            severity,
-            finding_id
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(())
     }
 
     /// Put every `fixing` finding no `running` job works on back to

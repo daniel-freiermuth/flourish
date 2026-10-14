@@ -20,7 +20,7 @@
 //! [`Store::transition`]: crate::store::Store::transition
 
 use crate::domain::{ClosureClass, FindingStatus};
-use crate::store::{FindingInsert, VerdictAnchor};
+use crate::store::{FindingAnalysisUpdate, FindingInsert, VerdictAnchor};
 
 /// A finding status no fix claim holds: every [`FindingStatus`] but
 /// `fixing`, which only a [`crate::recovery::FixClaim`]'s holder moves a
@@ -166,8 +166,9 @@ pub enum Transition<'a> {
         verdict: ReleaseVerdict,
         reason: &'a str,
     },
-    /// A recheck confirmed the finding; it goes back to triage.
-    RecheckConfirmed,
+    /// A recheck confirmed the finding; it goes back to triage, with the
+    /// recheck's revised analysis.
+    RecheckConfirmed { analysis: &'a FindingAnalysisUpdate },
     /// A recheck found the code moved on, taking the bug with it.
     RecheckStale { reason: &'a str },
     /// A recheck found the finding wrong, anchored to what it judged.
@@ -212,6 +213,9 @@ pub enum Transition<'a> {
 pub(crate) enum Record<'a> {
     /// Nothing: the verdict reason and anchor stay as they were.
     StatusOnly,
+    /// A recheck's revised analysis: each field given replaces the
+    /// finding's, each absent one leaves it.
+    Analysis(&'a FindingAnalysisUpdate),
     /// A scan's analysis, replacing the finding's; the verdict reason and
     /// anchor are removed.
     Rescan(&'a FindingInsert),
@@ -239,9 +243,9 @@ impl<'a> Transition<'a> {
             Self::Unqueued | Self::HandedOver { .. } => One(S::Queued),
             Self::Verdict(v) => One(v.from),
             Self::HoldReleased { from, .. } => One(*from),
-            Self::RecheckConfirmed | Self::RecheckStale { .. } | Self::RecheckInvalid { .. } => {
-                One(S::Rechecking)
-            }
+            Self::RecheckConfirmed { .. }
+            | Self::RecheckStale { .. }
+            | Self::RecheckInvalid { .. } => One(S::Rechecking),
             Self::Reopened { .. } => Either(S::Rejected, S::Wontfix),
             Self::Reproposed => One(S::Superseded),
             Self::TakesOver { .. } => Either(S::New, S::Queued),
@@ -255,9 +259,10 @@ impl<'a> Transition<'a> {
         use Unclaimed as S;
         match self {
             Self::RecheckRequested => S::Rechecking,
-            Self::Unqueued | Self::RecheckConfirmed | Self::Reopened { .. } | Self::Reproposed => {
-                S::New
-            }
+            Self::Unqueued
+            | Self::RecheckConfirmed { .. }
+            | Self::Reopened { .. }
+            | Self::Reproposed => S::New,
             Self::Verdict(v) => v.to,
             Self::HoldReleased { verdict, .. } => match verdict {
                 ReleaseVerdict::Rejected => S::Rejected,
@@ -277,21 +282,18 @@ impl<'a> Transition<'a> {
 
     pub(crate) fn record(&self) -> Record<'a> {
         match *self {
-            Self::RecheckRequested
-            | Self::Unqueued
-            | Self::RecheckConfirmed
-            | Self::PrMissing
-            | Self::PrMerged => Record::StatusOnly,
+            Self::RecheckRequested | Self::Unqueued | Self::PrMissing | Self::PrMerged => {
+                Record::StatusOnly
+            }
+            Self::RecheckConfirmed { analysis } => Record::Analysis(analysis),
             Self::Reopened { scan } => Record::Rescan(scan),
             Self::TakesOver { from_id } => Record::InheritOverride { from_id },
-            // An operator's verdict has no tree to anchor to; one given
-            // without a reason changes the status alone.
-            Self::Verdict(v) => v
-                .reason
-                .map_or(Record::StatusOnly, |reason| Record::Verdict {
-                    reason: Some(reason),
-                    anchor: None,
-                }),
+            // An operator's verdict has no tree to anchor to, and one given
+            // without a reason clears the reason an earlier verdict left.
+            Self::Verdict(v) => Record::Verdict {
+                reason: v.reason,
+                anchor: None,
+            },
             // The retirement's reason no longer applies.
             Self::Reproposed => Record::Verdict {
                 reason: None,
