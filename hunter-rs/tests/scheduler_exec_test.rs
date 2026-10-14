@@ -64,19 +64,11 @@ async fn record_job_done_state() {
     let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
     let store = rw_store(&path).await;
-    let job_id = store
-        .create_job(
-            RepoJobKind::Hunt.into(),
-            1,
-            None,
-            Some(100_000),
-            hunter::domain::JobState::Running,
-            None,
-            None,
-        )
+    let job = support::scope(&store)
+        .create_job(RepoJobKind::Hunt.into(), 1, None, Some(100_000), None, None)
         .await
         .unwrap()
-        .id;
+        .job;
     let rr = RunResult {
         exit_code: Some(0),
         killed_reason: None,
@@ -87,9 +79,10 @@ async fn record_job_done_state() {
         stdout_tail: "all good".to_owned(),
         usage_delta: Some(0.05),
     };
-    let state = hunter::scheduler::record_job(&store, job_id, &rr, Some("claude-4"), None)
+    let state = hunter::scheduler::record_job(&store, job, &rr, Some("claude-4"), None)
         .await
-        .unwrap();
+        .unwrap()
+        .state();
     assert_eq!(state, hunter::domain::JobState::Done);
 
     // Verify written fields
@@ -112,19 +105,18 @@ async fn record_job_failed_state() {
     let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
     let store = rw_store(&path).await;
-    let job_id = store
+    let job = support::scope(&store)
         .create_job(
             FindingJobKind::Fix.into(),
             1,
             None,
             Some(100_000),
-            hunter::domain::JobState::Running,
             None,
             None,
         )
         .await
         .unwrap()
-        .id;
+        .job;
     let rr = RunResult {
         exit_code: Some(1),
         killed_reason: None,
@@ -135,9 +127,10 @@ async fn record_job_failed_state() {
         stdout_tail: "error: something broke\npanic at line 42".to_owned(),
         usage_delta: None,
     };
-    let state = hunter::scheduler::record_job(&store, job_id, &rr, None, None)
+    let state = hunter::scheduler::record_job(&store, job, &rr, None, None)
         .await
-        .unwrap();
+        .unwrap()
+        .state();
     assert_eq!(state, hunter::domain::JobState::Failed);
 
     let jobs = store.list_jobs(10).await.unwrap();
@@ -158,19 +151,11 @@ async fn record_job_cap_kill_without_a_session_stays_killed() {
     let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
     let store = rw_store(&path).await;
-    let job_id = store
-        .create_job(
-            RepoJobKind::Hunt.into(),
-            1,
-            None,
-            Some(50_000),
-            hunter::domain::JobState::Running,
-            None,
-            None,
-        )
+    let job = support::scope(&store)
+        .create_job(RepoJobKind::Hunt.into(), 1, None, Some(50_000), None, None)
         .await
         .unwrap()
-        .id;
+        .job;
     let rr = RunResult {
         exit_code: None,
         killed_reason: Some("cap".to_owned()),
@@ -181,9 +166,10 @@ async fn record_job_cap_kill_without_a_session_stays_killed() {
         stdout_tail: "exceeded cap".to_owned(),
         usage_delta: Some(0.1),
     };
-    let state = hunter::scheduler::record_job(&store, job_id, &rr, Some("claude-4"), None)
+    let state = hunter::scheduler::record_job(&store, job, &rr, Some("claude-4"), None)
         .await
-        .unwrap();
+        .unwrap()
+        .state();
     assert_eq!(state, hunter::domain::JobState::Killed);
 
     let jobs = store.list_jobs(10).await.unwrap();
@@ -205,19 +191,11 @@ async fn record_job_cap_kill_with_a_session_suspends() {
     let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
     let store = rw_store(&path).await;
-    let job_id = store
-        .create_job(
-            RepoJobKind::Hunt.into(),
-            1,
-            None,
-            Some(50_000),
-            hunter::domain::JobState::Running,
-            None,
-            None,
-        )
+    let job = support::scope(&store)
+        .create_job(RepoJobKind::Hunt.into(), 1, None, Some(50_000), None, None)
         .await
         .unwrap()
-        .id;
+        .job;
     let rr = RunResult {
         exit_code: None,
         killed_reason: Some("cap".to_owned()),
@@ -228,9 +206,10 @@ async fn record_job_cap_kill_with_a_session_suspends() {
         stdout_tail: "exceeded cap".to_owned(),
         usage_delta: Some(0.1),
     };
-    let state = hunter::scheduler::record_job(&store, job_id, &rr, Some("claude-4"), None)
+    let state = hunter::scheduler::record_job(&store, job, &rr, Some("claude-4"), None)
         .await
-        .unwrap();
+        .unwrap()
+        .state();
     assert_eq!(state, hunter::domain::JobState::Suspended);
 
     let jobs = store.list_jobs(10).await.unwrap();
@@ -254,22 +233,14 @@ async fn record_job_wallclock_kill_with_work_and_a_session_suspends() {
     let store = rw_store(&path).await;
     // Two kinds: a second attempt at the same work would replace the
     // first one's checkpoint, however it ended.
-    let mut ids = Vec::new();
+    let mut jobs = Vec::new();
     for kind in [RepoJobKind::Hunt, RepoJobKind::TestGap] {
-        ids.push(
-            store
-                .create_job(
-                    kind.into(),
-                    1,
-                    None,
-                    Some(50_000),
-                    hunter::domain::JobState::Running,
-                    None,
-                    None,
-                )
+        jobs.push(
+            support::scope(&store)
+                .create_job(kind.into(), 1, None, Some(50_000), None, None)
                 .await
                 .unwrap()
-                .id,
+                .job,
         );
     }
     let rr = |tokens_new| RunResult {
@@ -282,15 +253,19 @@ async fn record_job_wallclock_kill_with_work_and_a_session_suspends() {
         stdout_tail: "ran out of wall clock".to_owned(),
         usage_delta: Some(0.1),
     };
-    let worked = hunter::scheduler::record_job(&store, ids[0], &rr(50_000), None, None)
+    let (idle_job, worked_job) = (jobs.pop().unwrap(), jobs.pop().unwrap());
+    let worked_id = worked_job.id();
+    let worked = hunter::scheduler::record_job(&store, worked_job, &rr(50_000), None, None)
         .await
-        .unwrap();
+        .unwrap()
+        .state();
     assert_eq!(worked, hunter::domain::JobState::Suspended);
     // Nothing metered means nothing to continue: resuming would re-run
     // whatever stalled before the first answer.
-    let idle = hunter::scheduler::record_job(&store, ids[1], &rr(0), None, None)
+    let idle = hunter::scheduler::record_job(&store, idle_job, &rr(0), None, None)
         .await
-        .unwrap();
+        .unwrap()
+        .state();
     assert_eq!(idle, hunter::domain::JobState::Killed);
     let resumable: Vec<i64> = store
         .list_resumable_jobs()
@@ -299,7 +274,7 @@ async fn record_job_wallclock_kill_with_work_and_a_session_suspends() {
         .iter()
         .map(|j| j.id)
         .collect();
-    assert_eq!(resumable, vec![ids[0]]);
+    assert_eq!(resumable, vec![worked_id]);
 }
 
 // -- 2. create_job + update_job round-trip -----------------------------------
@@ -311,20 +286,19 @@ async fn create_and_update_job_round_trip() {
     let store = rw_store(&path).await;
 
     // Create job
-    let job_id = store
+    let job = support::scope(&store)
         .create_job(
             FindingJobKind::Fix.into(),
             1,
             None,
             Some(150_000),
-            hunter::domain::JobState::Running,
             None,
             None,
         )
         .await
         .unwrap()
-        .id;
-    assert!(job_id > 0);
+        .job;
+    assert!(job.id() > 0);
 
     // Verify initial state
     let jobs = store.list_jobs(10).await.unwrap();
@@ -335,24 +309,20 @@ async fn create_and_update_job_round_trip() {
     assert_eq!(jobs[0].job.cap_tokens, Some(150_000));
 
     // Update with completion
-    store
-        .complete_job(
-            job_id,
-            &JobOutcome {
-                state: hunter::domain::JobState::Done,
-                tokens_new: 80_000,
-                calls: 25,
-                exit_code: Some(0),
-                killed_reason: None,
-                session_file: Some("/tmp/s.json"),
-                notes: Some("completed"),
-                model: Some("claude-4"),
-                usage_delta: Some(0.03),
-                finished_at: 2000,
-            },
-        )
-        .await
-        .unwrap();
+    job.complete(&JobOutcome {
+        state: hunter::domain::FinishedState::Done,
+        tokens_new: 80_000,
+        calls: 25,
+        exit_code: Some(0),
+        killed_reason: None,
+        session_file: Some("/tmp/s.json"),
+        notes: Some("completed"),
+        model: Some("claude-4"),
+        usage_delta: Some(0.03),
+        finished_at: 2000,
+    })
+    .await
+    .unwrap();
 
     let jobs = store.list_jobs(10).await.unwrap();
     let j = &jobs[0];
@@ -365,48 +335,519 @@ async fn create_and_update_job_round_trip() {
     assert_eq!(j.job.finished_at, Some(2000));
 }
 
-// -- 3. reconcile_orphaned_jobs ----------------------------------------------
+// -- 3. startup reconcile, cycle scopes, and the stranded-fix requeue --------
 
+/// At startup every `running` job is the dead process's: the fix job is
+/// killed as orphaned and the claim it held goes back to `queued`.
 #[tokio::test]
-async fn reconcile_orphaned_jobs() {
-    let (_dir, path, pool) = fresh_db().await;
+async fn reconcile_kills_the_orphaned_fix_and_requeues_its_finding() {
+    let (dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
     seed_findings(&pool).await;
-    let store = rw_store(&path).await;
-
-    // Create a "running" job (orphaned)
-    let job_id = store
+    // The prior process: finding #3 is at "fixing" (seeded); its job is
+    // "running" when the process dies.
+    let prior = rw_store(&path).await;
+    let job_id = support::scope(&prior)
         .create_job(
             FindingJobKind::Fix.into(),
             1,
             Some(3),
             Some(100_000),
-            hunter::domain::JobState::Running,
             None,
             None,
         )
         .await
         .unwrap()
-        .id;
+        .job
+        .disown();
+    drop(prior);
+    let store = rw_store(&path).await;
 
-    // Finding #3 is at "fixing" (seeded above), job at "running"
-    let (stuck_findings, orphaned_jobs) = store.reconcile_orphaned_jobs().await.unwrap();
+    let (_, settled) = hunter::recovery::reconcile_and_log(
+        store.take_unreconciled().unwrap(),
+        &dir.subdir("work_root"),
+    )
+    .await
+    .unwrap();
 
-    // Finding #3 should have been moved from "fixing" to "queued"
-    assert_eq!(stuck_findings.len(), 1);
-    assert_eq!(stuck_findings[0].id, 3);
+    assert_eq!(
+        settled,
+        hunter::recovery::Settled {
+            jobs: 1,
+            requeued: 1,
+            deferred: 0,
+        }
+    );
     let f = store.get_finding(3).await.unwrap().unwrap();
     assert_eq!(f.status, hunter::domain::FindingStatus::Queued);
-
-    // Job should have been marked "killed"
-    assert_eq!(orphaned_jobs.len(), 1);
-    assert_eq!(orphaned_jobs[0].id, job_id);
     let jobs = store.list_jobs(10).await.unwrap();
     let j = jobs.iter().find(|j| j.job.id == job_id).unwrap();
     assert_eq!(j.job.state, hunter::domain::JobState::Killed);
     assert_eq!(j.job.killed_reason.as_deref(), Some("orphaned"));
-    assert!(j.job.notes.as_deref().unwrap().contains("reconciled"));
+    assert_eq!(
+        j.job.notes.as_deref(),
+        Some("orphaned -- prior process died mid-job")
+    );
     assert!(j.job.finished_at.is_some());
+    let events = store.recent_events(20).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.message == "#3 stuck 'fixing' -> 'queued' -- prior process died mid-job"),
+        "{events:?}"
+    );
+}
+
+/// The daemon's startup token comes only with the lock on its database,
+/// and that lock is the database's, not the work root's: a second daemon
+/// on the same database is refused even with a work root of its own, so
+/// it cannot reconcile the first one's live jobs. The store holds the
+/// lock while any handle of it lives, and is recovered once the token is
+/// spent.
+#[tokio::test]
+async fn the_startup_token_comes_with_the_database_lock() {
+    use hunter::recovery::DaemonLock;
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo(&pool).await;
+    let lock = DaemonLock::acquire(&dir.subdir("work_root"), &path).unwrap();
+    let (store, token) = Store::connect_exclusive(lock).await.unwrap();
+
+    let second = DaemonLock::acquire(&dir.subdir("other_root"), &path);
+    assert!(second.is_err(), "a second daemon on the same database");
+    assert!(
+        DaemonLock::acquire(&dir.subdir("work_root"), &dir.join("other.db")).is_err(),
+        "a second daemon in the same work root"
+    );
+    assert!(store.recovered().is_none(), "the token is out, not spent");
+    let (recovered, _) = hunter::recovery::reconcile_and_log(token, &dir.subdir("work_root"))
+        .await
+        .unwrap();
+    assert!(store.recovered().is_some());
+
+    drop(store);
+    assert!(
+        DaemonLock::acquire(&dir.subdir("other_root"), &path).is_err(),
+        "held while a handle -- here the proof of recovery -- lives"
+    );
+    drop(recovered);
+    DaemonLock::acquire(&dir.subdir("other_root"), &path).expect("released with the last handle");
+}
+
+/// A settle takes what was dropped unended and nothing that is still
+/// held: the cycle's abandoned jobs are killed, and its claims -- one
+/// whose fix was abandoned, one whose release never landed -- go back to
+/// `queued`. A job abandoned on a finding whose claim another fix holds
+/// does not release that claim. Another owner's job and claim, held
+/// throughout, are untouched.
+#[tokio::test]
+async fn a_settle_takes_only_what_was_dropped_unended() {
+    use hunter::domain::FindingStatus::{Fixing, Queued};
+    use hunter::domain::JobState::{Killed, Running};
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo(&pool).await;
+    seed_findings(&pool).await;
+    sqlx::raw_sql(
+        "INSERT INTO findings (id, type, repo_id, fingerprint, severity, confidence, summary, \
+         status, created_at, updated_at) VALUES (5, 'bug', 1, 'fp5', 'low', 0.5, 'five', \
+         'queued', 1000, 1000)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let store = rw_store(&path).await;
+    let scope = support::scope(&store);
+    let job = |kind: FindingJobKind, fid| {
+        scope.create_job(kind.into(), 1, Some(fid), Some(100_000), None, None)
+    };
+    // The cycle's fix of #2 claimed it and abandoned its job.
+    let abandoned_claim = scope.claim_fix(2).await.unwrap().unwrap();
+    let abandoned_fix = job(FindingJobKind::Fix, 2).await.unwrap().job;
+    let abandoned_fix_id = abandoned_fix.id();
+    // Another fix of #3 (seeded `fixing`) holds its claim and has not
+    // created its job yet; the cycle abandons an engage on #3.
+    let abandoned_engage = job(FindingJobKind::Engage, 3).await.unwrap().job;
+    let abandoned_engage_id = abandoned_engage.id();
+    // Another owner claims #4 and runs its fix, holding both.
+    let live_claim = scope.claim_fix(4).await.unwrap().unwrap();
+    let live = job(FindingJobKind::Fix, 4).await.unwrap().job;
+    let live_id = live.id();
+    // The cycle's fix of #5 returned with its claim unreleased (the
+    // release write failed after its job was recorded).
+    let unreleased = scope.claim_fix(5).await.unwrap().unwrap();
+    drop((abandoned_claim, abandoned_fix, abandoned_engage, unreleased));
+
+    let settled = scope.settle(&dir.subdir("work_root")).await.unwrap();
+
+    assert_eq!(
+        settled,
+        hunter::recovery::Settled {
+            jobs: 2,
+            requeued: 2,
+            deferred: 0,
+        }
+    );
+    for (fid, expected) in [(2, Queued), (5, Queued), (3, Fixing), (4, Fixing)] {
+        let status = store.get_finding(fid).await.unwrap().unwrap().status;
+        assert_eq!(status, expected, "finding #{fid}");
+    }
+    let jobs = store.list_jobs(10).await.unwrap();
+    let state = |id| jobs.iter().find(|j| j.job.id == id).unwrap().job.state;
+    assert_eq!(
+        (
+            state(abandoned_fix_id),
+            state(abandoned_engage_id),
+            state(live_id)
+        ),
+        (Killed, Killed, Running)
+    );
+    live_claim.disown();
+    live.disown();
+}
+
+/// A claim, once released, is gone: when another fix claims the same
+/// finding before the first fix's cycle settles, that settle leaves the
+/// new claim alone. A release is not remembered as something to release
+/// again.
+#[tokio::test]
+async fn a_released_claim_is_not_released_again_under_a_later_claim() {
+    use hunter::domain::FindingStatus::Fixing;
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo(&pool).await;
+    seed_findings(&pool).await;
+    let store = rw_store(&path).await;
+    let first = support::scope(&store);
+    let second = support::scope(&store);
+    let claim = first.claim_fix(2).await.unwrap().unwrap();
+    assert!(claim.release().await.unwrap());
+    let later = second.claim_fix(2).await.unwrap().unwrap();
+
+    let settled = first.settle(&dir.subdir("work_root")).await.unwrap();
+
+    assert_eq!(settled, hunter::recovery::Settled::default());
+    let status = store.get_finding(2).await.unwrap().unwrap().status;
+    assert_eq!(status, Fixing);
+    later.disown();
+}
+
+/// `FixClaim::disown`, the fixtures' stand-in for a claim a live fix still
+/// holds, leaves it in no ledger: a settle after it keeps the finding
+/// `fixing`. The tests that model a live holder this way rely on it.
+#[tokio::test]
+async fn a_disowned_claim_is_owed_to_no_settle() {
+    use hunter::domain::FindingStatus::Fixing;
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo(&pool).await;
+    seed_findings(&pool).await;
+    let store = rw_store(&path).await;
+    let scope = support::scope(&store);
+    scope.claim_fix(2).await.unwrap().unwrap().disown();
+
+    let settled = scope.settle(&dir.subdir("work_root")).await.unwrap();
+
+    assert_eq!(settled, hunter::recovery::Settled::default());
+    let status = store.get_finding(2).await.unwrap().unwrap().status;
+    assert_eq!(status, Fixing);
+}
+
+/// A claim a settle released is struck from what is owed: when another
+/// fix then claims the same finding, the next settle leaves that claim
+/// alone. A settled claim is not remembered as something to release
+/// again.
+#[tokio::test]
+async fn a_settled_claim_is_not_released_again_under_a_later_claim() {
+    use hunter::domain::FindingStatus::Fixing;
+    use hunter::recovery::Settled;
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo(&pool).await;
+    seed_findings(&pool).await;
+    let store = rw_store(&path).await;
+    let recovered = support::recovered(&store);
+    let work_root = dir.subdir("work_root");
+    drop(support::scope(&store).claim_fix(2).await.unwrap().unwrap());
+    let released = recovered.settle_unsettled(&work_root).await.unwrap();
+    assert_eq!(released.requeued, 1);
+    let later = support::scope(&store).claim_fix(2).await.unwrap().unwrap();
+
+    let settled = recovered.settle_unsettled(&work_root).await.unwrap();
+
+    assert_eq!(settled, Settled::default());
+    let status = store.get_finding(2).await.unwrap().unwrap().status;
+    assert_eq!(status, Fixing);
+    later.disown();
+}
+
+/// A post-run downgrade (`fail_job`, an engage whose publish failed)
+/// revises the job whose outcome it was handed, and no other.
+#[tokio::test]
+async fn a_downgrade_fails_the_recorded_job_and_no_other() {
+    use hunter::domain::{FinishedState, JobState};
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo(&pool).await;
+    let store = rw_store(&path).await;
+    let scope = support::scope(&store);
+    let mut recorded = Vec::new();
+    for _ in 0..2 {
+        let job = scope
+            .create_job(RepoJobKind::Hunt.into(), 1, None, None, None, None)
+            .await
+            .unwrap()
+            .job;
+        let outcome = JobOutcome {
+            state: FinishedState::Done,
+            tokens_new: 1_000,
+            calls: 1,
+            exit_code: Some(0),
+            killed_reason: None,
+            session_file: None,
+            notes: None,
+            model: None,
+            usage_delta: None,
+            finished_at: 2000,
+        };
+        recorded.push(job.complete(&outcome).await.unwrap());
+    }
+
+    store.fail_job(&recorded[1], "push failed").await.unwrap();
+
+    let jobs = store.list_jobs(10).await.unwrap();
+    let row = |id: i64| {
+        let j = &jobs.iter().find(|j| j.job.id == id).unwrap().job;
+        (j.state, j.notes.clone())
+    };
+    assert_eq!(row(recorded[0].id()), (JobState::Done, None));
+    assert_eq!(
+        row(recorded[1].id()),
+        (JobState::Failed, Some("push failed".to_owned()))
+    );
+}
+
+/// A declined fix's verdict is written only while its claim still holds
+/// the finding. One that left `fixing` meanwhile keeps the verdict it was
+/// given there, its anchor included: the anchor goes with the status
+/// write, not past it.
+#[tokio::test]
+async fn a_conclusion_leaves_a_verdict_written_past_the_claim() {
+    use hunter::domain::FindingStatus::{Rejected, Wontfix};
+    use hunter::store::VerdictAnchor;
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo(&pool).await;
+    seed_findings(&pool).await;
+    let store = rw_store(&path).await;
+    let claim = support::scope(&store).claim_fix(2).await.unwrap().unwrap();
+    let operator = VerdictAnchor {
+        sha: "a".repeat(40),
+        files: vec!["src/a.rs".to_owned()],
+        holds_while: None,
+    };
+    store
+        .set_anchored_verdict(2, Rejected, "operator: wrong", Some(&operator))
+        .await
+        .unwrap();
+    let worker = VerdictAnchor {
+        sha: "b".repeat(40),
+        files: vec!["src/b.rs".to_owned()],
+        holds_while: Some("b stays as it is".to_owned()),
+    };
+
+    let concluded = claim
+        .conclude(Wontfix, "worker: not worth it", Some(&worker))
+        .await;
+
+    assert!(concluded.is_ok(), "the write itself succeeds");
+    let finding = store.get_finding(2).await.unwrap().unwrap();
+    assert_eq!(
+        (finding.status, finding.verdict_reason.as_deref()),
+        (Rejected, Some("operator: wrong"))
+    );
+    assert_eq!(store.verdict_anchor(2).await.unwrap(), Some(operator));
+}
+
+/// A dropped claim is released only when no `running` job works on the
+/// finding: an owed claim on which a fix still runs is kept, so a settle
+/// cannot take a claim from a fix that is running. Kept, not forgotten:
+/// once that job has ended, the next settle releases it.
+#[tokio::test]
+async fn a_settled_claim_spares_a_finding_a_running_job_works_on() {
+    use hunter::domain::FindingStatus::{Fixing, Queued};
+    use hunter::recovery::Settled;
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo(&pool).await;
+    seed_findings(&pool).await;
+    let store = rw_store(&path).await;
+    let scope = support::scope(&store);
+    drop(scope.claim_fix(2).await.unwrap().unwrap());
+    let running = scope
+        .create_job(
+            FindingJobKind::Fix.into(),
+            1,
+            Some(2),
+            Some(100_000),
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .job;
+    let recovered = support::recovered(&store);
+    let work_root = dir.subdir("work_root");
+
+    let spared = recovered.settle_unsettled(&work_root).await.unwrap();
+
+    assert_eq!(
+        spared,
+        Settled {
+            deferred: 1,
+            ..Settled::default()
+        }
+    );
+    let status = store.get_finding(2).await.unwrap().unwrap().status;
+    assert_eq!(status, Fixing, "job {} still runs on it", running.id());
+
+    running
+        .complete(&JobOutcome {
+            state: hunter::domain::FinishedState::Failed,
+            tokens_new: 0,
+            calls: 0,
+            exit_code: Some(1),
+            killed_reason: None,
+            session_file: None,
+            notes: None,
+            model: None,
+            usage_delta: None,
+            finished_at: 2000,
+        })
+        .await
+        .unwrap();
+    let released = recovered.settle_unsettled(&work_root).await.unwrap();
+
+    assert_eq!(
+        released,
+        Settled {
+            requeued: 1,
+            ..Settled::default()
+        }
+    );
+    let status = store.get_finding(2).await.unwrap().unwrap().status;
+    assert_eq!(status, Queued);
+}
+
+/// A dropped job is not a stopped worker: a worker runs on a blocking
+/// thread that cancelling its runner's future does not stop. While a
+/// process still works in the job's tree, the settle leaves the job
+/// `running` and owed, holding its reservation; once the tree is free,
+/// the next settle ends it.
+#[tokio::test]
+async fn a_job_dropped_while_its_tree_is_in_use_stays_owed() {
+    use hunter::domain::JobState::{Killed, Running};
+    use hunter::recovery::Settled;
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo(&pool).await;
+    seed_findings(&pool).await;
+    let store = rw_store(&path).await;
+    let work_root = dir.subdir("work_root");
+    let job = support::scope(&store)
+        .create_job(RepoJobKind::Hunt.into(), 1, None, Some(100_000), None, None)
+        .await
+        .unwrap()
+        .job;
+    let id = job.id();
+    let tree = hunter::workspace::Workspace::for_chain(&work_root, Path::new(""), id).tree;
+    std::fs::create_dir_all(&tree).unwrap();
+    // The worker its runner's dropped future left behind.
+    let mut worker = std::process::Command::new("sleep")
+        .arg("60")
+        .current_dir(&tree)
+        .spawn()
+        .unwrap();
+    drop(job);
+    let recovered = support::recovered(&store);
+    let state = |store: Store| async move {
+        let jobs = store.list_jobs(10).await.unwrap();
+        jobs.into_iter().find(|j| j.job.id == id).unwrap().job.state
+    };
+
+    let while_working = recovered.settle_unsettled(&work_root).await;
+    let state_while_working = state(store.clone()).await;
+    worker.kill().unwrap();
+    worker.wait().unwrap();
+    let after = recovered.settle_unsettled(&work_root).await.unwrap();
+
+    assert_eq!(
+        while_working.unwrap(),
+        Settled {
+            deferred: 1,
+            ..Settled::default()
+        }
+    );
+    assert_eq!(state_while_working, Running);
+    assert_eq!(
+        after,
+        Settled {
+            jobs: 1,
+            ..Settled::default()
+        }
+    );
+    assert_eq!(state(store).await, Killed);
+}
+
+/// A job dropped unended -- its runner returned early, its future was
+/// cancelled, a panic unwound through it -- is owed: the next settle of
+/// the store's ledger kills it.
+#[tokio::test]
+async fn a_job_dropped_unended_is_owed_to_the_next_settle() {
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo(&pool).await;
+    seed_findings(&pool).await;
+    let store = rw_store(&path).await;
+    let job = support::scope(&store)
+        .create_job(RepoJobKind::Hunt.into(), 1, None, Some(100_000), None, None)
+        .await
+        .unwrap()
+        .job;
+    let id = job.id();
+    drop(job);
+
+    let settled = support::recovered(&store)
+        .settle_unsettled(&dir.subdir("work_root"))
+        .await
+        .unwrap();
+
+    assert_eq!(settled.jobs, 1);
+    let jobs = store.list_jobs(10).await.unwrap();
+    let row = &jobs.iter().find(|j| j.job.id == id).unwrap().job;
+    assert_eq!(row.state, hunter::domain::JobState::Killed);
+    assert_eq!(
+        row.notes.as_deref(),
+        Some("abandoned -- its runner returned without recording an outcome")
+    );
+}
+
+/// `fixing` is taken only through `claim_fix`, and left only through the
+/// `FixClaim` it returns: taking or releasing the claim any other way is
+/// refused, so no claim exists that nothing would release, and none is
+/// released by code that does not hold it.
+#[tokio::test]
+async fn a_fix_claim_without_an_owner_is_refused() {
+    use hunter::domain::FindingStatus::{Fixing, Queued};
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo(&pool).await;
+    seed_findings(&pool).await;
+    let store = rw_store(&path).await;
+
+    let claimed = store.claim_in_progress(2, Queued, Fixing).await;
+    let finalized = store.finalize_in_progress(2, Queued, Fixing).await;
+    let set = store.set_finding_status(2, Fixing).await;
+    // #3 is seeded `fixing`: only its claim's holder may move it on.
+    let released = store.finalize_in_progress(3, Fixing, Queued).await;
+
+    assert!(claimed.is_err(), "{claimed:?}");
+    assert!(finalized.is_err(), "{finalized:?}");
+    assert!(set.is_err(), "{set:?}");
+    assert!(released.is_err(), "{released:?}");
+    for (fid, expected) in [(2, Queued), (3, Fixing)] {
+        let status = store.get_finding(fid).await.unwrap().unwrap().status;
+        assert_eq!(status, expected, "finding #{fid}");
+    }
 }
 
 // -- 4. ingest_findings: valid inserted, duplicates skipped, invalid counted -
@@ -515,44 +956,35 @@ async fn ingest_findings_test_gap_type() {
 
 // -- 5. finalize_in_progress ------------------------------------------------
 
+/// A recheck's claim (`rechecking`) goes back only while it is unchanged:
+/// a finding something else moved on meanwhile is left where it is. A fix
+/// claim is released through its `FixClaim` instead
+/// (`a_fix_claim_without_an_owner_is_refused`).
 #[tokio::test]
 async fn finalize_in_progress_resets_when_unchanged() {
+    use hunter::domain::FindingStatus::{New, PrOpen, Rechecking};
     let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
     seed_findings(&pool).await;
     let store = rw_store(&path).await;
 
-    // Finding #3 is "fixing"
+    // Finding #1 is "new"; claim it for a recheck, then give it back.
+    assert!(store.claim_in_progress(1, New, Rechecking).await.unwrap());
     store
-        .finalize_in_progress(
-            3,
-            hunter::domain::FindingStatus::Fixing,
-            hunter::domain::FindingStatus::Queued,
-        )
+        .finalize_in_progress(1, Rechecking, New)
         .await
         .unwrap();
-    let f = store.get_finding(3).await.unwrap().unwrap();
-    assert_eq!(f.status, hunter::domain::FindingStatus::Queued);
+    let f = store.get_finding(1).await.unwrap().unwrap();
+    assert_eq!(f.status, New);
 
     // If status is different, no-op
+    store.set_finding_status(2, PrOpen).await.unwrap(); // not rechecking
     store
-        .set_finding_status(2, hunter::domain::FindingStatus::Fixing)
-        .await
-        .unwrap();
-    store
-        .set_finding_status(2, hunter::domain::FindingStatus::PrOpen)
-        .await
-        .unwrap(); // changed away
-    store
-        .finalize_in_progress(
-            2,
-            hunter::domain::FindingStatus::Fixing,
-            hunter::domain::FindingStatus::Queued,
-        )
+        .finalize_in_progress(2, Rechecking, New)
         .await
         .unwrap();
     let f2 = store.get_finding(2).await.unwrap().unwrap();
-    assert_eq!(f2.status, hunter::domain::FindingStatus::PrOpen); // untouched
+    assert_eq!(f2.status, PrOpen); // untouched
 }
 
 // -- 6. upsert_finding + suppressions + known_active -------------------------
@@ -668,23 +1100,23 @@ async fn work_failure_streak_tracking() {
 async fn reconcile_suspends_an_orphan_that_did_work_and_kills_one_that_did_not() {
     let (dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
-    let store = rw_store(&path).await;
+    let prior = rw_store(&path).await;
     let work_root = dir.subdir("work_root");
     let mut ids = Vec::new();
     for _ in 0..2 {
-        let id = store
+        let id = support::scope(&prior)
             .create_job(
                 hunter::domain::RepoJobKind::TestGap.into(),
                 1,
                 None,
                 Some(100_000),
-                hunter::domain::JobState::Running,
                 None,
                 None,
             )
             .await
             .unwrap()
-            .id;
+            .job
+            .disown();
         std::fs::create_dir_all(work_root.join("jobs").join(id.to_string()).join("session"))
             .unwrap();
         ids.push(id);
@@ -702,7 +1134,8 @@ async fn reconcile_suspends_an_orphan_that_did_work_and_kills_one_that_did_not()
     )
     .unwrap();
 
-    hunter::daemon::reconcile_and_log(&store, &work_root)
+    let store = rw_store(&path).await;
+    hunter::recovery::reconcile_and_log(store.take_unreconciled().unwrap(), &work_root)
         .await
         .unwrap();
 
@@ -753,7 +1186,7 @@ async fn reconcile_counts_only_the_orphans_own_work_in_a_handed_off_transcript()
         let lines = vec![CALL_1600; 1 + extra_calls].join("\n") + "\n";
         std::fs::write(session.join("s.jsonl"), lines).unwrap();
 
-        hunter::daemon::reconcile_and_log(&store, &work_root)
+        hunter::recovery::reconcile_and_log(store.take_unreconciled().unwrap(), &work_root)
             .await
             .unwrap();
 
@@ -798,7 +1231,8 @@ async fn reconcile_does_not_suspend_an_orphan_whose_worker_is_still_running() {
         .spawn()
         .unwrap();
 
-    let result = hunter::daemon::reconcile_and_log(&store, &work_root).await;
+    let result =
+        hunter::recovery::reconcile_and_log(store.take_unreconciled().unwrap(), &work_root).await;
     worker.kill().unwrap();
     worker.wait().unwrap();
     result.unwrap();
@@ -909,7 +1343,7 @@ async fn a_hunt_whose_suppressions_cannot_be_read_is_refused() {
         repo_with_an_undecodable_finding(&dir, FindingType::Bug.as_str()).await;
     let backend = ScriptedBackend::noop();
 
-    let err = hunter::scheduler::run_hunt(&store, &cfg, &row, &backend, None)
+    let err = hunter::scheduler::run_hunt(&support::scope(&store), &cfg, &row, &backend, None)
         .await
         .expect_err("an unreadable suppression list must refuse the hunt");
 
@@ -940,15 +1374,16 @@ async fn an_analysis_job_whose_suppressions_cannot_be_read_is_refused() {
         let dir = TempDir::new("analysis-bad-suppressions");
         let (_path, store, row, cfg) = repo_with_an_undecodable_finding(&dir, kind.as_str()).await;
         let backend = ScriptedBackend::noop();
+        let scope = support::scope(&store);
 
         let result = match kind {
             RepoJobKind::Refactor => {
-                hunter::scheduler::run_refactor(&store, &cfg, &row, &backend, None).await
+                hunter::scheduler::run_refactor(&scope, &cfg, &row, &backend, None).await
             }
             RepoJobKind::Modernization => {
-                hunter::scheduler::run_modernize(&store, &cfg, &row, &backend, None).await
+                hunter::scheduler::run_modernize(&scope, &cfg, &row, &backend, None).await
             }
-            _ => hunter::scheduler::run_standards(&store, &cfg, &row, &backend, None).await,
+            _ => hunter::scheduler::run_standards(&scope, &cfg, &row, &backend, None).await,
         };
         let err = result.expect_err("an unreadable suppression list must refuse the job");
 
@@ -977,7 +1412,7 @@ async fn a_test_gap_whose_bug_suppressions_cannot_be_read_is_refused() {
         repo_with_an_undecodable_finding(&dir, FindingType::Bug.as_str()).await;
     let backend = ScriptedBackend::noop();
 
-    let err = hunter::scheduler::run_test_gap(&store, &cfg, &row, &backend, None)
+    let err = hunter::scheduler::run_test_gap(&support::scope(&store), &cfg, &row, &backend, None)
         .await
         .expect_err("an unreadable bug suppression list must refuse the job");
 

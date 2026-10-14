@@ -1,6 +1,7 @@
 //! Daemon loop — UI server + scheduler loop + usage prober, one process,
 //! three tokio tasks. Port of server.py daemon/_`compute_sleep_s`/
-//! _`usage_prober_loop`/_`reconcile_and_log`/_`describe_cycle`/_`acquire_lockfile`.
+//! _`usage_prober_loop`/_`describe_cycle`; the lockfile
+//! (`_acquire_lockfile`) and the startup reconcile are [`crate::recovery`].
 
 use std::path::Path;
 use std::sync::Arc;
@@ -39,122 +40,6 @@ async fn next_signal(sig: Option<Signal>) {
         }
         None => std::future::pending().await,
     }
-}
-
-/// Exclusive lockfile on <`work_root>/hunter.lock` (`server._acquire_lockfile`).
-/// Returns the open File (holds the lock while alive).
-pub fn acquire_lockfile(work_root: &Path) -> anyhow::Result<std::fs::File> {
-    let lock_path = work_root.join("hunter.lock");
-    std::fs::create_dir_all(work_root)?;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)?;
-    file.try_lock().map_err(|_| {
-        anyhow::anyhow!(
-            "another hunter process is already running (lock: {})\n  \
-             check: ps aux | grep '[h]unter --root'\n  \
-             or:    systemctl --user status hunter.service",
-            lock_path.display()
-        )
-    })?;
-    Ok(file)
-}
-
-/// Recover orphaned jobs/findings from a crashed prior process.
-///
-/// A job still `running` here outlived the process that ran it. When its
-/// chain's session directory holds a transcript with metered work from
-/// this attempt, the job is recorded `suspended`, so the resume tier
-/// continues it instead of the work being lost; the same rule
-/// `scheduler::job_state` applies to a worker that died on its own. The
-/// rest are marked killed as before -- among them every job that died
-/// before its worker made a call, such as the fix jobs killed inside
-/// `git worktree add` on 2026-09-29.
-pub async fn reconcile_and_log(store: &Store, work_root: &Path) -> anyhow::Result<()> {
-    for j in store.list_running_jobs().await? {
-        if let Some((session_file, tokens)) = orphan_work(store, work_root, &j).await? {
-            let note = "reconciled at cycle startup -- prior process died mid-job; \
-                        transcript kept for the resume";
-            store
-                .suspend_orphan(j.id, &session_file, tokens, note, crate::util::now_ms())
-                .await?;
-            let _ = store
-                .log_event(
-                    "resume",
-                    &format!(
-                        "orphaned {} job #{} suspended for resume ({tokens} tok of work in {})",
-                        j.kind, j.id, session_file
-                    ),
-                    Some(j.id),
-                    j.finding_id,
-                )
-                .await;
-        }
-    }
-    let (findings, jobs) = store.reconcile_orphaned_jobs().await?;
-    for f in &findings {
-        let _ = store
-            .log_event(
-                "error",
-                &format!(
-                    "reconciled #{} stuck 'fixing' -> 'queued' -- prior process died mid-fix",
-                    f.id
-                ),
-                None,
-                Some(f.id),
-            )
-            .await;
-    }
-    for j in &jobs {
-        let _ = store
-            .log_event(
-                "error",
-                &format!(
-                    "reconciled orphaned {} job #{} (finding {:?}) -- prior process died mid-job",
-                    j.kind, j.id, j.finding_id
-                ),
-                Some(j.id),
-                j.finding_id,
-            )
-            .await;
-    }
-    if !findings.is_empty() || !jobs.is_empty() {
-        tracing::warn!(
-            "reconciled {} stuck finding(s) + {} orphaned job(s)",
-            findings.len(),
-            jobs.len()
-        );
-    }
-    Ok(())
-}
-
-/// `(session_file, tokens)` of the work orphaned job `j` did itself,
-/// when it did any and nothing is still running in its tree.
-///
-/// The chain's session directory is shared by every attempt, so the
-/// ledger there also holds what earlier attempts already recorded --
-/// across kinds, when an engage handed its session to a harvest. That is
-/// subtracted, as the harness meters a resume against its base.
-async fn orphan_work(
-    store: &Store,
-    work_root: &Path,
-    j: &crate::types::Job,
-) -> anyhow::Result<Option<(String, i64)>> {
-    let origin = store.resume_origin_job(j.id).await?;
-    let ws = crate::workspace::Workspace::for_chain(work_root, Path::new(""), origin);
-    let Some((file, tokens, _)) =
-        crate::backends::omp_scavenge::harness::ledger_dir_usage(&ws.session)
-    else {
-        return Ok(None);
-    };
-    let own = tokens - store.ancestor_tokens(j.id).await?;
-    if own <= 0 || crate::workspace::tree_in_use(&ws.tree) {
-        return Ok(None);
-    }
-    Ok(Some((file.to_string_lossy().into_owned(), own)))
 }
 
 /// Release finished chains' trees and reclaim old workspaces and the
@@ -275,6 +160,12 @@ pub async fn compute_sleep_s(store: &Store, summary: &CycleSummary) -> f64 {
     sleep_s
 }
 
+/// When a loop that sleeps `sleep_s` from `now_ms` wakes, in epoch ms:
+/// the `next_wake_at` the status page counts down to.
+pub fn next_wake_ms(now_ms: i64, sleep_s: f64) -> i64 {
+    now_ms + (sleep_s * 1000.0) as i64
+}
+
 /// Run the daemon: axum serve + scheduler loop + usage prober.
 #[allow(
     clippy::too_many_lines,
@@ -283,9 +174,19 @@ pub async fn compute_sleep_s(store: &Store, summary: &CycleSummary) -> f64 {
               startup contract"
 )]
 pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
-    let _lockfile = acquire_lockfile(&cfg.work_root)?;
-
-    let store = Arc::new(Store::connect(&cfg.db_path).await?);
+    // The lock first, then the store under it: the daemon's startup
+    // token comes only with the lock, and the store holds the lock until
+    // its last clone is gone. Before anything else reads the job table:
+    // every `running` row and every `fixing` claim is the dead prior
+    // process's. The loop needs the `Recovered` the token becomes, so
+    // this runs exactly once and before any job exists. The sweep below
+    // then releases the trees of the chains this ended.
+    let lock = crate::recovery::DaemonLock::acquire(&cfg.work_root, &cfg.db_path)?;
+    let (store, unreconciled) = Store::connect_exclusive(lock).await?;
+    let store = Arc::new(store);
+    let (recovered, settled) =
+        crate::recovery::reconcile_and_log(unreconciled, &cfg.work_root).await?;
+    tracing::info!("startup reconcile: {settled:?}");
     // One mutex for the whole process, shared by the HTTP handlers and
     // the reaper passes below: it exists to keep a note append from
     // recreating a file that reclamation is removing, which only works
@@ -438,46 +339,21 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
             continue;
         }
 
-        let sleep_s: f64;
         cycle_running.store(true, Ordering::SeqCst);
-        let cycle_result: anyhow::Result<CycleSummary> = async {
-            reconcile_and_log(&store, &cfg.work_root).await?;
-            crate::server::reap_deleted_repos(&store, &cfg.work_root, &repo_notes).await;
-            sweep_workspaces(&store, &cfg.work_root).await;
-            let summary = crate::scheduler::run_cycle(&store, &cfg, &*backend, None).await;
-            Ok(summary)
-        }
-        .await;
+        crate::server::reap_deleted_repos(&store, &cfg.work_root, &repo_notes).await;
+        sweep_workspaces(&store, &cfg.work_root).await;
+        let summary = crate::scheduler::run_cycle(&recovered, &cfg, &*backend, None).await;
         cycle_running.store(false, Ordering::SeqCst);
 
-        match cycle_result {
-            Ok(summary) => {
-                sleep_s = compute_sleep_s(&store, &summary).await;
-                let (state_label, detail) = describe_cycle(&summary);
-                let next_wake = crate::util::now_ms() + (sleep_s * 1000.0) as i64;
-                let _ = store
-                    .set_scheduler_state(&state_label, &detail, Some(next_wake))
-                    .await;
-                let summary_str = serde_json::to_string(&summary).unwrap_or_default();
-                let summary_head: String = summary_str.chars().take(200).collect();
-                tracing::info!("cycle: {summary_head} -> sleep {sleep_s:.0}s");
-            }
-            Err(e) => {
-                tracing::error!("cycle crashed: {e:#}");
-                sleep_s = 5.0 * 60.0;
-                let next_wake = crate::util::now_ms() + (sleep_s * 1000.0) as i64;
-                let _ = store
-                    .set_scheduler_state(
-                        "error",
-                        &format!("daemon loop crashed: {e}")
-                            .chars()
-                            .take(200)
-                            .collect::<String>(),
-                        Some(next_wake),
-                    )
-                    .await;
-            }
-        }
+        let sleep_s = compute_sleep_s(&store, &summary).await;
+        let (state_label, detail) = describe_cycle(&summary);
+        let next_wake = next_wake_ms(crate::util::now_ms(), sleep_s);
+        let _ = store
+            .set_scheduler_state(&state_label, &detail, Some(next_wake))
+            .await;
+        let summary_str = serde_json::to_string(&summary).unwrap_or_default();
+        let summary_head: String = summary_str.chars().take(200).collect();
+        tracing::info!("cycle: {summary_head} -> sleep {sleep_s:.0}s");
 
         // Sleep, wake on shutdown or notify
         tokio::select! {

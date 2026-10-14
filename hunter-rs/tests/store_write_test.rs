@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use hunter::backend::SpendLedger;
 use hunter::domain::{
-    BudgetOverride, ClosureClass, FindingJobKind, FindingStatus, ForgeName, HoldReason, JobState,
+    BudgetOverride, ClosureClass, FindingJobKind, FindingStatus, ForgeName, HoldReason,
     ReleaseAction, RepoJobKind,
 };
 use hunter::store::{RepoUpdate, ResumeChainStats, Store, StoreWriteError};
@@ -226,18 +226,19 @@ async fn create_job_refuses_a_soft_deleted_repo_and_leaves_it_reapable() {
     let picked = store.get_repo_by_id(2).await.unwrap().unwrap();
     store.soft_delete_repo(2).await.unwrap();
 
-    let err = store
+    let Err(err) = support::scope(&store)
         .create_job(
             RepoJobKind::Hunt.into(),
             picked.id,
             None,
             Some(100_000),
-            JobState::Running,
             None,
             None,
         )
         .await
-        .unwrap_err();
+    else {
+        panic!("a job was created on a deleted repo");
+    };
     match err {
         StoreWriteError::Refused(msg) => {
             assert_eq!(msg, "repo 2 is deleted -- cannot start a hunt job");
@@ -251,19 +252,12 @@ async fn create_job_refuses_a_soft_deleted_repo_and_leaves_it_reapable() {
 
     // The guard is keyed on deleted_at, not on the repo being absent: a
     // live repo still gets its job.
-    let job = store
-        .create_job(
-            RepoJobKind::Hunt.into(),
-            1,
-            None,
-            Some(100_000),
-            JobState::Running,
-            None,
-            None,
-        )
+    let job = support::scope(&store)
+        .create_job(RepoJobKind::Hunt.into(), 1, None, Some(100_000), None, None)
         .await
         .unwrap()
-        .id;
+        .job
+        .disown();
     assert!(job > 0);
 
     // And the deletion can still finish: no job row is holding repo 2's
@@ -1378,6 +1372,17 @@ async fn set_tokens(pool: &SqlitePool, job_id: i64, tokens: i64) {
         .unwrap();
 }
 
+/// Seed how a job ended, raw: a job is created `running` and only a
+/// recorded outcome moves it on, which these chain fixtures skip.
+async fn set_state(pool: &SqlitePool, job_id: i64, state: &str) {
+    sqlx::query("UPDATE jobs SET state = ?1 WHERE id = ?2")
+        .bind(state)
+        .bind(job_id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
 /// Only a work item's checkpoint is resumable, and the freshest comes
 /// first. A killed, a done or an older suspended attempt of the same work
 /// sits in the same table looking similar and must never appear here:
@@ -1510,13 +1515,12 @@ async fn resumable_jobs_skip_a_suspension_that_already_has_a_successor() {
     insert_suspended_job(&pool, 10, (1, "hunt"), Some("/s/10/session.jsonl")).await;
     insert_suspended_job(&pool, 11, (1, "test_gap"), Some("/s/11/session.jsonl")).await;
     let store = rw_store(&path).await;
-    store
+    support::scope(&store)
         .create_job(
             RepoJobKind::TestGap.into(),
             1,
             None,
             None,
-            JobState::Running,
             Some(250_000),
             Some(11),
         )
@@ -1547,22 +1551,22 @@ async fn a_resume_that_never_ran_keeps_the_repo_checkpoint() {
     seed_repo(&pool).await;
     insert_suspended_job(&pool, 10, (1, "hunt"), Some("/s/10/session.jsonl")).await;
     let store = rw_store(&path).await;
-    let resumed = store
+    let resumed = support::scope(&store)
         .create_job(
             RepoJobKind::Hunt.into(),
             1,
             None,
             None,
-            JobState::Running,
             Some(250_000),
             Some(10),
         )
         .await
         .unwrap();
-    assert!(resumed.superseded.is_empty(), "{resumed:?}");
+    assert!(resumed.superseded.is_empty(), "{:?}", resumed.superseded);
 
-    store
-        .fail_unstarted_job(resumed.id, "runner error: no backend")
+    resumed
+        .job
+        .fail_unstarted("runner error: no backend")
         .await
         .unwrap();
 
@@ -1626,20 +1630,14 @@ async fn resume_chain_stats_measure_every_attempt_from_any_link() {
     let mut chain = Vec::new();
     let mut previous = None;
     for tokens in [120_000, 90_000, 30_000] {
-        let id = store
-            .create_job(
-                RepoJobKind::Hunt.into(),
-                1,
-                None,
-                None,
-                JobState::Suspended,
-                None,
-                previous,
-            )
+        let id = support::scope(&store)
+            .create_job(RepoJobKind::Hunt.into(), 1, None, None, None, previous)
             .await
             .unwrap()
-            .id;
+            .job
+            .disown();
         set_tokens(&pool, id, tokens).await;
+        set_state(&pool, id, "suspended").await;
         chain.push(id);
         previous = Some(id);
     }
@@ -1657,20 +1655,14 @@ async fn resume_chain_stats_measure_every_attempt_from_any_link() {
     }
 
     // Unrelated work is not swept in: the walk follows the link, not the repo.
-    let loner = store
-        .create_job(
-            RepoJobKind::Hunt.into(),
-            1,
-            None,
-            None,
-            JobState::Done,
-            None,
-            None,
-        )
+    let loner = support::scope(&store)
+        .create_job(RepoJobKind::Hunt.into(), 1, None, None, None, None)
         .await
         .unwrap()
-        .id;
+        .job
+        .disown();
     set_tokens(&pool, loner, 7_000).await;
+    set_state(&pool, loner, "done").await;
     assert_eq!(
         store.resume_chain_stats(loner, None).await.unwrap(),
         ResumeChainStats {
@@ -1705,20 +1697,14 @@ async fn resume_chain_stats_terminate_on_a_cyclic_link() {
     let mut chain = Vec::new();
     let mut previous = None;
     for tokens in [120_000, 90_000, 30_000] {
-        let id = store
-            .create_job(
-                RepoJobKind::Hunt.into(),
-                1,
-                None,
-                None,
-                JobState::Suspended,
-                None,
-                previous,
-            )
+        let id = support::scope(&store)
+            .create_job(RepoJobKind::Hunt.into(), 1, None, None, None, previous)
             .await
             .unwrap()
-            .id;
+            .job
+            .disown();
         set_tokens(&pool, id, tokens).await;
+        set_state(&pool, id, "suspended").await;
         chain.push(id);
         previous = Some(id);
     }
@@ -1768,7 +1754,7 @@ async fn leaving_a_tier_drops_the_checkpoint_and_keeps_the_job_row() {
             let (_dir, path, pool) = fresh_db().await;
             seed_repo_and_findings(&pool).await;
             let store = rw_store(&path).await;
-            store.set_finding_status(1, at).await.unwrap();
+            support::seed_status(&path, 1, at).await;
             sqlx::query(
                 "INSERT INTO jobs (id, kind, repo_id, finding_id, state, session_file, started_at) \
                  VALUES (11, ?1, 1, 1, 'suspended', '/s/11/session.jsonl', 1000)",
@@ -1786,7 +1772,7 @@ async fn leaving_a_tier_drops_the_checkpoint_and_keeps_the_job_row() {
             .await
             .unwrap();
 
-            store.set_finding_status(1, to).await.unwrap();
+            support::seed_status(&path, 1, to).await;
 
             let stays = to == at
                 || matches!(
@@ -1893,7 +1879,7 @@ async fn finding_checkpoints_resume_only_at_their_actionable_status() {
     }
     let store = rw_store(&path).await;
     for status in FindingStatus::ALL {
-        store.set_finding_status(1, status).await.unwrap();
+        support::seed_status(&path, 1, status).await;
         // Pointed after the move: this is about which status resumes a
         // checkpoint, not about which statuses keep one.
         sqlx::query(

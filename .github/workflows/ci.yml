@@ -41,6 +41,14 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      # `--all-targets` builds the tests, whose self dev-dependency turns
+      # on `test-support` for the whole build. This pass compiles the
+      # library and binaries without it, so production code cannot reach
+      # the fixture-only API (`Unreconciled::assume_clean`,
+      # `Store::recovered`, `RunningJob::disown`, ...).
+      - name: Clippy (production build, no test-support)
+        run: cargo clippy --lib --bins -- -D warnings
+
       # Same script `just lint` runs locally — `just` itself is not
       # installed in this job, so both call the script rather than CI
       # re-implementing the rules.

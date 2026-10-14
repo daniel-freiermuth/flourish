@@ -963,19 +963,18 @@ async fn fresh_work_on_a_finding_supersedes_its_suspended_attempt() {
     seed_finding_suspension(&pool, 22, "fix", 5, &session).await;
     let store = rw_store(&path).await;
 
-    let created = store
+    let created = support::scope(&store)
         .create_job(
             FindingJobKind::Engage.into(),
             1,
             Some(5),
             None,
-            JobState::Running,
             Some(40_000),
             None,
         )
         .await
         .unwrap();
-    let fresh = created.id;
+    let fresh = created.job.disown();
     assert_eq!(
         created.superseded,
         vec![20],
@@ -1035,19 +1034,12 @@ async fn fresh_work_on_a_repo_supersedes_its_suspended_attempt() {
     }
     let store = rw_store(&path).await;
 
-    let fresh = store
-        .create_job(
-            RepoJobKind::Hunt.into(),
-            1,
-            None,
-            None,
-            JobState::Running,
-            Some(40_000),
-            None,
-        )
+    let fresh = support::scope(&store)
+        .create_job(RepoJobKind::Hunt.into(), 1, None, None, Some(40_000), None)
         .await
         .unwrap()
-        .id;
+        .job
+        .disown();
 
     assert_eq!(hunt_checkpoint(&store).await, None);
     let (state, reason, _) = job_row(&pool, 10).await;
@@ -1163,19 +1155,19 @@ async fn resume_unavailable_fails_the_attempt_and_gives_up_the_checkpoint() {
     seed_suspension(&pool, 10, &session, 40_000).await;
     let store = rw_store(&path).await;
 
-    let attempt = store
+    let attempt = support::scope(&store)
         .create_job(
             RepoJobKind::Hunt.into(),
             1,
             None,
             None,
-            JobState::Running,
             Some(260_000),
             Some(10),
         )
         .await
         .unwrap()
-        .id;
+        .job;
+    let attempt_id = attempt.id();
     let plan = ResumePlan {
         kind: RepoJobKind::Hunt.into(),
         repo_id: 1,
@@ -1212,14 +1204,15 @@ async fn resume_unavailable_fails_the_attempt_and_gives_up_the_checkpoint() {
 
     let state = record_job(&store, attempt, &rr, None, Some(&plan))
         .await
-        .unwrap();
+        .unwrap()
+        .state();
 
     assert_eq!(
         state,
         JobState::Failed,
         "nothing ran, so nothing was killed"
     );
-    let (attempt_state, _, _) = job_row(&pool, attempt).await;
+    let (attempt_state, _, _) = job_row(&pool, attempt_id).await;
     assert_eq!(attempt_state, JobState::Failed.as_str());
 
     let (pred_state, pred_reason, _) = job_row(&pool, 10).await;
@@ -1231,7 +1224,7 @@ async fn resume_unavailable_fails_the_attempt_and_gives_up_the_checkpoint() {
     assert_eq!(hunt_checkpoint(&store).await, None);
     let gone: Vec<String> =
         sqlx::query_scalar("SELECT message FROM events WHERE kind = 'error' AND job_id = ?1")
-            .bind(attempt)
+            .bind(attempt_id)
             .fetch_all(&pool)
             .await
             .unwrap();
@@ -1417,7 +1410,7 @@ async fn a_resumed_hunt_continues_the_session_and_ingests_the_origin_output_path
     );
     let row = store.get_repo_by_id(1).await.unwrap().unwrap();
 
-    let summary = run_hunt(&store, &cfg, &row, &backend, Some(&plan))
+    let summary = run_hunt(&support::scope(&store), &cfg, &row, &backend, Some(&plan))
         .await
         .unwrap();
 
@@ -1484,7 +1477,7 @@ async fn a_resumed_hunt_does_not_sync_the_clone() {
     let row = store.get_repo_by_id(1).await.unwrap().unwrap();
 
     let cold = RecordingBackend::new(cfg.work_root.join("out").join("cold.json"), String::new());
-    run_hunt(&store, &cfg, &row, &cold, None)
+    run_hunt(&support::scope(&store), &cfg, &row, &cold, None)
         .await
         .expect_err("a cold hunt has to sync, and cannot without a remote");
 
@@ -1492,7 +1485,7 @@ async fn a_resumed_hunt_does_not_sync_the_clone() {
         cfg.work_root.join("out").join("job10.findings.json"),
         one_finding(),
     );
-    let summary = run_hunt(&store, &cfg, &row, &warm, Some(&plan))
+    let summary = run_hunt(&support::scope(&store), &cfg, &row, &warm, Some(&plan))
         .await
         .expect("a resume must not touch the remote at all");
     assert_eq!(summary.state, Some(JobState::Done));
@@ -1516,7 +1509,8 @@ async fn a_cycle_dispatches_a_resume_to_the_suspended_kinds_executor() {
         one_finding(),
     );
 
-    let summary = hunter::scheduler::run_cycle(&store, &cfg, &backend, None).await;
+    let summary =
+        hunter::scheduler::run_cycle(&support::recovered(&store), &cfg, &backend, None).await;
 
     assert_eq!(summary.kind.map(|k| k.to_string()), Some("hunt".to_owned()));
     assert_eq!(summary.state, Some(JobState::Done));
@@ -1603,7 +1597,7 @@ async fn a_cold_start_reserves_at_least_the_efficiency_floor() {
     let row = store.get_repo_by_id(1).await.unwrap().unwrap();
 
     let collapsed = GateProbe::default();
-    let summary = run_hunt(&store, &cfg, &row, &collapsed, None)
+    let summary = run_hunt(&support::scope(&store), &cfg, &row, &collapsed, None)
         .await
         .unwrap();
     assert!(summary.denied.is_some(), "the probe refuses: {summary:?}");
@@ -1612,7 +1606,9 @@ async fn a_cold_start_reserves_at_least_the_efficiency_floor() {
         .await
         .unwrap();
     let healthy = GateProbe::default();
-    run_hunt(&store, &cfg, &row, &healthy, None).await.unwrap();
+    run_hunt(&support::scope(&store), &cfg, &row, &healthy, None)
+        .await
+        .unwrap();
 
     assert_eq!(
         (collapsed.reserved(), healthy.reserved()),
@@ -1771,7 +1767,7 @@ async fn repeated_suspensions_of_a_fix_are_not_a_stuck_streak() {
     let mut outcomes = Vec::new();
     for _ in 0..3 {
         let finding = store.get_finding(fid).await.unwrap().unwrap();
-        let summary = run_fix(&store, &cfg, &finding, &suspending, None)
+        let summary = run_fix(&support::scope(&store), &cfg, &finding, &suspending, None)
             .await
             .unwrap();
         assert_eq!(summary.state, Some(JobState::Suspended), "{summary:?}");
@@ -1801,7 +1797,7 @@ async fn repeated_suspensions_of_a_recheck_are_not_a_stuck_streak() {
     let mut outcomes = Vec::new();
     for _ in 0..3 {
         let finding = store.get_finding(fid).await.unwrap().unwrap();
-        let summary = run_recheck(&store, &cfg, &finding, &suspending, None)
+        let summary = run_recheck(&support::scope(&store), &cfg, &finding, &suspending, None)
             .await
             .unwrap();
         assert_eq!(summary.state, Some(JobState::Suspended), "{summary:?}");
@@ -1834,7 +1830,7 @@ async fn confirmed_recheck_with_severity(raw: &'static str) -> hunter::types::Fi
     });
 
     let finding = store.get_finding(fid).await.unwrap().unwrap();
-    let summary = run_recheck(&store, &cfg, &finding, &worker, None)
+    let summary = run_recheck(&support::scope(&store), &cfg, &finding, &worker, None)
         .await
         .unwrap();
     assert_eq!(summary.outcome.as_deref(), Some("confirmed"), "{summary:?}");
@@ -1898,7 +1894,7 @@ async fn a_stale_recheck_supersedes_and_only_an_invalid_one_suppresses() {
         });
 
         let finding = store.get_finding(fid).await.unwrap().unwrap();
-        let summary = run_recheck(&store, &cfg, &finding, &worker, None)
+        let summary = run_recheck(&support::scope(&store), &cfg, &finding, &worker, None)
             .await
             .unwrap();
 
@@ -1953,7 +1949,7 @@ async fn a_recheck_without_a_verdict_retries_then_is_held() {
     let mut seen = Vec::new();
     for _ in 0..3 {
         let finding = store.get_finding(fid).await.unwrap().unwrap();
-        let summary = run_recheck(&store, &cfg, &finding, &silent, None)
+        let summary = run_recheck(&support::scope(&store), &cfg, &finding, &silent, None)
             .await
             .unwrap();
         let after = store.get_finding(fid).await.unwrap().unwrap();
@@ -1995,7 +1991,7 @@ async fn a_recheck_whose_tree_can_never_be_made_is_held() {
     let mut seen = Vec::new();
     for _ in 0..3 {
         let finding = store.get_finding(fid).await.unwrap().unwrap();
-        let summary = run_recheck(&store, &cfg, &finding, &never, None)
+        let summary = run_recheck(&support::scope(&store), &cfg, &finding, &never, None)
             .await
             .unwrap();
         assert!(
@@ -2060,7 +2056,7 @@ async fn every_end_of_a_recheck_attempt_spends_only_a_once_override() {
             });
 
             let finding = store.get_finding(fid).await.unwrap().unwrap();
-            let summary = run_recheck(&store, &cfg, &finding, &worker, None)
+            let summary = run_recheck(&support::scope(&store), &cfg, &finding, &worker, None)
                 .await
                 .unwrap();
 
@@ -2107,7 +2103,7 @@ async fn repeated_suspensions_of_a_harvest_are_not_a_stuck_streak() {
     let mut outcomes = Vec::new();
     for _ in 0..3 {
         let finding = store.get_finding(fid).await.unwrap().unwrap();
-        let summary = run_harvest(&store, &cfg, &finding, &suspending, None)
+        let summary = run_harvest(&support::scope(&store), &cfg, &finding, &suspending, None)
             .await
             .unwrap();
         assert_eq!(summary.state, Some(JobState::Suspended), "{summary:?}");
@@ -2203,7 +2199,7 @@ async fn a_no_commit_hunt_whose_watermark_cannot_be_written_fails() {
     let row = store.get_repo_by_id(1).await.unwrap().unwrap();
     let never = ScriptedBackend::new(|_| panic!("no new commits: nothing may run"));
 
-    let err = run_hunt(&store, &cfg, &row, &never, None)
+    let err = run_hunt(&support::scope(&store), &cfg, &row, &never, None)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("injected write failure"), "{err}");
@@ -2285,7 +2281,9 @@ async fn a_recheck_that_keeps_overrunning_is_held_instead_of_restarting_forever(
     // third identical failure.
     let mut kinds = Vec::new();
     for _ in 0..12 {
-        let summary = hunter::scheduler::run_cycle(&store, &cfg, &overrunning, None).await;
+        let summary =
+            hunter::scheduler::run_cycle(&support::recovered(&store), &cfg, &overrunning, None)
+                .await;
         kinds.push(summary.kind.map(|k| k.to_string()));
     }
     let next = pick_next(&store, &cfg, None).await.unwrap();

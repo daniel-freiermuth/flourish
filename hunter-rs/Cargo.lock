@@ -691,6 +691,7 @@ dependencies = [
  "axum",
  "chrono",
  "getrandom 0.4.3",
+ "hunter",
  "insta",
  "nix",
  "proptest",

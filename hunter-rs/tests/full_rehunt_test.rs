@@ -204,13 +204,15 @@ async fn a_resumed_periodic_rehunt_records_its_full_hunt() {
     let row = f.repo().await;
 
     let cold = ScriptedBackend::new(suspended_at_cap);
-    let first = run_hunt(&f.store, &f.cfg, &row, &cold, None).await.unwrap();
+    let first = run_hunt(&support::scope(&f.store), &f.cfg, &row, &cold, None)
+        .await
+        .unwrap();
     assert_eq!(first.state, Some(JobState::Suspended), "{first:?}");
     assert_eq!(first.full_rehunt, Some(true));
 
     let plan = f.resume_plan().await;
     let resumed = run_hunt(
-        &f.store,
+        &support::scope(&f.store),
         &f.cfg,
         &f.repo().await,
         &f.clean_worker(),
@@ -237,9 +239,15 @@ async fn a_resumed_periodic_rehunt_records_its_full_hunt() {
     assert_eq!(after.last_hunt_sha.as_deref(), Some(head.as_str()));
 
     // The next cold hunt is incremental again: nothing new, so skipped.
-    let next = run_hunt(&f.store, &f.cfg, &after, &f.clean_worker(), None)
-        .await
-        .unwrap();
+    let next = run_hunt(
+        &support::scope(&f.store),
+        &f.cfg,
+        &after,
+        &f.clean_worker(),
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(next.skipped.as_deref(), Some("no new commits"), "{next:?}");
 }
 
@@ -271,7 +279,7 @@ async fn a_requested_rehunt_runs_now_over_the_complete_history() {
 
     let before = f.repo().await;
     let backend = f.clean_worker();
-    let summary = run_hunt(&f.store, &f.cfg, &before, &backend, None)
+    let summary = run_hunt(&support::scope(&f.store), &f.cfg, &before, &backend, None)
         .await
         .unwrap();
     assert_eq!(summary.state, Some(JobState::Done), "{summary:?}");
@@ -310,7 +318,7 @@ async fn a_request_made_during_a_full_chain_outlives_it() {
     tick().await;
     let row = f.repo().await;
     let first = run_hunt(
-        &f.store,
+        &support::scope(&f.store),
         &f.cfg,
         &row,
         &ScriptedBackend::new(suspended_at_cap),
@@ -326,7 +334,7 @@ async fn a_request_made_during_a_full_chain_outlives_it() {
 
     let plan = f.resume_plan().await;
     let resumed = run_hunt(
-        &f.store,
+        &support::scope(&f.store),
         &f.cfg,
         &f.repo().await,
         &f.clean_worker(),
@@ -369,7 +377,7 @@ async fn an_incremental_chain_neither_settles_nor_delays_a_request() {
     f.push_commits(1);
     let row = f.repo().await;
     let first = run_hunt(
-        &f.store,
+        &support::scope(&f.store),
         &f.cfg,
         &row,
         &ScriptedBackend::new(suspended_at_cap),
@@ -383,7 +391,7 @@ async fn an_incremental_chain_neither_settles_nor_delays_a_request() {
     assert!(f.store.request_full_hunt(1).await.unwrap());
     let plan = f.resume_plan().await;
     let resumed = run_hunt(
-        &f.store,
+        &support::scope(&f.store),
         &f.cfg,
         &f.repo().await,
         &f.clean_worker(),
@@ -422,7 +430,7 @@ async fn a_failed_requested_hunt_waits_for_the_next_hunt_turn() {
         exit_code: Some(1),
         ..done()
     });
-    let summary = run_cycle(&f.store, &f.cfg, &failing, None).await;
+    let summary = run_cycle(&support::recovered(&f.store), &f.cfg, &failing, None).await;
     assert_eq!(summary.state, Some(JobState::Failed), "{summary:?}");
 
     assert!(
@@ -432,9 +440,15 @@ async fn a_failed_requested_hunt_waits_for_the_next_hunt_turn() {
     let row = f.repo().await;
     assert!(row.full_hunt_requested_at.is_some());
 
-    let summary = run_hunt(&f.store, &f.cfg, &row, &f.clean_worker(), None)
-        .await
-        .unwrap();
+    let summary = run_hunt(
+        &support::scope(&f.store),
+        &f.cfg,
+        &row,
+        &f.clean_worker(),
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(summary.full_rehunt, Some(true), "{summary:?}");
 }
 
@@ -455,9 +469,15 @@ async fn a_full_rehunt_that_is_denied_or_fails_keeps_the_watermark() {
     assert!(watermark.is_some());
 
     let denying = ScriptedBackend::new(|_| panic!("a denied hunt runs nothing")).denying_above(0);
-    let summary = run_hunt(&f.store, &f.cfg, &f.repo().await, &denying, None)
-        .await
-        .unwrap();
+    let summary = run_hunt(
+        &support::scope(&f.store),
+        &f.cfg,
+        &f.repo().await,
+        &denying,
+        None,
+    )
+    .await
+    .unwrap();
     assert!(summary.denied.is_some(), "{summary:?}");
     assert_eq!(f.repo().await.last_hunt_sha, watermark, "denied");
 
@@ -465,9 +485,15 @@ async fn a_full_rehunt_that_is_denied_or_fails_keeps_the_watermark() {
         exit_code: Some(1),
         ..done()
     });
-    let summary = run_hunt(&f.store, &f.cfg, &f.repo().await, &failing, None)
-        .await
-        .unwrap();
+    let summary = run_hunt(
+        &support::scope(&f.store),
+        &f.cfg,
+        &f.repo().await,
+        &failing,
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(summary.full_rehunt, Some(true), "{summary:?}");
     assert_eq!(summary.state, Some(JobState::Failed), "{summary:?}");
     assert_eq!(f.repo().await.last_hunt_sha, watermark, "failed");
@@ -484,7 +510,7 @@ async fn a_never_hunted_repo_keeps_a_requested_full_scope_across_a_resume() {
     assert!(f.store.request_full_hunt(1).await.unwrap());
     tick().await;
     let first = run_hunt(
-        &f.store,
+        &support::scope(&f.store),
         &f.cfg,
         &f.repo().await,
         &ScriptedBackend::new(suspended_at_cap),
@@ -497,7 +523,7 @@ async fn a_never_hunted_repo_keeps_a_requested_full_scope_across_a_resume() {
 
     let plan = f.resume_plan().await;
     let resumed = run_hunt(
-        &f.store,
+        &support::scope(&f.store),
         &f.cfg,
         &f.repo().await,
         &f.clean_worker(),
@@ -524,9 +550,15 @@ async fn a_never_hunted_repo_keeps_a_requested_full_scope_across_a_resume() {
 async fn a_never_hunted_repo_without_a_request_takes_a_bounded_first_hunt() {
     let f = fixture("rehunt-first-bounded", History::Never).await;
     f.push_commits(31);
-    let summary = run_hunt(&f.store, &f.cfg, &f.repo().await, &f.clean_worker(), None)
-        .await
-        .unwrap();
+    let summary = run_hunt(
+        &support::scope(&f.store),
+        &f.cfg,
+        &f.repo().await,
+        &f.clean_worker(),
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(summary.state, Some(JobState::Done), "{summary:?}");
     assert_eq!(summary.full_rehunt, Some(false), "{summary:?}");
 }
@@ -548,9 +580,15 @@ async fn a_request_made_while_an_incremental_hunt_is_prepared_stays_unanswered()
     let picked = f.repo().await;
     assert!(f.store.request_full_hunt(1).await.unwrap());
 
-    let summary = run_hunt(&f.store, &f.cfg, &picked, &f.clean_worker(), None)
-        .await
-        .unwrap();
+    let summary = run_hunt(
+        &support::scope(&f.store),
+        &f.cfg,
+        &picked,
+        &f.clean_worker(),
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(summary.state, Some(JobState::Done), "{summary:?}");
     assert_eq!(summary.full_rehunt, Some(false), "{summary:?}");
     assert!(f.repo().await.full_hunt_requested_at.is_some());
@@ -577,9 +615,15 @@ async fn a_request_replaced_while_a_full_hunt_is_prepared_survives_it() {
     assert!(f.store.request_full_hunt(1).await.unwrap());
     let replaced = f.repo().await.full_hunt_requested_at;
 
-    let summary = run_hunt(&f.store, &f.cfg, &picked, &f.clean_worker(), None)
-        .await
-        .unwrap();
+    let summary = run_hunt(
+        &support::scope(&f.store),
+        &f.cfg,
+        &picked,
+        &f.clean_worker(),
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(summary.state, Some(JobState::Done), "{summary:?}");
     assert_eq!(summary.full_rehunt, Some(true), "{summary:?}");
     assert_eq!(f.repo().await.full_hunt_requested_at, replaced);
@@ -604,7 +648,13 @@ async fn a_requested_hunt_whose_fetch_fails_waits_for_the_next_hunt_turn() {
     assert!(f.store.request_full_hunt(1).await.unwrap());
     std::fs::remove_dir_all(&f.origin).unwrap();
 
-    let summary = run_cycle(&f.store, &f.cfg, &ScriptedBackend::noop(), None).await;
+    let summary = run_cycle(
+        &support::recovered(&f.store),
+        &f.cfg,
+        &ScriptedBackend::noop(),
+        None,
+    )
+    .await;
 
     assert!(summary.error.is_some(), "{summary:?}");
     assert!(
@@ -622,7 +672,7 @@ async fn a_resumed_bounded_first_hunt_stays_bounded() {
     let f = fixture("rehunt-first-resumed", History::Never).await;
     f.push_commits(31);
     let first = run_hunt(
-        &f.store,
+        &support::scope(&f.store),
         &f.cfg,
         &f.repo().await,
         &ScriptedBackend::new(suspended_at_cap),
@@ -635,7 +685,7 @@ async fn a_resumed_bounded_first_hunt_stays_bounded() {
 
     let plan = f.resume_plan().await;
     let resumed = run_hunt(
-        &f.store,
+        &support::scope(&f.store),
         &f.cfg,
         &f.repo().await,
         &f.clean_worker(),

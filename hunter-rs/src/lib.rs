@@ -9,6 +9,7 @@ pub mod forge;
 pub mod ingest;
 pub mod playbooks;
 pub mod reach;
+pub mod recovery;
 pub mod scheduler;
 pub mod server;
 pub mod store;

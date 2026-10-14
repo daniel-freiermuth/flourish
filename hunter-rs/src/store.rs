@@ -27,8 +27,12 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 
 use crate::auth::CurrentUser;
 use crate::domain::{
-    BudgetOverride, BugClass, ClosureClass, FindingJobKind, FindingStatus, FindingType, ForgeName,
-    HoldReason, JobKind, JobState, ReleaseAction, RepoJobKind, RepoWorkKind, Severity,
+    BudgetOverride, BugClass, ClosureClass, FindingJobKind, FindingStatus, FindingType,
+    FinishedState, ForgeName, HoldReason, JobKind, JobState, ReleaseAction, RepoJobKind,
+    RepoWorkKind, Severity,
+};
+use crate::recovery::{
+    DaemonLock, Owner, RecordedJob, Recovery, StrandedClaim, StrandedJob, Unreconciled,
 };
 use crate::types::{
     Event, Finding, Job, JobListEntry, PrState, Repo, SchedulerState, StatsByFinding, StatsByKind,
@@ -221,11 +225,14 @@ pub struct HoldRelease<'a> {
 }
 
 /// A job row just inserted, and the checkpoints its insert superseded.
+/// The store's half of [`CycleScope::create_job`](crate::recovery::CycleScope::create_job),
+/// which turns `id` into the [`RunningJob`](crate::recovery::RunningJob) that
+/// owns the row.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreatedJob {
-    pub id: i64,
+pub(crate) struct InsertedJob {
+    pub(crate) id: i64,
     /// Ids of the checkpoints this fresh job superseded, oldest first.
-    pub superseded: Vec<i64>,
+    pub(crate) superseded: Vec<i64>,
 }
 
 /// Whether a chain's working tree is still needed; see
@@ -261,7 +268,7 @@ pub struct SessionRef {
     pub finished_at: Option<i64>,
 }
 
-/// Everything [`Store::complete_job`] writes when a job finishes.
+/// Everything [`RunningJob::complete`](crate::recovery::RunningJob::complete) writes when a job finishes.
 ///
 /// Named fields rather than positional arguments: the outcome carries
 /// four optional strings and three integers whose order the compiler
@@ -269,7 +276,9 @@ pub struct SessionRef {
 /// the per-kind token budget is estimated from.
 #[derive(Debug, Clone, Copy)]
 pub struct JobOutcome<'a> {
-    pub state: JobState,
+    /// How the attempt ended. Never `running`: a job is `running` only
+    /// from its creation in an owning scope until its outcome is recorded.
+    pub state: FinishedState,
     pub tokens_new: i64,
     pub calls: i64,
     pub exit_code: Option<i64>,
@@ -413,6 +422,12 @@ pub struct VerdictAnchor {
 #[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
+    /// This handle's startup recovery and the ledger of settles it still
+    /// owes. Opaque here: only `crate::recovery` reads or moves it, so no
+    /// code outside that module can mint a token, mark the store
+    /// recovered or drop owed work. Shared by clones, which are the same
+    /// handle.
+    recovery: Recovery,
 }
 
 /// INSERT one event row on `ex` — the pool, or an open transaction when
@@ -775,13 +790,38 @@ impl Store {
             .max_connections(4)
             .connect_with(opts)
             .await?;
-        Ok(Self { pool })
+        Ok(Self::new(pool, Recovery::default()))
     }
 
     /// Open the live DB read-write. Runs embedded migrations on connect —
     /// the binary carries its own schema, so deploying a new binary
     /// automatically migrates the DB.
+    ///
+    /// The handle has no startup token: [`Recovered`], and so any job,
+    /// is out of its reach. The daemon connects through
+    /// [`Self::connect_exclusive`] instead.
     pub async fn connect(db_path: &Path) -> anyhow::Result<Self> {
+        Ok(Self::new(
+            Self::open_rw(db_path).await?,
+            Recovery::default(),
+        ))
+    }
+
+    /// [`Self::connect`] for the daemon: the database `lock` holds, with
+    /// its one startup token ([`crate::recovery::reconcile_and_log`]).
+    ///
+    /// The store keeps `lock` until its last clone is dropped, so the
+    /// lock outlives every token and every job this handle can make: no
+    /// second daemon can reconcile this database while they exist.
+    pub async fn connect_exclusive(lock: DaemonLock) -> anyhow::Result<(Self, Unreconciled)> {
+        let pool = Self::open_rw(lock.db_path()).await?;
+        let store = Self::new(pool, Recovery::exclusive(lock));
+        let token = crate::recovery::take_unreconciled(&store)
+            .ok_or_else(|| anyhow::anyhow!("a store just connected has no startup token"))?;
+        Ok((store, token))
+    }
+
+    async fn open_rw(db_path: &Path) -> anyhow::Result<SqlitePool> {
         let opts = SqliteConnectOptions::new()
             .filename(db_path)
             .create_if_missing(true)
@@ -800,7 +840,36 @@ impl Store {
             .connect_with(opts)
             .await?;
         MIGRATOR.run(&pool).await?;
-        Ok(Self { pool })
+        Ok(pool)
+    }
+
+    const fn new(pool: SqlitePool, recovery: Recovery) -> Self {
+        Self { pool, recovery }
+    }
+
+    /// This handle's recovery state, for `crate::recovery` alone: every
+    /// method on it is private to that module.
+    pub(crate) const fn recovery(&self) -> &Recovery {
+        &self.recovery
+    }
+
+    /// The startup token of a store a test just made, which no daemon
+    /// lock guards; `None` once it was handed out. Only in a
+    /// `test-support` build: the daemon's token comes with its lock
+    /// ([`Self::connect_exclusive`]).
+    #[cfg(feature = "test-support")]
+    pub fn take_unreconciled(&self) -> Option<Unreconciled> {
+        crate::recovery::take_unreconciled(self)
+    }
+
+    /// Proof that this store is recovered, once its [`Unreconciled`]
+    /// token was spent on it. Only in a `test-support` build: the daemon's
+    /// one [`Recovered`](crate::recovery::Recovered) is the one `recovery::reconcile_and_log` returns,
+    /// and the right to create jobs is handed on from there, never read
+    /// back from a store handle.
+    #[cfg(feature = "test-support")]
+    pub fn recovered(&self) -> Option<crate::recovery::Recovered> {
+        crate::recovery::recovered(self)
     }
 
     // -- writes (API-CONTRACT-WRITES.md; commit-per-method) -------------------
@@ -829,12 +898,21 @@ impl Store {
         .await
     }
 
-    /// Plain finding status transition (new, queued, rechecking, merged, fixing).
+    /// Plain finding status transition (new, queued, rechecking, merged).
+    ///
+    /// Never to `fixing`: that claim has an owner that releases it if its
+    /// fix does not, which only [`CycleScope::claim_fix`](crate::recovery::CycleScope::claim_fix) records. Refused,
+    /// as [`Self::claim_in_progress`] refuses it.
     pub async fn set_finding_status(
         &self,
         finding_id: i64,
         status: FindingStatus,
-    ) -> sqlx::Result<()> {
+    ) -> Result<(), StoreWriteError> {
+        if status == FindingStatus::Fixing {
+            return Err(StoreWriteError::Refused(format!(
+                "finding #{finding_id}: a fix claim needs an owner (CycleScope::claim_fix)"
+            )));
+        }
         let now = now_ms();
         sqlx::query!(
             "UPDATE findings SET status = ?1, updated_at = ?2 WHERE id = ?3",
@@ -870,18 +948,62 @@ impl Store {
         reason: &str,
         anchor: Option<&VerdictAnchor>,
     ) -> sqlx::Result<()> {
+        self.write_verdict(finding_id, None, status, reason, anchor)
+            .await
+    }
+
+    /// [`Self::set_anchored_verdict`] for a fix the worker declined, applied
+    /// only while the finding is still `fixing`, anchor included.
+    /// Takes an [`Owner`], which only `crate::recovery` makes, inside
+    /// [`FixClaim::conclude`](crate::recovery::FixClaim::conclude): only the
+    /// claim's holder moves a finding out of `fixing`.
+    pub(crate) async fn conclude_fixing(
+        &self,
+        _owner: &Owner,
+        finding_id: i64,
+        status: FindingStatus,
+        reason: &str,
+        anchor: Option<&VerdictAnchor>,
+    ) -> sqlx::Result<()> {
+        self.write_verdict(
+            finding_id,
+            Some(FindingStatus::Fixing),
+            status,
+            reason,
+            anchor,
+        )
+        .await
+    }
+
+    /// The verdict write behind [`Self::set_anchored_verdict`] and
+    /// [`Self::conclude_fixing`]: guarded by `from` when given, the anchor
+    /// replaced only when the status was written.
+    async fn write_verdict(
+        &self,
+        finding_id: i64,
+        from: Option<FindingStatus>,
+        status: FindingStatus,
+        reason: &str,
+        anchor: Option<&VerdictAnchor>,
+    ) -> sqlx::Result<()> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let now = now_ms();
-        sqlx::query!(
-            "UPDATE findings SET status = ?1, verdict_reason = ?2, updated_at = ?3 WHERE id = ?4",
+        let set = sqlx::query!(
+            "UPDATE findings SET status = ?1, verdict_reason = ?2, updated_at = ?3 \
+             WHERE id = ?4 AND (?5 IS NULL OR status = ?5)",
             status,
             reason,
             now,
-            finding_id
+            finding_id,
+            from
         )
         .execute(&mut *tx)
-        .await?;
-        Self::write_anchor(&mut tx, finding_id, anchor).await?;
+        .await?
+        .rows_affected()
+            > 0;
+        if set {
+            Self::write_anchor(&mut tx, finding_id, anchor).await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -1083,7 +1205,11 @@ impl Store {
         Ok(reopened)
     }
 
-    /// Set finding status to `pr_open` with PR URL.
+    /// Set finding status to `pr_open` with PR URL, whatever it was: a
+    /// fixture write for tests that start from an open PR. Only in a
+    /// `test-support` build: the daemon moves a finding to `pr_open` only
+    /// through [`FixClaim::open_pr`](crate::recovery::FixClaim::open_pr).
+    #[cfg(feature = "test-support")]
     pub async fn set_finding_pr_open(&self, finding_id: i64, pr_url: &str) -> sqlx::Result<()> {
         let now = now_ms();
         let pr_open = FindingStatus::PrOpen;
@@ -1093,6 +1219,31 @@ impl Store {
             pr_url,
             now,
             finding_id
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// `fixing` → `pr_open` with `pr_url`, only while the finding is still
+    /// `fixing`. Takes an [`Owner`], which only
+    /// `crate::recovery` makes, inside
+    /// [`FixClaim::open_pr`](crate::recovery::FixClaim::open_pr).
+    pub(crate) async fn open_pr_from_fixing(
+        &self,
+        _owner: &Owner,
+        finding_id: i64,
+        pr_url: &str,
+    ) -> sqlx::Result<()> {
+        let (now, pr_open, fixing) = (now_ms(), FindingStatus::PrOpen, FindingStatus::Fixing);
+        sqlx::query!(
+            "UPDATE findings SET status = ?1, pr_url = ?2, updated_at = ?3 \
+             WHERE id = ?4 AND status = ?5",
+            pr_open,
+            pr_url,
+            now,
+            finding_id,
+            fixing
         )
         .execute(&self.pool)
         .await?;
@@ -2453,8 +2604,9 @@ impl Store {
 
     // -- scheduler store methods ----------------------------------------------
 
-    /// INSERT INTO jobs, returns new id. state starts as "running" (the
-    /// scheduler immediately overwrites to the caller's desired state).
+    /// INSERT INTO jobs as `running`, returns the new id. Only a
+    /// [`FinishedState`] moves the row on ([`Self::complete_job`]), so a
+    /// job is never `running` without the owner that created it.
     ///
     /// Refuses when the repo has been soft-deleted. The `WHERE EXISTS` is
     /// part of the insert rather than a preceding SELECT because the
@@ -2497,16 +2649,20 @@ impl Store {
     /// attempt it continues, here in the INSERT, so every link of a chain
     /// names the commit its shared tree was created at and the newest PR
     /// feedback an engage chain's worker was shown.
-    pub async fn create_job(
+    ///
+    /// Takes an [`Owner`], which only `crate::recovery` makes, inside
+    /// [`CycleScope::create_job`](crate::recovery::CycleScope::create_job): every job is recorded in the scope that
+    /// settles it.
+    pub(crate) async fn insert_job(
         &self,
+        _owner: &Owner,
         kind: JobKind,
         repo_id: i64,
         finding_id: Option<i64>,
         cap_tokens: Option<i64>,
-        state: JobState,
         estimated_tokens: Option<i64>,
         resumed_from: Option<i64>,
-    ) -> Result<CreatedJob, StoreWriteError> {
+    ) -> Result<InsertedJob, StoreWriteError> {
         let now = now_ms();
         // IMMEDIATE so the supersession below reads the suspensions under
         // the same write lock that inserts their replacement.
@@ -2525,7 +2681,7 @@ impl Store {
             repo_id,
             finding_id,
             cap_tokens,
-            state,
+            JobState::Running,
             now,
             estimated_tokens,
             resumed_from
@@ -2608,7 +2764,7 @@ impl Store {
         }
 
         tx.commit().await?;
-        Ok(CreatedJob {
+        Ok(InsertedJob {
             id,
             superseded: retired,
         })
@@ -2617,8 +2773,16 @@ impl Store {
     /// Record a job that never ran: `failed`, finished now, with `notes`
     /// saying why. `tokens_new` stays NULL rather than 0 — nothing was
     /// spawned, so there is no spend to know, and a 0 would be read back by
-    /// the per-kind estimate as a job that cost nothing.
-    pub async fn fail_unstarted_job(&self, job_id: i64, notes: &str) -> sqlx::Result<()> {
+    /// the per-kind estimate as a job that cost nothing. Takes an
+    /// [`Owner`], which only `crate::recovery` makes, inside
+    /// [`RunningJob::fail_unstarted`](crate::recovery::RunningJob::fail_unstarted):
+    /// only the job's owner ends it.
+    pub(crate) async fn fail_unstarted_job(
+        &self,
+        _owner: &Owner,
+        job_id: i64,
+        notes: &str,
+    ) -> sqlx::Result<()> {
         let failed = JobState::Failed;
         let now = now_ms();
         sqlx::query!(
@@ -2634,7 +2798,7 @@ impl Store {
     }
 
     /// Record the commit a cold job's working tree was created at. See
-    /// migration 015; resumed attempts get theirs from [`Self::create_job`].
+    /// migration 015; resumed attempts get theirs from [`CycleScope::create_job`](crate::recovery::CycleScope::create_job).
     pub async fn set_pinned_sha(&self, job_id: i64, sha: &str) -> sqlx::Result<()> {
         sqlx::query!("UPDATE jobs SET pinned_sha = ?1 WHERE id = ?2", sha, job_id)
             .execute(&self.pool)
@@ -2653,7 +2817,7 @@ impl Store {
     }
 
     /// Record the newest PR feedback (epoch ms) a cold engage attempt's
-    /// worker was shown. Resumes inherit it ([`Self::create_job`]) instead.
+    /// worker was shown. Resumes inherit it ([`CycleScope::create_job`](crate::recovery::CycleScope::create_job)) instead.
     pub async fn set_seen_activity(&self, job_id: i64, at_ms: i64) -> sqlx::Result<()> {
         sqlx::query!(
             "UPDATE jobs SET seen_activity_at = ?1 WHERE id = ?2",
@@ -2764,8 +2928,16 @@ impl Store {
     ///
     /// This also moves its work item's checkpoint, in
     /// the same transaction: to this attempt when it ended paused, and off
-    /// whatever it was when it did not ([`point_checkpoint`]).
-    pub async fn complete_job(&self, job_id: i64, outcome: &JobOutcome<'_>) -> sqlx::Result<()> {
+    /// whatever it was when it did not ([`point_checkpoint`]). Takes an
+    /// [`Owner`], which only `crate::recovery` makes, inside
+    /// [`RunningJob::complete`](crate::recovery::RunningJob::complete): only
+    /// the job's owner records how it ended.
+    pub(crate) async fn complete_job(
+        &self,
+        _owner: &Owner,
+        job_id: i64,
+        outcome: &JobOutcome<'_>,
+    ) -> sqlx::Result<()> {
         let JobOutcome {
             state,
             tokens_new,
@@ -2778,6 +2950,8 @@ impl Store {
             usage_delta,
             finished_at,
         } = *outcome;
+        let suspended = state == FinishedState::Suspended;
+        let state = JobState::from(state);
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query!(
             "UPDATE jobs SET state = ?1, pid = NULL, tokens_new = ?2, calls = ?3, \
@@ -2798,7 +2972,7 @@ impl Store {
         )
         .execute(&mut *tx)
         .await?;
-        point_checkpoint(&mut tx, job_id, state == JobState::Suspended).await?;
+        point_checkpoint(&mut tx, job_id, suspended).await?;
         tx.commit().await
     }
 
@@ -2806,52 +2980,76 @@ impl Store {
     /// died while its worker had done metered work, and the transcript is
     /// on disk for the resume tier to continue. `killed_reason` stays
     /// `orphaned` so the row still says how the attempt ended. Its work
-    /// item now continues from it.
+    /// item now continues from it. Only for a job nothing will finish
+    /// ([`StrandedJob`], which only `crate::recovery` makes), and only
+    /// while it is still `running`: `false`, and nothing written, when it
+    /// no longer is.
     pub async fn suspend_orphan(
         &self,
-        job_id: i64,
+        job: &StrandedJob,
         session_file: &str,
         tokens_new: i64,
         notes: &str,
         finished_at: i64,
-    ) -> sqlx::Result<()> {
-        let suspended = JobState::Suspended;
+    ) -> sqlx::Result<bool> {
+        let job_id = job.id();
+        let (suspended, running) = (JobState::Suspended, JobState::Running);
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        sqlx::query!(
+        let updated = sqlx::query!(
             "UPDATE jobs SET state = ?1, pid = NULL, killed_reason = 'orphaned', \
              session_file = ?2, tokens_new = ?3, notes = ?4, finished_at = ?5 \
-             WHERE id = ?6",
+             WHERE id = ?6 AND state = ?7",
             suspended,
             session_file,
             tokens_new,
             notes,
             finished_at,
-            job_id
+            job_id,
+            running
         )
         .execute(&mut *tx)
-        .await?;
+        .await?
+        .rows_affected();
+        if updated == 0 {
+            return Ok(false);
+        }
         point_checkpoint(&mut tx, job_id, true).await?;
-        tx.commit().await
+        tx.commit().await?;
+        Ok(true)
     }
 
-    /// Mark an orphaned running job as killed during reconciliation.
-    pub async fn orphan_job(&self, job_id: i64, notes: &str, finished_at: i64) -> sqlx::Result<()> {
-        let killed = JobState::Killed;
-        sqlx::query!(
+    /// Mark an orphaned running job as killed. Only for a job nothing will
+    /// finish ([`StrandedJob`], which only `crate::recovery` makes), and
+    /// only while it is still `running`: `false`, and nothing written,
+    /// when it no longer is.
+    pub async fn orphan_job(
+        &self,
+        job: &StrandedJob,
+        notes: &str,
+        finished_at: i64,
+    ) -> sqlx::Result<bool> {
+        let job_id = job.id();
+        let (killed, running) = (JobState::Killed, JobState::Running);
+        let updated = sqlx::query!(
             "UPDATE jobs SET state = ?1, pid = NULL, killed_reason = 'orphaned', \
-             notes = ?2, finished_at = ?3 WHERE id = ?4",
+             notes = ?2, finished_at = ?3 WHERE id = ?4 AND state = ?5",
             killed,
             notes,
             finished_at,
-            job_id
+            job_id,
+            running
         )
         .execute(&self.pool)
-        .await?;
-        Ok(())
+        .await?
+        .rows_affected();
+        Ok(updated > 0)
     }
 
-    /// Downgrade an already-recorded job to failed (e.g. post-run push failure).
-    pub async fn fail_job(&self, job_id: i64, notes: &str) -> sqlx::Result<()> {
+    /// Downgrade an already-recorded job to failed (e.g. post-run push
+    /// failure). Takes the [`RecordedJob`] its outcome was recorded as, so
+    /// it cannot end a job that is still `running`.
+    pub async fn fail_job(&self, job: &RecordedJob, notes: &str) -> sqlx::Result<()> {
+        let job_id = job.id();
         let failed = JobState::Failed;
         sqlx::query!(
             "UPDATE jobs SET state = ?1, notes = ?2 WHERE id = ?3",
@@ -3817,32 +4015,48 @@ impl Store {
         Ok(())
     }
 
-    /// Recover orphaned jobs (state=running) and findings (status=fixing)
-    /// from a crashed prior process.
-    pub async fn reconcile_orphaned_jobs(&self) -> sqlx::Result<(Vec<Finding>, Vec<Job>)> {
-        // Findings stuck at 'fixing' -> queued
-        let stuck_findings = self
-            .list_findings(&FindingFilter {
-                status: Some(FindingStatus::Fixing),
-                ..FindingFilter::default()
-            })
-            .await?;
-        for f in &stuck_findings {
-            self.set_finding_status(f.id, FindingStatus::Queued).await?;
-        }
-        // Jobs stuck at 'running' -> killed/orphaned
-        let mut orphaned_jobs = Vec::new();
-        for j in self.list_running_jobs().await? {
-            let now = now_ms();
-            self.orphan_job(
-                j.id,
-                "reconciled at cycle startup -- prior process died mid-job",
-                now,
-            )
-            .await?;
-            orphaned_jobs.push(j);
-        }
-        Ok((stuck_findings, orphaned_jobs))
+    /// Put every `fixing` finding no `running` job works on back to
+    /// `queued`: at startup, every claim is a dead process's. Takes the
+    /// startup token, so it cannot run beside a live fix that has claimed
+    /// its finding but not yet created its job. Returns the ids.
+    pub async fn requeue_stranded_fixes(&self, _startup: &Unreconciled) -> sqlx::Result<Vec<i64>> {
+        self.requeue_unworked_fixing(None).await
+    }
+
+    /// Put `claim`'s finding back to `queued` if it is still `fixing` and
+    /// no `running` job works on it: its owner, a settled scope, can no
+    /// longer release it. `true` when it was put back.
+    pub async fn requeue_stranded_claim(&self, claim: &StrandedClaim) -> sqlx::Result<bool> {
+        Ok(!self
+            .requeue_unworked_fixing(Some(claim.finding_id()))
+            .await?
+            .is_empty())
+    }
+
+    /// `fixing → queued` for findings no `running` job works on; `only`
+    /// limits it to one finding. One guarded UPDATE, so a finding a live
+    /// job works on, or one a verdict moved on meanwhile, is left alone.
+    async fn requeue_unworked_fixing(&self, only: Option<i64>) -> sqlx::Result<Vec<i64>> {
+        let (fixing, queued, running) = (
+            FindingStatus::Fixing,
+            FindingStatus::Queued,
+            JobState::Running,
+        );
+        let now = now_ms();
+        let rows = sqlx::query!(
+            r#"UPDATE findings SET status = ?1, updated_at = ?2
+               WHERE status = ?3 AND (?5 IS NULL OR id = ?5) AND NOT EXISTS
+                   (SELECT 1 FROM jobs j WHERE j.finding_id = findings.id AND j.state = ?4)
+               RETURNING id AS "id!""#,
+            queued,
+            now,
+            fixing,
+            running,
+            only
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| r.id).collect())
     }
 
     /// The identical-failure streak of `finding_id`'s `kind` work: zero and
@@ -4458,7 +4672,29 @@ impl Store {
     /// Move a finding from `from` to `to` only if it is still at `from`;
     /// `false` when something else (an operator verdict) changed it since
     /// the caller read it. Undo with [`Self::finalize_in_progress`].
+    ///
+    /// Neither to nor from `fixing`: that claim is held by a
+    /// [`FixClaim`](crate::recovery::FixClaim), which alone takes it
+    /// ([`CycleScope::claim_fix`](crate::recovery::CycleScope::claim_fix)) and
+    /// moves the finding on. Refused.
     pub async fn claim_in_progress(
+        &self,
+        finding_id: i64,
+        from: FindingStatus,
+        to: FindingStatus,
+    ) -> Result<bool, StoreWriteError> {
+        if to == FindingStatus::Fixing || from == FindingStatus::Fixing {
+            return Err(StoreWriteError::Refused(format!(
+                "finding #{finding_id}: a fix claim is taken and released by its holder \
+                 (CycleScope::claim_fix, FixClaim)"
+            )));
+        }
+        Ok(self.move_if_at(finding_id, from, to).await?)
+    }
+
+    /// The guarded UPDATE behind [`Self::claim_in_progress`] and
+    /// [`CycleScope::claim_fix`](crate::recovery::CycleScope::claim_fix).
+    async fn move_if_at(
         &self,
         finding_id: i64,
         from: FindingStatus,
@@ -4476,15 +4712,38 @@ impl Store {
         .await?;
         Ok(claimed.rows_affected() > 0)
     }
+
+    /// Claim `finding_id` for a fix (`queued` → `fixing`); `false` when it
+    /// is no longer `queued`. Takes an [`Owner`], which only
+    /// `crate::recovery` makes, inside [`CycleScope::claim_fix`](crate::recovery::CycleScope::claim_fix):
+    /// every claim is a [`FixClaim`](crate::recovery::FixClaim) that releases it.
+    pub(crate) async fn claim_fixing(&self, _owner: &Owner, finding_id: i64) -> sqlx::Result<bool> {
+        self.move_if_at(finding_id, FindingStatus::Queued, FindingStatus::Fixing)
+            .await
+    }
+
+    /// Release a fix claim (`fixing` → `queued`) if the finding is still
+    /// `fixing`. Takes an [`Owner`], made only inside
+    /// [`FixClaim::release`](crate::recovery::FixClaim::release).
+    pub(crate) async fn release_fixing(
+        &self,
+        _owner: &Owner,
+        finding_id: i64,
+    ) -> sqlx::Result<bool> {
+        self.move_if_at(finding_id, FindingStatus::Fixing, FindingStatus::Queued)
+            .await
+    }
+
     /// If finding is still at `expected_status`, reset to `fallback`. One
     /// guarded UPDATE, so a verdict landing between a read and a write here
-    /// cannot be overwritten.
+    /// cannot be overwritten. Neither to nor from `fixing`, as
+    /// [`Self::claim_in_progress`].
     pub async fn finalize_in_progress(
         &self,
         finding_id: i64,
         expected_status: FindingStatus,
         fallback: FindingStatus,
-    ) -> sqlx::Result<()> {
+    ) -> Result<(), StoreWriteError> {
         self.claim_in_progress(finding_id, expected_status, fallback)
             .await
             .map(drop)
