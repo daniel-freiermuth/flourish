@@ -229,6 +229,54 @@ async fn a_merged_pr_moves_its_finding_to_merged_and_drops_attention() {
     assert_eq!(ps.needs_attention, None, "a merged PR needs nobody");
 }
 
+/// A merge whose PR record cannot be written leaves the finding
+/// `pr_open`: the move and the record are one write. Set `merged` over a
+/// `pr_state` that never says MERGED, the finding would be out of the
+/// sync's reach (it revisits only `pr_open`) with no merged PR for its
+/// harvest. Left `pr_open`, the next sync records both.
+#[tokio::test]
+async fn a_merge_that_cannot_be_recorded_is_retried_by_the_next_sync() {
+    let f = fixture("sync-merged-unrecorded").await;
+    let bins = FakeBins::acquire("sync-merged-unrecorded");
+    serve_pr(&bins, &pr(&json!({ "state": "MERGED" })));
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    for trigger in [
+        "CREATE TRIGGER no_merge_insert BEFORE INSERT ON pr_state \
+         WHEN NEW.state = 'MERGED' \
+         BEGIN SELECT RAISE(ABORT, 'injected pr_state failure'); END",
+        "CREATE TRIGGER no_merge_update BEFORE UPDATE OF state ON pr_state \
+         WHEN NEW.state = 'MERGED' \
+         BEGIN SELECT RAISE(ABORT, 'injected pr_state failure'); END",
+    ] {
+        sqlx::query(trigger).execute(&pool).await.unwrap();
+    }
+
+    let result = f.sync().await;
+
+    assert_eq!((result.merged, result.errors), (0, 1), "{result:?}");
+    assert_eq!(f.status().await, FindingStatus::PrOpen);
+    let events = f.store.recent_events(50).await.unwrap();
+    assert!(
+        events.iter().any(|e| e.kind == "error"
+            && e.finding_id == Some(f.fid)
+            && e.message.contains("PR merged but not recorded")),
+        "{events:?}"
+    );
+
+    sqlx::raw_sql("DROP TRIGGER no_merge_insert; DROP TRIGGER no_merge_update")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let result = f.sync().await;
+
+    assert_eq!(result.merged, 1, "{result:?}");
+    assert_eq!(f.status().await, FindingStatus::Merged);
+    assert_eq!(f.pr_state().await.state.as_deref(), Some("MERGED"));
+}
+
 /// A finding something else moved off `pr_open` while its PR was being
 /// viewed keeps that move: the sync neither overwrites it nor records the
 /// PR merged for it. The other write is staged with a trigger that lands

@@ -34,7 +34,9 @@ use crate::domain::{
 use crate::recovery::{
     DaemonLock, Owner, RecordedJob, Recovery, StrandedClaim, StrandedJob, Unreconciled,
 };
-use crate::transition::{Moved, Record, ReleaseVerdict, Transition, Unclaimed, decline_status};
+use crate::transition::{
+    Moved, PrEnd, Record, ReleaseVerdict, Transition, Unclaimed, decline_status,
+};
 use crate::types::{
     Event, Finding, Job, JobListEntry, PrState, Repo, SchedulerState, StatsByFinding, StatsByKind,
     StatsTotals,
@@ -452,6 +454,49 @@ async fn insert_event<'e, E: sqlx::SqliteExecutor<'e>>(
         job_id,
         finding_id,
         user_id
+    )
+    .execute(ex)
+    .await?;
+    Ok(())
+}
+
+/// Record on `ex` that `finding_id`'s PR `pr_number` ended (UPSERT). The
+/// daemon writes this only inside [`Store::transition`], with the status
+/// change it belongs to.
+///
+/// `pr_state` holds one row per finding, not per PR, and a finding can
+/// ship more than one PR: a closure harvested as `abandoned` sends it
+/// back to `new`, and its next fix opens a fresh PR on the same row.
+/// The harvest bookkeeping (`harvested_at`, and the harvest streak in
+/// `finding_work`, which migration 023's trigger resets) describes the
+/// PR it was recorded for, so a different `pr_number` clears it;
+/// otherwise the new PR inherits the old one's stamp and
+/// `list_pending_harvest` never selects it. The same number keeps it,
+/// so re-syncing a PR never un-harvests it. A stored NULL is an unknown
+/// number, not another PR (`set_pr_number` fills it in for the PR
+/// already being worked), hence `<>` and not `IS NOT`. Every `pr_state`
+/// upsert repeats this CASE: `query!` takes one literal, so the SQL
+/// cannot be shared.
+async fn upsert_pr_end<'e, E: sqlx::SqliteExecutor<'e>>(
+    ex: E,
+    finding_id: i64,
+    end: PrEnd,
+    pr_number: i64,
+    synced_at: i64,
+) -> sqlx::Result<()> {
+    let state = end.as_str();
+    sqlx::query!(
+        "INSERT INTO pr_state (finding_id, pr_number, state, needs_attention, synced_at) \
+         VALUES (?1, ?2, ?3, NULL, ?4) \
+         ON CONFLICT(finding_id) DO UPDATE SET \
+         pr_number = excluded.pr_number, state = excluded.state, \
+         needs_attention = NULL, synced_at = excluded.synced_at, \
+         harvested_at = CASE WHEN pr_state.pr_number <> excluded.pr_number \
+             THEN NULL ELSE pr_state.harvested_at END",
+        finding_id,
+        pr_number,
+        state,
+        synced_at
     )
     .execute(ex)
     .await?;
@@ -975,8 +1020,8 @@ impl Store {
     /// Make `transition` on `finding_id`, only while the finding is still
     /// at one of the transition's sources. One transaction: the status, and
     /// what the transition records with it (a verdict's reason and anchor,
-    /// or an analysis), land together or not at all. [`Moved::Conflict`]
-    /// names where the finding is instead.
+    /// an analysis, how the finding's PR ended in `pr_state`), land together
+    /// or not at all. [`Moved::Conflict`] names where the finding is instead.
     pub async fn transition(
         &self,
         finding_id: i64,
@@ -1124,6 +1169,9 @@ impl Store {
             }
         };
         if applied {
+            if let Some((end, pr_number)) = transition.pr_end() {
+                upsert_pr_end(&mut **tx, finding_id, end, pr_number, now).await?;
+            }
             return Ok(Moved::Applied);
         }
         let now = sqlx::query_scalar!(
@@ -3776,74 +3824,36 @@ impl Store {
         Ok(handed)
     }
 
-    /// Mark a PR as merged (UPSERT).
-    ///
-    /// `pr_state` holds one row per finding, not per PR, and a finding can
-    /// ship more than one PR: a closure harvested as `abandoned` sends it
-    /// back to `new`, and its next fix opens a fresh PR on the same row.
-    /// The harvest bookkeeping (`harvested_at`, and the harvest streak in
-    /// `finding_work`, which migration 023's trigger resets) describes the
-    /// PR it was recorded for, so a different `pr_number` clears it;
-    /// otherwise the new PR inherits the old one's stamp and
-    /// `list_pending_harvest` never selects it. The same number keeps it,
-    /// so re-syncing a PR never un-harvests it. A stored NULL is an unknown
-    /// number, not another PR (`set_pr_number` fills it in for the PR
-    /// already being worked), hence `<>` and not `IS NOT`. Every `pr_state`
-    /// upsert repeats this CASE: `query!` takes one literal, so the SQL
-    /// cannot be shared.
+    /// Record PR `pr_number` merged whatever the finding's status: a
+    /// fixture write, only in a `test-support` build. The daemon records
+    /// it with the finding's move ([`Transition::PrMerged`]).
+    #[cfg(feature = "test-support")]
     pub async fn mark_pr_merged(
         &self,
         finding_id: i64,
         pr_number: i64,
         synced_at: i64,
     ) -> sqlx::Result<()> {
-        sqlx::query!(
-            "INSERT INTO pr_state (finding_id, pr_number, state, needs_attention, synced_at) \
-             VALUES (?1, ?2, 'MERGED', NULL, ?3) \
-             ON CONFLICT(finding_id) DO UPDATE SET \
-             pr_number = excluded.pr_number, state = 'MERGED', \
-             needs_attention = NULL, synced_at = excluded.synced_at, \
-             harvested_at = CASE WHEN pr_state.pr_number <> excluded.pr_number \
-                 THEN NULL ELSE pr_state.harvested_at END",
-            finding_id,
-            pr_number,
-            synced_at
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        upsert_pr_end(&self.pool, finding_id, PrEnd::Merged, pr_number, synced_at).await
     }
 
-    /// Mark a PR as closed (UPSERT). A new `pr_number` clears the harvest
-    /// bookkeeping, as in [`Self::mark_pr_merged`].
+    /// [`Self::mark_pr_merged`] for a closed PR: a fixture write
+    /// ([`Transition::PrClosed`] in the daemon).
+    #[cfg(feature = "test-support")]
     pub async fn mark_pr_closed(
         &self,
         finding_id: i64,
         pr_number: i64,
         synced_at: i64,
     ) -> sqlx::Result<()> {
-        sqlx::query!(
-            "INSERT INTO pr_state (finding_id, pr_number, state, needs_attention, synced_at) \
-             VALUES (?1, ?2, 'CLOSED', NULL, ?3) \
-             ON CONFLICT(finding_id) DO UPDATE SET \
-             pr_number = excluded.pr_number, state = 'CLOSED', \
-             needs_attention = NULL, synced_at = excluded.synced_at, \
-             harvested_at = CASE WHEN pr_state.pr_number <> excluded.pr_number \
-                 THEN NULL ELSE pr_state.harvested_at END",
-            finding_id,
-            pr_number,
-            synced_at
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        upsert_pr_end(&self.pool, finding_id, PrEnd::Closed, pr_number, synced_at).await
     }
 
     /// Full sync of an open PR.  The main UPSERT sets all always-present
     /// columns; two conditional queries handle `attention_since` and
     /// clearing addressed state — three compile-time checked queries
     /// instead of one dynamic one. A new `pr_number` clears the harvest
-    /// bookkeeping, as in [`Self::mark_pr_merged`].
+    /// bookkeeping, as in `upsert_pr_end`.
     ///
     /// All three share one transaction because the conditional UPDATEs are
     /// decided from the state the UPSERT writes: `attention_since` is only
@@ -4001,7 +4011,7 @@ impl Store {
 
     /// Self-heal a missing `pr_number` (UPSERT — row may not exist yet).
     /// A new `pr_number` clears the harvest bookkeeping, as in
-    /// [`Self::mark_pr_merged`]; filling in a NULL one does not.
+    /// `upsert_pr_end`; filling in a NULL one does not.
     pub async fn set_pr_number(&self, finding_id: i64, pr_number: i64) -> sqlx::Result<()> {
         sqlx::query!(
             "INSERT INTO pr_state (finding_id, pr_number) VALUES (?1, ?2) \

@@ -1398,13 +1398,14 @@ async fn a_handoff_whose_diff_fails_counts_no_harvest_attempt() {
     assert_left_for_the_cold_harvest(&f, &runs[0].tree).await;
 }
 
-/// The forge accepted the close and `pr_state` records it, but the
-/// finding could not be set `closed`. A harvest run now would find the
-/// finding `pr_open`, keep that as if a human had set it, and still mark
-/// the PR harvested, so the `closed` the next sync writes would never be
+/// The forge accepted the close, but the finding could not be set
+/// `closed`. Its `pr_state` CLOSED is the same write, so neither lands:
+/// a `pr_state` reading CLOSED beside a `pr_open` finding would send a
+/// harvest that keeps `pr_open` as if a human had set it and marks the PR
+/// harvested, so the `closed` the next sync writes would never be
 /// harvested. Nothing continues: the finding stays `pr_open`, and the
 /// next sync -- which revisits `pr_open` findings and sees the PR closed
-/// -- sets it `closed` and queues the cold harvest.
+/// -- records both and queues the cold harvest.
 ///
 /// The failing write is injected with a trigger that refuses to set a
 /// finding's status to `closed`.
@@ -1444,7 +1445,11 @@ async fn an_unrecorded_closed_verdict_starts_no_harvest_and_waits_for_the_sync()
     );
     let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
     assert_eq!(after.status, FindingStatus::PrOpen);
-    assert_eq!(f.pr_state().await.as_deref(), Some("CLOSED"));
+    assert_ne!(
+        f.pr_state().await.as_deref(),
+        Some("CLOSED"),
+        "the closure lands with the finding's move or not at all"
+    );
     let ps = f.store.get_pr_state(f.fid).await.unwrap().unwrap();
     assert_eq!(ps.harvested_at, None);
     assert!(!runs[0].tree.exists(), "the chain's tree must be released");

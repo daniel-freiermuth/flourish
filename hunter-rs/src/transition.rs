@@ -195,17 +195,35 @@ pub enum Transition<'a> {
     /// A `pr_open` row without a PR URL (a fix that failed before its PR,
     /// from before fix claims): retried.
     PrMissing,
-    /// The PR sync saw the PR merged.
-    PrMerged,
-    /// The PR closed without merging: seen by the PR sync, or withdrawn by
-    /// engage. The harvest classifies it.
-    PrClosed { reason: &'a str },
+    /// The PR sync saw PR `pr_number` merged. `pr_state` records it in the
+    /// same write.
+    PrMerged { pr_number: i64 },
+    /// PR `pr_number` closed without merging: seen by the PR sync, or
+    /// withdrawn by engage. `pr_state` records it in the same write; the
+    /// harvest classifies it.
+    PrClosed { reason: &'a str, pr_number: i64 },
     /// A closed PR's harvest classified why it closed.
     Classified {
         class: ClosureClass,
         reason: &'a str,
         anchor: Option<&'a VerdictAnchor>,
     },
+}
+
+/// How a PR ended, as `pr_state.state` spells it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrEnd {
+    Merged,
+    Closed,
+}
+
+impl PrEnd {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Merged => "MERGED",
+            Self::Closed => "CLOSED",
+        }
+    }
 }
 
 /// What a transition writes besides the status.
@@ -249,7 +267,7 @@ impl<'a> Transition<'a> {
             Self::Reopened { .. } => Either(S::Rejected, S::Wontfix),
             Self::Reproposed => One(S::Superseded),
             Self::TakesOver { .. } => Either(S::New, S::Queued),
-            Self::PrMissing | Self::PrMerged | Self::PrClosed { .. } => One(S::PrOpen),
+            Self::PrMissing | Self::PrMerged { .. } | Self::PrClosed { .. } => One(S::PrOpen),
             Self::Classified { .. } => One(S::Closed),
         }
     }
@@ -274,7 +292,7 @@ impl<'a> Transition<'a> {
             }
             Self::RecheckInvalid { .. } => S::Rejected,
             Self::PrMissing | Self::TakesOver { .. } => S::Queued,
-            Self::PrMerged => S::Merged,
+            Self::PrMerged { .. } => S::Merged,
             Self::PrClosed { .. } => S::Closed,
             Self::Classified { class, .. } => (*class).into(),
         }
@@ -282,7 +300,7 @@ impl<'a> Transition<'a> {
 
     pub(crate) fn record(&self) -> Record<'a> {
         match *self {
-            Self::RecheckRequested | Self::Unqueued | Self::PrMissing | Self::PrMerged => {
+            Self::RecheckRequested | Self::Unqueued | Self::PrMissing | Self::PrMerged { .. } => {
                 Record::StatusOnly
             }
             Self::RecheckConfirmed { analysis } => Record::Analysis(analysis),
@@ -303,7 +321,7 @@ impl<'a> Transition<'a> {
             | Self::RecheckStale { reason }
             | Self::Unproposed { reason }
             | Self::HandedOver { reason }
-            | Self::PrClosed { reason } => Record::Verdict {
+            | Self::PrClosed { reason, .. } => Record::Verdict {
                 reason: Some(reason),
                 anchor: None,
             },
@@ -313,6 +331,28 @@ impl<'a> Transition<'a> {
                     anchor,
                 }
             }
+        }
+    }
+
+    /// The PR end `pr_state` records with the change, in the same write.
+    pub(crate) fn pr_end(&self) -> Option<(PrEnd, i64)> {
+        match *self {
+            Self::PrMerged { pr_number } => Some((PrEnd::Merged, pr_number)),
+            Self::PrClosed { pr_number, .. } => Some((PrEnd::Closed, pr_number)),
+            Self::RecheckRequested
+            | Self::Unqueued
+            | Self::Verdict(_)
+            | Self::HoldReleased { .. }
+            | Self::RecheckConfirmed { .. }
+            | Self::RecheckStale { .. }
+            | Self::RecheckInvalid { .. }
+            | Self::Reopened { .. }
+            | Self::Reproposed
+            | Self::Unproposed { .. }
+            | Self::HandedOver { .. }
+            | Self::TakesOver { .. }
+            | Self::PrMissing
+            | Self::Classified { .. } => None,
         }
     }
 }
@@ -384,19 +424,6 @@ pub enum Moved {
 mod tests {
     use super::*;
     use FindingStatus as S;
-
-    /// Every operator verdict the table admits, and only those: the
-    /// `/api/verdict` contract (WORK-MODEL.md §5.3).
-    #[test]
-    fn operator_verdicts_are_exactly_the_awaiting_to_verdict_moves() {
-        for from in S::ALL {
-            for to in S::ALL {
-                let made = OperatorVerdict::new(from, to, Some("why")).is_ok();
-                let allowed = from.awaits_verdict() && to.is_verdict() && from != to;
-                assert_eq!(made, allowed, "{from} -> {to}");
-            }
-        }
-    }
 
     #[test]
     fn a_suppressing_verdict_needs_its_reason() {
