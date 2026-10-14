@@ -33,6 +33,7 @@ use crate::domain::{
     ReleaseAction, RepoWorkKind, Severity,
 };
 use crate::store::{FindingFilter, HoldRelease, RepoUpdate, Store, StoreWriteError};
+use crate::transition::{Moved, OperatorVerdict, Transition, VerdictRefused};
 use crate::types::{
     ActivityStatus, BudgetState, Event, Finding, FindingDetail, FindingOut, HoldOut, JobListEntry,
     Repo, RepoBrief, RepoHoldOut, RepoOut, RepoStreakOut, RepoWorkOut, Stats, Summary,
@@ -854,6 +855,12 @@ async fn fetch_repo(store: &Store, rid: i64) -> Result<Repo, ApiError> {
 
 // -- POST /api/verdict (contract §1) ------------------------------------------
 
+/// The 400 for a status that is not a verdict (contract §1).
+// ACCEPTED DEVIATION: Python's f-string renders StrEnum reprs here
+// (`<Status.QUEUED: 'queued'>`, ...). We emit the plain value list —
+// the UI only ever displays this string.
+const NOT_A_VERDICT: &str = "status must be one of ['queued', 'rejected', 'wontfix', 'note']";
+
 async fn verdict(
     State(state): State<AppState>,
     Extension(user): Extension<CurrentUser>,
@@ -871,12 +878,7 @@ async fn verdict(
         .copied()
         .filter(|fs| fs.is_verdict());
     let Some(status) = status else {
-        // ACCEPTED DEVIATION: Python's f-string renders StrEnum reprs here
-        // (`<Status.QUEUED: 'queued'>`, ...). We emit the plain value list —
-        // the UI only ever displays this string.
-        return Err(ApiError::BadRequest(
-            "status must be one of ['queued', 'rejected', 'wontfix', 'note']".to_owned(),
-        ));
+        return Err(ApiError::BadRequest(NOT_A_VERDICT.to_owned()));
     };
     // (body.get("reason") or "").strip() or None — absent/null/empty/
     // whitespace (and Python-falsy non-strings) all become None
@@ -901,31 +903,28 @@ async fn verdict(
     let finding = fetch_finding(&state.store, fid).await?;
     // The operator gives a verdict only where the finding asks for one;
     // anywhere else a job or the forge owns it. Same precondition shape as
-    // /api/recheck and /api/unqueue.
-    if !finding.status.awaits_verdict() || finding.status == status {
-        return Err(ApiError::BadRequest(format!(
-            "finding #{fid} is '{}'; a verdict applies only to new, note or closed findings, \
-             and must change its status",
-            finding.status
-        )));
-    }
+    // /api/recheck and /api/unqueue. The status and reason were checked
+    // above, so only the finding's own status can refuse here.
+    let verdict = OperatorVerdict::new(finding.status, status, reason.as_deref()).map_err(
+        |refused| match refused {
+            VerdictRefused::NotAwaiting => ApiError::BadRequest(format!(
+                "finding #{fid} is '{}'; a verdict applies only to new, note or closed findings, \
+                 and must change its status",
+                finding.status
+            )),
+            VerdictRefused::NotAVerdict => ApiError::BadRequest(NOT_A_VERDICT.to_owned()),
+            VerdictRefused::ReasonRequired => {
+                ApiError::BadRequest(format!("reason required for status '{status}'"))
+            }
+        },
+    )?;
     // Conditional on the status just read, so a job that claimed the
     // finding in between keeps it.
-    let applied = match reason.as_deref() {
-        Some(r) => {
-            state
-                .store
-                .set_verdict_if(fid, finding.status, status, r)
-                .await?
-        }
-        None => {
-            state
-                .store
-                .claim_in_progress(fid, finding.status, status)
-                .await?
-        }
-    };
-    if !applied {
+    if let Moved::Conflict { .. } = state
+        .store
+        .transition(fid, &Transition::Verdict(verdict))
+        .await?
+    {
         return Err(ApiError::Conflict(format!(
             "finding #{fid} changed while the verdict was being applied; reload and retry"
         )));
@@ -1146,9 +1145,9 @@ async fn recheck(
     }
     // Conditional on `new`, like every operator write: whatever moved the
     // finding since the read above wins.
-    if !state
+    if let Moved::Conflict { .. } = state
         .store
-        .claim_in_progress(fid, FindingStatus::New, FindingStatus::Rechecking)
+        .transition(fid, &Transition::RecheckRequested)
         .await?
     {
         return Err(ApiError::Conflict(format!(
@@ -1190,11 +1189,7 @@ async fn unqueue(
     }
     // Conditional on `queued`: a fix that claimed the finding since the
     // read above owns it now.
-    if !state
-        .store
-        .claim_in_progress(fid, FindingStatus::Queued, FindingStatus::New)
-        .await?
-    {
+    if let Moved::Conflict { .. } = state.store.transition(fid, &Transition::Unqueued).await? {
         return Err(ApiError::Conflict(format!(
             "finding #{fid} changed while it was being unqueued; reload and retry"
         )));

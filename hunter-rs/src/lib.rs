@@ -14,6 +14,7 @@ pub mod scheduler;
 pub mod server;
 pub mod store;
 pub mod suppression;
+pub mod transition;
 pub mod types;
 pub mod util;
 pub mod workspace;

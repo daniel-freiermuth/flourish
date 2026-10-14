@@ -190,22 +190,6 @@ impl ClosureClass {
             Self::Abandoned => "abandoned",
         }
     }
-
-    /// The status the finding takes once its PR's closure is classified.
-    ///
-    /// Only `wrong` and `unwanted` suppress, because only they say
-    /// something about the finding: its premise failed, or the maintainers
-    /// do not want that kind of change. Work that landed another way, or
-    /// whose code is gone, says the finding was right. `abandoned` says
-    /// nothing at all, so the finding goes back to triage.
-    pub fn status(self) -> FindingStatus {
-        match self {
-            Self::Superseded | Self::Duplicate | Self::Obsolete => FindingStatus::Superseded,
-            Self::Wrong => FindingStatus::Rejected,
-            Self::Unwanted => FindingStatus::Wontfix,
-            Self::Abandoned => FindingStatus::New,
-        }
-    }
 }
 
 impl std::fmt::Display for ClosureClass {

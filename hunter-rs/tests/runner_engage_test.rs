@@ -1461,6 +1461,58 @@ async fn an_unrecorded_closed_verdict_starts_no_harvest_and_waits_for_the_sync()
     assert_left_for_the_cold_harvest(&f, &runs[0].tree).await;
 }
 
+/// The finding left `pr_open` between the engage's read and its `closed`
+/// verdict: here the PR sync recorded the closure first. That decision
+/// owns the finding, so the engage neither overwrites its verdict nor
+/// starts the harvest it would hand to, and no second harvest of the one
+/// closure can start.
+///
+/// The race is staged with a trigger: the engage's UPDATE first moves the
+/// row the way the sync would and is then skipped, exactly as if the
+/// sync's write had landed in between.
+#[tokio::test]
+async fn a_withdrawal_the_sync_recorded_first_keeps_the_syncs_verdict() {
+    let f = fixture("handoff-sync-first").await;
+    let bins = FakeBins::acquire("handoff-sync-first");
+    gh_for_handoff(&bins);
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER sync_first BEFORE UPDATE OF status ON findings \
+         WHEN NEW.status = 'closed' AND NEW.verdict_reason IS NOT 'sync: closed' \
+         BEGIN \
+           UPDATE findings SET status = 'closed', verdict_reason = 'sync: closed' \
+             WHERE id = OLD.id; \
+           SELECT RAISE(IGNORE); \
+         END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let backend = withdraw_then_classify(true);
+
+    let summary =
+        hunter::scheduler::run_engage(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
+            .await
+            .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("withdrawn"));
+    let engage_job = summary.job_id.unwrap();
+    let runs = backend.runs();
+    assert_eq!(runs.len(), 1, "only the engage may run: {runs:?}");
+    let jobs = f.jobs().await;
+    assert!(
+        jobs.iter().all(|j| j.3 != Some(engage_job)),
+        "no harvest may continue the engage: {jobs:?}"
+    );
+    let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(after.status, FindingStatus::Closed);
+    assert_eq!(after.verdict_reason.as_deref(), Some("sync: closed"));
+}
+
 /// The same for the closed PR's view, which the harvest fetches before
 /// the diff. The engage's own view (the first) succeeds; the handoff's
 /// (the second) fails.

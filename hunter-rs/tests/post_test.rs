@@ -2418,7 +2418,8 @@ async fn operator_writes_lose_to_a_status_change_after_their_check() {
     .await
     .unwrap();
     // A verdict with a reason and one without take different writes
-    // (set_verdict_if / claim_in_progress), so both are staged.
+    // (`Store::transition` writes the reason and anchor only for the
+    // first), so both are staged.
     for (path, id, operator_to, reason, job_to) in [
         ("/api/unqueue", 2, "new", None, "fixing"),
         ("/api/recheck", 1, "rechecking", None, "rejected"),

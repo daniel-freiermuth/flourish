@@ -229,6 +229,47 @@ async fn a_merged_pr_moves_its_finding_to_merged_and_drops_attention() {
     assert_eq!(ps.needs_attention, None, "a merged PR needs nobody");
 }
 
+/// A finding something else moved off `pr_open` while its PR was being
+/// viewed keeps that move: the sync neither overwrites it nor records the
+/// PR merged for it. The other write is staged with a trigger that lands
+/// it just before the sync's and then skips the sync's, exactly as if it
+/// had landed in between.
+#[tokio::test]
+async fn a_finding_moved_off_pr_open_during_the_sync_keeps_that_move() {
+    let f = fixture("sync-merged-moved").await;
+    let bins = FakeBins::acquire("sync-merged-moved");
+    serve_pr(&bins, &pr(&json!({ "state": "MERGED" })));
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER moved_first BEFORE UPDATE OF status ON findings \
+         WHEN NEW.status = 'merged' \
+         BEGIN \
+           UPDATE findings SET status = 'closed', verdict_reason = 'withdrawn' \
+             WHERE id = OLD.id; \
+           SELECT RAISE(IGNORE); \
+         END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let result = f.sync().await;
+
+    assert_eq!((result.merged, result.errors), (0, 0), "{result:?}");
+    let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(after.status, FindingStatus::Closed);
+    assert_eq!(after.verdict_reason.as_deref(), Some("withdrawn"));
+    let ps = f.store.get_pr_state(f.fid).await.unwrap();
+    assert!(
+        ps.as_ref()
+            .is_none_or(|p| p.state.as_deref() != Some("MERGED")),
+        "{ps:?}"
+    );
+}
+
 /// `pr_open` without a URL is a fix that failed before opening its PR:
 /// requeued for another attempt, not counted as a sync error, and never
 /// sent to the forge.
