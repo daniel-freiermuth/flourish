@@ -57,6 +57,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::domain::{ClosureClass, FindingStatus, JobKind, JobState};
 use crate::store::{JobOutcome, Store, StoreWriteError, VerdictAnchor};
+use crate::transition::Moved;
 use crate::types::Job;
 use crate::workspace::{Workspace, tree_in_use};
 
@@ -552,16 +553,18 @@ impl FixClaim {
     }
 
     /// `fixing` → `pr_open` with `pr_url`, if the finding is still
-    /// `fixing`. On an error the claim is handed back, still held.
-    pub async fn open_pr(mut self, pr_url: &str) -> Result<(), (Self, sqlx::Error)> {
+    /// `fixing`. [`Moved::Conflict`]: it had left `fixing`, so nothing was
+    /// written and nothing is left to release; the claim ends either way.
+    /// On an error the claim is handed back, still held.
+    pub async fn open_pr(mut self, pr_url: &str) -> Result<Moved, (Self, sqlx::Error)> {
         match self
             .store
             .open_pr_from_fixing(&Owner(()), self.finding_id, pr_url)
             .await
         {
-            Ok(()) => {
+            Ok(moved) => {
                 self.ended = true;
-                Ok(())
+                Ok(moved)
             }
             Err(e) => Err((self, e)),
         }
@@ -571,22 +574,22 @@ impl FixClaim {
     /// unclassified: back to triage, as an `abandoned` closure), with
     /// `reason` and its `anchor`, if the finding is still `fixing`. A
     /// classification is the only thing a decline can say, so no other
-    /// exit from `fixing` can be written here. On an error the claim is
-    /// handed back, still held.
+    /// exit from `fixing` can be written here. [`Moved::Conflict`] as for
+    /// [`Self::open_pr`]. On an error the claim is handed back, still held.
     pub async fn conclude(
         mut self,
         class: Option<ClosureClass>,
         reason: &str,
         anchor: Option<&VerdictAnchor>,
-    ) -> Result<(), (Self, sqlx::Error)> {
+    ) -> Result<Moved, (Self, sqlx::Error)> {
         match self
             .store
             .conclude_fixing(&Owner(()), self.finding_id, class, reason, anchor)
             .await
         {
-            Ok(()) => {
+            Ok(moved) => {
                 self.ended = true;
-                Ok(())
+                Ok(moved)
             }
             Err(e) => Err((self, e)),
         }

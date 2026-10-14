@@ -503,6 +503,20 @@ async fn upsert_pr_end<'e, E: sqlx::SqliteExecutor<'e>>(
     Ok(())
 }
 
+/// Where finding `finding_id` is now (`None`: there is no such finding),
+/// for the [`Moved::Conflict`] of a guarded write that did not land.
+async fn status_now<'e, E: sqlx::SqliteExecutor<'e>>(
+    ex: E,
+    finding_id: i64,
+) -> sqlx::Result<Option<FindingStatus>> {
+    sqlx::query_scalar!(
+        r#"SELECT status AS "status!: FindingStatus" FROM findings WHERE id = ?1"#,
+        finding_id
+    )
+    .fetch_optional(ex)
+    .await
+}
+
 /// Move the checkpoint of the work item `job_id` belongs to: to `job_id`
 /// when `paused`, otherwise off it. An attempt that ended without pausing
 /// has consumed whatever its chain continued from, so nothing is left to
@@ -1174,18 +1188,14 @@ impl Store {
             }
             return Ok(Moved::Applied);
         }
-        let now = sqlx::query_scalar!(
-            r#"SELECT status AS "status!: FindingStatus" FROM findings WHERE id = ?1"#,
-            finding_id
-        )
-        .fetch_optional(&mut **tx)
-        .await?;
+        let now = status_now(&mut **tx, finding_id).await?;
         Ok(Moved::Conflict { now })
     }
 
     /// The verdict of a fix the worker declined, its classification's
     /// status ([`decline_status`]) with the anchor, applied only while the
-    /// finding is still `fixing`.
+    /// finding is still `fixing`; [`Moved::Conflict`] names where it is
+    /// instead, and nothing is written.
     /// Takes an [`Owner`], which only `crate::recovery` makes, inside
     /// [`FixClaim::conclude`](crate::recovery::FixClaim::conclude): only the
     /// claim's holder moves a finding out of `fixing`.
@@ -1196,7 +1206,7 @@ impl Store {
         class: Option<ClosureClass>,
         reason: &str,
         anchor: Option<&VerdictAnchor>,
-    ) -> sqlx::Result<()> {
+    ) -> sqlx::Result<Moved> {
         let (now, fixing) = (now_ms(), FindingStatus::Fixing);
         let status = FindingStatus::from(decline_status(class));
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -1213,11 +1223,16 @@ impl Store {
         .await?
         .rows_affected()
             > 0;
-        if set {
+        let moved = if set {
             Self::write_anchor(&mut tx, finding_id, anchor).await?;
-        }
+            Moved::Applied
+        } else {
+            Moved::Conflict {
+                now: status_now(&mut *tx, finding_id).await?,
+            }
+        };
         tx.commit().await?;
-        Ok(())
+        Ok(moved)
     }
 
     /// Replace `finding_id`'s verdict anchor with `anchor`, or remove it.
@@ -1356,17 +1371,18 @@ impl Store {
     }
 
     /// `fixing` → `pr_open` with `pr_url`, only while the finding is still
-    /// `fixing`. Takes an [`Owner`], which only
-    /// `crate::recovery` makes, inside
-    /// [`FixClaim::open_pr`](crate::recovery::FixClaim::open_pr).
+    /// `fixing`; [`Moved::Conflict`] names where it is instead, and nothing
+    /// is written. Takes an [`Owner`], which only `crate::recovery` makes,
+    /// inside [`FixClaim::open_pr`](crate::recovery::FixClaim::open_pr).
     pub(crate) async fn open_pr_from_fixing(
         &self,
         _owner: &Owner,
         finding_id: i64,
         pr_url: &str,
-    ) -> sqlx::Result<()> {
+    ) -> sqlx::Result<Moved> {
         let (now, pr_open, fixing) = (now_ms(), FindingStatus::PrOpen, FindingStatus::Fixing);
-        sqlx::query!(
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let set = sqlx::query!(
             "UPDATE findings SET status = ?1, pr_url = ?2, updated_at = ?3 \
              WHERE id = ?4 AND status = ?5",
             pr_open,
@@ -1375,9 +1391,19 @@ impl Store {
             finding_id,
             fixing
         )
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+        let moved = if set {
+            Moved::Applied
+        } else {
+            Moved::Conflict {
+                now: status_now(&mut *tx, finding_id).await?,
+            }
+        };
+        tx.commit().await?;
+        Ok(moved)
     }
 
     /// UPDATE findings SET `budget_override` = ?, `updated_at` = now WHERE id = ?.

@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use hunter::domain::{FindingJobKind, FindingType, ForgeName, RepoJobKind};
 use hunter::store::{JobOutcome, Store};
+use hunter::transition::Moved;
 use hunter::types::RunResult;
 use sqlx::SqlitePool;
 use support::{GitRepo, ScriptedBackend, TempDir, fresh_pool};
@@ -624,7 +625,7 @@ async fn a_downgrade_fails_the_recorded_job_and_no_other() {
 /// A declined fix's verdict is written only while its claim still holds
 /// the finding. One that left `fixing` meanwhile keeps the verdict it was
 /// given there, its anchor included: the anchor goes with the status
-/// write, not past it.
+/// write, not past it. The conclusion reports where the finding went.
 #[tokio::test]
 async fn a_conclusion_leaves_a_verdict_written_past_the_claim() {
     use hunter::domain::FindingStatus::Rejected;
@@ -657,13 +658,41 @@ async fn a_conclusion_leaves_a_verdict_written_past_the_claim() {
         )
         .await;
 
-    assert!(concluded.is_ok(), "the write itself succeeds");
+    assert_eq!(
+        concluded.ok(),
+        Some(Moved::Conflict {
+            now: Some(Rejected)
+        })
+    );
     let finding = store.get_finding(2).await.unwrap().unwrap();
     assert_eq!(
         (finding.status, finding.verdict_reason.as_deref()),
         (Rejected, Some("operator: wrong"))
     );
     assert_eq!(store.verdict_anchor(2).await.unwrap(), Some(operator));
+}
+
+/// A shipped fix moves its finding to `pr_open` only while its claim still
+/// holds it. One that left `fixing` meanwhile stays where it went, without
+/// the PR's URL, and the claim reports where that is.
+#[tokio::test]
+async fn an_opened_pr_leaves_a_finding_moved_past_the_claim() {
+    use hunter::domain::FindingStatus::Wontfix;
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo(&pool).await;
+    seed_findings(&pool).await;
+    let store = rw_store(&path).await;
+    let claim = support::scope(&store).claim_fix(2).await.unwrap().unwrap();
+    store
+        .set_finding_verdict(2, Wontfix, "operator: not worth it")
+        .await
+        .unwrap();
+
+    let opened = claim.open_pr("https://github.com/o/r/pull/7").await;
+
+    assert_eq!(opened.ok(), Some(Moved::Conflict { now: Some(Wontfix) }));
+    let finding = store.get_finding(2).await.unwrap().unwrap();
+    assert_eq!((finding.status, finding.pr_url), (Wontfix, None));
 }
 
 /// A dropped claim is released only when no `running` job works on the
