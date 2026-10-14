@@ -988,6 +988,30 @@ async fn a_transition_applies_only_from_its_source_status() {
     assert_eq!(gone, Moved::Conflict { now: None });
 }
 
+/// An operator's verdict replaces the verdict before it entirely: one
+/// given without a reason leaves no reason behind, so a closed PR the
+/// operator queues again no longer reads as "awaiting harvest".
+#[tokio::test]
+async fn a_verdict_without_a_reason_clears_the_earlier_one() {
+    use hunter::domain::FindingStatus::{Closed, Queued};
+    use hunter::transition::{Moved, OperatorVerdict, Transition};
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo(&pool).await;
+    seed_findings(&pool).await;
+    let store = rw_store(&path).await;
+    store
+        .set_finding_verdict(1, Closed, "PR closed without merge; awaiting harvest")
+        .await
+        .unwrap();
+
+    let requeue = OperatorVerdict::new(Closed, Queued, None).unwrap();
+    let moved = store.transition(1, &Transition::Verdict(requeue)).await;
+
+    assert_eq!(moved.unwrap(), Moved::Applied);
+    let f = store.get_finding(1).await.unwrap().unwrap();
+    assert_eq!((f.status, f.verdict_reason), (Queued, None));
+}
+
 // -- 6. upsert_finding + suppressions + known_active -------------------------
 
 #[tokio::test]

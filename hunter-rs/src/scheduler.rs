@@ -1877,7 +1877,9 @@ fn log_write_failure<T, E: std::fmt::Display>(
 /// as [`log_write_failure`] logs one. A conflict, the finding no longer
 /// being where the change starts, is logged as a `kind` event: it records
 /// that something else decided the finding in between, and that decision
-/// stands.
+/// stands. `#[must_use]`, as [`Moved`]: whatever a caller records about
+/// the change it records only when the change was made.
+#[must_use]
 async fn make_transition(
     store: &Store,
     fid: i64,
@@ -2917,6 +2919,7 @@ pub async fn run_recheck(
     let reason = reason.as_str();
 
     // Declared out here: the transition borrows what each arm builds.
+    let analysis;
     let verdict_reason;
     let anchor;
     let (transition, verdict_str) = match outcome {
@@ -2937,17 +2940,18 @@ pub async fn run_recheck(
                     )
                     .await;
             }
-            let update = crate::store::FindingAnalysisUpdate {
+            analysis = crate::store::FindingAnalysisUpdate {
                 summary: verdict_obj.updated_summary.clone(),
                 detail: verdict_obj.updated_detail.clone(),
                 confidence: verdict_obj.updated_confidence,
                 severity,
             };
-            log_write_failure(
-                store.update_finding_analysis(fid, &update).await,
-                format_args!("#{fid}: recording recheck analysis"),
-            );
-            (Transition::RecheckConfirmed, "confirmed")
+            (
+                Transition::RecheckConfirmed {
+                    analysis: &analysis,
+                },
+                "confirmed",
+            )
         }
         RecheckOutcome::Stale => {
             // Superseded, not suppressed: the code moved on and took the
@@ -2997,18 +3001,22 @@ pub async fn run_recheck(
             return Ok(summary);
         }
     };
-    make_transition(store, fid, Some(job), "recheck", &transition).await;
-    let _ = store
-        .log_event(
-            "recheck",
-            &format!("#{fid} {verdict_str}: {reason}"),
-            Some(job),
-            Some(fid),
-        )
-        .await;
-    summary.outcome = Some(verdict_str.into());
-    summary.verdict = Some(verdict_str.to_owned());
-    summary.reason = Some(reason.to_owned());
+    // Recorded only once it is made: a conflict means something else
+    // decided the finding meanwhile (`make_transition` logs which), and
+    // this verdict, analysis included, is dropped.
+    if make_transition(store, fid, Some(job), "recheck", &transition).await {
+        let _ = store
+            .log_event(
+                "recheck",
+                &format!("#{fid} {verdict_str}: {reason}"),
+                Some(job),
+                Some(fid),
+            )
+            .await;
+        summary.outcome = Some(verdict_str.into());
+        summary.verdict = Some(verdict_str.to_owned());
+        summary.reason = Some(reason.to_owned());
+    }
     // A verdict ends the recheck: its tree is no checkpoint.
     close_workspace(store, &ws).await;
     if override_mode == Some(BudgetOverride::Once) {

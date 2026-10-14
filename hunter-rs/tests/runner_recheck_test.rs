@@ -463,6 +463,61 @@ async fn a_bare_confirmation_keeps_the_existing_analysis() {
     );
 }
 
+/// A confirmation that finds the finding moved off `rechecking` since the
+/// recheck read it is dropped whole: the other move stands, the analysis
+/// is not rewritten, and neither the summary nor the events claim a
+/// verdict. The other move is staged with a trigger that lands it just
+/// before the recheck's write and then skips that write, exactly as if it
+/// had landed in between.
+#[tokio::test]
+async fn a_confirmation_that_lost_the_finding_records_nothing() {
+    let f = fixture("recheck-confirmed-moved", FindingStatus::Rechecking).await;
+    sqlx::query(
+        "CREATE TRIGGER moved_first BEFORE UPDATE OF status ON findings \
+         WHEN NEW.status = 'new' \
+         BEGIN \
+           UPDATE findings SET status = 'rejected', verdict_reason = 'operator' \
+             WHERE id = OLD.id; \
+           SELECT RAISE(IGNORE); \
+         END",
+    )
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    let backend = replying(
+        f.out(),
+        &serde_json::json!({
+            "verdict": "confirmed",
+            "reason": "still reachable",
+            "updated_summary": "a sharper summary",
+        }),
+    );
+
+    let summary = f.recheck(&backend).await;
+
+    assert_eq!((summary.outcome, summary.verdict), (None, None));
+    let after = f.finding().await;
+    assert_eq!(after.status, FindingStatus::Rejected);
+    assert_eq!(after.verdict_reason.as_deref(), Some("operator"));
+    assert_eq!(after.summary, "a real bug");
+    let messages: Vec<String> =
+        sqlx::query_scalar("SELECT message FROM events WHERE finding_id = ?1 ORDER BY id")
+            .bind(f.fid)
+            .fetch_all(&f.pool)
+            .await
+            .unwrap();
+    assert!(
+        !messages.iter().any(|m| m.contains("confirmed")),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("not moved rechecking -> new")),
+        "{messages:?}"
+    );
+}
+
 /// The stored reason is capped at 500 characters — characters, not
 /// bytes, so a multibyte reason is cut on a boundary instead of panicking
 /// or storing half a code point.
