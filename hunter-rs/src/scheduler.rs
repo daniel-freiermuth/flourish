@@ -1912,7 +1912,26 @@ async fn log_conflict(
     transition: &Transition<'_>,
     now: Option<FindingStatus>,
 ) {
-    let (from, to) = (transition.from(), transition.to());
+    log_not_moved(
+        store,
+        fid,
+        job,
+        kind,
+        (transition.from(), transition.to()),
+        now,
+    )
+    .await;
+}
+
+/// [`log_conflict`] for any `from -> to` edge, a fix claim's included.
+async fn log_not_moved(
+    store: &Store,
+    fid: i64,
+    job: Option<i64>,
+    kind: &str,
+    (from, to): (impl std::fmt::Display, impl std::fmt::Display),
+    now: Option<FindingStatus>,
+) {
     let now = now.map_or_else(|| "gone".to_owned(), |s| format!("'{s}'"));
     let _ = store
         .log_event(
@@ -4627,10 +4646,20 @@ async fn record_declined_fix(
         holds_while.as_deref(),
         &depends_on,
     );
-    // A claim whose verdict could not be written goes back to `queued`.
-    if let Err((claim, e)) = claim.conclude(class, reason, anchor.as_ref()).await {
-        log_write_failure(Err::<(), _>(e), format_args!("#{fid}: verdict -> {status}"));
-        release_claim(claim).await;
+    match claim.conclude(class, reason, anchor.as_ref()).await {
+        Ok(Moved::Applied) => {}
+        // Something moved the finding off its claim meanwhile, and that
+        // decision stands: the decline records nothing.
+        Ok(Moved::Conflict { now }) => {
+            let edge = (FindingStatus::Fixing, status);
+            log_not_moved(store, fid, Some(job), "fix", edge, now).await;
+            return;
+        }
+        // A claim whose verdict could not be written goes back to `queued`.
+        Err((claim, e)) => {
+            log_write_failure(Err::<(), _>(e), format_args!("#{fid}: verdict -> {status}"));
+            release_claim(claim).await;
+        }
     }
     let first_line: String = reason
         .lines()
@@ -4677,14 +4706,22 @@ async fn record_fix_outcome(
         FixOutcome::Shipped { pr_url, recovered } => {
             // A claim whose `pr_open` could not be written goes back to
             // `queued`.
-            let unopened = match claim.open_pr(&pr_url).await {
-                Ok(()) => None,
+            let (lost, unopened) = match claim.open_pr(&pr_url).await {
+                Ok(Moved::Applied) => (false, None),
+                // The PR exists, but something moved the finding off its
+                // claim meanwhile, and that decision stands: it is not
+                // `pr_open`, and nothing is left to release.
+                Ok(Moved::Conflict { now }) => {
+                    let edge = (FindingStatus::Fixing, FindingStatus::PrOpen);
+                    log_not_moved(store, fid, Some(job), "ship", edge, now).await;
+                    (true, None)
+                }
                 Err((claim, e)) => {
                     log_write_failure(
                         Err::<(), _>(e),
                         format_args!("#{fid}: status -> pr_open ({pr_url})"),
                     );
-                    Some(claim)
+                    (false, Some(claim))
                 }
             };
             let message = if recovered {
@@ -4693,7 +4730,9 @@ async fn record_fix_outcome(
                 format!("#{fid} draft PR: {pr_url}")
             };
             let _ = fix_event(store, "ship", fid, job, message).await;
-            summary.outcome = Some("pr_open".into());
+            if !lost {
+                summary.outcome = Some("pr_open".into());
+            }
             summary.pr_url = Some(pr_url);
             unopened
         }
