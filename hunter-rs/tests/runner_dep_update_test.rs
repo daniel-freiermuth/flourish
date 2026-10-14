@@ -667,6 +667,38 @@ async fn a_queued_update_hands_its_queue_to_the_scans_finding_for_the_same_move(
     );
 }
 
+/// A handover is both of its halves or neither. Should the scan's finding
+/// have moved by the time it would take the queue, the queued update must
+/// not have given its place up already: that would leave the move queued
+/// nowhere. The handover is refused whole and fails the cycle.
+#[tokio::test]
+async fn a_handover_whose_taker_moved_gives_nothing_up() {
+    let rig = Rig::new("depupd-handover-taker-moved").await;
+    let fallback = "widget:dep:left-pad-non-major@1.2.0";
+    let renovate = "widget:dep:left-pad-1.x@1.2.0";
+    rig.seed_update(fallback, "left-pad", "minor", rig.repo.id)
+        .await;
+    rig.set_status(fallback, "queued", None).await;
+    // Between the halves, as a write the handover did not see would land.
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE TRIGGER taker_moved BEFORE UPDATE OF status ON findings \
+         WHEN NEW.status = 'superseded' AND NEW.verdict_reason LIKE 'replaced by #%' \
+         BEGIN UPDATE findings SET status = 'wontfix' WHERE fingerprint = '{renovate}'; END"
+    )))
+    .execute(&rig.pool)
+    .await
+    .unwrap();
+
+    let result = rig.scan(&left_pad("1.2.0", Some("1.3.0"))).await;
+
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(
+        rig.state_of(fallback).await,
+        ("queued".into(), None, None),
+        "the queued update keeps its place"
+    );
+}
+
 /// The scan's finding may be a group: a queued update for one of its
 /// members is the same move.
 #[tokio::test]
