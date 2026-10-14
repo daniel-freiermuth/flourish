@@ -3797,7 +3797,7 @@ impl Store {
         &self,
         repo_id: i64,
         moves: &[ProposedMove],
-    ) -> sqlx::Result<u64> {
+    ) -> Result<u64, StoreWriteError> {
         let new = FindingStatus::New;
         let queued = FindingStatus::Queued;
         let moves = serde_json::to_string(moves).unwrap_or_else(|_| "[]".to_owned());
@@ -3832,19 +3832,25 @@ impl Store {
         .await?;
         let mut handed = 0;
         for pair in pairs {
-            // Both read in this transaction: the scan's finding at `new`,
-            // or queued by an earlier pair, so both edges apply.
+            // Both read in this transaction: the queued finding, and the
+            // scan's finding at `new` or queued by an earlier pair. Either
+            // edge conflicting is a store fault, and committing past it
+            // would leave a queue place given up with nobody taking it:
+            // the whole handover is refused, rolled back with `tx`.
             let reason = format!("replaced by #{} from the dependency scan", pair.to_id);
             let gives = Transition::HandedOver { reason: &reason };
-            if Self::apply_transition(&mut tx, pair.from_id, &gives).await? != Moved::Applied {
-                continue;
-            }
             let takes = Transition::TakesOver {
                 from_id: pair.from_id,
             };
-            if Self::apply_transition(&mut tx, pair.to_id, &takes).await? == Moved::Applied {
-                handed += 1;
+            for (id, edge) in [(pair.from_id, &gives), (pair.to_id, &takes)] {
+                if let Moved::Conflict { now } = Self::apply_transition(&mut tx, id, edge).await? {
+                    return Err(StoreWriteError::Refused(format!(
+                        "#{id} moved from {} to {now:?} inside its dep-update handover",
+                        edge.from()
+                    )));
+                }
             }
+            handed += 1;
         }
         tx.commit().await?;
         Ok(handed)
