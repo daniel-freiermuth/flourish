@@ -154,9 +154,15 @@ impl Fixture {
 
     /// Run a hunt with `worker`; return what [`Self::hunt_reporting`] does.
     async fn hunt_with(&self, worker: &ScriptedBackend) -> (String, i64) {
-        let summary = run_hunt(&self.store, &self.cfg, &self.repo().await, worker, None)
-            .await
-            .unwrap();
+        let summary = run_hunt(
+            &support::scope(&self.store),
+            &self.cfg,
+            &self.repo().await,
+            worker,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(summary.skipped.is_none(), "{summary:?}");
         let prompt = worker.runs()[0].prompt.clone();
         let reopened = summary.ingest.as_ref().map_or(0, |i| i.reopened);
@@ -208,7 +214,7 @@ async fn decline_phantom(f: &Fixture, fid: i64) -> String {
          Evidence: the row never reaches the output.",
     );
     let finding = f.store.get_finding(fid).await.unwrap().unwrap();
-    run_fix(&f.store, &f.cfg, &finding, &decline, None)
+    run_fix(&support::scope(&f.store), &f.cfg, &finding, &decline, None)
         .await
         .unwrap();
     judged_at

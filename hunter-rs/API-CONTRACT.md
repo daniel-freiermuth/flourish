@@ -349,7 +349,7 @@ Paths are resolved relative to `PROJECT_ROOT` (the `hunter/` dir containing the 
 | `serve.host` | — (Rust: `serve_host`) | `127.0.0.1` | Rust only: bind address, an IP (`0.0.0.0` = every IPv4 interface); anything else is a load error |
 | `serve.allowedHosts` | — (Rust: `allowed_hosts`) | `[]` | Rust only: `Host` names accepted beyond loopback (case-insensitive, no port); `["*"]` accepts any name and cannot be combined with names |
 | `workRoot` | `work_root` | `"data"` | `hunter.lock` lockfile (server.py:75), repo clones `repos/repo-<id>` (store.py:105-113), repo notes `notes/repo-<id>.md` (store.py:727) |
-| `dbPath` | `db_path` | `"data/hunter.db"` | SQLite database (store.py:165-166) |
+| `dbPath` | `db_path` | `"data/hunter.db"` | SQLite database (store.py:165-166); Rust: also the daemon's `<dbPath>-daemon.lock` lockfile, beside `<workRoot>/hunter.lock` (`recovery::DaemonLock`), so two daemons with their own work roots cannot share a database |
 | — (constant) | `UI_DIR` | `PROJECT_ROOT / "ui"` (types.py:20) | static files + index.html |
 
 `hunter/config.anthropic.example.json` and `hunter/config.openai-codex.example.json` are tracked templates; copy the provider-matched one to ignored `hunter/config.json`. The templates bind compatible models to their `backend.llmProvider`. Other keys (hunt/fix caps, models, budget) feed the scheduler/backend, which `/api/summary` reaches only through `scheduler.pick_next` / `backend.decide()` / `backend.status()` — for round 1 those can stay behind a trait boundary.

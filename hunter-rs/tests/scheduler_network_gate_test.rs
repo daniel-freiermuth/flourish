@@ -127,7 +127,7 @@ async fn an_unreachable_forge_denies_a_scan() {
         .offline(&[FORGE]);
 
     let before = hunter::util::now_ms();
-    let summary = run_cycle(&store, &cfg, &backend, None).await;
+    let summary = run_cycle(&support::recovered(&store), &cfg, &backend, None).await;
 
     assert_denied_for(&store, &summary, &down, before).await;
     assert_eq!(summary.unreachable.as_deref(), Some(down.as_str()));
@@ -155,7 +155,7 @@ async fn an_unreachable_provider_denies_a_scan() {
         .offline(&[PROVIDER]);
 
     let before = hunter::util::now_ms();
-    let summary = run_cycle(&store, &cfg, &backend, None).await;
+    let summary = run_cycle(&support::recovered(&store), &cfg, &backend, None).await;
 
     assert_denied_for(&store, &summary, &down, before).await;
 }
@@ -169,7 +169,7 @@ async fn an_unreachable_forge_denies_the_cloning_hunt() {
     let backend = ScriptedBackend::new(|_| panic!("no worker may start offline")).offline(&[FORGE]);
 
     let before = hunter::util::now_ms();
-    let summary = run_cycle(&store, &cfg, &backend, None).await;
+    let summary = run_cycle(&support::recovered(&store), &cfg, &backend, None).await;
 
     assert_eq!(
         summary.kind.map(hunter::domain::JobKind::as_str),
@@ -210,7 +210,7 @@ async fn a_denied_fix_leaves_its_finding_queued() {
     let backend = ScriptedBackend::new(|_| panic!("no worker may start offline")).offline(&[FORGE]);
 
     let before = hunter::util::now_ms();
-    let summary = run_cycle(&store, &cfg, &backend, None).await;
+    let summary = run_cycle(&support::recovered(&store), &cfg, &backend, None).await;
 
     assert_eq!(
         summary.kind.map(hunter::domain::JobKind::as_str),
@@ -240,7 +240,7 @@ async fn the_overdrive_wrapper_reports_the_providers_hosts() {
     let backend = OverdriveBackend::new(Arc::new(provider), Arc::new(AtomicBool::new(false)));
 
     let before = hunter::util::now_ms();
-    let summary = run_cycle(&store, &cfg, &backend, None).await;
+    let summary = run_cycle(&support::recovered(&store), &cfg, &backend, None).await;
 
     assert_denied_for(&store, &summary, &down, before).await;
 }
@@ -252,7 +252,7 @@ async fn the_overdrive_wrapper_reports_the_providers_hosts() {
 async fn a_backend_without_hosts_adds_nothing_to_probe() {
     let (_dir, store, cfg) = fixture("net-null", "/srv/git/widget", true).await;
 
-    let summary = run_cycle(&store, &cfg, &NullBackend, None).await;
+    let summary = run_cycle(&support::recovered(&store), &cfg, &NullBackend, None).await;
 
     assert_eq!(
         summary.denied.as_deref(),
@@ -291,7 +291,7 @@ async fn an_offline_cycle_still_reports_its_pr_sync() {
         .unwrap();
     let backend = ScriptedBackend::new(|_| panic!("no worker may start offline")).offline(&[FORGE]);
 
-    let summary = run_cycle(&store, &cfg, &backend, None).await;
+    let summary = run_cycle(&support::recovered(&store), &cfg, &backend, None).await;
 
     assert_eq!(
         summary.denied,
@@ -312,7 +312,7 @@ async fn reachable_hosts_let_the_candidate_run() {
     let (_dir, store, cfg) = fixture("net-up", &forge_url(FORGE), true).await;
     let backend = ScriptedBackend::noop().needing(&[PROVIDER]);
 
-    let summary = run_cycle(&store, &cfg, &backend, None).await;
+    let summary = run_cycle(&support::recovered(&store), &cfg, &backend, None).await;
 
     assert_eq!(summary.denied, None, "{summary:?}");
     assert_eq!(
@@ -334,7 +334,7 @@ async fn the_gate_switched_off_probes_nothing() {
         .needing(&[PROVIDER])
         .offline(&[FORGE, PROVIDER]);
 
-    let summary = run_cycle(&store, &cfg, &backend, None).await;
+    let summary = run_cycle(&support::recovered(&store), &cfg, &backend, None).await;
 
     assert_eq!(summary.denied, None, "{summary:?}");
     assert_eq!(backend.runs().len(), 1, "the worker ran");
@@ -368,9 +368,10 @@ async fn a_fetch_that_fails_while_offline_is_not_counted() {
     let repo = store.get_repo_by_id(1).await.unwrap().unwrap();
     let backend = ScriptedBackend::new(|_| panic!("no worker may start offline")).offline(&[FORGE]);
 
-    let summary = hunter::scheduler::run_test_gap(&store, &cfg, &repo, &backend, None)
-        .await
-        .unwrap();
+    let summary =
+        hunter::scheduler::run_test_gap(&support::scope(&store), &cfg, &repo, &backend, None)
+            .await
+            .unwrap();
 
     assert_eq!(
         summary.denied.as_deref(),
@@ -381,7 +382,8 @@ async fn a_fetch_that_fails_while_offline_is_not_counted() {
 
     // The same failure with the forge reachable is the repo's own.
     let up = ScriptedBackend::new(|_| panic!("no worker may start without a fetch"));
-    let failed = hunter::scheduler::run_test_gap(&store, &cfg, &repo, &up, None).await;
+    let failed =
+        hunter::scheduler::run_test_gap(&support::scope(&store), &cfg, &repo, &up, None).await;
     assert!(failed.is_err(), "{failed:?}");
     assert_eq!(repo_streaks(&store).await, (1, 0));
 }
@@ -394,9 +396,10 @@ async fn a_runner_error_while_offline_is_not_counted() {
     let repo = store.get_repo_by_id(1).await.unwrap().unwrap();
     let backend = ScriptedBackend::failing().offline(&[FORGE]);
 
-    let summary = hunter::scheduler::run_test_gap(&store, &cfg, &repo, &backend, None)
-        .await
-        .unwrap();
+    let summary =
+        hunter::scheduler::run_test_gap(&support::scope(&store), &cfg, &repo, &backend, None)
+            .await
+            .unwrap();
 
     assert_eq!(
         summary.denied.as_deref(),

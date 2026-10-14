@@ -55,10 +55,17 @@ sha2 = "0.11"
 getrandom = "0.4"
 ts-rs = "12"
 
+[features]
+# Test fixtures only: `recovery::Unreconciled::assume_clean`, which skips the
+# startup reconcile on a store the test just created. Enabled for this
+# crate's own tests through the dev-dependency below; never in the daemon.
+test-support = []
+
 [dev-dependencies]
 insta = "1.48.0"
 proptest = "1.11.0"
 tower = { version = "0.5", features = ["util"] }
+hunter = { path = ".", features = ["test-support"] }
 
 [profile.release]
 lto = "thin"

@@ -263,7 +263,9 @@ async fn suspend_then_resume_a_hunt(f: &Fixture) -> (String, String, Seen, Seen,
     let row = f.store.get_repo_by_id(1).await.unwrap().unwrap();
 
     let cold = StagedBackend::new(|ws, _| suspended_at_cap(&ws.session));
-    let first = run_hunt(&f.store, &f.cfg, &row, &cold, None).await.unwrap();
+    let first = run_hunt(&support::scope(&f.store), &f.cfg, &row, &cold, None)
+        .await
+        .unwrap();
     assert_eq!(first.state, Some(JobState::Suspended), "{first:?}");
     let origin_id = first.job_id.unwrap();
 
@@ -303,7 +305,7 @@ async fn suspend_then_resume_a_hunt(f: &Fixture) -> (String, String, Seen, Seen,
             usage_delta: None,
         }
     });
-    let second = run_hunt(&f.store, &f.cfg, &row, &warm, Some(&plan))
+    let second = run_hunt(&support::scope(&f.store), &f.cfg, &row, &warm, Some(&plan))
         .await
         .unwrap();
     assert_eq!(second.state, Some(JobState::Done), "{second:?}");
@@ -648,9 +650,15 @@ async fn a_fresh_fix_superseding_a_suspended_fix_takes_over_its_branch() {
 
     let suspending =
         ScriptedBackend::new(|tree| suspended_at_cap(&tree.parent().unwrap().join("session")));
-    let first = run_fix(&f.store, &f.cfg, &finding, &suspending, None)
-        .await
-        .unwrap();
+    let first = run_fix(
+        &support::scope(&f.store),
+        &f.cfg,
+        &finding,
+        &suspending,
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(first.state, Some(JobState::Suspended), "{first:?}");
     let old = first.job_id.unwrap();
     let old_tree = f
@@ -664,9 +672,15 @@ async fn a_fresh_fix_superseding_a_suspended_fix_takes_over_its_branch() {
     let finding = f.store.get_finding(fid).await.unwrap().unwrap();
     let declining =
         ScriptedBackend::writing("NOT-A-BUG.md", "Classification: wrong\nmisread the code");
-    let fresh = run_fix(&f.store, &f.cfg, &finding, &declining, None)
-        .await
-        .unwrap();
+    let fresh = run_fix(
+        &support::scope(&f.store),
+        &f.cfg,
+        &finding,
+        &declining,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         fresh.outcome.as_deref(),
@@ -759,7 +773,7 @@ async fn a_cold_job_whose_tree_cannot_be_made_fails_and_leaves_nothing() {
     let row = f.store.get_repo_by_id(1).await.unwrap().unwrap();
     let backend = ScriptedBackend::new(|_| panic!("nothing may run without a tree"));
 
-    let summary = run_test_gap(&f.store, &f.cfg, &row, &backend, None)
+    let summary = run_test_gap(&support::scope(&f.store), &f.cfg, &row, &backend, None)
         .await
         .unwrap();
 
@@ -841,7 +855,7 @@ async fn a_cold_job_fetches_the_clone_but_never_moves_its_checkout() {
         usage_delta: None,
     });
 
-    run_hunt(&f.store, &f.cfg, &row, &backend, None)
+    run_hunt(&support::scope(&f.store), &f.cfg, &row, &backend, None)
         .await
         .unwrap();
 
@@ -883,9 +897,15 @@ async fn a_suspended_fix_whose_work_concluded_keeps_no_checkpoint_and_is_release
             suspended_at_cap(&tree.parent().unwrap().join("session"))
         });
 
-        let summary = run_fix(&f.store, &f.cfg, &finding, &concluded, None)
-            .await
-            .unwrap();
+        let summary = run_fix(
+            &support::scope(&f.store),
+            &f.cfg,
+            &finding,
+            &concluded,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(summary.outcome.as_deref(), Some(outcome));
         let job = summary.job_id.unwrap();
@@ -945,9 +965,15 @@ async fn a_suspended_harvest_keeps_its_tree() {
     let suspending =
         ScriptedBackend::new(|tree| suspended_at_cap(&tree.parent().unwrap().join("session")));
 
-    let summary = hunter::scheduler::run_harvest(&f.store, &f.cfg, &finding, &suspending, None)
-        .await
-        .unwrap();
+    let summary = hunter::scheduler::run_harvest(
+        &support::scope(&f.store),
+        &f.cfg,
+        &finding,
+        &suspending,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(summary.state, Some(JobState::Suspended), "{summary:?}");
     let tree = f
@@ -1055,9 +1081,15 @@ async fn renovate_scans_a_tree_at_the_fetched_tip() {
     .unwrap();
     let row = f.store.get_repo_by_id(1).await.unwrap().unwrap();
 
-    hunter::scheduler::run_dep_update(&f.store, &f.cfg, &row, &ScriptedBackend::noop(), None)
-        .await
-        .unwrap();
+    hunter::scheduler::run_dep_update(
+        &support::scope(&f.store),
+        &f.cfg,
+        &row,
+        &ScriptedBackend::noop(),
+        None,
+    )
+    .await
+    .unwrap();
 
     let scan = f.cfg.work_root.join("scan").join("repo-1");
     let cwd = std::fs::read_to_string(&seen_cwd).expect("renovate ran");

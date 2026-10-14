@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-use hunter::domain::{FindingJobKind, FindingType, ForgeName, JobState, RepoJobKind, Severity};
+use hunter::domain::{FindingJobKind, FindingType, ForgeName, RepoJobKind, Severity};
 use hunter::store::{FindingFilter, Store};
 
 mod support;
@@ -219,19 +219,19 @@ async fn produced_by(store: &Store, job: i64) -> Vec<i64> {
 #[tokio::test]
 async fn findings_are_attributed_to_the_hunt_that_produced_them() {
     let (dir, store, repo_id) = provenance_fixture().await;
-    let job = store
+    let job = support::scope(&store)
         .create_job(
             RepoJobKind::Hunt.into(),
             repo_id,
             None,
             Some(1000),
-            JobState::Running,
             None,
             None,
         )
         .await
         .unwrap()
-        .id;
+        .job
+        .disown();
 
     let inserted = hunt_producing_two(&dir, &store, repo_id, job).await;
     assert_eq!(inserted, 2, "fixture: both entries are new");
@@ -250,35 +250,35 @@ async fn findings_are_attributed_to_the_hunt_that_produced_them() {
 #[tokio::test]
 async fn a_rediscovery_does_not_steal_attribution() {
     let (dir, store, repo_id) = provenance_fixture().await;
-    let first = store
+    let first = support::scope(&store)
         .create_job(
             RepoJobKind::Hunt.into(),
             repo_id,
             None,
             Some(1000),
-            JobState::Running,
             None,
             None,
         )
         .await
         .unwrap()
-        .id;
+        .job
+        .disown();
     assert_eq!(hunt_producing_two(&dir, &store, repo_id, first).await, 2);
     let original = produced_by(&store, first).await;
 
-    let second = store
+    let second = support::scope(&store)
         .create_job(
             RepoJobKind::Hunt.into(),
             repo_id,
             None,
             Some(1000),
-            JobState::Running,
             None,
             None,
         )
         .await
         .unwrap()
-        .id;
+        .job
+        .disown();
     assert_eq!(
         hunt_producing_two(&dir, &store, repo_id, second).await,
         0,
@@ -301,35 +301,35 @@ async fn a_rediscovery_does_not_steal_attribution() {
 #[tokio::test]
 async fn a_job_given_a_finding_produces_nothing() {
     let (dir, store, repo_id) = provenance_fixture().await;
-    let hunt = store
+    let hunt = support::scope(&store)
         .create_job(
             RepoJobKind::Hunt.into(),
             repo_id,
             None,
             Some(1000),
-            JobState::Running,
             None,
             None,
         )
         .await
         .unwrap()
-        .id;
+        .job
+        .disown();
     hunt_producing_two(&dir, &store, repo_id, hunt).await;
     let found = produced_by(&store, hunt).await;
 
-    let fix = store
+    let fix = support::scope(&store)
         .create_job(
             FindingJobKind::Fix.into(),
             repo_id,
             Some(found[0]),
             Some(1000),
-            JobState::Running,
             None,
             None,
         )
         .await
         .unwrap()
-        .id;
+        .job
+        .disown();
     let entry = store
         .list_jobs(50)
         .await
@@ -350,36 +350,36 @@ async fn a_job_given_a_finding_produces_nothing() {
 #[tokio::test]
 async fn follow_ups_link_to_the_finding_their_job_worked_on() {
     let (dir, store, repo_id) = provenance_fixture().await;
-    let hunt = store
+    let hunt = support::scope(&store)
         .create_job(
             RepoJobKind::Hunt.into(),
             repo_id,
             None,
             Some(1000),
-            JobState::Running,
             None,
             None,
         )
         .await
         .unwrap()
-        .id;
+        .job
+        .disown();
     hunt_producing_two(&dir, &store, repo_id, hunt).await;
     let found = produced_by(&store, hunt).await;
     let (source, bystander) = (found[0], found[1]);
 
-    let engage = store
+    let engage = support::scope(&store)
         .create_job(
             FindingJobKind::Engage.into(),
             repo_id,
             Some(source),
             Some(1000),
-            JobState::Running,
             None,
             None,
         )
         .await
         .unwrap()
-        .id;
+        .job
+        .disown();
     let entries = serde_json::json!([{
         "fingerprint": "widget:src/c.rs:h:3", "type": "bug", "file": "src/c.rs",
         "bug_class": "boundary", "severity": "medium", "confidence": 0.7, "summary": "follow-up"

@@ -309,3 +309,12 @@ async fn a_skipped_cycle_restarts_at_once() {
     let idle = hunter::scheduler::CycleSummary::default();
     assert_eq!(hunter::daemon::compute_sleep_s(&store, &idle).await, 900.0);
 }
+
+/// The status page counts down to the loop's wake: now plus the sleep,
+/// in milliseconds, whole or fractional seconds alike.
+#[test]
+fn the_next_wake_is_the_sleep_after_now_in_ms() {
+    assert_eq!(hunter::daemon::next_wake_ms(1_000, 0.0), 1_000);
+    assert_eq!(hunter::daemon::next_wake_ms(1_000, 2.5), 3_500);
+    assert_eq!(hunter::daemon::next_wake_ms(1_000, 900.0), 901_000);
+}

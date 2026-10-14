@@ -6,16 +6,17 @@
 //! `run_*` executors below are the other half.
 
 use std::collections::BTreeSet;
+use std::ops::ControlFlow;
 use std::path::Path;
 
 use anyhow::Context as _;
 
 use crate::config::Config;
 use crate::domain::{
-    BudgetOverride, ClosureClass, FindingJobKind, FindingStatus, FindingType, HoldReason, JobKind,
-    JobState, RepoJobKind, RepoWorkKind, Severity,
+    BudgetOverride, ClosureClass, FindingJobKind, FindingStatus, FindingType, FinishedState,
+    HoldReason, JobKind, JobState, RepoJobKind, RepoWorkKind, Severity,
 };
-use crate::store::{CreatedJob, FindingFilter, JobOutcome, Store, StoreWriteError, SyncPrData};
+use crate::store::{FindingFilter, JobOutcome, Store, StoreWriteError, SyncPrData};
 use crate::types::{Finding, Job, Repo};
 use crate::util::now_ms;
 
@@ -1128,6 +1129,7 @@ use crate::backend::{Backend, JobClass, Verdict};
 use crate::forge::{self, CheckConclusion, GhCheckRun, Mergeable, PrView, ReviewDecision};
 use crate::ingest::{EntryTypes, IngestResult, ingest_findings, ingest_scan_findings};
 use crate::playbooks;
+use crate::recovery::{CreatedJob, CycleScope, FixClaim, RecordedJob, Recovered, RunningJob};
 use crate::types::RunResult;
 use crate::workspace::{TreeSpec, Workspace};
 use serde::{Deserialize, Serialize};
@@ -1247,15 +1249,17 @@ const MAX_CONSECUTIVE_SAME_FAILURE: i64 = 3;
 ///
 /// `resume-unavailable` is `Failed` rather than `Killed` because nothing
 /// was spawned — there was no run to kill, the attempt could not start.
-fn job_state(rr: &RunResult) -> JobState {
+fn job_state(rr: &RunResult) -> FinishedState {
     match rr.killed_reason.as_deref() {
-        Some("cap") if rr.session_file.is_some() => JobState::Suspended,
-        Some("wallclock") if rr.session_file.is_some() && rr.tokens_new > 0 => JobState::Suspended,
-        Some("resume-unavailable") => JobState::Failed,
-        Some(_) => JobState::Killed,
-        None if rr.exit_code == Some(0) => JobState::Done,
-        None if rr.session_file.is_some() && rr.tokens_new > 0 => JobState::Suspended,
-        None => JobState::Failed,
+        Some("cap") if rr.session_file.is_some() => FinishedState::Suspended,
+        Some("wallclock") if rr.session_file.is_some() && rr.tokens_new > 0 => {
+            FinishedState::Suspended
+        }
+        Some("resume-unavailable") => FinishedState::Failed,
+        Some(_) => FinishedState::Killed,
+        None if rr.exit_code == Some(0) => FinishedState::Done,
+        None if rr.session_file.is_some() && rr.tokens_new > 0 => FinishedState::Suspended,
+        None => FinishedState::Failed,
     }
 }
 
@@ -1292,33 +1296,31 @@ fn job_refused(
 /// `resume-unavailable` — is identical for all six.
 pub async fn record_job(
     store: &Store,
-    job_id: i64,
+    running: RunningJob,
     rr: &RunResult,
     model: Option<&str>,
     resume: Option<&ResumePlan>,
-) -> anyhow::Result<JobState> {
+) -> anyhow::Result<RecordedJob> {
+    let job_id = running.id();
     let state = job_state(rr);
-    let notes = if state != JobState::Done && !rr.stdout_tail.is_empty() {
+    let notes = if state != FinishedState::Done && !rr.stdout_tail.is_empty() {
         Some(crate::util::tail(&rr.stdout_tail, 500))
     } else {
         None
     };
-    store
-        .complete_job(
-            job_id,
-            &JobOutcome {
-                state,
-                tokens_new: rr.tokens_new,
-                calls: rr.calls,
-                exit_code: rr.exit_code.map(i64::from),
-                killed_reason: rr.killed_reason.as_deref(),
-                session_file: rr.session_file.as_deref(),
-                notes,
-                model,
-                usage_delta: rr.usage_delta,
-                finished_at: now_ms(),
-            },
-        )
+    let recorded = running
+        .complete(&JobOutcome {
+            state,
+            tokens_new: rr.tokens_new,
+            calls: rr.calls,
+            exit_code: rr.exit_code.map(i64::from),
+            killed_reason: rr.killed_reason.as_deref(),
+            session_file: rr.session_file.as_deref(),
+            notes,
+            model,
+            usage_delta: rr.usage_delta,
+            finished_at: now_ms(),
+        })
         .await?;
 
     // The transcript this attempt was to continue is gone, so nothing
@@ -1349,7 +1351,7 @@ pub async fn record_job(
             .log_event("error", &msg, Some(job_id), plan.finding_id)
             .await;
     }
-    Ok(state)
+    Ok(recorded)
 }
 
 /// End a hold for the operator ([`Store::release_hold`]), and file what the
@@ -1775,45 +1777,48 @@ async fn budget_gate(
 ///
 /// `Ok(Err(summary))`: the tree could not be made. The job is recorded
 /// `failed` with the reason, and [`crate::workspace::create`] has already
-/// removed whatever it made.
+/// removed whatever it made. `Ok(Ok(..))` hands the job back for its
+/// runner to end.
 async fn open_workspace(
     store: &Store,
     cfg: &Config,
     repo: &Repo,
-    created: &CreatedJob,
+    created: CreatedJob,
     resume: Option<&ResumePlan>,
     spec: TreeSpec,
     kind: JobKind,
     log_prefix: &str,
     finding_id: Option<i64>,
-) -> anyhow::Result<Result<(Workspace, String), CycleSummary>> {
+) -> anyhow::Result<Result<(Workspace, String, RunningJob), CycleSummary>> {
+    let CreatedJob { job, superseded } = created;
     if let Some(plan) = resume {
-        return Ok(Ok((plan.workspace.clone(), plan.pinned_sha.clone())));
+        return Ok(Ok((plan.workspace.clone(), plan.pinned_sha.clone(), job)));
     }
+    let id = job.id();
     let clone = Path::new(&repo.path);
-    for &old in &created.superseded {
+    for &old in &superseded {
         let origin = store.resume_origin_job(old).await?;
         let stale = Workspace::for_chain(&cfg.work_root, clone, origin);
         crate::workspace::release_if_idle(store, &stale).await?;
     }
-    let ws = Workspace::for_chain(&cfg.work_root, clone, created.id);
+    let ws = Workspace::for_chain(&cfg.work_root, clone, id);
     let made = {
         let ws = ws.clone();
         tokio::task::spawn_blocking(move || crate::workspace::create(&ws, &spec)).await?
     };
     match made {
         Ok(sha) => {
-            store.set_pinned_sha(created.id, &sha).await?;
-            Ok(Ok((ws, sha)))
+            store.set_pinned_sha(id, &sha).await?;
+            Ok(Ok((ws, sha, job)))
         }
         Err(why) => {
             let note = format!("{TREE_NOT_MADE}: {why}");
-            store.fail_unstarted_job(created.id, &note).await?;
+            job.fail_unstarted(&note).await?;
             let _ = store
                 .log_event(
                     "error",
-                    &format!("{log_prefix}: job {} {note}", created.id),
-                    Some(created.id),
+                    &format!("{log_prefix}: job {id} {note}"),
+                    Some(id),
                     finding_id,
                 )
                 .await;
@@ -1821,7 +1826,7 @@ async fn open_workspace(
                 kind: Some(kind),
                 repo: Some(repo.name.clone()),
                 finding_id,
-                job_id: Some(created.id),
+                job_id: Some(id),
                 state: Some(JobState::Failed),
                 failure: Some(note),
                 ..Default::default()
@@ -1845,9 +1850,9 @@ async fn close_workspace(store: &Store, ws: &Workspace) {
 /// Log a failed store write the job deliberately continues past.
 ///
 /// These writes sit mid-job, ahead of steps that must still run —
-/// `finalize_in_progress`, releasing the tree, retiring the job row — so
-/// aborting with `?` would trade one inconsistency for a worse one, such
-/// as a finding stranded in `fixing` until the next restart. Continuing
+/// releasing a fix claim or a recheck's, releasing the tree, retiring the
+/// job row — so aborting with `?` would trade one inconsistency for a
+/// worse one, such as a finding left `fixing` until a settle. Continuing
 /// is intended; doing so without a trace is not. Logged through `tracing`
 /// rather than `log_event`: a store that just refused a write is the
 /// least likely place for the record of that refusal to land.
@@ -2008,7 +2013,7 @@ async fn prior_findings(
               would only move the same state behind argument lists"
 )]
 pub async fn run_hunt(
-    store: &Store,
+    scope: &CycleScope,
     cfg: &Config,
     repo: &Repo,
     backend: &dyn Backend,
@@ -2018,6 +2023,7 @@ pub async fn run_hunt(
     // Using this as diff base includes the root commit itself.
     const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
+    let store = scope.store();
     let rid = repo.id;
     let rname = &repo.name;
     let rpath = PathBuf::from(&repo.path);
@@ -2240,13 +2246,12 @@ pub async fn run_hunt(
         BudgetDecision::Denied(d) => return Ok(*d),
     };
 
-    let created = match store
+    let created = match scope
         .create_job(
             RepoJobKind::Hunt.into(),
             rid,
             None,
             cap,
-            JobState::Running,
             Some(anticipated),
             resume.map(|r| r.predecessor_id),
         )
@@ -2255,7 +2260,7 @@ pub async fn run_hunt(
         Ok(j) => j,
         Err(e) => return job_refused(RepoJobKind::Hunt.into(), Some(rname), None, e),
     };
-    let job = created.id;
+    let job = created.job.id();
     if resume.is_none() {
         if full_scope {
             // Before the worker runs, so a suspension carries it to the
@@ -2274,11 +2279,11 @@ pub async fn run_hunt(
             );
         }
     }
-    let (ws, pinned) = match open_workspace(
+    let (ws, pinned, running) = match open_workspace(
         store,
         cfg,
         repo,
-        &created,
+        created,
         resume,
         TreeSpec::Detached { at: head.clone() },
         RepoJobKind::Hunt.into(),
@@ -2334,19 +2339,24 @@ pub async fn run_hunt(
     {
         Ok(rr) => rr,
         Err(e) => {
-            let ran = (WorkOf::Repo(RepoJobKind::Hunt, repo), job);
+            let ran = (WorkOf::Repo(RepoJobKind::Hunt, repo), running);
             let denied = runner_failed(store, (cfg, backend, &repo.url), ran, &e).await;
             close_workspace(store, &ws).await;
             return denied.ok_or(e);
         }
     };
-    let ran = (WorkOf::Repo(RepoJobKind::Hunt, repo), job);
-    if let Some(denied) = unmetered_offline(store, cfg, backend, &repo.url, ran, &rr).await {
-        close_workspace(store, &ws).await;
-        return Ok(denied);
-    }
+    let ran = (WorkOf::Repo(RepoJobKind::Hunt, repo), running);
+    let running = match unmetered_offline(store, cfg, backend, &repo.url, ran, &rr).await {
+        ControlFlow::Continue(running) => running,
+        ControlFlow::Break(denied) => {
+            close_workspace(store, &ws).await;
+            return Ok(denied);
+        }
+    };
     let state = log_write_failure(
-        record_job(store, job, &rr, model, resume).await,
+        record_job(store, running, &rr, model, resume)
+            .await
+            .map(|r| r.state()),
         format_args!("job {job}: recording outcome"),
     )
     .unwrap_or(JobState::Failed);
@@ -2533,7 +2543,7 @@ async fn handle_recheck_failure(
               locals (fid, job, summary, override_mode)"
 )]
 pub async fn run_recheck(
-    store: &Store,
+    scope: &CycleScope,
     cfg: &Config,
     finding: &Finding,
     backend: &dyn Backend,
@@ -2581,6 +2591,7 @@ pub async fn run_recheck(
         depends_on: Vec<String>,
     }
 
+    let store = scope.store();
     let fid = finding.id;
     if finding.status != FindingStatus::Rechecking {
         return Ok(CycleSummary {
@@ -2639,13 +2650,12 @@ pub async fn run_recheck(
     };
 
     remove_stale_report(resume)?;
-    let created = match store
+    let created = match scope
         .create_job(
             FindingJobKind::Recheck.into(),
             repo.id,
             Some(fid),
             cap,
-            JobState::Running,
             Some(anticipated),
             resume.map(|r| r.predecessor_id),
         )
@@ -2661,12 +2671,12 @@ pub async fn run_recheck(
             );
         }
     };
-    let job = created.id;
-    let (ws, pinned) = match open_workspace(
+    let job = created.job.id();
+    let (ws, pinned, running) = match open_workspace(
         store,
         cfg,
         &repo,
-        &created,
+        created,
         resume,
         TreeSpec::Detached {
             at: format!("origin/{}", repo.default_branch),
@@ -2735,19 +2745,24 @@ pub async fn run_recheck(
     {
         Ok(rr) => rr,
         Err(e) => {
-            let ran = (WorkOf::Finding(FindingJobKind::Recheck, fid), job);
+            let ran = (WorkOf::Finding(FindingJobKind::Recheck, fid), running);
             let denied = runner_failed(store, (cfg, backend, &repo.url), ran, &e).await;
             close_workspace(store, &ws).await;
             return denied.ok_or(e);
         }
     };
-    let ran = (WorkOf::Finding(FindingJobKind::Recheck, fid), job);
-    if let Some(denied) = unmetered_offline(store, cfg, backend, &repo.url, ran, &rr).await {
-        close_workspace(store, &ws).await;
-        return Ok(denied);
-    }
+    let ran = (WorkOf::Finding(FindingJobKind::Recheck, fid), running);
+    let running = match unmetered_offline(store, cfg, backend, &repo.url, ran, &rr).await {
+        ControlFlow::Continue(running) => running,
+        ControlFlow::Break(denied) => {
+            close_workspace(store, &ws).await;
+            return Ok(denied);
+        }
+    };
     let state = log_write_failure(
-        record_job(store, job, &rr, model, resume).await,
+        record_job(store, running, &rr, model, resume)
+            .await
+            .map(|r| r.state()),
         format_args!("job {job}: recording outcome"),
     )
     .unwrap_or(JobState::Failed);
@@ -3091,13 +3106,14 @@ const STANDARDS_SPEC: AnalysisSpec = AnalysisSpec {
               is a single non-branching sequence"
 )]
 async fn run_analysis_job(
-    store: &Store,
+    scope: &CycleScope,
     cfg: &Config,
     repo: &Repo,
     spec: &AnalysisSpec,
     backend: &dyn Backend,
     resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
+    let store = scope.store();
     let rid = repo.id;
     let rname = &repo.name;
     let rpath = PathBuf::from(&repo.path);
@@ -3146,13 +3162,12 @@ async fn run_analysis_job(
         BudgetDecision::Approved { cap, anticipated } => (cap, anticipated),
         BudgetDecision::Denied(d) => return Ok(*d),
     };
-    let created = match store
+    let created = match scope
         .create_job(
             kind.into(),
             rid,
             None,
             cap,
-            JobState::Running,
             Some(anticipated),
             resume.map(|r| r.predecessor_id),
         )
@@ -3161,12 +3176,12 @@ async fn run_analysis_job(
         Ok(j) => j,
         Err(e) => return job_refused(kind.into(), Some(rname), None, e),
     };
-    let job = created.id;
-    let (ws, pinned) = match open_workspace(
+    let job = created.job.id();
+    let (ws, pinned, running) = match open_workspace(
         store,
         cfg,
         repo,
-        &created,
+        created,
         resume,
         TreeSpec::Detached {
             at: format!("origin/{}", repo.default_branch),
@@ -3219,19 +3234,24 @@ async fn run_analysis_job(
     {
         Ok(rr) => rr,
         Err(e) => {
-            let ran = (WorkOf::Repo(kind, repo), job);
+            let ran = (WorkOf::Repo(kind, repo), running);
             let denied = runner_failed(store, (cfg, backend, &repo.url), ran, &e).await;
             close_workspace(store, &ws).await;
             return denied.ok_or(e);
         }
     };
-    let ran = (WorkOf::Repo(kind, repo), job);
-    if let Some(denied) = unmetered_offline(store, cfg, backend, &repo.url, ran, &rr).await {
-        close_workspace(store, &ws).await;
-        return Ok(denied);
-    }
+    let ran = (WorkOf::Repo(kind, repo), running);
+    let running = match unmetered_offline(store, cfg, backend, &repo.url, ran, &rr).await {
+        ControlFlow::Continue(running) => running,
+        ControlFlow::Break(denied) => {
+            close_workspace(store, &ws).await;
+            return Ok(denied);
+        }
+    };
     let state = log_write_failure(
-        record_job(store, job, &rr, model, resume).await,
+        record_job(store, running, &rr, model, resume)
+            .await
+            .map(|r| r.state()),
         format_args!("job {job}: recording outcome"),
     )
     .unwrap_or(JobState::Failed);
@@ -3296,13 +3316,13 @@ async fn run_analysis_job(
 }
 
 pub async fn run_test_gap(
-    store: &Store,
+    scope: &CycleScope,
     cfg: &Config,
     repo: &Repo,
     backend: &dyn Backend,
     resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
-    run_analysis_job(store, cfg, repo, &TEST_GAP_SPEC, backend, resume).await
+    run_analysis_job(scope, cfg, repo, &TEST_GAP_SPEC, backend, resume).await
 }
 /// The zero-token Renovate scan of the repo at its fetched tip, with the
 /// GitHub token the repo's forge qualifies for. `None` means Renovate has
@@ -3391,12 +3411,13 @@ async fn settle_dep_updates(
 /// Dependency scan. Renovate answers it for free whenever it can;
 /// otherwise an AI worker does.
 pub async fn run_dep_update(
-    store: &Store,
+    scope: &CycleScope,
     cfg: &Config,
     repo: &Repo,
     backend: &dyn Backend,
     resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
+    let store = scope.store();
     // A resume continues a suspended AI worker, so the Renovate
     // shortcut below is not an option for it: that path spends no
     // tokens, creates no job row, and would leave the suspension
@@ -3404,7 +3425,7 @@ pub async fn run_dep_update(
     // clone check and the sync, so nothing is skipped by going straight
     // there.
     if resume.is_some() {
-        return run_analysis_job(store, cfg, repo, &DEP_UPDATE_SPEC, backend, resume).await;
+        return run_analysis_job(scope, cfg, repo, &DEP_UPDATE_SPEC, backend, resume).await;
     }
     let rpath = std::path::PathBuf::from(&repo.path);
     if !rpath.exists() {
@@ -3428,7 +3449,7 @@ pub async fn run_dep_update(
             "dep_update {}: renovate unavailable, falling back to AI",
             repo.name
         );
-        return run_analysis_job(store, cfg, repo, &DEP_UPDATE_SPEC, backend, resume).await;
+        return run_analysis_job(scope, cfg, repo, &DEP_UPDATE_SPEC, backend, resume).await;
     };
 
     // Write candidates to JSON and ingest via the standard path
@@ -3526,31 +3547,31 @@ async fn renovate_outcome(store: &Store, repo: &Repo, counts: IngestResult) -> C
     summary
 }
 pub async fn run_refactor(
-    store: &Store,
+    scope: &CycleScope,
     cfg: &Config,
     repo: &Repo,
     backend: &dyn Backend,
     resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
-    run_analysis_job(store, cfg, repo, &REFACTOR_SPEC, backend, resume).await
+    run_analysis_job(scope, cfg, repo, &REFACTOR_SPEC, backend, resume).await
 }
 pub async fn run_modernize(
-    store: &Store,
+    scope: &CycleScope,
     cfg: &Config,
     repo: &Repo,
     backend: &dyn Backend,
     resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
-    run_analysis_job(store, cfg, repo, &MODERNIZATION_SPEC, backend, resume).await
+    run_analysis_job(scope, cfg, repo, &MODERNIZATION_SPEC, backend, resume).await
 }
 pub async fn run_standards(
-    store: &Store,
+    scope: &CycleScope,
     cfg: &Config,
     repo: &Repo,
     backend: &dyn Backend,
     resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
-    run_analysis_job(store, cfg, repo, &STANDARDS_SPEC, backend, resume).await
+    run_analysis_job(scope, cfg, repo, &STANDARDS_SPEC, backend, resume).await
 }
 
 fn extract_pr_url(text: &str) -> Option<String> {
@@ -3604,7 +3625,10 @@ fn fix_branch(finding: &Finding) -> String {
     format!("{prefix}/{slug}-{}", finding.id)
 }
 
-/// A fix job that owns its finding (`fixing`) and has a working tree.
+/// A fix job that owns its finding (`fixing`) and has a working tree. The
+/// row and the claim are owned apart, by the [`RunningJob`] and
+/// [`FixClaim`] [`start_fix`] returns beside it, since they end at
+/// different points.
 struct FixStart {
     repo: Repo,
     job: i64,
@@ -3615,15 +3639,14 @@ struct FixStart {
     cap: Option<i64>,
 }
 
-/// Put the finding back to `queued` after a step between the claim and the
-/// worker failed; [`Store::finalize_in_progress`] only does so while the
-/// fix still owns it.
-async fn release_claim(store: &Store, fid: i64) {
+/// Put the claimed finding back to `queued` ([`FixClaim::release`]). A
+/// release that fails is logged; the claim is then owed, and the cycle's
+/// settle retries it.
+async fn release_claim(claim: FixClaim) {
+    let fid = claim.finding_id();
     log_write_failure(
-        store
-            .finalize_in_progress(fid, FindingStatus::Fixing, FindingStatus::Queued)
-            .await,
-        format_args!("#{fid}: finalizing fixing -> queued"),
+        claim.release().await,
+        format_args!("#{fid}: releasing fixing -> queued"),
     );
 }
 
@@ -3639,13 +3662,20 @@ fn fix_skipped(why: String) -> CycleSummary {
 /// Everything before the worker runs: budget gate, claim, job row, tree.
 /// `Ok(Err(summary))` is a cycle that ends here without a worker (denied,
 /// skipped, refused, no tree); every failure after the claim releases it.
+#[allow(
+    clippy::too_many_lines,
+    reason = "linear start sequence: gate, claim, job row, tree. Every step \
+              after the claim must release it on failure, which only reads \
+              as correct while the steps sit in order beside the claim"
+)]
 async fn start_fix(
-    store: &Store,
+    scope: &CycleScope,
     cfg: &Config,
     finding: &Finding,
     backend: &dyn Backend,
     resume: Option<&ResumePlan>,
-) -> anyhow::Result<Result<FixStart, CycleSummary>> {
+) -> anyhow::Result<Result<(FixStart, RunningJob, FixClaim), CycleSummary>> {
+    let store = scope.store();
     let fid = finding.id;
     if finding.status != FindingStatus::Queued {
         return Ok(Err(fix_skipped(format!(
@@ -3685,25 +3715,21 @@ async fn start_fix(
     // read the row must win: a job created first would overwrite it with
     // `fixing` and continue or supersede the checkpoint of a finding the
     // operator has just rejected.
-    if !store
-        .claim_in_progress(fid, FindingStatus::Queued, FindingStatus::Fixing)
-        .await?
-    {
+    let Some(claim) = scope.claim_fix(fid).await? else {
         return Ok(Err(fix_skipped(format!(
             "finding #{fid} is no longer queued"
         ))));
-    }
+    };
     if let Err(e) = remove_stale_report(resume) {
-        release_claim(store, fid).await;
+        release_claim(claim).await;
         anyhow::bail!("fix #{fid}: {e}");
     }
-    let created = match store
+    let created = match scope
         .create_job(
             FindingJobKind::Fix.into(),
             repo.id,
             Some(fid),
             cap,
-            JobState::Running,
             Some(anticipated),
             resume.map(|r| r.predecessor_id),
         )
@@ -3711,11 +3737,12 @@ async fn start_fix(
     {
         Ok(j) => j,
         Err(e) => {
-            release_claim(store, fid).await;
+            release_claim(claim).await;
             return job_refused(FindingJobKind::Fix.into(), Some(&repo.name), Some(fid), e)
                 .map(Err);
         }
     };
+    let job = created.job.id();
     // The branch is per finding, so a superseded fix chain of this finding
     // holds it checked out; `open_workspace` releases that chain's tree
     // before adding this one.
@@ -3723,7 +3750,7 @@ async fn start_fix(
         store,
         cfg,
         &repo,
-        &created,
+        created,
         resume,
         TreeSpec::Branch {
             name: branch.clone(),
@@ -3734,22 +3761,27 @@ async fn start_fix(
         Some(fid),
     )
     .await;
-    // A tree that could not be made releases the claim once it is counted.
-    if opened.is_err() {
-        release_claim(store, fid).await;
-    }
-    let (ws, pinned) = match opened? {
-        Ok(opened) => opened,
-        Err(failed) => return Ok(Err(count_unmade_tree(store, fid, created.id, failed).await)),
+    let (ws, pinned, running) = match opened {
+        Ok(Ok(opened)) => opened,
+        // An unmade tree releases the claim once it is counted.
+        Ok(Err(failed)) => return Ok(Err(count_unmade_tree(store, claim, job, failed).await)),
+        Err(e) => {
+            release_claim(claim).await;
+            return Err(e);
+        }
     };
-    Ok(Ok(FixStart {
-        repo,
-        job: created.id,
-        ws,
-        pinned,
-        branch,
-        cap,
-    }))
+    Ok(Ok((
+        FixStart {
+            repo,
+            job,
+            ws,
+            pinned,
+            branch,
+            cap,
+        },
+        running,
+        claim,
+    )))
 }
 
 /// The file a worker of any kind writes when it cannot go on without
@@ -3820,14 +3852,12 @@ async fn hold_on_report(
 /// The worker's prompt. The playbook builders run on a resume too: the
 /// session already holds the playbook, but a builder that fails is a
 /// configuration fault worth surfacing on either path.
-async fn fix_prompt(
-    store: &Store,
+fn fix_prompt(
     cfg: &Config,
     finding: &Finding,
     start: &FixStart,
     resume: Option<&ResumePlan>,
 ) -> anyhow::Result<String> {
-    let fid = finding.id;
     let worktree = &start.ws.tree;
     let repo_notes = Store::repo_notes(&cfg.work_root, start.repo.id);
     let built = match finding.kind {
@@ -3856,13 +3886,7 @@ async fn fix_prompt(
             &repo_notes,
         ),
     };
-    let prompt = match built {
-        Ok(p) => p,
-        Err(e) => {
-            release_claim(store, fid).await;
-            anyhow::bail!("{e}");
-        }
-    };
+    let prompt = built.map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(
         if let Some((reason, detail)) = resume.and_then(|r| r.after_hold.as_ref()) {
             match reason {
@@ -4015,9 +4039,9 @@ fn header(line: &str) -> Option<(String, String)> {
 }
 
 /// Read the worker's result and decide the attempt's outcome. Shipping is
-/// part of deciding (a push or a PR that fails is a failed attempt).
+/// part of deciding (a push or a PR that fails is a failed attempt). An
+/// error leaves the claim to the caller, which releases it.
 async fn conclude_fix(
-    store: &Store,
     (cfg, backend): (&Config, &dyn Backend),
     finding: &Finding,
     start: &FixStart,
@@ -4042,13 +4066,10 @@ async fn conclude_fix(
     };
     // Any bytes the worker wrote are its report; only a file that cannot be
     // read at all (a directory, permissions) is an error, and that must not
-    // strand the finding at `fixing`.
+    // strand the finding at `fixing` (the caller releases the claim).
     let report = match report_file.map(|f| read_report(f)).transpose() {
         Ok(report) => report,
-        Err(e) => {
-            release_claim(store, fid).await;
-            anyhow::bail!("fix #{fid}: cannot read the worker's report: {e}");
-        }
+        Err(e) => anyhow::bail!("fix #{fid}: cannot read the worker's report: {e}"),
     };
     if declined {
         return Ok(FixOutcome::Declined(parse_decline(
@@ -4213,16 +4234,16 @@ impl WorkOf<'_> {
 async fn runner_failed(
     store: &Store,
     (cfg, backend, repo_url): (&Config, &dyn Backend, &str),
-    (work, job): (WorkOf<'_>, i64),
+    (work, running): (WorkOf<'_>, RunningJob),
     err: &anyhow::Error,
 ) -> Option<CycleSummary> {
+    let job = running.id();
     if let Some(host) = unreachable_now(cfg, repo_url, backend).await {
         log_write_failure(
-            store
-                .fail_unstarted_job(
-                    job,
-                    &format!("offline: {host} unreachable; {RUNNER_ERROR}: {err}"),
-                )
+            running
+                .fail_unstarted(&format!(
+                    "offline: {host} unreachable; {RUNNER_ERROR}: {err}"
+                ))
                 .await,
             format_args!("job {job}: failing unstarted"),
         );
@@ -4232,7 +4253,7 @@ async fn runner_failed(
     }
     let detail = format!("{RUNNER_ERROR}: {err}");
     log_write_failure(
-        store.fail_unstarted_job(job, &detail).await,
+        running.fail_unstarted(&detail).await,
         format_args!("job {job}: failing unstarted"),
     );
     let mut summary = CycleSummary::default();
@@ -4314,10 +4335,11 @@ async fn runner_failed(
 /// keeps it whole.
 async fn count_unmade_tree(
     store: &Store,
-    fid: i64,
+    claim: FixClaim,
     job: i64,
     mut summary: CycleSummary,
 ) -> CycleSummary {
+    let fid = claim.finding_id();
     let note = summary.failure.take().unwrap_or_default();
     let why = note
         .strip_prefix(TREE_NOT_MADE)
@@ -4335,7 +4357,7 @@ async fn count_unmade_tree(
         &mut summary,
     )
     .await;
-    release_claim(store, fid).await;
+    release_claim(claim).await;
     summary.failure = Some(note);
     summary
 }
@@ -4482,11 +4504,12 @@ async fn fix_event(
 /// nothing concluded.
 async fn hold_prerequisite(
     store: &Store,
-    fid: i64,
     start: &FixStart,
+    claim: FixClaim,
     report: &str,
     summary: &mut CycleSummary,
 ) -> anyhow::Result<()> {
+    let fid = claim.finding_id();
     let held = hold_on_report(
         store,
         FindingJobKind::Fix,
@@ -4496,7 +4519,7 @@ async fn hold_prerequisite(
         report,
     )
     .await;
-    release_claim(store, fid).await;
+    release_claim(claim).await;
     if !held? {
         anyhow::bail!("fix #{fid}: BLOCKED.md, but the fix has left its tier; nothing held");
     }
@@ -4515,6 +4538,7 @@ async fn record_declined_fix(
     store: &Store,
     finding: &Finding,
     start: &FixStart,
+    claim: FixClaim,
     decline: Decline,
     summary: &mut CycleSummary,
 ) {
@@ -4535,12 +4559,11 @@ async fn record_declined_fix(
         holds_while.as_deref(),
         &depends_on,
     );
-    log_write_failure(
-        store
-            .set_anchored_verdict(fid, status, reason, anchor.as_ref())
-            .await,
-        format_args!("#{fid}: verdict -> {status}"),
-    );
+    // A claim whose verdict could not be written goes back to `queued`.
+    if let Err((claim, e)) = claim.conclude(status, reason, anchor.as_ref()).await {
+        log_write_failure(Err::<(), _>(e), format_args!("#{fid}: verdict -> {status}"));
+        release_claim(claim).await;
+    }
     let first_line: String = reason
         .lines()
         .next()
@@ -4554,7 +4577,6 @@ async fn record_declined_fix(
     };
     let _ = fix_event(store, "fix", fid, job, message).await;
     summary.outcome = Some(status.as_str().into());
-    release_claim(store, fid).await;
 }
 
 /// Write a fix outcome: the finding's status, the event, and the summary.
@@ -4562,10 +4584,11 @@ async fn record_declined_fix(
 /// hold, a decline, and an attempt that could not publish offline (none of
 /// them concluded the work's attempt; a streak's hold did, and spends it);
 /// any outcome that leaves the finding `fixing` returns it to `queued`.
+/// Every outcome ends `claim`.
 async fn record_fix_outcome(
     store: &Store,
     finding: &Finding,
-    start: &FixStart,
+    (start, claim): (&FixStart, FixClaim),
     outcome: FixOutcome,
     stdout_tail: &str,
     summary: &mut CycleSummary,
@@ -4573,19 +4596,29 @@ async fn record_fix_outcome(
     let fid = finding.id;
     let job = start.job;
     let tail = crate::util::tail(stdout_tail, 300);
-    match outcome {
+    // The claim still to release once the outcome is written: none once
+    // the finding has moved on to `pr_open`.
+    let unreleased = match outcome {
         FixOutcome::Held { report } => {
-            return hold_prerequisite(store, fid, start, &report, summary).await;
+            return hold_prerequisite(store, start, claim, &report, summary).await;
         }
         FixOutcome::Declined(decline) => {
-            record_declined_fix(store, finding, start, decline, summary).await;
+            record_declined_fix(store, finding, start, claim, decline, summary).await;
             return Ok(());
         }
         FixOutcome::Shipped { pr_url, recovered } => {
-            log_write_failure(
-                store.set_finding_pr_open(fid, &pr_url).await,
-                format_args!("#{fid}: status -> pr_open ({pr_url})"),
-            );
+            // A claim whose `pr_open` could not be written goes back to
+            // `queued`.
+            let unopened = match claim.open_pr(&pr_url).await {
+                Ok(()) => None,
+                Err((claim, e)) => {
+                    log_write_failure(
+                        Err::<(), _>(e),
+                        format_args!("#{fid}: status -> pr_open ({pr_url})"),
+                    );
+                    Some(claim)
+                }
+            };
             let message = if recovered {
                 format!("#{fid} recovered existing PR: {pr_url}")
             } else {
@@ -4594,6 +4627,7 @@ async fn record_fix_outcome(
             let _ = fix_event(store, "ship", fid, job, message).await;
             summary.outcome = Some("pr_open".into());
             summary.pr_url = Some(pr_url);
+            unopened
         }
         FixOutcome::Suspended => {
             // Back to queued below, where the fix tier continues it.
@@ -4610,9 +4644,11 @@ async fn record_fix_outcome(
             .await;
             summary.outcome = Some("suspended".into());
             summary.worktree = Some(start.ws.tree.to_string_lossy().into_owned());
+            Some(claim)
         }
         FixOutcome::Failed { failure } => {
             record_fix_failure(store, fid, job, &failure, tail, HoldReason::Stuck, summary).await;
+            Some(claim)
         }
         FixOutcome::Offline { host } => {
             // Nothing concluded, so a one-shot override is kept for the
@@ -4629,17 +4665,19 @@ async fn record_fix_outcome(
                 host,
             )
             .await;
-            release_claim(store, fid).await;
+            release_claim(claim).await;
             return Ok(());
         }
-    }
+    };
     if finding.budget_override == Some(BudgetOverride::Once) {
         log_write_failure(
             store.set_budget_override(fid, None).await,
             format_args!("#{fid}: clearing one-shot budget override"),
         );
     }
-    release_claim(store, fid).await;
+    if let Some(claim) = unreleased {
+        release_claim(claim).await;
+    }
     Ok(())
 }
 
@@ -4647,18 +4685,27 @@ async fn record_fix_outcome(
 /// worker, then decide ([`conclude_fix`]) and record
 /// ([`record_fix_outcome`]) what the attempt amounts to.
 pub async fn run_fix(
-    store: &Store,
+    scope: &CycleScope,
     cfg: &Config,
     finding: &Finding,
     backend: &dyn Backend,
     resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
+    let store = scope.store();
     let fid = finding.id;
-    let start = match start_fix(store, cfg, finding, backend, resume).await? {
+    let (start, running, claim) = match start_fix(scope, cfg, finding, backend, resume).await? {
         Ok(start) => start,
         Err(ended) => return Ok(ended),
     };
-    let prompt = fix_prompt(store, cfg, finding, &start, resume).await?;
+    // Any early return from here on drops `running`: the cycle's settle
+    // records the abandoned job.
+    let prompt = match fix_prompt(cfg, finding, &start, resume) {
+        Ok(prompt) => prompt,
+        Err(e) => {
+            release_claim(claim).await;
+            return Err(e);
+        }
+    };
     let model = cfg.model_for("fix");
     let rr = match backend
         .run(
@@ -4675,21 +4722,26 @@ pub async fn run_fix(
         Err(e) => {
             // Counted while the claim still holds the finding, as a
             // worker's failure is.
-            let ran = (WorkOf::Finding(FindingJobKind::Fix, fid), start.job);
+            let ran = (WorkOf::Finding(FindingJobKind::Fix, fid), running);
             let denied = runner_failed(store, (cfg, backend, &start.repo.url), ran, &e).await;
-            release_claim(store, fid).await;
+            release_claim(claim).await;
             close_workspace(store, &start.ws).await;
             return denied.ok_or(e);
         }
     };
-    let ran = (WorkOf::Finding(FindingJobKind::Fix, fid), start.job);
-    if let Some(denied) = unmetered_offline(store, cfg, backend, &start.repo.url, ran, &rr).await {
-        release_claim(store, fid).await;
-        close_workspace(store, &start.ws).await;
-        return Ok(denied);
-    }
+    let ran = (WorkOf::Finding(FindingJobKind::Fix, fid), running);
+    let running = match unmetered_offline(store, cfg, backend, &start.repo.url, ran, &rr).await {
+        ControlFlow::Continue(running) => running,
+        ControlFlow::Break(denied) => {
+            release_claim(claim).await;
+            close_workspace(store, &start.ws).await;
+            return Ok(denied);
+        }
+    };
     let state = log_write_failure(
-        record_job(store, start.job, &rr, model, resume).await,
+        record_job(store, running, &rr, model, resume)
+            .await
+            .map(|r| r.state()),
         format_args!("job {}: recording outcome", start.job),
     )
     .unwrap_or(JobState::Failed);
@@ -4702,11 +4754,17 @@ pub async fn run_fix(
         tokens_new: Some(rr.tokens_new),
         ..Default::default()
     };
-    let outcome = conclude_fix(store, (cfg, backend), finding, &start, state).await?;
+    let outcome = match conclude_fix((cfg, backend), finding, &start, state).await {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            release_claim(claim).await;
+            return Err(e);
+        }
+    };
     record_fix_outcome(
         store,
         finding,
-        &start,
+        (&start, claim),
         outcome,
         &rr.stdout_tail,
         &mut summary,
@@ -5330,13 +5388,13 @@ async fn engage_view(
 /// Everything before the worker runs: target, fetch, budget gate, PR view,
 /// job row, tree. `Ok(Err(summary))` is a cycle that ends here.
 async fn start_engage(
-    store: &Store,
+    scope: &CycleScope,
     cfg: &Config,
     finding: &Finding,
     backend: &dyn Backend,
     resume: Option<&ResumePlan>,
-) -> anyhow::Result<Result<EngageStart, CycleSummary>> {
-    let fid = finding.id;
+) -> anyhow::Result<Result<(EngageStart, RunningJob), CycleSummary>> {
+    let (store, fid) = (scope.store(), finding.id);
     let (repo, ps, head_ref, pr_number) = match engage_target(store, finding, resume).await {
         Ok(target) => target,
         Err(e) => {
@@ -5371,13 +5429,12 @@ async fn start_engage(
         Err(denied) => return Ok(Err(denied)),
     };
 
-    let created = match store
+    let created = match scope
         .create_job(
             FindingJobKind::Engage.into(),
             repo.id,
             Some(fid),
             cap,
-            JobState::Running,
             Some(anticipated),
             resume.map(|r| r.predecessor_id),
         )
@@ -5394,11 +5451,12 @@ async fn start_engage(
             .map(Err);
         }
     };
-    let (ws, pinned) = match open_workspace(
+    let job = created.job.id();
+    let (ws, pinned, running) = match open_workspace(
         store,
         cfg,
         &repo,
-        &created,
+        created,
         resume,
         TreeSpec::PrHead {
             head_ref: head_ref.clone(),
@@ -5411,10 +5469,7 @@ async fn start_engage(
     {
         Ok(opened) => opened,
         Err(failed) => {
-            return Ok(Err(count_unmade_engage_tree(
-                store, fid, created.id, failed,
-            )
-            .await));
+            return Ok(Err(count_unmade_engage_tree(store, fid, job, failed).await));
         }
     };
     // Only a fresh attempt reads the PR, and its playbook shows the worker
@@ -5423,23 +5478,26 @@ async fn start_engage(
         let seen = latest_activity_ms(pr);
         // Unrecorded, a resume of this chain falls back to the mark the
         // chain started with: a re-raised comment, never a hidden one.
-        let _ = store.set_seen_activity(created.id, seen).await;
+        let _ = store.set_seen_activity(job, seen).await;
         Some(seen)
     } else {
-        store.seen_activity(created.id).await.ok().flatten()
+        store.seen_activity(job).await.ok().flatten()
     };
-    Ok(Ok(EngageStart {
-        repo,
-        ps,
-        head_ref,
-        pr_number,
-        pr,
-        job: created.id,
-        ws,
-        pinned,
-        cap,
-        seen_activity,
-    }))
+    Ok(Ok((
+        EngageStart {
+            repo,
+            ps,
+            head_ref,
+            pr_number,
+            pr,
+            job,
+            ws,
+            pinned,
+            cap,
+            seen_activity,
+        },
+        running,
+    )))
 }
 
 /// The worker asked to withdraw the PR (`WITHDRAW.md`): close it on the
@@ -5660,12 +5718,14 @@ async fn record_engage(
     store: &Store,
     (net, finding): ((&Config, &dyn Backend), &Finding),
     start: &EngageStart,
-    state: JobState,
+    recorded: Option<RecordedJob>,
     published: Result<(bool, bool), String>,
     stdout_tail: &str,
     summary: &mut CycleSummary,
 ) {
     let (fid, job, ps, pr_number) = (finding.id, start.job, &start.ps, start.pr_number);
+    // An outcome that could not be recorded reads as `failed`.
+    let state = recorded.map_or(JobState::Failed, |r| r.state());
     let tail = crate::util::tail(stdout_tail, 300);
     match published {
         // A pause, not a failure: the tree and transcript are kept, and
@@ -5701,9 +5761,11 @@ async fn record_engage(
             return;
         }
         Err(fail) => {
-            if state == JobState::Done {
+            // Only a recorded `done` is revised: an attempt that did not
+            // finish has nothing published to fail.
+            if let Some(recorded) = recorded.filter(|r| r.state() == JobState::Done) {
                 log_write_failure(
-                    store.fail_job(job, fail.as_str()).await,
+                    store.fail_job(&recorded, fail.as_str()).await,
                     format_args!("job {job}: failing ({fail})"),
                 );
             }
@@ -5945,16 +6007,17 @@ fn engage_prompt(
 /// run the worker, then withdraw the PR ([`withdraw_pr`]) or publish its
 /// work ([`push_and_reply`]) and record that ([`record_engage`]).
 pub async fn run_engage(
-    store: &Store,
+    scope: &CycleScope,
     cfg: &Config,
     finding: &Finding,
     backend: &dyn Backend,
     resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
+    let store = scope.store();
     let fid = finding.id;
     remove_stale_report(resume)?;
-    let start = match start_engage(store, cfg, finding, backend, resume).await? {
-        Ok(start) => start,
+    let (start, running) = match start_engage(scope, cfg, finding, backend, resume).await? {
+        Ok(started) => started,
         Err(ended) => return Ok(ended),
     };
     let prompt = engage_prompt(cfg, finding, &start, resume)?;
@@ -5972,22 +6035,25 @@ pub async fn run_engage(
     {
         Ok(rr) => rr,
         Err(e) => {
-            let ran = (WorkOf::Finding(FindingJobKind::Engage, fid), start.job);
+            let ran = (WorkOf::Finding(FindingJobKind::Engage, fid), running);
             let denied = runner_failed(store, (cfg, backend, &start.repo.url), ran, &e).await;
             close_workspace(store, &start.ws).await;
             return denied.ok_or(e);
         }
     };
-    let ran = (WorkOf::Finding(FindingJobKind::Engage, fid), start.job);
-    if let Some(denied) = unmetered_offline(store, cfg, backend, &start.repo.url, ran, &rr).await {
-        close_workspace(store, &start.ws).await;
-        return Ok(denied);
-    }
-    let state = log_write_failure(
-        record_job(store, start.job, &rr, model, resume).await,
+    let ran = (WorkOf::Finding(FindingJobKind::Engage, fid), running);
+    let running = match unmetered_offline(store, cfg, backend, &start.repo.url, ran, &rr).await {
+        ControlFlow::Continue(running) => running,
+        ControlFlow::Break(denied) => {
+            close_workspace(store, &start.ws).await;
+            return Ok(denied);
+        }
+    };
+    let recorded = log_write_failure(
+        record_job(store, running, &rr, model, resume).await,
         format_args!("job {}: recording outcome", start.job),
-    )
-    .unwrap_or(JobState::Failed);
+    );
+    let state = recorded.map_or(JobState::Failed, |r| r.state());
     let mut summary = CycleSummary {
         kind: Some(FindingJobKind::Engage.into()),
         finding_id: Some(fid),
@@ -6027,7 +6093,7 @@ pub async fn run_engage(
             store,
             ((cfg, backend), finding),
             &start,
-            state,
+            recorded,
             published,
             &rr.stdout_tail,
             &mut summary,
@@ -6037,7 +6103,7 @@ pub async fn run_engage(
     };
     if closed_on_forge {
         continue_into_harvest(
-            store,
+            scope,
             cfg,
             backend,
             &start.repo,
@@ -6099,7 +6165,7 @@ async fn engage_blocked(
 /// review. That is the whole fallback — no retry. The caller releases the
 /// tree afterwards, as it always does.
 async fn continue_into_harvest(
-    store: &Store,
+    scope: &CycleScope,
     cfg: &Config,
     backend: &dyn Backend,
     repo: &Repo,
@@ -6109,6 +6175,7 @@ async fn continue_into_harvest(
     pinned: &str,
     session_file: Option<&str>,
 ) {
+    let store = scope.store();
     let Some(session_file) = session_file.map(PathBuf::from) else {
         let _ = store
             .log_event(
@@ -6173,7 +6240,7 @@ async fn continue_into_harvest(
             Some(fid),
         )
         .await;
-    if let Err(e) = run_harvest(store, cfg, &finding, backend, Some(&plan)).await {
+    if let Err(e) = run_harvest(scope, cfg, &finding, backend, Some(&plan)).await {
         let _ = store
             .log_event(
                 "error",
@@ -6355,12 +6422,13 @@ async fn harvest_blocked(
               ingest follow-up findings"
 )]
 pub async fn run_harvest(
-    store: &Store,
+    scope: &CycleScope,
     cfg: &Config,
     finding: &Finding,
     backend: &dyn Backend,
     resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
+    let store = scope.store();
     let fid = finding.id;
     let Ok(Some(repo)) = store.get_repo_by_id(finding.repo_id).await else {
         let _ = store
@@ -6521,13 +6589,12 @@ pub async fn run_harvest(
         String::new()
     };
 
-    let created = match store
+    let created = match scope
         .create_job(
             FindingJobKind::Harvest.into(),
             repo.id,
             Some(fid),
             cap,
-            JobState::Running,
             Some(anticipated),
             resume.map(|r| r.predecessor_id),
         )
@@ -6543,12 +6610,12 @@ pub async fn run_harvest(
             );
         }
     };
-    let job = created.id;
-    let (ws, pinned) = match open_workspace(
+    let job = created.job.id();
+    let (ws, pinned, running) = match open_workspace(
         store,
         cfg,
         &repo,
-        &created,
+        created,
         resume,
         TreeSpec::Detached {
             at: format!("origin/{}", repo.default_branch),
@@ -6633,27 +6700,32 @@ pub async fn run_harvest(
             // harvest's own: its job is closed, nothing is counted.
             let denied = if handoff {
                 log_write_failure(
-                    store
-                        .fail_unstarted_job(job, &format!("{RUNNER_ERROR}: {e}"))
+                    running
+                        .fail_unstarted(&format!("{RUNNER_ERROR}: {e}"))
                         .await,
                     format_args!("job {job}: failing unstarted"),
                 );
                 None
             } else {
-                let ran = (WorkOf::Finding(FindingJobKind::Harvest, fid), job);
+                let ran = (WorkOf::Finding(FindingJobKind::Harvest, fid), running);
                 runner_failed(store, (cfg, backend, &repo.url), ran, &e).await
             };
             close_workspace(store, &ws).await;
             return denied.ok_or(e);
         }
     };
-    let ran = (WorkOf::Finding(FindingJobKind::Harvest, fid), job);
-    if let Some(denied) = unmetered_offline(store, cfg, backend, &repo.url, ran, &rr).await {
-        close_workspace(store, &ws).await;
-        return Ok(denied);
-    }
+    let ran = (WorkOf::Finding(FindingJobKind::Harvest, fid), running);
+    let running = match unmetered_offline(store, cfg, backend, &repo.url, ran, &rr).await {
+        ControlFlow::Continue(running) => running,
+        ControlFlow::Break(denied) => {
+            close_workspace(store, &ws).await;
+            return Ok(denied);
+        }
+    };
     let state = log_write_failure(
-        record_job(store, job, &rr, model, resume).await,
+        record_job(store, running, &rr, model, resume)
+            .await
+            .map(|r| r.state()),
         format_args!("job {job}: recording outcome"),
     )
     .unwrap_or(JobState::Failed);
@@ -7093,30 +7165,36 @@ async fn offline_denial(
 /// work needs is unreachable: it never got to the work, so its failure is
 /// not counted. Its job is closed `failed` as unstarted, which leaves the
 /// checkpoint it was continuing in place, and the cycle ends as
-/// [`offline_denial`]. `None` for any other run: one that did metered work
+/// [`offline_denial`] (`Break`). Any other run is handed back
+/// (`Continue`) for its outcome to be recorded: one that did metered work
 /// failed at the work, and is counted as before.
 async fn unmetered_offline(
     store: &Store,
     cfg: &Config,
     backend: &dyn Backend,
     repo_url: &str,
-    (work, job): (WorkOf<'_>, i64),
+    (work, running): (WorkOf<'_>, RunningJob),
     rr: &RunResult,
-) -> Option<CycleSummary> {
-    if !matches!(job_state(rr), JobState::Failed | JobState::Killed) || rr.tokens_new > 0 {
-        return None;
+) -> ControlFlow<CycleSummary, RunningJob> {
+    if !matches!(job_state(rr), FinishedState::Failed | FinishedState::Killed) || rr.tokens_new > 0
+    {
+        return ControlFlow::Continue(running);
     }
-    let host = unreachable_now(cfg, repo_url, backend).await?;
+    let Some(host) = unreachable_now(cfg, repo_url, backend).await else {
+        return ControlFlow::Continue(running);
+    };
+    let job = running.id();
     log_write_failure(
-        store
-            .fail_unstarted_job(
-                job,
-                &format!("offline: {host} unreachable; the worker did no metered work"),
-            )
+        running
+            .fail_unstarted(&format!(
+                "offline: {host} unreachable; the worker did no metered work"
+            ))
             .await,
         format_args!("job {job}: failing unstarted"),
     );
-    Some(offline_denial(store, work.job_kind(), work.finding_id(), Some(job), host).await)
+    ControlFlow::Break(
+        offline_denial(store, work.job_kind(), work.finding_id(), Some(job), host).await,
+    )
 }
 
 /// The host `candidate` needs that cannot be reached, if any; always
@@ -7139,14 +7217,42 @@ async fn network_gate(
 }
 
 /// Run one cycle: sync PRs, `pick_next`, dispatch to the appropriate runner (`scheduler.run_cycle`).
+///
+/// Takes `recovered` because a cycle creates jobs, which a store whose
+/// dead-process rows are unsettled must not get ([`Recovered`]). Leaves
+/// no job it created `running` and no claim it took `fixing`, however its
+/// runner returned: each is a [`RunningJob`] or [`FixClaim`] the runner
+/// either ended or dropped, and the cycle's [`CycleScope`] settles what
+/// was dropped. Nothing still held, by this cycle or any other, is touched.
+///
+/// A settle that fails is the cycle's error, ahead of any the runner
+/// returned, so the status page and the 5-minute error backoff know.
+/// What it failed on is owed to the store's ledger, and the next cycle
+/// settles that first ([`Recovered::settle_unsettled`]); while that
+/// still fails, no cycle starts, so nothing new is created beside rows
+/// that hold budget and trees with no runner.
 pub async fn run_cycle(
-    store: &Store,
+    recovered: &Recovered,
     cfg: &Config,
     backend: &dyn Backend,
     force_repo: Option<&str>,
 ) -> CycleSummary {
+    let store = recovered.store();
+    // Every settled row already leaves its own event; this is only the
+    // per-cycle count, so it is logged whatever it is.
+    if let Err(e) = recovered
+        .settle_unsettled(&cfg.work_root)
+        .await
+        .map(|settled| tracing::debug!("owed settles: {settled:?}"))
+    {
+        return CycleSummary {
+            error: Some(settle_failed(store, "an earlier cycle's", &e).await),
+            ..Default::default()
+        };
+    }
+    let scope = CycleScope::open(recovered);
     // Catch-all
-    match run_cycle_inner(store, cfg, backend, force_repo).await {
+    let mut summary = match run_cycle_inner(&scope, cfg, backend, force_repo).await {
         Ok(result) => result,
         Err(e) => {
             let _ = store
@@ -7157,24 +7263,45 @@ pub async fn run_cycle(
                 ..Default::default()
             }
         }
+    };
+    if let Err(e) = scope.settle(&cfg.work_root).await {
+        let msg = settle_failed(store, "the cycle's", &e).await;
+        summary.error = Some(match summary.error.take() {
+            Some(runner) => format!("{msg}; {runner}"),
+            None => msg,
+        });
     }
+    summary
+}
+
+/// Log a failed settle of `whose` abandoned work; the message it logged.
+async fn settle_failed(store: &Store, whose: &str, e: &anyhow::Error) -> String {
+    // What it means for the operator first: `describe_cycle` keeps the
+    // first 200 characters, and a store error can be longer than that.
+    let msg = format!(
+        "settling {whose} abandoned work failed, no new work starts until a retry succeeds: {e:#}"
+    );
+    tracing::error!("{msg}");
+    let _ = store.log_event("error", &msg, None, None).await;
+    msg
 }
 
 /// Run the picked candidate through its kind's executor.
 ///
 /// Exhaustive dispatch on Candidate variant and sub-kind.
 async fn dispatch(
-    store: &Store,
+    scope: &CycleScope,
     cfg: &Config,
     backend: &dyn Backend,
     candidate: &Candidate,
 ) -> anyhow::Result<CycleSummary> {
+    let store = scope.store();
     match candidate {
         Candidate::Finding {
             kind, finding_id, ..
-        } => run_finding_job(store, cfg, backend, *kind, *finding_id, None).await,
+        } => run_finding_job(scope, cfg, backend, *kind, *finding_id, None).await,
         Candidate::Repo { kind, repo_id, .. } => {
-            run_repo_job(store, cfg, backend, *kind, *repo_id, None).await
+            run_repo_job(scope, cfg, backend, *kind, *repo_id, None).await
         }
         // A resume runs through the executor of the kind that was
         // suspended — so ingest, watermarks and PR handling are that
@@ -7203,7 +7330,7 @@ async fn dispatch(
             let resume = Some(plan.as_ref());
             match plan.kind {
                 JobKind::Repo(kind) => {
-                    run_repo_job(store, cfg, backend, kind, plan.repo_id, resume).await
+                    run_repo_job(scope, cfg, backend, kind, plan.repo_id, resume).await
                 }
                 JobKind::Finding(kind) => {
                     // A finding-kind job always recorded its target, so a
@@ -7211,7 +7338,7 @@ async fn dispatch(
                     let fid = plan
                         .finding_id
                         .ok_or_else(|| anyhow::anyhow!("resume of a {kind} job with no finding"))?;
-                    run_finding_job(store, cfg, backend, kind, fid, resume).await
+                    run_finding_job(scope, cfg, backend, kind, fid, resume).await
                 }
             }
         }
@@ -7219,44 +7346,46 @@ async fn dispatch(
 }
 
 async fn run_repo_job(
-    store: &Store,
+    scope: &CycleScope,
     cfg: &Config,
     backend: &dyn Backend,
     kind: RepoJobKind,
     repo_id: i64,
     resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
+    let store = scope.store();
     let repo = store
         .get_repo_by_id(repo_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("repo {repo_id} not found"))?;
     match kind {
-        RepoJobKind::Hunt => run_hunt(store, cfg, &repo, backend, resume).await,
-        RepoJobKind::TestGap => run_test_gap(store, cfg, &repo, backend, resume).await,
-        RepoJobKind::DepUpdate => run_dep_update(store, cfg, &repo, backend, resume).await,
-        RepoJobKind::Refactor => run_refactor(store, cfg, &repo, backend, resume).await,
-        RepoJobKind::Modernization => run_modernize(store, cfg, &repo, backend, resume).await,
-        RepoJobKind::Standards => run_standards(store, cfg, &repo, backend, resume).await,
+        RepoJobKind::Hunt => run_hunt(scope, cfg, &repo, backend, resume).await,
+        RepoJobKind::TestGap => run_test_gap(scope, cfg, &repo, backend, resume).await,
+        RepoJobKind::DepUpdate => run_dep_update(scope, cfg, &repo, backend, resume).await,
+        RepoJobKind::Refactor => run_refactor(scope, cfg, &repo, backend, resume).await,
+        RepoJobKind::Modernization => run_modernize(scope, cfg, &repo, backend, resume).await,
+        RepoJobKind::Standards => run_standards(scope, cfg, &repo, backend, resume).await,
     }
 }
 
 async fn run_finding_job(
-    store: &Store,
+    scope: &CycleScope,
     cfg: &Config,
     backend: &dyn Backend,
     kind: FindingJobKind,
     finding_id: i64,
     resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
+    let store = scope.store();
     let finding = store
         .get_finding(finding_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("finding {finding_id} not found"))?;
     match kind {
-        FindingJobKind::Engage => run_engage(store, cfg, &finding, backend, resume).await,
-        FindingJobKind::Harvest => run_harvest(store, cfg, &finding, backend, resume).await,
-        FindingJobKind::Recheck => run_recheck(store, cfg, &finding, backend, resume).await,
-        FindingJobKind::Fix => run_fix(store, cfg, &finding, backend, resume).await,
+        FindingJobKind::Engage => run_engage(scope, cfg, &finding, backend, resume).await,
+        FindingJobKind::Harvest => run_harvest(scope, cfg, &finding, backend, resume).await,
+        FindingJobKind::Recheck => run_recheck(scope, cfg, &finding, backend, resume).await,
+        FindingJobKind::Fix => run_fix(scope, cfg, &finding, backend, resume).await,
     }
 }
 
@@ -7267,11 +7396,12 @@ async fn run_finding_job(
               which is exactly what extracting them into helpers destroys"
 )]
 async fn run_cycle_inner(
-    store: &Store,
+    scope: &CycleScope,
     cfg: &Config,
     backend: &dyn Backend,
     force_repo: Option<&str>,
 ) -> anyhow::Result<CycleSummary> {
+    let store = scope.store();
     // (0) Cheap PR sync
     let has_pr_open = !store
         .list_findings(&FindingFilter {
@@ -7335,7 +7465,7 @@ async fn run_cycle_inner(
     // alone, so the work is retried as soon as the rotation reaches it and
     // is held after three identical failures (WORK-MODEL.md §17), where it
     // used to be bumped here and wait out its interval each time.
-    let mut result = dispatch(store, cfg, backend, &candidate).await?;
+    let mut result = dispatch(scope, cfg, backend, &candidate).await?;
 
     if sync.is_some() {
         result.sync = sync;

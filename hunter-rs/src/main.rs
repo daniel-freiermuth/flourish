@@ -3,11 +3,13 @@
 //! manages accounts.
 //!
 //! Hand-parsed args -- a handful of words do not justify a CLI dependency.
-//! The daemon takes an exclusive lock on <`work_root>/hunter.lock` and
-//! owns the database schema: it runs the embedded migrations on startup.
-//! `user` commands do not take the lock -- they are meant to run next to a
-//! live daemon -- but they open the database read-write and run the same
-//! migrations.
+//! The daemon takes exclusive locks on <`work_root>/hunter.lock` and
+//! <`db_path>-daemon.lock` (`recovery::DaemonLock`) and owns the database
+//! schema: it runs the embedded migrations on startup. `user` commands do
+//! not take the locks -- they are meant to run next to a live daemon --
+//! but they open the database read-write and run the same migrations.
+//! Their store has no startup token, so they cannot reconcile or create
+//! jobs under the daemon.
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;

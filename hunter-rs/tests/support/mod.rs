@@ -123,6 +123,54 @@ pub async fn fresh_store(dir: &TempDir, name: &str) -> (PathBuf, Store) {
     (path, store)
 }
 
+/// Put finding `id` at `status` with a raw UPDATE on the database at
+/// `db`, for fixtures that need any status -- `fixing` included, which
+/// `Store::set_finding_status` refuses because only an owning
+/// `CycleScope::claim_fix` may take that claim. The status triggers fire
+/// as for any write.
+pub async fn seed_status(db: &Path, id: i64, status: hunter::domain::FindingStatus) {
+    let pool = SqlitePool::connect_with(SqliteConnectOptions::new().filename(db))
+        .await
+        .expect("open pool");
+    sqlx::query("UPDATE findings SET status = ?1 WHERE id = ?2")
+        .bind(status.as_str())
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect("seed status");
+    pool.close().await;
+}
+
+/// `store`'s proof of recovery, spending its startup token as "nothing
+/// to reconcile" the first time: a fixture's store was made by the test,
+/// so no dead process left anything in it. A test of the startup
+/// reconcile takes the token itself instead
+/// ([`Store::take_unreconciled`]).
+pub fn recovered(store: &Store) -> hunter::recovery::Recovered {
+    store.recovered().unwrap_or_else(|| {
+        store
+            .take_unreconciled()
+            .expect("the store is mid-reconcile")
+            .assume_clean()
+    })
+}
+
+/// The authority for jobs a test creates or runners it calls directly
+/// ([`hunter::recovery::CycleScope`]). What the runner abandons is owed
+/// to the store's ledger and settled only by a cycle, so a test asserts
+/// what the runner itself left. A fixture job that stands for one a live
+/// owner still runs is kept out of the ledger with
+/// [`hunter::recovery::RunningJob::disown`] ([`live_job`]).
+pub fn scope(store: &Store) -> hunter::recovery::CycleScope {
+    hunter::recovery::CycleScope::open(&recovered(store))
+}
+
+/// The id of a fixture job left `running` for a live owner: created, and
+/// disowned so no settle takes it.
+pub fn live_job(created: hunter::recovery::CreatedJob) -> i64 {
+    created.job.disown()
+}
+
 // ---------------------------------------------------------------------------
 // Fake executables on PATH
 // ---------------------------------------------------------------------------

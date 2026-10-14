@@ -30,6 +30,7 @@ dev-db:
 lint:
     cargo fmt --check
     cargo clippy --all-targets -- -D warnings
+    cargo clippy --lib --bins -- -D warnings
     ./check-sql.sh
 
 check:

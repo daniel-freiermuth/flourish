@@ -2169,7 +2169,7 @@ async fn verdict_reason_required_before_any_status_change() {
 /// Finding 1 queued, its fix held as a missing prerequisite after a job
 /// whose worker ran: the state, the job and the report.
 async fn held_fix_state() -> (TestState, i64, String) {
-    use hunter::domain::{FindingJobKind, FindingStatus, HoldReason, JobState};
+    use hunter::domain::{FindingJobKind, FindingStatus, FinishedState, HoldReason};
     use hunter::store::JobOutcome;
 
     let state = test_state().await;
@@ -2178,39 +2178,33 @@ async fn held_fix_state() -> (TestState, i64, String) {
         .set_finding_status(1, FindingStatus::Queued)
         .await
         .unwrap();
-    let job_id = state
-        .store
+    let job_id = support::scope(&state.store)
         .create_job(
             FindingJobKind::Fix.into(),
             1,
             Some(1),
             Some(5000),
-            JobState::Running,
             Some(1000),
             None,
         )
         .await
         .unwrap()
-        .id;
-    state
-        .store
-        .complete_job(
-            job_id,
-            &JobOutcome {
-                state: JobState::Done,
-                tokens_new: 900,
-                calls: 4,
-                exit_code: Some(0),
-                killed_reason: None,
-                session_file: Some("/s/fix/session.jsonl"),
-                notes: Some("implemented fix"),
-                model: None,
-                usage_delta: None,
-                finished_at: 2000,
-            },
-        )
+        .job
+        .complete(&JobOutcome {
+            state: FinishedState::Done,
+            tokens_new: 900,
+            calls: 4,
+            exit_code: Some(0),
+            killed_reason: None,
+            session_file: Some("/s/fix/session.jsonl"),
+            notes: Some("implemented fix"),
+            model: None,
+            usage_delta: None,
+            finished_at: 2000,
+        })
         .await
-        .unwrap();
+        .unwrap()
+        .id();
     let reason = format!(
         "Baseline verification is unavailable.\n{}\nDiagnostic tail",
         "x".repeat(800)
@@ -2372,7 +2366,7 @@ async fn verdicts_follow_the_finding_state_machine() {
     let verdicts = FindingStatus::ALL.into_iter().filter(|s| s.is_verdict());
     for to in verdicts {
         for from in FindingStatus::ALL {
-            state.store.set_finding_status(1, from).await.unwrap();
+            support::seed_status(&state.config.db_path, 1, from).await;
             let before = state.store.get_finding(1).await.unwrap().unwrap();
             let (status, body) = post(
                 &state,

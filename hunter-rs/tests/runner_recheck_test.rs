@@ -52,9 +52,15 @@ impl Fixture {
 
     async fn recheck(&self, backend: &ScriptedBackend) -> CycleSummary {
         let finding = self.finding().await;
-        run_recheck(&self.store, &self.cfg, &finding, backend, None)
-            .await
-            .unwrap()
+        run_recheck(
+            &support::scope(&self.store),
+            &self.cfg,
+            &finding,
+            backend,
+            None,
+        )
+        .await
+        .unwrap()
     }
 
     async fn streak(&self) -> WorkStreak {
@@ -612,7 +618,7 @@ async fn a_recheck_whose_backend_keeps_failing_is_held() {
     let failing = ScriptedBackend::failing();
     for _ in 0..3 {
         let finding = f.finding().await;
-        let err = run_recheck(&f.store, &f.cfg, &finding, &failing, None)
+        let err = run_recheck(&support::scope(&f.store), &f.cfg, &finding, &failing, None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("backend failed"), "{err}");
@@ -713,9 +719,15 @@ async fn a_continued_recheck_hold_resumes_with_its_reason() {
     let resumed = replying(f.out(), &serde_json::json!({ "verdict": "confirmed" }));
 
     let finding = f.finding().await;
-    run_recheck(&f.store, &f.cfg, &finding, &resumed, Some(&plan))
-        .await
-        .unwrap();
+    run_recheck(
+        &support::scope(&f.store),
+        &f.cfg,
+        &finding,
+        &resumed,
+        Some(&plan),
+    )
+    .await
+    .unwrap();
 
     let prompt = &resumed.runs()[0].prompt;
     assert!(prompt.contains("Re-evaluate the prerequisite"), "{prompt}");

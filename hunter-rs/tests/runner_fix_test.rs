@@ -18,8 +18,9 @@ use hunter::store::{FindingInsert, WorkStreak};
 use support::{GitRepo, ScriptedBackend, TempDir, fresh_store, git};
 
 const REPO_URL: &str = "https://github.com/acme/widget";
-/// Matches the slug `run_fix` derives from the finding summary below.
-const BRANCH: &str = "fix/a-real-bug-1";
+/// Matches the slug `run_fix` derives from the finding summary below and
+/// its id, 2 behind the fixture's bystander.
+const BRANCH: &str = "fix/a-real-bug-2";
 
 struct Fixture {
     cfg: Config,
@@ -52,6 +53,25 @@ async fn fixture_on(label: &str, url: &str, forge: ForgeName) -> Fixture {
     let repo_dir = hunter::store::Store::repo_dir(&repos_root, rid);
     std::fs::rename(&repo.work, &repo_dir).unwrap();
 
+    // Filed first and left `new`, so the finding under fix is not id 1: a
+    // write aimed at the wrong finding id lands on this one, not on the
+    // finding the test then reads back.
+    store
+        .upsert_finding(
+            rid,
+            &FindingInsert {
+                fingerprint: "fp-bystander".to_owned(),
+                file: "src/other.rs".to_owned(),
+                severity: hunter::domain::Severity::Low,
+                confidence: 0.5,
+                summary: "a bystander".to_owned(),
+                ..Default::default()
+            },
+            "bug",
+            None,
+        )
+        .await
+        .unwrap();
     let (fid, _) = store
         .upsert_finding(
             rid,
@@ -101,9 +121,10 @@ async fn leftover_branch_without_a_worktree_does_not_wedge_the_fix() {
     // under test is the worktree setup that precedes it.
     let backend =
         ScriptedBackend::writing("NOT-A-BUG.md", "Classification: wrong\nmisread the code");
-    let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &backend, None)
-        .await
-        .expect("a leftover branch is reclaimable, not a permanent failure");
+    let summary =
+        hunter::scheduler::run_fix(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
+            .await
+            .expect("a leftover branch is reclaimable, not a permanent failure");
 
     assert_eq!(summary.branch.as_deref(), Some(BRANCH));
     assert_eq!(
@@ -133,9 +154,10 @@ async fn leftover_branch_held_by_a_killed_worktree_add_does_not_wedge_the_fix() 
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let backend =
         ScriptedBackend::writing("NOT-A-BUG.md", "Classification: wrong\nmisread the code");
-    let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &backend, None)
-        .await
-        .unwrap();
+    let summary =
+        hunter::scheduler::run_fix(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
+            .await
+            .unwrap();
 
     assert_eq!(
         summary.outcome.as_deref(),
@@ -153,9 +175,10 @@ async fn clean_repo_runs_the_fix() {
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let backend =
         ScriptedBackend::writing("NOT-A-BUG.md", "Classification: wrong\nmisread the code");
-    let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &backend, None)
-        .await
-        .unwrap();
+    let summary =
+        hunter::scheduler::run_fix(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
+            .await
+            .unwrap();
 
     assert_eq!(summary.outcome.as_deref(), Some("rejected"));
 }
@@ -168,7 +191,8 @@ async fn a_cycle_runs_the_queued_fix() {
     let backend =
         ScriptedBackend::writing("NOT-A-BUG.md", "Classification: wrong\nmisread the code");
 
-    let summary = hunter::scheduler::run_cycle(&f.store, &f.cfg, &backend, None).await;
+    let summary =
+        hunter::scheduler::run_cycle(&support::recovered(&f.store), &f.cfg, &backend, None).await;
 
     assert_eq!(summary.finding_id, Some(f.fid), "{summary:?}");
     assert_eq!(summary.outcome.as_deref(), Some("rejected"), "{summary:?}");
@@ -206,9 +230,10 @@ async fn a_tree_that_can_never_be_made_ends_held_as_stuck() {
             FindingStatus::Queued,
             "before attempt {attempt}"
         );
-        let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &never, None)
-            .await
-            .unwrap();
+        let summary =
+            hunter::scheduler::run_fix(&support::scope(&f.store), &f.cfg, &finding, &never, None)
+                .await
+                .unwrap();
         assert!(
             summary
                 .failure
@@ -216,6 +241,7 @@ async fn a_tree_that_can_never_be_made_ends_held_as_stuck() {
                 .is_some_and(|r| r.starts_with("workspace not created")),
             "{summary:?}"
         );
+        assert_eq!(summary.finding_id, Some(f.fid), "{summary:?}");
         outcomes.push(summary.outcome.unwrap_or_default());
     }
 
@@ -264,7 +290,7 @@ async fn granted_cap_is_the_backend_headroom_verbatim() {
     let backend =
         ScriptedBackend::writing("NOT-A-BUG.md", "Classification: wrong\nmisread the code")
             .granting(Some(777_000));
-    hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &backend, None)
+    hunter::scheduler::run_fix(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
         .await
         .unwrap();
 
@@ -288,7 +314,7 @@ async fn backend_without_a_ceiling_leaves_the_job_unbounded() {
     let backend =
         ScriptedBackend::writing("NOT-A-BUG.md", "Classification: wrong\nmisread the code")
             .granting(None);
-    hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &backend, None)
+    hunter::scheduler::run_fix(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
         .await
         .unwrap();
 
@@ -311,9 +337,10 @@ async fn fix_whose_tree_cannot_be_made_returns_the_finding_to_queued() {
 
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let never = ScriptedBackend::new(|_| panic!("nothing may run without a tree"));
-    let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &never, None)
-        .await
-        .unwrap();
+    let summary =
+        hunter::scheduler::run_fix(&support::scope(&f.store), &f.cfg, &finding, &never, None)
+            .await
+            .unwrap();
     assert_eq!(summary.state, Some(hunter::domain::JobState::Failed));
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     assert_eq!(finding.status.as_str(), "queued");
@@ -354,9 +381,10 @@ async fn a_finished_fix_ships_and_records_its_draft_pr() {
             support::done()
         });
         let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-        let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &worker, None)
-            .await
-            .unwrap();
+        let summary =
+            hunter::scheduler::run_fix(&support::scope(&f.store), &f.cfg, &finding, &worker, None)
+                .await
+                .unwrap();
 
         assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{case}");
         assert_eq!(
@@ -399,9 +427,10 @@ async fn verdict_after_selection_stops_the_fix_before_its_job() {
         result
     });
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-    let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &capped, None)
-        .await
-        .unwrap();
+    let summary =
+        hunter::scheduler::run_fix(&support::scope(&f.store), &f.cfg, &finding, &capped, None)
+            .await
+            .unwrap();
     assert_eq!(summary.outcome.as_deref(), Some("suspended"));
     let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
         hunter::scheduler::pick_next(&f.store, &f.cfg, None)
@@ -421,9 +450,15 @@ async fn verdict_after_selection_stops_the_fix_before_its_job() {
         .unwrap();
 
     let never = ScriptedBackend::new(|_| panic!("a rejected finding must not run"));
-    let result = hunter::scheduler::run_fix(&f.store, &f.cfg, &stale, &never, Some(&plan))
-        .await
-        .unwrap();
+    let result = hunter::scheduler::run_fix(
+        &support::scope(&f.store),
+        &f.cfg,
+        &stale,
+        &never,
+        Some(&plan),
+    )
+    .await
+    .unwrap();
     assert!(result.skipped.is_some());
     assert!(result.job_id.is_none());
     assert_eq!(
@@ -496,9 +531,10 @@ async fn held_fixture() -> (
         result
     });
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-    let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &blocked, None)
-        .await
-        .unwrap();
+    let summary =
+        hunter::scheduler::run_fix(&support::scope(&f.store), &f.cfg, &finding, &blocked, None)
+            .await
+            .unwrap();
     (f, blocked, summary, expected_reason)
 }
 
@@ -589,9 +625,15 @@ async fn a_continued_fix_resumes_its_checkpoint_and_is_ordinary_again() {
     );
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let denied = ScriptedBackend::noop().denying_above(0);
-    let result = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &denied, Some(&plan))
-        .await
-        .unwrap();
+    let result = hunter::scheduler::run_fix(
+        &support::scope(&f.store),
+        &f.cfg,
+        &finding,
+        &denied,
+        Some(&plan),
+    )
+    .await
+    .unwrap();
     assert!(result.denied.is_some());
     assert_eq!(
         checkpoint(&f).await,
@@ -614,10 +656,15 @@ async fn a_continued_fix_resumes_its_checkpoint_and_is_ordinary_again() {
         result.session_file = session.map(|path| path.to_string_lossy().into_owned());
         result
     });
-    let failed =
-        hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &provider_failure, Some(&plan))
-            .await
-            .unwrap();
+    let failed = hunter::scheduler::run_fix(
+        &support::scope(&f.store),
+        &f.cfg,
+        &finding,
+        &provider_failure,
+        Some(&plan),
+    )
+    .await
+    .unwrap();
     let prompt = &provider_failure.runs()[0].prompt;
     assert!(
         prompt.contains("Re-evaluate the prerequisite")
@@ -669,12 +716,23 @@ async fn an_interrupted_continue_resumes_as_an_ordinary_resume() {
     });
     let (store, cfg) = (f.store.clone(), f.cfg.clone());
     let crashed = tokio::spawn(async move {
-        hunter::scheduler::run_fix(&store, &cfg, &finding, &crashing, Some(&plan)).await
+        hunter::scheduler::run_fix(
+            &support::scope(&store),
+            &cfg,
+            &finding,
+            &crashing,
+            Some(&plan),
+        )
+        .await
     })
     .await;
     assert!(crashed.unwrap_err().is_panic());
 
-    hunter::daemon::reconcile_and_log(&f.store, &f.cfg.work_root)
+    // The restart: a new process, so a new store handle, opened under the
+    // daemon's lock with its own startup token.
+    let lock = hunter::recovery::DaemonLock::acquire(&f.cfg.work_root, &f.db).unwrap();
+    let (_restarted, token) = hunter::store::Store::connect_exclusive(lock).await.unwrap();
+    hunter::recovery::reconcile_and_log(token, &f.cfg.work_root)
         .await
         .unwrap();
     let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
@@ -693,10 +751,15 @@ async fn an_interrupted_continue_resumes_as_an_ordinary_resume() {
         result.session_file = session.map(|path| path.to_string_lossy().into_owned());
         result
     });
-    let failed =
-        hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &provider_failure, Some(&plan))
-            .await
-            .unwrap();
+    let failed = hunter::scheduler::run_fix(
+        &support::scope(&f.store),
+        &f.cfg,
+        &finding,
+        &provider_failure,
+        Some(&plan),
+    )
+    .await
+    .unwrap();
     assert_eq!(failed.outcome.as_deref(), Some("requeued"));
     assert_eq!(
         provider_failure.runs()[0].prompt,
@@ -767,9 +830,15 @@ async fn a_continued_fix_that_concludes_ends_ordinarily() {
             result.session_file = session.map(|path| path.to_string_lossy().into_owned());
             result
         });
-        let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &worker, Some(&plan))
-            .await
-            .unwrap();
+        let summary = hunter::scheduler::run_fix(
+            &support::scope(&f.store),
+            &f.cfg,
+            &finding,
+            &worker,
+            Some(&plan),
+        )
+        .await
+        .unwrap();
         assert_eq!(summary.outcome.as_deref(), Some(expected), "{case}");
         if case == "finished" {
             assert_eq!(summary.failure.as_deref(), Some("no PR-DESCRIPTION.md"));
@@ -787,9 +856,10 @@ async fn repeated_identical_fix_failures_are_held_at_the_limit() {
     let mut outcomes = Vec::new();
     for _ in 0..3 {
         let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-        let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &empty, None)
-            .await
-            .unwrap();
+        let summary =
+            hunter::scheduler::run_fix(&support::scope(&f.store), &f.cfg, &finding, &empty, None)
+                .await
+                .unwrap();
         assert_eq!(summary.failure.as_deref(), Some("no commits"));
         outcomes.push(summary.outcome.unwrap());
     }
@@ -834,9 +904,15 @@ async fn resumed_hold_prompt(f: &Fixture) -> String {
         result.session_file = session.map(|path| path.to_string_lossy().into_owned());
         result
     });
-    hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &worker, Some(&plan))
-        .await
-        .unwrap();
+    hunter::scheduler::run_fix(
+        &support::scope(&f.store),
+        &f.cfg,
+        &finding,
+        &worker,
+        Some(&plan),
+    )
+    .await
+    .unwrap();
     worker.runs()[0].prompt.clone()
 }
 
@@ -865,9 +941,15 @@ async fn a_held_fix_resumes_against_what_held_it() {
     });
     for _ in 0..3 {
         let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-        hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &unfinished, None)
-            .await
-            .unwrap();
+        hunter::scheduler::run_fix(
+            &support::scope(&f.store),
+            &f.cfg,
+            &finding,
+            &unfinished,
+            None,
+        )
+        .await
+        .unwrap();
     }
     assert_eq!(held(&f).await.map(|h| h.reason), Some(HoldReason::Stuck));
     let streak = resumed_hold_prompt(&f).await;
@@ -908,9 +990,10 @@ async fn fix_resume_without_a_blocker_runs_the_plain_continuation() {
         result
     });
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-    let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &capped, None)
-        .await
-        .unwrap();
+    let summary =
+        hunter::scheduler::run_fix(&support::scope(&f.store), &f.cfg, &finding, &capped, None)
+            .await
+            .unwrap();
     assert_eq!(summary.outcome.as_deref(), Some("suspended"));
     let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
         hunter::scheduler::pick_next(&f.store, &f.cfg, None)
@@ -925,9 +1008,15 @@ async fn fix_resume_without_a_blocker_runs_the_plain_continuation() {
         result.session_file = session.map(|path| path.to_string_lossy().into_owned());
         result
     });
-    let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &resumed, Some(&plan))
-        .await
-        .unwrap();
+    let summary = hunter::scheduler::run_fix(
+        &support::scope(&f.store),
+        &f.cfg,
+        &finding,
+        &resumed,
+        Some(&plan),
+    )
+    .await
+    .unwrap();
     assert_eq!(resumed.runs().len(), 1);
     assert_eq!(summary.outcome.as_deref(), Some("requeued"));
 }
@@ -958,9 +1047,15 @@ async fn an_unremovable_stale_report_stops_the_resume_before_its_job() {
     std::fs::create_dir(tree.join("BLOCKED.md")).unwrap();
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let never = ScriptedBackend::new(|_| panic!("must not run beside a stale report"));
-    let err = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &never, Some(&plan))
-        .await
-        .unwrap_err();
+    let err = hunter::scheduler::run_fix(
+        &support::scope(&f.store),
+        &f.cfg,
+        &finding,
+        &never,
+        Some(&plan),
+    )
+    .await
+    .unwrap_err();
     assert!(
         err.to_string().contains("cannot remove the stale "),
         "{err}"
@@ -1062,9 +1157,15 @@ async fn a_fix_whose_backend_keeps_failing_is_held() {
             "the continued checkpoint: attempt {attempt}"
         );
         let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-        let err = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &failing, plan.as_ref())
-            .await
-            .unwrap_err();
+        let err = hunter::scheduler::run_fix(
+            &support::scope(&f.store),
+            &f.cfg,
+            &finding,
+            &failing,
+            plan.as_ref(),
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("backend failed"), "{err}");
         let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
         assert_eq!(after.status.as_str(), "queued");
@@ -1105,9 +1206,10 @@ async fn a_report_that_is_not_utf8_still_counts() {
             support::done()
         });
         let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-        let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &worker, None)
-            .await
-            .unwrap();
+        let summary =
+            hunter::scheduler::run_fix(&support::scope(&f.store), &f.cfg, &finding, &worker, None)
+                .await
+                .unwrap();
         assert_eq!(summary.outcome.as_deref(), Some(expected), "{file}");
         let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
         assert_eq!(finding.status.as_str(), status, "{file}");
@@ -1182,9 +1284,10 @@ async fn a_decline_lands_as_its_classification() {
         let f = fixture("fix-decline-class").await;
         let backend = ScriptedBackend::writing("NOT-A-BUG.md", report);
         let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-        let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &backend, None)
-            .await
-            .unwrap();
+        let summary =
+            hunter::scheduler::run_fix(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
+                .await
+                .unwrap();
         assert_eq!(summary.outcome.as_deref(), Some(status), "{report:?}");
         let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
         assert_eq!(after.status.as_str(), status, "{report:?}");
@@ -1210,9 +1313,10 @@ async fn an_unreadable_report_returns_the_finding_to_queued() {
         support::done()
     });
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-    let err = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &worker, None)
-        .await
-        .unwrap_err();
+    let err =
+        hunter::scheduler::run_fix(&support::scope(&f.store), &f.cfg, &finding, &worker, None)
+            .await
+            .unwrap_err();
     assert!(
         err.to_string().contains("cannot read the worker's report"),
         "{err}"
@@ -1249,9 +1353,15 @@ async fn a_verdict_after_selection_wins_over_a_stale_report() {
         .await
         .unwrap();
     let never = ScriptedBackend::new(|_| panic!("a rejected finding must not run"));
-    let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &picked, &never, Some(&plan))
-        .await
-        .unwrap();
+    let summary = hunter::scheduler::run_fix(
+        &support::scope(&f.store),
+        &f.cfg,
+        &picked,
+        &never,
+        Some(&plan),
+    )
+    .await
+    .unwrap();
     assert!(summary.skipped.is_some(), "{summary:?}");
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     assert_eq!(finding.status.as_str(), "rejected");
@@ -1279,9 +1389,10 @@ async fn a_hold_that_cannot_be_recorded_returns_the_finding_to_queued() {
         support::done()
     });
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-    let err = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &worker, None)
-        .await
-        .unwrap_err();
+    let err =
+        hunter::scheduler::run_fix(&support::scope(&f.store), &f.cfg, &finding, &worker, None)
+            .await
+            .unwrap_err();
     assert!(err.to_string().contains("injected"), "{err}");
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     assert_eq!(finding.status.as_str(), "queued");
@@ -1327,9 +1438,10 @@ async fn each_fix_kind_gets_its_branch_and_playbook_with_the_decline_classes() {
             .unwrap();
         let finding = f.store.get_finding(fid).await.unwrap().unwrap();
         let worker = ScriptedBackend::noop();
-        let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &worker, None)
-            .await
-            .unwrap();
+        let summary =
+            hunter::scheduler::run_fix(&support::scope(&f.store), &f.cfg, &finding, &worker, None)
+                .await
+                .unwrap();
         assert_eq!(
             summary.branch.as_deref(),
             Some(format!("{prefix}/move-to-the-new-api-{fid}").as_str()),
@@ -1364,10 +1476,15 @@ async fn a_one_shot_override_is_spent_by_its_fix_attempt() {
             .await
             .unwrap();
         let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-        let summary =
-            hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &ScriptedBackend::noop(), None)
-                .await
-                .unwrap();
+        let summary = hunter::scheduler::run_fix(
+            &support::scope(&f.store),
+            &f.cfg,
+            &finding,
+            &ScriptedBackend::noop(),
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(summary.outcome.as_deref(), Some("requeued"), "{mode:?}");
         let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
         assert_eq!(finding.budget_override, after, "{mode:?}");
@@ -1385,9 +1502,10 @@ async fn a_fix_for_a_finding_no_longer_queued_is_skipped() {
         .unwrap();
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let never = ScriptedBackend::new(|_| panic!("a finding that is not queued must not run"));
-    let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &never, None)
-        .await
-        .unwrap();
+    let summary =
+        hunter::scheduler::run_fix(&support::scope(&f.store), &f.cfg, &finding, &never, None)
+            .await
+            .unwrap();
     assert_eq!(
         summary.kind,
         Some(hunter::domain::FindingJobKind::Fix.into())
@@ -1417,9 +1535,10 @@ async fn a_description_without_commits_ships_nothing() {
     );
     let worker = ScriptedBackend::writing("PR-DESCRIPTION.md", "nothing changed");
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-    let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &worker, None)
-        .await
-        .unwrap();
+    let summary =
+        hunter::scheduler::run_fix(&support::scope(&f.store), &f.cfg, &finding, &worker, None)
+            .await
+            .unwrap();
     assert_eq!(summary.outcome.as_deref(), Some("requeued"));
     assert_eq!(summary.failure.as_deref(), Some("no commits"));
     assert!(!bins.called_with("gh", "create"), "{:?}", bins.calls());
@@ -1456,7 +1575,7 @@ fn committing(describe: bool) -> ScriptedBackend {
 /// Run one fix attempt of the fixture's finding, as the store has it now.
 async fn fix(f: &Fixture, backend: &ScriptedBackend) -> hunter::scheduler::CycleSummary {
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-    hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, backend, None)
+    hunter::scheduler::run_fix(&support::scope(&f.store), &f.cfg, &finding, backend, None)
         .await
         .unwrap()
 }
@@ -1768,9 +1887,15 @@ async fn a_runner_error_while_the_provider_is_unreachable_counts_nothing() {
         .needing(&[provider])
         .offline(&[provider]);
 
-    let denied = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &failing, Some(&plan))
-        .await
-        .expect("the network's failure ends the cycle denied, not failed");
+    let denied = hunter::scheduler::run_fix(
+        &support::scope(&f.store),
+        &f.cfg,
+        &finding,
+        &failing,
+        Some(&plan),
+    )
+    .await
+    .expect("the network's failure ends the cycle denied, not failed");
 
     assert_eq!(denied.unreachable.as_deref(), Some(provider));
     assert_eq!(
@@ -1809,9 +1934,10 @@ async fn a_blocked_fix_keeps_its_one_shot_override() {
         support::done()
     });
 
-    let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &blocked, None)
-        .await
-        .unwrap();
+    let summary =
+        hunter::scheduler::run_fix(&support::scope(&f.store), &f.cfg, &finding, &blocked, None)
+            .await
+            .unwrap();
 
     assert_eq!(summary.outcome.as_deref(), Some("held"));
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();

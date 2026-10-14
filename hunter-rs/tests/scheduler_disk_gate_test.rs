@@ -84,7 +84,7 @@ async fn a_cycle_short_of_disk_is_denied_before_any_job_starts() {
     let backend = ScriptedBackend::new(|_| panic!("no worker may start on a full disk"));
 
     let before = hunter::util::now_ms();
-    let summary = run_cycle(&store, &cfg, &backend, None).await;
+    let summary = run_cycle(&support::recovered(&store), &cfg, &backend, None).await;
     let after = hunter::util::now_ms();
 
     let denied = summary.denied.as_deref().unwrap_or_default();

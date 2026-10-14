@@ -398,6 +398,31 @@ impl std::fmt::Display for JobState {
     }
 }
 
+/// How an attempt ended: the [`JobState`]s a `running` job can be
+/// recorded with ([`crate::recovery::RunningJob::complete`]). `Running` is not
+/// one, so recording an outcome cannot put a job back to `running`
+/// outside the scope that owns it; `Denied` is not one either, since this
+/// daemon never writes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishedState {
+    Done,
+    Failed,
+    Killed,
+    /// See [`JobState::Suspended`].
+    Suspended,
+}
+
+impl From<FinishedState> for JobState {
+    fn from(state: FinishedState) -> Self {
+        match state {
+            FinishedState::Done => Self::Done,
+            FinishedState::Failed => Self::Failed,
+            FinishedState::Killed => Self::Killed,
+            FinishedState::Suspended => Self::Suspended,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Severity (replaces the existing types::Severity with sqlx + serde)
 // ---------------------------------------------------------------------------
