@@ -1887,23 +1887,73 @@ async fn make_transition(
     kind: &str,
     transition: &Transition<'_>,
 ) -> bool {
-    let (from, to) = (transition.from(), transition.to());
     match store.transition(fid, transition).await {
         Ok(Moved::Applied) => true,
         Ok(Moved::Conflict { now }) => {
-            let now = now.map_or_else(|| "gone".to_owned(), |s| format!("'{s}'"));
-            let _ = store
-                .log_event(
-                    kind,
-                    &format!("#{fid} not moved {from} -> {to}: it is {now} now"),
-                    job,
-                    Some(fid),
-                )
-                .await;
+            log_conflict(store, fid, job, kind, transition, now).await;
             false
         }
         Err(e) => {
+            let (from, to) = (transition.from(), transition.to());
             log_write_failure::<(), _>(Err(e), format_args!("#{fid}: status {from} -> {to}"));
+            false
+        }
+    }
+}
+
+/// Log as a `kind` event that `transition` was not made on `fid` because
+/// the finding is at `now` instead: something else decided it in between,
+/// and that decision stands.
+async fn log_conflict(
+    store: &Store,
+    fid: i64,
+    job: Option<i64>,
+    kind: &str,
+    transition: &Transition<'_>,
+    now: Option<FindingStatus>,
+) {
+    let (from, to) = (transition.from(), transition.to());
+    let now = now.map_or_else(|| "gone".to_owned(), |s| format!("'{s}'"));
+    let _ = store
+        .log_event(
+            kind,
+            &format!("#{fid} not moved {from} -> {to}: it is {now} now"),
+            job,
+            Some(fid),
+        )
+        .await;
+}
+
+/// [`make_transition`] for the PR sync's merged and closed edges, which
+/// also record the PR's end in `pr_state`: a failed write is an `error`
+/// event and a sync error, and leaves the finding `pr_open` with its
+/// `pr_state` unchanged, so the next sync retries both.
+async fn sync_pr_end(
+    store: &Store,
+    fid: i64,
+    kind: &str,
+    transition: &Transition<'_>,
+    summary: &mut SyncResult,
+) -> bool {
+    match store.transition(fid, transition).await {
+        Ok(Moved::Applied) => true,
+        Ok(Moved::Conflict { now }) => {
+            log_conflict(store, fid, None, kind, transition, now).await;
+            false
+        }
+        Err(err) => {
+            let _ = store
+                .log_event(
+                    "error",
+                    &format!(
+                        "sync #{fid}: PR {} but not recorded: {err} (the next sync retries)",
+                        transition.to()
+                    ),
+                    None,
+                    Some(fid),
+                )
+                .await;
+            summary.errors += 1;
             false
         }
     }
@@ -5048,16 +5098,13 @@ pub async fn sync_prs(store: &Store, cfg: &Config) -> SyncResult {
 
         match pr.state {
             forge::PrState::Merged => {
-                // Not moved, the PR's record waits too: a failed write
-                // leaves the finding pr_open for the next sync to retry
-                // both, and a conflict leaves it to what moved it.
-                if !make_transition(store, fid, None, "ship", &Transition::PrMerged).await {
+                // The finding's move and the PR's record are one write: a
+                // failed write leaves both for the next sync, and a
+                // conflict leaves the finding to what moved it.
+                let merged = Transition::PrMerged { pr_number };
+                if !sync_pr_end(store, fid, "ship", &merged, &mut summary).await {
                     continue;
                 }
-                log_write_failure(
-                    store.mark_pr_merged(fid, pr_number, now_ms()).await,
-                    format_args!("#{fid}: recording PR #{pr_number} merged"),
-                );
                 let _ = store
                     .log_event("ship", &format!("#{fid} PR merged: {url}"), None, Some(fid))
                     .await;
@@ -5069,29 +5116,14 @@ pub async fn sync_prs(store: &Store, cfg: &Config) -> SyncResult {
                 // finding was wrong, and suppression is permanent and silent.
                 // Of the first 16 closed PRs only one was closed by a human.
                 // The finding waits here until its harvest classifies why.
-                // Record the closure first, and only then leave pr_open:
-                // sync_prs only revisits pr_open findings, so a finding set
-                // Closed while pr_state still reads OPEN would never be
-                // looked at again. Kept pr_open, the next sync retries both.
-                if let Err(err) = store.mark_pr_closed(fid, pr_number, now_ms()).await {
-                    let _ = store
-                        .log_event(
-                            "error",
-                            &format!(
-                                "sync #{fid}: PR closed but not recorded: {err} \
-                                 (the next sync retries)"
-                            ),
-                            None,
-                            Some(fid),
-                        )
-                        .await;
-                    summary.errors += 1;
-                    continue;
-                }
+                // `closed` and `pr_state` CLOSED land together: sync_prs only
+                // revisits pr_open findings, so a finding set closed while
+                // pr_state still read OPEN would never be looked at again.
                 let closed = Transition::PrClosed {
                     reason: "PR closed without merge; awaiting harvest",
+                    pr_number,
                 };
-                if !make_transition(store, fid, None, "verdict", &closed).await {
+                if !sync_pr_end(store, fid, "verdict", &closed, &mut summary).await {
                     continue;
                 }
                 let _ = store
@@ -5582,31 +5614,8 @@ async fn withdraw_pr(
     // owns the follow-ups, which is why this no longer ingests a
     // FOLLOW-UPS.json.
     let reason_short: String = reason.chars().take(500).collect();
-    let mut closed_on_forge = false;
-    if let Err(err) = store.mark_pr_closed(fid, pr_number, now_ms()).await {
-        // The harvest picks its playbook from pr_state: with the row still
-        // OPEN it would run the merged-PR review, never ask why the PR
-        // closed, and still mark the finding harvested. So no handoff, and
-        // the finding stays pr_open rather than going Closed: Closed with
-        // an OPEN pr_state is a state nothing else produces, and pr_open is
-        // what sync_prs revisits. The PR is closed on the forge, so the
-        // next cycle's sync takes its Closed branch, records both, and the
-        // cold harvest follows with the right playbook.
-        tracing::warn!(finding = fid, pr = pr_number, error = %err, "mark_pr_closed failed");
-        let _ = store
-            .log_event(
-                "error",
-                &format!(
-                    "#{fid} PR #{pr_number} withdrawn but not recorded closed: {err} \
-                     (the next PR sync records it)"
-                ),
-                Some(job),
-                Some(fid),
-            )
-            .await;
-    } else if set_withdrawn_closed(store, fid, job, pr_number, &reason_short).await {
-        closed_on_forge = forge_closed;
-    }
+    let closed_on_forge =
+        set_withdrawn_closed(store, fid, job, pr_number, &reason_short).await && forge_closed;
     let first_line: String = reason
         .lines()
         .next()
@@ -5624,8 +5633,8 @@ async fn withdraw_pr(
     closed_on_forge
 }
 
-/// Record a withdrawn PR's finding `closed` (after its `pr_state` already
-/// reads CLOSED); `true` when it was.
+/// Record a withdrawn PR's finding `closed` and its `pr_state` CLOSED, in
+/// one write; `true` when it was.
 async fn set_withdrawn_closed(
     store: &Store,
     fid: i64,
@@ -5634,7 +5643,7 @@ async fn set_withdrawn_closed(
     reason: &str,
 ) -> bool {
     match store
-        .transition(fid, &Transition::PrClosed { reason })
+        .transition(fid, &Transition::PrClosed { reason, pr_number })
         .await
     {
         Ok(Moved::Applied) => true,
@@ -5657,20 +5666,20 @@ async fn set_withdrawn_closed(
             false
         }
         Err(err) => {
-            // pr_state reads CLOSED but the finding is still pr_open, so no
-            // handoff: the harvest would take pr_open for a human's verdict,
-            // keep it, and mark the PR harvested, and the finding the next
-            // sync sets `closed` would never be harvested. sync_prs revisits
-            // pr_open findings, takes its Closed branch (mark_pr_closed is an
-            // UPSERT, so the row already reading CLOSED is fine), sets the
-            // finding `closed`, and the cold harvest follows.
+            // Neither landed: the finding is still pr_open and pr_state
+            // still OPEN, so no handoff. The harvest picks its playbook from
+            // pr_state and takes pr_open for a human's verdict, so it would
+            // review the closed PR as a merged one and mark it harvested.
+            // The PR is closed on the forge and sync_prs revisits pr_open
+            // findings: the next sync takes its Closed branch, records both,
+            // and the cold harvest follows with the right playbook.
             tracing::warn!(finding = fid, pr = pr_number, error = %err, "closed verdict failed");
             let _ = store
                 .log_event(
                     "error",
                     &format!(
-                        "#{fid} PR #{pr_number} withdrawn but the finding was not set closed: \
-                         {err} (the next PR sync sets it)"
+                        "#{fid} PR #{pr_number} withdrawn but not recorded closed: {err} \
+                         (the next PR sync records it)"
                     ),
                     Some(job),
                     Some(fid),
