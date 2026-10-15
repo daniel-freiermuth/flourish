@@ -20,6 +20,7 @@
 //! [`Store::transition`]: crate::store::Store::transition
 
 use crate::domain::{ClosureClass, FindingStatus};
+use crate::forge::Forge;
 use crate::store::{FindingAnalysisUpdate, FindingInsert, VerdictAnchor};
 
 /// A finding status no fix claim holds: every [`FindingStatus`] but
@@ -195,19 +196,120 @@ pub enum Transition<'a> {
     /// A `pr_open` row without a PR URL (a fix that failed before its PR,
     /// from before fix claims): retried.
     PrMissing,
-    /// The PR sync saw PR `pr_number` merged. `pr_state` records it in the
-    /// same write.
-    PrMerged { pr_number: i64 },
-    /// PR `pr_number` closed without merging: seen by the PR sync, or
-    /// withdrawn by engage. `pr_state` records it in the same write; the
-    /// harvest classifies it.
-    PrClosed { reason: &'a str, pr_number: i64 },
     /// A closed PR's harvest classified why it closed.
     Classified {
         class: ClosureClass,
         reason: &'a str,
         anchor: Option<&'a VerdictAnchor>,
     },
+}
+
+/// The PR a write about a PR is about: its URL, as the writer read it from
+/// the finding, and its number, parsed from that URL.
+///
+/// Made only by [`Self::parse`], so the number and the URL always name the
+/// same PR. With both taken separately -- the URL from the finding, the
+/// number from `pr_state` -- a write could check one PR and record the
+/// other: the store checks the URL against the finding and records the
+/// number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrRef {
+    url: String,
+    number: i64,
+}
+
+impl PrRef {
+    /// The PR at `url`, its number parsed by `forge`; `None` when `url` is
+    /// not a PR URL of `forge`'s.
+    pub fn parse(forge: &dyn Forge, url: &str) -> Option<Self> {
+        let (_slug, number) = forge.parse_pr_url(url)?;
+        Some(Self {
+            url: url.to_owned(),
+            number,
+        })
+    }
+
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub const fn number(&self) -> i64 {
+        self.number
+    }
+}
+
+/// A finding's PR ended: `pr_open` → `merged` or `closed`, with `pr_state`
+/// recording the end in the same write ([`Store::end_pr`]).
+///
+/// Not a [`Transition`]: a transition is guarded by status alone, and
+/// `pr_open` cannot tell the PR its writer read from the one the finding
+/// went on to ship. `pr_state` holds one row per finding, so an end of the
+/// old PR landing after that would close the finding under its open new
+/// PR and put the old number on the new PR's row. An end therefore names
+/// its PR ([`PrRef`]) and lands only while that is still the finding's
+/// ([`PrEnded::OtherPr`] otherwise), as an observation and an answer do
+/// (`crate::attention`).
+///
+/// [`Store::end_pr`]: crate::store::Store::end_pr
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrEnding<'a> {
+    /// The PR sync saw the PR merged.
+    Merged,
+    /// Closed without merging: seen by the PR sync, or withdrawn by
+    /// engage. The harvest classifies it.
+    Closed { reason: &'a str },
+}
+
+impl<'a> PrEnding<'a> {
+    /// The status an end applies from: only a `pr_open` finding has a PR
+    /// to end.
+    pub const fn from(&self) -> Unclaimed {
+        Unclaimed::PrOpen
+    }
+
+    /// The status the end writes.
+    pub const fn to(&self) -> Unclaimed {
+        match self {
+            Self::Merged => Unclaimed::Merged,
+            Self::Closed { .. } => Unclaimed::Closed,
+        }
+    }
+
+    pub(crate) const fn record(&self) -> Record<'a> {
+        match *self {
+            Self::Merged => Record::StatusOnly,
+            Self::Closed { reason } => Record::Verdict {
+                reason: Some(reason),
+                anchor: None,
+            },
+        }
+    }
+
+    /// How `pr_state` records the end.
+    pub(crate) const fn end(&self) -> PrEnd {
+        match self {
+            Self::Merged => PrEnd::Merged,
+            Self::Closed { .. } => PrEnd::Closed,
+        }
+    }
+}
+
+/// The result of a [`PrEnding`]. `#[must_use]`, as [`Moved`]: whatever a
+/// caller records about the end it records only when the end was made.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrEnded {
+    Applied,
+    /// The finding is not `pr_open`: `now` is where it is (`None`: there
+    /// is no such finding). Whatever moved it decided it, and recorded the
+    /// PR's end if that is what moved it.
+    Conflict {
+        now: Option<FindingStatus>,
+    },
+    /// The finding is `pr_open`, but with another PR than the one ended:
+    /// that PR ended, and the finding shipped a new one, after the writer
+    /// read it. Nothing is written; the row is the new PR's.
+    OtherPr,
 }
 
 /// How a PR ended, as `pr_state.state` spells it.
@@ -267,7 +369,7 @@ impl<'a> Transition<'a> {
             Self::Reopened { .. } => Either(S::Rejected, S::Wontfix),
             Self::Reproposed => One(S::Superseded),
             Self::TakesOver { .. } => Either(S::New, S::Queued),
-            Self::PrMissing | Self::PrMerged { .. } | Self::PrClosed { .. } => One(S::PrOpen),
+            Self::PrMissing => One(S::PrOpen),
             Self::Classified { .. } => One(S::Closed),
         }
     }
@@ -292,17 +394,13 @@ impl<'a> Transition<'a> {
             }
             Self::RecheckInvalid { .. } => S::Rejected,
             Self::PrMissing | Self::TakesOver { .. } => S::Queued,
-            Self::PrMerged { .. } => S::Merged,
-            Self::PrClosed { .. } => S::Closed,
             Self::Classified { class, .. } => (*class).into(),
         }
     }
 
     pub(crate) fn record(&self) -> Record<'a> {
         match *self {
-            Self::RecheckRequested | Self::Unqueued | Self::PrMissing | Self::PrMerged { .. } => {
-                Record::StatusOnly
-            }
+            Self::RecheckRequested | Self::Unqueued | Self::PrMissing => Record::StatusOnly,
             Self::RecheckConfirmed { analysis } => Record::Analysis(analysis),
             Self::Reopened { scan } => Record::Rescan(scan),
             Self::TakesOver { from_id } => Record::InheritOverride { from_id },
@@ -320,8 +418,7 @@ impl<'a> Transition<'a> {
             Self::HoldReleased { reason, .. }
             | Self::RecheckStale { reason }
             | Self::Unproposed { reason }
-            | Self::HandedOver { reason }
-            | Self::PrClosed { reason, .. } => Record::Verdict {
+            | Self::HandedOver { reason } => Record::Verdict {
                 reason: Some(reason),
                 anchor: None,
             },
@@ -331,28 +428,6 @@ impl<'a> Transition<'a> {
                     anchor,
                 }
             }
-        }
-    }
-
-    /// The PR end `pr_state` records with the change, in the same write.
-    pub(crate) fn pr_end(&self) -> Option<(PrEnd, i64)> {
-        match *self {
-            Self::PrMerged { pr_number } => Some((PrEnd::Merged, pr_number)),
-            Self::PrClosed { pr_number, .. } => Some((PrEnd::Closed, pr_number)),
-            Self::RecheckRequested
-            | Self::Unqueued
-            | Self::Verdict(_)
-            | Self::HoldReleased { .. }
-            | Self::RecheckConfirmed { .. }
-            | Self::RecheckStale { .. }
-            | Self::RecheckInvalid { .. }
-            | Self::Reopened { .. }
-            | Self::Reproposed
-            | Self::Unproposed { .. }
-            | Self::HandedOver { .. }
-            | Self::TakesOver { .. }
-            | Self::PrMissing
-            | Self::Classified { .. } => None,
         }
     }
 }

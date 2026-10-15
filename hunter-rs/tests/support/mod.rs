@@ -155,6 +155,22 @@ pub fn recovered(store: &Store) -> hunter::recovery::Recovered {
     })
 }
 
+/// `store`'s PR sync pass ([`hunter::store::PrSyncPass`]), for a test that
+/// syncs or records an observation. Only one is live at a time: a test
+/// drops it before the next sync begins its own.
+pub fn pr_sync(store: &Store) -> hunter::store::PrSyncPass {
+    recovered(store)
+        .begin_pr_sync()
+        .expect("another PR sync pass of this store is still live")
+}
+
+/// The GitHub PR at `url`, as the daemon names one
+/// ([`hunter::transition::PrRef::parse`]).
+pub fn pr_ref(url: &str) -> hunter::transition::PrRef {
+    hunter::transition::PrRef::parse(&hunter::forge::GitHubForge, url)
+        .unwrap_or_else(|| panic!("not a GitHub PR URL: {url}"))
+}
+
 /// The authority for jobs a test creates or runners it calls directly
 /// ([`hunter::recovery::CycleScope`]). What the runner abandons is owed
 /// to the store's ledger and settled only by a cycle, so a test asserts

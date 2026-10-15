@@ -2,8 +2,9 @@
 //! `sync_prs` — the PR lifecycle state machine run every cycle.
 //!
 //! It is the only code that moves a finding out of `pr_open` and the only
-//! code that raises `needs_attention`, which `pick_next` ranks second for
-//! engage work. Its decisions are what is pinned here, through the public
+//! code that records what the forge shows of an open PR, from which
+//! `needs_attention` -- ranked second by `pick_next`, for engage work -- is
+//! settled. Its decisions are what is pinned here, through the public
 //! entry point and a scripted `gh pr view`:
 //!
 //! * merged / unparseable / failing-view / URL-less / repo-gone findings;
@@ -19,12 +20,16 @@
 
 mod support;
 
+use hunter::attention::{
+    AnswerRecorded, Declined, EngageAnswer, ObservedFixture, ObservedOpenPr, OpenPrRecorded,
+    ProblemsAnswer,
+};
 use hunter::config::Config;
 use hunter::domain::{FindingStatus, ForgeName};
-use hunter::store::{FindingInsert, Store, SyncPrData};
-use hunter::types::PrState;
+use hunter::forge::Mergeable;
+use hunter::store::{FindingInsert, RecordedPrState, SeenActivity, Store};
 use serde_json::{Value, json};
-use support::{FakeBins, TempDir, fresh_store};
+use support::{FakeBins, TempDir, fresh_store, pr_ref, pr_sync};
 
 const PR_URL: &str = "https://github.com/acme/widget/pull/7";
 const REPO_URL: &str = "https://github.com/acme/widget";
@@ -50,7 +55,7 @@ struct Fixture {
 
 impl Fixture {
     async fn sync(&self) -> hunter::scheduler::SyncResult {
-        hunter::scheduler::sync_prs(&self.store, &self.cfg).await
+        hunter::scheduler::sync_prs(&pr_sync(&self.store), &self.cfg).await
     }
 
     async fn status(&self) -> FindingStatus {
@@ -62,7 +67,7 @@ impl Fixture {
             .status
     }
 
-    async fn pr_state(&self) -> PrState {
+    async fn pr_state(&self) -> RecordedPrState {
         self.store
             .get_pr_state(self.fid)
             .await
@@ -70,45 +75,78 @@ impl Fixture {
             .expect("sync_prs wrote a pr_state row")
     }
 
-    /// A `pr_state` row as an earlier sync would have left it.
-    async fn seed(
-        &self,
-        needs_attention: Option<&str>,
-        fingerprint: Option<&str>,
-        engaged: i64,
-        since: i64,
-    ) {
-        self.store
-            .sync_pr_open(
+    /// A `pr_state` row as earlier syncs and an engage would have left it:
+    /// the PR's problems observed at `at`, and feedback up to `engaged`
+    /// answered.
+    async fn seed(&self, mergeable: Mergeable, changes_requested: bool, engaged: i64, at: i64) {
+        let observed = |last_activity_at| ObservedFixture {
+            mergeable,
+            changes_requested,
+            checks: None,
+            failing_checks: Vec::new(),
+            head_ref: BRANCH.to_owned(),
+            head_sha: SHA.to_owned(),
+            last_activity_at,
+        };
+        // The feedback arrives only once it is answered, so the problems'
+        // attention dates from `at`, not from the engage. Each sync of the
+        // two is its own pass.
+        let pass = pr_sync(&self.store);
+        let pr = pr_ref(PR_URL);
+        let read = pass
+            .begin_read_at(self.fid, &pr, at)
+            .await
+            .unwrap()
+            .unwrap();
+        let first = ObservedOpenPr::fixture(read, observed(0));
+        let first = self.store.record_open_pr(self.fid, &first).await.unwrap();
+        drop(pass);
+        assert!(matches!(first, OpenPrRecorded::Recorded(_)), "{first:?}");
+        let answered = self
+            .store
+            .mark_pr_engaged(
                 self.fid,
-                &SyncPrData {
-                    pr_number: 7,
-                    state: "OPEN".to_owned(),
-                    mergeable: "MERGEABLE".to_owned(),
-                    checks: None,
-                    head_ref: BRANCH.to_owned(),
-                    head_sha: SHA.to_owned(),
-                    last_activity_at: engaged,
-                    last_engaged_activity_at: engaged,
-                    needs_attention: needs_attention.map(str::to_owned),
-                    attention_fingerprint: fingerprint.map(str::to_owned),
-                    synced_at: 1,
-                    attention_since: Some(Some(since)),
-                    clear_addressed: false,
-                },
+                &EngageAnswer::fixture(
+                    &pr,
+                    Some(SeenActivity::fixture(engaged)),
+                    ProblemsAnswer::NoneRecorded,
+                ),
             )
             .await
             .unwrap();
+        assert!(
+            matches!(answered, AnswerRecorded::Recorded(_)),
+            "{answered:?}"
+        );
+        let pass = pr_sync(&self.store);
+        let read = pass
+            .begin_read_at(self.fid, &pr, at)
+            .await
+            .unwrap()
+            .unwrap();
+        let second = ObservedOpenPr::fixture(read, observed(engaged));
+        let second = self.store.record_open_pr(self.fid, &second).await.unwrap();
+        assert!(matches!(second, OpenPrRecorded::Recorded(_)), "{second:?}");
     }
 
     /// What an engage cycle records when it replied but pushed nothing:
-    /// the reason it declined, and the head it declined it at.
-    async fn mark_declined(&self, fingerprint: &str, head_sha: &str) {
-        let engaged = self.pr_state().await.last_engaged_activity_at.unwrap();
-        self.store
-            .mark_pr_engaged(self.fid, engaged, 2, Some(fingerprint), Some(head_sha))
+    /// the problems the row records declined, on the head it records.
+    async fn decline_what_was_read(&self) {
+        let ps = self.pr_state().await;
+        assert!(
+            Declined::as_read(&ps).is_some(),
+            "a sync recorded problems on a head"
+        );
+        let pr = pr_ref(PR_URL);
+        let answered = self
+            .store
+            .mark_pr_engaged(self.fid, &EngageAnswer::without_push(&pr, None, &ps))
             .await
             .unwrap();
+        assert!(
+            matches!(answered, AnswerRecorded::Recorded(_)),
+            "{answered:?}"
+        );
     }
 }
 
@@ -206,8 +244,7 @@ fn now_ms() -> i64 {
 #[tokio::test]
 async fn a_merged_pr_moves_its_finding_to_merged_and_drops_attention() {
     let f = fixture("sync-merged").await;
-    f.seed(Some("conflict"), Some("mergeable:CONFLICTING"), 1, 1)
-        .await;
+    f.seed(Mergeable::Conflicting, false, 1, 1).await;
     let bins = FakeBins::acquire("sync-merged");
     serve_pr(&bins, &pr(&json!({ "state": "MERGED" })));
 
@@ -275,6 +312,98 @@ async fn a_merge_that_cannot_be_recorded_is_retried_by_the_next_sync() {
     assert_eq!(result.merged, 1, "{result:?}");
     assert_eq!(f.status().await, FindingStatus::Merged);
     assert_eq!(f.pr_state().await.state.as_deref(), Some("MERGED"));
+}
+
+/// An open PR whose observation cannot be recorded is a sync error, not a
+/// synced PR: nothing about it was stored, so nothing was settled from it.
+/// The next sync records it.
+#[tokio::test]
+async fn an_open_pr_that_cannot_be_recorded_is_an_error_and_retried() {
+    let f = fixture("sync-open-unrecorded").await;
+    let bins = FakeBins::acquire("sync-open-unrecorded");
+    serve_pr(&bins, &pr(&json!({})));
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER no_open_insert BEFORE INSERT ON pr_state \
+         BEGIN SELECT RAISE(ABORT, 'injected pr_state failure'); END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let result = f.sync().await;
+
+    assert_eq!((result.synced, result.errors), (0, 1), "{result:?}");
+    assert!(f.store.get_pr_state(f.fid).await.unwrap().is_none());
+
+    sqlx::raw_sql("DROP TRIGGER no_open_insert")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let result = f.sync().await;
+
+    assert_eq!((result.synced, result.errors), (1, 0), "{result:?}");
+    assert_eq!(f.pr_state().await.state.as_deref(), Some("OPEN"));
+}
+
+/// A PR this pass has already read is not read again: counted as an error
+/// and left `pr_open`, without asking the forge, so a second observation
+/// can never land from the same pass.
+#[tokio::test]
+async fn a_pr_already_read_in_the_pass_is_an_error_and_not_read_again() {
+    let f = fixture("sync-read-twice").await;
+    let bins = FakeBins::acquire("sync-read-twice");
+    serve_pr(&bins, &pr(&json!({})));
+    let pass = pr_sync(&f.store);
+    let earlier = pass.begin_read(f.fid, &pr_ref(PR_URL)).await.unwrap();
+    assert!(earlier.is_some());
+
+    let result = hunter::scheduler::sync_prs(&pass, &f.cfg).await;
+
+    assert_eq!((result.errors, result.synced), (1, 0), "{result:?}");
+    assert!(bins.calls_to("gh").is_empty(), "{:?}", bins.calls());
+    assert_eq!(f.status().await, FindingStatus::PrOpen);
+    let events = f.store.recent_events(50).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.message.contains("already read in this pass")),
+        "{events:?}"
+    );
+}
+
+/// A read whose push count cannot be taken is never begun: an error, the
+/// forge not asked, the finding left `pr_open` for the next sync.
+#[tokio::test]
+async fn a_read_that_cannot_be_begun_is_an_error_and_retried() {
+    let f = fixture("sync-read-unbegun").await;
+    let bins = FakeBins::acquire("sync-read-unbegun");
+    serve_pr(&bins, &pr(&json!({})));
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    sqlx::query("ALTER TABLE pr_state RENAME TO pr_state_away")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let result = f.sync().await;
+
+    assert_eq!((result.errors, result.synced), (1, 0), "{result:?}");
+    assert!(bins.calls_to("gh").is_empty(), "{:?}", bins.calls());
+    assert_eq!(f.status().await, FindingStatus::PrOpen);
+
+    sqlx::query("ALTER TABLE pr_state_away RENAME TO pr_state")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let result = f.sync().await;
+
+    assert_eq!((result.errors, result.synced), (0, 1), "{result:?}");
 }
 
 /// A finding something else moved off `pr_open` while its PR was being
@@ -453,14 +582,17 @@ async fn the_first_sync_flags_feedback_already_on_the_pr() {
     assert_eq!((result.synced, result.attention), (1, 1), "{result:?}");
     let ps = f.pr_state().await;
     assert_eq!(ps.last_activity_at, Some(LATER_MS - 30 * 60 * 1000));
-    assert_eq!(ps.last_engaged_activity_at, Some(0));
+    assert_eq!(
+        ps.last_engaged_activity_at, None,
+        "sync writes no engage watermark"
+    );
     assert_eq!(ps.needs_attention.as_deref(), Some("new_comments"));
 }
 
 #[tokio::test]
 async fn activity_after_the_watermark_is_new_comments() {
     let f = fixture("sync-new-comments").await;
-    f.seed(None, None, UPDATED_MS, 1).await;
+    f.seed(Mergeable::Mergeable, false, UPDATED_MS, 1).await;
     let bins = FakeBins::acquire("sync-new-comments");
     serve_pr(
         &bins,
@@ -553,6 +685,24 @@ async fn passing_or_absent_checks_raise_nothing() {
     assert_eq!(ps.checks.as_deref(), Some("1 pass / 1 pending"));
     assert_eq!(ps.attention_fingerprint, None);
     assert_eq!(ps.needs_attention, None);
+
+    serve_pr(
+        &bins,
+        &pr(&json!({
+            "statusCheckRollup": [
+                { "name": "build", "conclusion": "SUCCESS" },
+                { "context": "ci/legacy", "state": "SUCCESS" },
+            ],
+        })),
+    );
+    f.sync().await;
+    let ps = f.pr_state().await;
+    assert_eq!(
+        ps.checks.as_deref(),
+        Some("2 pass"),
+        "nothing pending, none listed"
+    );
+    assert_eq!(ps.needs_attention, None);
 }
 
 // ---------------------------------------------------------------------------
@@ -577,7 +727,7 @@ async fn a_declined_reason_is_not_reflagged_on_the_same_head() {
         f.pr_state().await.needs_attention.as_deref(),
         Some("changes_requested")
     );
-    f.mark_declined(CHANGES_REQUESTED_FP, SHA).await;
+    f.decline_what_was_read().await;
 
     let result = f.sync().await;
 
@@ -608,7 +758,7 @@ async fn suppression_does_not_hide_new_comments() {
         &pr(&json!({ "reviewDecision": "CHANGES_REQUESTED" })),
     );
     f.sync().await;
-    f.mark_declined(CHANGES_REQUESTED_FP, SHA).await;
+    f.decline_what_was_read().await;
 
     serve_pr(
         &bins,
@@ -638,7 +788,7 @@ async fn a_push_lifts_suppression() {
         &pr(&json!({ "reviewDecision": "CHANGES_REQUESTED" })),
     );
     f.sync().await;
-    f.mark_declined(CHANGES_REQUESTED_FP, SHA).await;
+    f.decline_what_was_read().await;
 
     serve_pr(
         &bins,
@@ -664,7 +814,7 @@ async fn a_changed_reason_lifts_suppression() {
         &pr(&json!({ "reviewDecision": "CHANGES_REQUESTED" })),
     );
     f.sync().await;
-    f.mark_declined(CHANGES_REQUESTED_FP, SHA).await;
+    f.decline_what_was_read().await;
 
     serve_pr(
         &bins,
@@ -697,13 +847,7 @@ async fn a_changed_reason_lifts_suppression() {
 #[tokio::test]
 async fn attention_since_moves_only_when_the_reason_changes() {
     let f = fixture("sync-attention-since").await;
-    f.seed(
-        Some("changes_requested"),
-        Some(CHANGES_REQUESTED_FP),
-        UPDATED_MS,
-        42,
-    )
-    .await;
+    f.seed(Mergeable::Mergeable, true, UPDATED_MS, 42).await;
     let bins = FakeBins::acquire("sync-attention-since");
 
     serve_pr(

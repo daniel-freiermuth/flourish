@@ -1116,3 +1116,122 @@ async fn upgrading_keeps_every_hold_and_adds_the_repo_subject() {
     );
     drop(store);
 }
+
+/// A `pr_state` row after migration 029: (finding, `changes_requested`,
+/// `failing_checks`, the generated `attention_fingerprint`,
+/// `addressed_fingerprint`).
+type UpgradedProblems = (i64, bool, Option<String>, Option<String>, Option<String>);
+
+/// Migration 029 reads each PR's problems out of its old
+/// `attention_fingerprint` and regenerates the fingerprint from them. The
+/// regenerated one has to match the old byte for byte: an engage's
+/// decline (`addressed_fingerprint`) holds the old string, and settle
+/// voids a decline that no longer matches, so any drift would re-flag
+/// every declined PR on the first sync after the upgrade.
+#[tokio::test]
+async fn upgrading_derives_pr_problems_from_the_old_fingerprint() {
+    let (_dir, path) = scratch("mig-pr-problems");
+
+    let before_029 = sqlx::migrate!("./migrations")
+        .iter()
+        .position(|m| m.version == 29)
+        .expect("migration 029 exists");
+    let pool = seed_state(&path, before_029).await;
+    // (finding, mergeable, old fingerprint), as the old sync wrote them:
+    // review part first, checks part last, each part only when present.
+    let rows: [(i64, &str, Option<&str>); 5] = [
+        (
+            1,
+            "CONFLICTING",
+            Some("review:CHANGES_REQUESTED|mergeable:CONFLICTING|checks:build,lint"),
+        ),
+        (2, "CONFLICTING", Some("mergeable:CONFLICTING")),
+        // A check whose name reads like the review part.
+        (3, "MERGEABLE", Some("checks:review:CHANGES_REQUESTED")),
+        (4, "MERGEABLE", None),
+        (5, "MERGEABLE", Some("review:CHANGES_REQUESTED")),
+    ];
+    sqlx::query(
+        "INSERT INTO repos (id, name, url, path, forge, default_branch, added_at) \
+         VALUES (1, 'widget', 'https://e/w.git', '/wr/repos/repo-1', 'github', 'main', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    for (fid, mergeable, fingerprint) in rows {
+        sqlx::query(
+            "INSERT INTO findings (id, type, repo_id, fingerprint, severity, confidence, \
+                                   summary, status, pr_url, created_at, updated_at) \
+             VALUES (?1, 'bug', 1, 'fp-' || ?1, 'high', 0.9, 's', 'pr_open', \
+                     'https://github.com/o/r/pull/' || ?1, 1, 1)",
+        )
+        .bind(fid)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Each row's problems declined on its head, so the decline holds
+        // the old fingerprint.
+        sqlx::query(
+            "INSERT INTO pr_state (finding_id, pr_number, state, mergeable, head_sha, \
+                                   attention_fingerprint, addressed_fingerprint, \
+                                   addressed_head_sha) \
+             VALUES (?1, ?1, 'OPEN', ?2, 'head', ?3, ?3, 'head')",
+        )
+        .bind(fid)
+        .bind(mergeable)
+        .bind(fingerprint)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    pool.close().await;
+
+    let store = Store::connect(&path).await.expect("roll forward");
+    drop(store);
+
+    let pool = open(&path).await;
+    let upgraded: Vec<UpgradedProblems> = sqlx::query_as(
+        "SELECT finding_id, changes_requested, failing_checks, attention_fingerprint, \
+                addressed_fingerprint \
+         FROM pr_state ORDER BY finding_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let fp = |s: &str| Some(s.to_owned());
+    assert_eq!(
+        upgraded,
+        [
+            (
+                1,
+                true,
+                fp("build,lint"),
+                fp("review:CHANGES_REQUESTED|mergeable:CONFLICTING|checks:build,lint"),
+                fp("review:CHANGES_REQUESTED|mergeable:CONFLICTING|checks:build,lint"),
+            ),
+            (
+                2,
+                false,
+                None,
+                fp("mergeable:CONFLICTING"),
+                fp("mergeable:CONFLICTING")
+            ),
+            (
+                3,
+                false,
+                fp("review:CHANGES_REQUESTED"),
+                fp("checks:review:CHANGES_REQUESTED"),
+                fp("checks:review:CHANGES_REQUESTED"),
+            ),
+            (4, false, None, None, None),
+            (
+                5,
+                true,
+                None,
+                fp("review:CHANGES_REQUESTED"),
+                fp("review:CHANGES_REQUESTED")
+            ),
+        ]
+    );
+    pool.close().await;
+}

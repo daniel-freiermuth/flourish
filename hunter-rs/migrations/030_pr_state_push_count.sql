@@ -1,0 +1,21 @@
+-- Which observation of an open PR predates an engage's last push, so the
+-- problems sync saw before it are not read as the pushed commit's.
+--
+-- An engage that pushes answers the PR with new code: no decline is
+-- recorded, and the attention is settled as it records. The static
+-- problems in the row (`changes_requested`, `mergeable`, `failing_checks`)
+-- are still the ones a sync observed before the push, so settling from
+-- them flagged the PR again at once, for a conflict or a failing check of
+-- a commit that is no longer the PR's -- an engage spent before any sync
+-- had seen the new head.
+--
+-- `push_count` (the answered group, src/attention.rs) counts the pushes an
+-- engage recorded on the row. A sync read takes it when it begins
+-- (`PrSyncPass::begin_read`), and its observation stores it as
+-- `observed_push_count` (the observed group). While the observation's is
+-- the lower, the read began before the latest push, whichever commits
+-- anyone pushed before it: its static problems are not counted, new
+-- feedback still is. The next read begun after the push counts them again.
+-- Neither the wall clock nor commit hashes are compared.
+ALTER TABLE pr_state ADD COLUMN push_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE pr_state ADD COLUMN observed_push_count INTEGER NOT NULL DEFAULT 0;
