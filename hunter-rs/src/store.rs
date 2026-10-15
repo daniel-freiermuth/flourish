@@ -43,6 +43,41 @@ use crate::types::{
 };
 use crate::util::now_ms;
 
+/// A write transaction that took SQLite's write lock when it began
+/// (`BEGIN IMMEDIATE`), not at its first write as sqlx's plain `begin()`
+/// does. Nothing else can commit between two of its statements, so a
+/// check it reads still holds when it writes: every guarded write in this
+/// module (a status checked, then moved; a row read, then settled) is
+/// correct only inside one. The only way to make one is [`Self::begin`],
+/// private to this module, and the helpers that rely on the lock take
+/// this type, not a `sqlx::Transaction`: handing them a deferred
+/// transaction does not compile.
+struct ImmediateTx(sqlx::Transaction<'static, sqlx::Sqlite>);
+
+impl ImmediateTx {
+    async fn begin(pool: &SqlitePool) -> sqlx::Result<Self> {
+        pool.begin_with("BEGIN IMMEDIATE").await.map(Self)
+    }
+
+    async fn commit(self) -> sqlx::Result<()> {
+        self.0.commit().await
+    }
+}
+
+impl std::ops::Deref for ImmediateTx {
+    type Target = sqlx::SqliteConnection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ImmediateTx {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 /// The verdict a `dep_update` gets when a Renovate scan stops proposing it
 /// ([`Store::supersede_unproposed_dep_updates`]). Also the marker that lets
 /// a later scan proposing it again bring it back
@@ -524,11 +559,7 @@ async fn status_now<'e, E: sqlx::SqliteExecutor<'e>>(
 /// (`work_tiers`): work that has left it keeps no checkpoint. A repo-level
 /// job's work item is `(repo, kind)` (`repo_work`), active while the repo
 /// exists.
-async fn point_checkpoint(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    job_id: i64,
-    paused: bool,
-) -> sqlx::Result<()> {
+async fn point_checkpoint(tx: &mut ImmediateTx, job_id: i64, paused: bool) -> sqlx::Result<()> {
     sqlx::query!(
         "INSERT INTO finding_work (finding_id, kind, checkpoint_job_id) \
          SELECT j.finding_id, j.kind, CASE WHEN ?2 THEN j.id END \
@@ -602,7 +633,7 @@ fn release_verdict(
 /// `finding-left-tier`. A `classify` also stamps the closed PR harvested,
 /// as its harvest would have.
 async fn write_release_verdict(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut ImmediateTx,
     finding_id: i64,
     from: FindingStatus,
     verdict: ReleaseVerdict,
@@ -656,7 +687,7 @@ async fn write_release_verdict(
 /// engage's checkpoint, since the finding stays in the engage tier and no
 /// trigger ends its work.
 async fn apply_release(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut ImmediateTx,
     finding_id: i64,
     kind: FindingJobKind,
     action: ReleaseAction,
@@ -1016,7 +1047,7 @@ impl Store {
         reason: &str,
         anchor: Option<&VerdictAnchor>,
     ) -> sqlx::Result<()> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
         let now = now_ms();
         sqlx::query!(
             "UPDATE findings SET status = ?1, verdict_reason = ?2, updated_at = ?3 WHERE id = ?4",
@@ -1041,7 +1072,7 @@ impl Store {
         finding_id: i64,
         transition: &Transition<'_>,
     ) -> sqlx::Result<Moved> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
         let moved = Self::apply_transition(&mut tx, finding_id, transition).await?;
         tx.commit().await?;
         Ok(moved)
@@ -1056,7 +1087,7 @@ impl Store {
                   the arms cannot share their SQL"
     )]
     async fn apply_transition(
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        tx: &mut ImmediateTx,
         finding_id: i64,
         transition: &Transition<'_>,
     ) -> sqlx::Result<Moved> {
@@ -1209,7 +1240,7 @@ impl Store {
     ) -> sqlx::Result<Moved> {
         let (now, fixing) = (now_ms(), FindingStatus::Fixing);
         let status = FindingStatus::from(decline_status(class));
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
         let set = sqlx::query!(
             "UPDATE findings SET status = ?1, verdict_reason = ?2, updated_at = ?3 \
              WHERE id = ?4 AND status = ?5",
@@ -1237,7 +1268,7 @@ impl Store {
 
     /// Replace `finding_id`'s verdict anchor with `anchor`, or remove it.
     async fn write_anchor(
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        tx: &mut ImmediateTx,
         finding_id: i64,
         anchor: Option<&VerdictAnchor>,
     ) -> sqlx::Result<()> {
@@ -1381,7 +1412,7 @@ impl Store {
         pr_url: &str,
     ) -> sqlx::Result<Moved> {
         let (now, pr_open, fixing) = (now_ms(), FindingStatus::PrOpen, FindingStatus::Fixing);
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
         let set = sqlx::query!(
             "UPDATE findings SET status = ?1, pr_url = ?2, updated_at = ?3 \
              WHERE id = ?4 AND status = ?5",
@@ -1567,7 +1598,7 @@ impl Store {
         // counts below would be read outside it and a job inserted
         // concurrently could land between the check and the flag. Taking
         // the lock up front makes the check and the flag see one state.
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
         let findings = sqlx::query_scalar!(
             r#"SELECT COUNT(*) AS "n!: i64" FROM findings WHERE repo_id = ?1"#,
             id
@@ -1707,7 +1738,7 @@ impl Store {
     /// changed because it leaked also logs out whoever used it. `false`
     /// when no such account exists.
     pub async fn set_password(&self, username: &str, password_hash: &str) -> sqlx::Result<bool> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
         let id = sqlx::query_scalar!(
             r#"UPDATE users SET password_hash = ?2 WHERE username = ?1
                RETURNING id AS "id!: i64""#,
@@ -1729,7 +1760,7 @@ impl Store {
     /// Disable an account and end its sessions. The row stays, so events
     /// it authored keep their author. `false` when no such account exists.
     pub async fn disable_user(&self, username: &str) -> sqlx::Result<bool> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
         let now = now_ms();
         let id = sqlx::query_scalar!(
             r#"UPDATE users SET disabled_at = COALESCE(disabled_at, ?2) WHERE username = ?1
@@ -2420,7 +2451,7 @@ impl Store {
         .await?
         .unwrap_or(false);
         if resumable {
-            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            let mut tx = ImmediateTx::begin(&self.pool).await?;
             point_checkpoint(&mut tx, job_id, true).await?;
             tx.commit().await?;
         }
@@ -2453,7 +2484,7 @@ impl Store {
         job_id: i64,
         msg: &str,
     ) -> sqlx::Result<bool> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
         let dropped = sqlx::query!(
             "UPDATE finding_work SET checkpoint_job_id = NULL \
              WHERE finding_id = ?1 AND kind = ?2 AND checkpoint_job_id = ?3",
@@ -2526,7 +2557,7 @@ impl Store {
         msg: &str,
     ) -> sqlx::Result<bool> {
         let kind = JobKind::Repo(kind);
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
         let dropped = sqlx::query!(
             "UPDATE repo_work SET checkpoint_job_id = NULL \
              WHERE repo_id = ?1 AND kind = ?2 AND checkpoint_job_id = ?3",
@@ -2822,7 +2853,7 @@ impl Store {
         let now = now_ms();
         // IMMEDIATE so the supersession below reads the suspensions under
         // the same write lock that inserts their replacement.
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
         let result = sqlx::query!(
             "INSERT INTO jobs \
              (kind, repo_id, finding_id, cap_tokens, state, started_at, estimated_tokens, \
@@ -3108,7 +3139,7 @@ impl Store {
         } = *outcome;
         let suspended = state == FinishedState::Suspended;
         let state = JobState::from(state);
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
         sqlx::query!(
             "UPDATE jobs SET state = ?1, pid = NULL, tokens_new = ?2, calls = ?3, \
              exit_code = ?4, killed_reason = ?5, session_file = ?6, notes = ?7, \
@@ -3150,7 +3181,7 @@ impl Store {
     ) -> sqlx::Result<bool> {
         let job_id = job.id();
         let (suspended, running) = (JobState::Suspended, JobState::Running);
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
         let updated = sqlx::query!(
             "UPDATE jobs SET state = ?1, pid = NULL, killed_reason = 'orphaned', \
              session_file = ?2, tokens_new = ?3, notes = ?4, finished_at = ?5 \
@@ -3646,7 +3677,7 @@ impl Store {
         finding_id: i64,
         row: &FindingInsert,
     ) -> Result<bool, StoreWriteError> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
         let open = sqlx::query!(
             r#"SELECT f.status AS "status!: FindingStatus", f.verdict_reason
                FROM findings f
@@ -3742,7 +3773,7 @@ impl Store {
         let new = FindingStatus::New;
         let proposed = serde_json::to_string(proposed).unwrap_or_else(|_| "[]".to_owned());
         let unchecked = serde_json::to_string(unchecked).unwrap_or_else(|_| "[]".to_owned());
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
         let unproposed = sqlx::query_scalar!(
             r#"SELECT id AS "id!: i64" FROM findings
                WHERE repo_id = ?1 AND type = 'dep_update' AND status = ?2
@@ -3801,7 +3832,7 @@ impl Store {
         let new = FindingStatus::New;
         let queued = FindingStatus::Queued;
         let moves = serde_json::to_string(moves).unwrap_or_else(|_| "[]".to_owned());
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
         // JSON booleans extract as 1/0, the same as the comparison on q.
         let pairs = sqlx::query!(
             r#"SELECT q.id AS "from_id!: i64", MIN(p.id) AS "to_id!: i64"
@@ -4022,7 +4053,7 @@ impl Store {
         anchor: Option<&VerdictAnchor>,
         harvested_at: i64,
     ) -> sqlx::Result<bool> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
         let classify = Transition::Classified {
             class,
             reason,
@@ -4291,7 +4322,7 @@ impl Store {
     ) -> sqlx::Result<bool> {
         let now = now_ms();
         let harvest = FindingJobKind::Harvest;
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
         let held = sqlx::query!(
             "INSERT INTO work_holds (finding_id, kind, reason, detail, held_at) \
              SELECT ?1, ?2, ?3, ?4, ?5 \
@@ -4415,7 +4446,7 @@ impl Store {
             return refuse(format!("a {kind} hold cannot be released with {action}"));
         }
         let now = now_ms();
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
         let hold = sqlx::query!(
             r#"SELECT h.id AS "id!: i64", w.checkpoint_job_id,
                       f.status AS "status!: FindingStatus"
@@ -4588,7 +4619,7 @@ impl Store {
         job: Option<i64>,
     ) -> sqlx::Result<bool> {
         let now = now_ms();
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
         let held = sqlx::query!(
             "INSERT INTO work_holds (repo_id, kind, reason, detail, held_at) \
              SELECT ?1, ?2, ?3, ?4, ?5 \
@@ -4704,7 +4735,7 @@ impl Store {
             ));
         }
         let now = now_ms();
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
         let hold = sqlx::query!(
             r#"SELECT h.id AS "id!: i64", w.checkpoint_job_id, r.name
                FROM work_holds h
