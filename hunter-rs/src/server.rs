@@ -589,7 +589,10 @@ async fn finding_detail(
     }
     Ok(Json(FindingDetail {
         jobs: store.jobs_by_finding(fid).await?,
-        pr_state: store.get_pr_state(fid).await?,
+        pr_state: store
+            .get_pr_state(fid)
+            .await?
+            .map(crate::store::RecordedPrState::into_inner),
     }))
 }
 

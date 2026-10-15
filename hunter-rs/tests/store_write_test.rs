@@ -18,10 +18,11 @@ use hunter::domain::{
     BudgetOverride, ClosureClass, FindingJobKind, FindingStatus, ForgeName, HoldReason,
     ReleaseAction, RepoJobKind,
 };
+use hunter::store::SeenActivity;
 use hunter::store::{RepoUpdate, ResumeChainStats, Store, StoreWriteError};
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnectOptions;
-use support::TempDir;
+use support::{TempDir, pr_ref, pr_sync};
 
 /// Copy dev.db (WAL, checkpointed, no rows) into a scratch directory and
 /// open a WRITABLE pool on the copy for fixture inserts and verification
@@ -896,29 +897,119 @@ async fn connect_creates_and_migrates_a_brand_new_database() {
     );
 }
 
-// -- 10. sync_pr_open atomicity -------------------------------------------
+// -- 10. record_open_pr atomicity ------------------------------------------
 
-fn sync_pr_data(
-    fingerprint: &str,
-    reason: &str,
-    since: i64,
-    clear_addressed: bool,
-) -> hunter::store::SyncPrData {
-    hunter::store::SyncPrData {
-        pr_number: 7,
-        state: "OPEN".into(),
-        mergeable: "MERGEABLE".into(),
+/// Finding 1's PR as sync observes it: changes requested, no feedback, and
+/// `mergeable`.
+fn observed(mergeable: hunter::forge::Mergeable) -> hunter::attention::ObservedFixture {
+    hunter::attention::ObservedFixture {
+        mergeable,
+        changes_requested: true,
         checks: Some("2 pass".into()),
+        failing_checks: Vec::new(),
         head_ref: "fix/one".into(),
         head_sha: "deadbee".into(),
-        last_activity_at: since,
-        last_engaged_activity_at: 0,
-        needs_attention: Some(reason.into()),
-        attention_fingerprint: Some(fingerprint.into()),
-        synced_at: since,
-        attention_since: Some(Some(since)),
-        clear_addressed,
+        last_activity_at: 0,
     }
+}
+
+/// `pr` as observed by `pass`'s forge read of finding 1's PR, begun now
+/// and stamped `at`: it carries the row's push count as it stands now.
+async fn read_at(
+    pass: &hunter::store::PrSyncPass,
+    at: i64,
+    pr: hunter::attention::ObservedFixture,
+) -> hunter::attention::ObservedOpenPr<'_> {
+    let read = pass
+        .begin_read_at(1, &pr_7(), at)
+        .await
+        .unwrap()
+        .expect("the pass's first read of finding 1");
+    hunter::attention::ObservedOpenPr::fixture(read, pr)
+}
+
+/// The PR [`open_pr_for_finding_1`] gives finding 1.
+fn pr_7() -> hunter::transition::PrRef {
+    pr_ref("https://github.com/o/r/pull/7")
+}
+
+/// Finding 1 as sync lists it: `pr_open`, with its PR's URL.
+async fn open_pr_for_finding_1(pool: &SqlitePool) {
+    sqlx::query(
+        "UPDATE findings SET status = 'pr_open', pr_url = 'https://github.com/o/r/pull/7' \
+         WHERE id = 1",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// [`Store::record_open_pr`] for a finding that is still `pr_open`: how
+/// it moved the attention.
+async fn record_open(
+    store: &Store,
+    fid: i64,
+    pr: &hunter::attention::ObservedOpenPr<'_>,
+) -> hunter::attention::AttentionChange {
+    match store.record_open_pr(fid, pr).await.unwrap() {
+        hunter::attention::OpenPrRecorded::Recorded(change) => change,
+        other => panic!("#{fid}'s observation must be recorded, got {other:?}"),
+    }
+}
+
+/// No two PR sync passes of one store are live at once, whichever handle
+/// begins them: a clone of the store is the same handle. Two passes would
+/// let two reads of one PR be out together, and the older observation
+/// land last.
+#[tokio::test]
+async fn a_pr_sync_pass_begins_only_once_the_last_one_ended() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo_and_findings(&pool).await;
+    let store = rw_store(&path).await;
+    let recovered = support::recovered(&store);
+
+    let first = recovered.begin_pr_sync().expect("no pass is live yet");
+    assert!(recovered.begin_pr_sync().is_none());
+    assert!(support::recovered(&store.clone()).begin_pr_sync().is_none());
+
+    drop(first);
+    assert!(recovered.begin_pr_sync().is_some());
+}
+
+/// A pass reads each finding's PR once: a second read of it in the same
+/// pass is refused, a read of another finding is not, and the next pass
+/// reads it again. A read that could not be begun does not count.
+#[tokio::test]
+async fn a_pr_sync_pass_reads_each_finding_s_pr_once() {
+    let (pr_7, pr_9) = (pr_7(), pr_ref("https://github.com/o/r/pull/9"));
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo_and_findings(&pool).await;
+    let store = rw_store(&path).await;
+
+    let pass = pr_sync(&store);
+    let read = pass.begin_read(1, &pr_7).await.unwrap();
+    assert!(read.is_some());
+    assert!(pass.begin_read(1, &pr_7).await.unwrap().is_none());
+    assert!(pass.begin_read(2, &pr_9).await.unwrap().is_some());
+    drop(read);
+    drop(pass);
+    let pass = pr_sync(&store);
+    assert!(pass.begin_read(1, &pr_7).await.unwrap().is_some());
+    drop(pass);
+
+    // A read whose push count cannot be read was never out: the same pass
+    // may begin it again once the table is back.
+    let pass = pr_sync(&store);
+    sqlx::query("ALTER TABLE pr_state RENAME TO pr_state_away")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(pass.begin_read(1, &pr_7).await.is_err());
+    sqlx::query("ALTER TABLE pr_state_away RENAME TO pr_state")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(pass.begin_read(1, &pr_7).await.unwrap().is_some());
 }
 
 #[derive(Debug, PartialEq, Eq, sqlx::FromRow)]
@@ -940,10 +1031,10 @@ async fn pr_state_row(pool: &SqlitePool) -> PrStateRow {
     .unwrap()
 }
 
-/// `sync_pr_open` decides its two conditional UPDATEs from the state its
-/// UPSERT writes, so a failure between them is not a lost update but a
-/// permanently wrong one: the next sync compares against the already
-/// committed `attention_fingerprint`, sees no change, and never stamps
+/// `record_open_pr` settles the PR's attention from the row its UPSERT
+/// writes, so a failure between them is not a lost update but a
+/// permanently wrong one: the next settle compares against reasons the
+/// committed observation already implies, sees no change, and never stamps
 /// `attention_since` again.
 ///
 /// Provoking the real trigger (`SQLITE_BUSY` past the 5 s busy timeout) is
@@ -952,18 +1043,19 @@ async fn pr_state_row(pool: &SqlitePool) -> PrStateRow {
 /// unwinds only that statement, leaving the caller's transaction (if any)
 /// to decide the fate of the UPSERT — which is exactly the question.
 #[tokio::test]
-async fn sync_pr_open_rolls_back_the_upsert_when_a_later_statement_fails() {
+async fn record_open_pr_rolls_back_the_upsert_when_its_settle_fails() {
+    use hunter::forge::Mergeable;
     let (_dir, path, pool) = fresh_db().await;
     seed_repo_and_findings(&pool).await;
+    open_pr_for_finding_1(&pool).await;
     let store = rw_store(&path).await;
 
-    store
-        .sync_pr_open(
-            1,
-            &sync_pr_data("fp-old", "review_changes_requested", 1000, false),
-        )
-        .await
-        .unwrap();
+    record_open(
+        &store,
+        1,
+        &read_at(&pr_sync(&store), 1000, observed(Mergeable::Mergeable)).await,
+    )
+    .await;
     sqlx::query("UPDATE pr_state SET addressed_fingerprint = 'af-old' WHERE finding_id = 1")
         .execute(&pool)
         .await
@@ -979,7 +1071,10 @@ async fn sync_pr_open_rolls_back_the_upsert_when_a_later_statement_fails() {
     .unwrap();
 
     let err = store
-        .sync_pr_open(1, &sync_pr_data("fp-new", "merge_conflict", 5000, true))
+        .record_open_pr(
+            1,
+            &read_at(&pr_sync(&store), 5000, observed(Mergeable::Conflicting)).await,
+        )
         .await
         .expect_err("the injected failure must surface to the caller");
     assert!(
@@ -994,25 +1089,494 @@ async fn sync_pr_open_rolls_back_the_upsert_when_a_later_statement_fails() {
         "the UPSERT must not survive a failure in a statement that depends on it"
     );
 
-    // With the injected failure removed the same sync applies all three
-    // writes, so the assertion above measures atomicity, not inertness.
+    // With the injected failure removed the same sync applies every
+    // write, so the assertion above measures atomicity, not inertness.
     sqlx::query("DROP TRIGGER no_attention_since")
         .execute(&pool)
         .await
         .unwrap();
-    store
-        .sync_pr_open(1, &sync_pr_data("fp-new", "merge_conflict", 5000, true))
-        .await
-        .unwrap();
+    record_open(
+        &store,
+        1,
+        &read_at(&pr_sync(&store), 5000, observed(Mergeable::Conflicting)).await,
+    )
+    .await;
     assert_eq!(
         pr_state_row(&pool).await,
         PrStateRow {
-            needs_attention: Some("merge_conflict".into()),
-            attention_fingerprint: Some("fp-new".into()),
+            needs_attention: Some("changes_requested,conflict".into()),
+            attention_fingerprint: Some("review:CHANGES_REQUESTED|mergeable:CONFLICTING".into()),
             attention_since: Some(5000),
             addressed_fingerprint: None,
             synced_at: Some(5000),
         }
+    );
+}
+
+/// An engage's answer that lands while a sync is in flight -- after the
+/// sync read the forge, before it wrote -- survives that sync's write.
+/// Sync used to compute the attention, and the engage columns it wrote
+/// back, from a copy of the row it read first: the old watermark came
+/// back, the decline was ignored, and the comments and the change request
+/// the worker had just answered were flagged for another engage.
+#[tokio::test]
+async fn an_engage_answer_landing_mid_sync_survives_the_sync() {
+    use hunter::attention::{AnswerRecorded, EngageAnswer, ObservedFixture};
+    use hunter::forge::Mergeable;
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo_and_findings(&pool).await;
+    open_pr_for_finding_1(&pool).await;
+    let store = rw_store(&path).await;
+    let with_feedback = ObservedFixture {
+        last_activity_at: 100,
+        ..observed(Mergeable::Mergeable)
+    };
+    let flagged = record_open(
+        &store,
+        1,
+        &read_at(&pr_sync(&store), 1000, with_feedback.clone()).await,
+    )
+    .await;
+    assert_eq!(
+        flagged.now.as_deref(),
+        Some("new_comments,changes_requested")
+    );
+
+    // The next sync has read the forge; the engage answers before it writes.
+    let pass = pr_sync(&store);
+    let in_flight = read_at(&pass, 2000, with_feedback).await;
+    let seen = store.get_pr_state(1).await.unwrap().unwrap();
+    let pr = pr_7();
+    let answered = store
+        .mark_pr_engaged(
+            1,
+            &EngageAnswer::without_push(&pr, Some(SeenActivity::fixture(100)), &seen),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(answered, AnswerRecorded::Recorded(_)),
+        "{answered:?}"
+    );
+    let synced = record_open(&store, 1, &in_flight).await;
+
+    assert_eq!(synced.now, None, "everything on the PR was answered");
+    let ps = store.get_pr_state(1).await.unwrap().unwrap();
+    assert_eq!(ps.last_engaged_activity_at, Some(100));
+    assert_eq!(
+        ps.addressed_fingerprint.as_deref(),
+        Some("review:CHANGES_REQUESTED")
+    );
+    assert_eq!(
+        (ps.needs_attention.as_deref(), ps.attention_since),
+        (None, None)
+    );
+}
+
+/// A sync's observation of an open PR that lands after the finding left
+/// `pr_open` writes nothing. Here an engage withdrew the PR after sync had
+/// seen it open: the withdrawal recorded the PR closed with the finding
+/// `closed`, which is what puts the closed-PR harvest in the queue. The
+/// older observation used to set the row back to OPEN, and since sync only
+/// revisits `pr_open` findings nothing corrected it: the harvest never ran.
+#[tokio::test]
+async fn an_open_observation_landing_after_a_withdrawal_leaves_the_closure() {
+    use hunter::attention::OpenPrRecorded;
+    use hunter::forge::Mergeable;
+    use hunter::transition::{PrEnded, PrEnding};
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo_and_findings(&pool).await;
+    open_pr_for_finding_1(&pool).await;
+    let store = rw_store(&path).await;
+    record_open(
+        &store,
+        1,
+        &read_at(&pr_sync(&store), 1000, observed(Mergeable::Mergeable)).await,
+    )
+    .await;
+    // Sync has read the forge (still open); the engage withdraws first.
+    let pass = pr_sync(&store);
+    let in_flight = read_at(&pass, 2000, observed(Mergeable::Mergeable)).await;
+
+    let withdrawn = PrEnding::Closed {
+        reason: "withdrawn by engage worker",
+    };
+    assert_eq!(
+        store.end_pr(1, &pr_7(), withdrawn).await.unwrap(),
+        PrEnded::Applied
+    );
+
+    assert_eq!(
+        store.record_open_pr(1, &in_flight).await.unwrap(),
+        OpenPrRecorded::NotPrOpen {
+            now: Some(FindingStatus::Closed)
+        }
+    );
+    let ps = store.get_pr_state(1).await.unwrap().unwrap();
+    assert_eq!(ps.state.as_deref(), Some("CLOSED"));
+    assert_eq!(ps.needs_attention, None);
+    let pending: Vec<i64> = store
+        .list_pending_harvest()
+        .await
+        .unwrap()
+        .iter()
+        .map(|f| f.id)
+        .collect();
+    assert_eq!(pending, [1], "the withdrawn PR still awaits its harvest");
+}
+
+/// A sync's observation of a PR that ended, landing after the finding has
+/// shipped a new PR, writes nothing: the row is the new PR's. Sync read PR
+/// 7; meanwhile it was withdrawn, and the finding went on to PR 8. The old
+/// read used to land on the new PR's row, putting PR 7's number and view
+/// back over it -- the status check cannot catch it, since the finding is
+/// `pr_open` again by then.
+#[tokio::test]
+async fn an_observation_of_an_ended_pr_never_lands_on_the_next_one() {
+    use hunter::attention::{ObservedOpenPr, OpenPrRecorded};
+    use hunter::forge::Mergeable;
+    use hunter::transition::{PrEnded, PrEnding};
+    const NEXT_PR: &str = "https://github.com/o/r/pull/8";
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo_and_findings(&pool).await;
+    open_pr_for_finding_1(&pool).await;
+    let store = rw_store(&path).await;
+    // Sync has begun reading PR 7; the engage withdraws it first.
+    let pass = pr_sync(&store);
+    let in_flight = read_at(&pass, 1000, observed(Mergeable::Conflicting)).await;
+    let withdrawn = PrEnding::Closed {
+        reason: "withdrawn by engage worker",
+    };
+    assert_eq!(
+        store.end_pr(1, &pr_7(), withdrawn).await.unwrap(),
+        PrEnded::Applied
+    );
+    // Its harvest, a fresh fix and that fix's PR, abridged.
+    sqlx::query("UPDATE findings SET status = 'pr_open', pr_url = ?1 WHERE id = 1")
+        .bind(NEXT_PR)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.record_open_pr(1, &in_flight).await.unwrap(),
+        OpenPrRecorded::OtherPr
+    );
+    let ps = store.get_pr_state(1).await.unwrap().unwrap();
+    assert_eq!(
+        (ps.pr_number, ps.state.as_deref()),
+        (Some(7), Some("CLOSED"))
+    );
+
+    // The new PR's own read lands, in the next sync pass.
+    drop(pass);
+    let pass = pr_sync(&store);
+    let read = pass
+        .begin_read_at(1, &pr_ref(NEXT_PR), 2000)
+        .await
+        .unwrap()
+        .unwrap();
+    let next = ObservedOpenPr::fixture(read, observed(Mergeable::Mergeable));
+    assert!(matches!(
+        store.record_open_pr(1, &next).await.unwrap(),
+        OpenPrRecorded::Recorded(_)
+    ));
+    let ps = store.get_pr_state(1).await.unwrap().unwrap();
+    assert_eq!((ps.pr_number, ps.state.as_deref()), (Some(8), Some("OPEN")));
+}
+
+/// The end of a PR that sync read lands only while that PR is still the
+/// finding's. Sync read PR 7 as merged or closed; by the time it wrote,
+/// PR 7 had been withdrawn and harvested, and the finding had shipped
+/// PR 8. The status guard alone let PR 7's end through, since the finding
+/// is `pr_open` again: it closed the finding under its open PR 8 and put
+/// PR 7's number on PR 8's row, and sync revisits only `pr_open` findings,
+/// so nothing would ever sync PR 8 again.
+#[tokio::test]
+async fn an_end_of_an_ended_pr_never_lands_on_the_next_one() {
+    use hunter::attention::{ObservedOpenPr, OpenPrRecorded};
+    use hunter::forge::Mergeable;
+    use hunter::transition::{PrEnded, PrEnding};
+    const NEXT_PR: &str = "https://github.com/o/r/pull/8";
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo_and_findings(&pool).await;
+    open_pr_for_finding_1(&pool).await;
+    // PR 7's withdrawal, its harvest, a fresh fix and that fix's PR,
+    // abridged; then PR 8's first sync.
+    sqlx::query("UPDATE findings SET pr_url = ?1 WHERE id = 1")
+        .bind(NEXT_PR)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let store = rw_store(&path).await;
+    let pass = pr_sync(&store);
+    let read = pass
+        .begin_read_at(1, &pr_ref(NEXT_PR), 1000)
+        .await
+        .unwrap()
+        .unwrap();
+    let next = ObservedOpenPr::fixture(read, observed(Mergeable::Mergeable));
+    assert!(matches!(
+        store.record_open_pr(1, &next).await.unwrap(),
+        OpenPrRecorded::Recorded(_)
+    ));
+    drop(pass);
+
+    for ending in [
+        PrEnding::Merged,
+        PrEnding::Closed {
+            reason: "PR closed without merge; awaiting harvest",
+        },
+    ] {
+        assert_eq!(
+            store.end_pr(1, &pr_7(), ending).await.unwrap(),
+            PrEnded::OtherPr,
+            "{ending:?}"
+        );
+    }
+    let f = store.get_finding(1).await.unwrap().unwrap();
+    assert_eq!(
+        (f.status, f.pr_url.as_deref()),
+        (FindingStatus::PrOpen, Some(NEXT_PR))
+    );
+    let ps = store.get_pr_state(1).await.unwrap().unwrap();
+    assert_eq!((ps.pr_number, ps.state.as_deref()), (Some(8), Some("OPEN")));
+
+    // PR 8's own end lands.
+    assert_eq!(
+        store
+            .end_pr(1, &pr_ref(NEXT_PR), PrEnding::Merged)
+            .await
+            .unwrap(),
+        PrEnded::Applied
+    );
+    let f = store.get_finding(1).await.unwrap().unwrap();
+    assert_eq!(f.status, FindingStatus::Merged);
+    let ps = store.get_pr_state(1).await.unwrap().unwrap();
+    assert_eq!(
+        (ps.pr_number, ps.state.as_deref()),
+        (Some(8), Some("MERGED"))
+    );
+}
+
+/// An engage's answer to a PR that ended while its worker ran writes
+/// nothing, whether the finding is still waiting on that closure or has
+/// shipped its next PR since. `pr_state` holds one row per finding: the
+/// answer used to land on whatever PR the row held by then, so the old
+/// PR's watermark hid the new PR's feedback and its decline, on an
+/// unchanged head, suppressed the new PR's change request.
+#[tokio::test]
+async fn an_answer_to_an_ended_pr_never_lands_on_the_next_one() {
+    use hunter::attention::{AnswerRecorded, EngageAnswer, ObservedFixture};
+    use hunter::forge::Mergeable;
+    use hunter::transition::{PrEnded, PrEnding};
+    const ANSWERED_PR: &str = "https://github.com/o/r/pull/7";
+    const NEXT_PR: &str = "https://github.com/o/r/pull/8";
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo_and_findings(&pool).await;
+    open_pr_for_finding_1(&pool).await;
+    let store = rw_store(&path).await;
+    record_open(
+        &store,
+        1,
+        &read_at(&pr_sync(&store), 1000, observed(Mergeable::Mergeable)).await,
+    )
+    .await;
+    // The engage starts on PR 7: what it would decline, and its feedback.
+    let started_on = store.get_pr_state(1).await.unwrap().unwrap();
+    let answered_pr = pr_ref(ANSWERED_PR);
+    let answer =
+        EngageAnswer::without_push(&answered_pr, Some(SeenActivity::fixture(9000)), &started_on);
+
+    // While its worker runs, PR 7 is closed.
+    let closed = PrEnding::Closed {
+        reason: "closed on the forge",
+    };
+    assert_eq!(
+        store.end_pr(1, &pr_7(), closed).await.unwrap(),
+        PrEnded::Applied
+    );
+    assert_eq!(
+        store.mark_pr_engaged(1, &answer).await.unwrap(),
+        AnswerRecorded::NotPrOpen {
+            now: Some(FindingStatus::Closed)
+        }
+    );
+
+    // Its harvest, a fresh fix and that fix's PR, abridged; then PR 8's
+    // first sync, which sees feedback and the same change request on it.
+    sqlx::query("UPDATE findings SET status = 'pr_open', pr_url = ?1 WHERE id = 1")
+        .bind(NEXT_PR)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let pass = pr_sync(&store);
+    let read = pass
+        .begin_read_at(1, &pr_ref(NEXT_PR), 2000)
+        .await
+        .unwrap()
+        .unwrap();
+    let next = hunter::attention::ObservedOpenPr::fixture(
+        read,
+        ObservedFixture {
+            last_activity_at: 1500,
+            ..observed(Mergeable::Mergeable)
+        },
+    );
+    let flagged = record_open(&store, 1, &next).await;
+    assert_eq!(
+        flagged.now.as_deref(),
+        Some("new_comments,changes_requested")
+    );
+    let before = store.get_pr_state(1).await.unwrap().unwrap();
+
+    assert_eq!(
+        store.mark_pr_engaged(1, &answer).await.unwrap(),
+        AnswerRecorded::OtherPr
+    );
+    let ps = store.get_pr_state(1).await.unwrap().unwrap();
+    assert_eq!(
+        (
+            ps.last_engaged_activity_at,
+            ps.addressed_fingerprint.as_deref(),
+            ps.needs_attention.as_deref(),
+        ),
+        (None, None, Some("new_comments,changes_requested")),
+        "PR 8 still needs the engage that PR 7's answer never gave it"
+    );
+    assert_eq!(ps.attention_since, before.attention_since);
+}
+
+/// An engage that pushed answered the PR with new code, and the problems
+/// sync recorded came from a read begun before the push: they wait for a
+/// read begun after it. Settled from them as soon as the push was
+/// recorded, the failing check and the change request of a commit that was
+/// no longer the PR's flagged it again at once -- an engage spent before
+/// any sync had seen what the push did.
+///
+/// Which commit an older read saw does not matter. Here the read in flight
+/// when the push lands saw a head nobody recorded (pushed by someone else
+/// after the last sync, before the engage fetched); it is still older than
+/// the push.
+#[tokio::test]
+async fn a_push_s_answer_waits_for_a_read_begun_after_the_push() {
+    use hunter::attention::{AnswerRecorded, AttentionChange, EngageAnswer};
+    use hunter::forge::Mergeable;
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo_and_findings(&pool).await;
+    open_pr_for_finding_1(&pool).await;
+    let store = rw_store(&path).await;
+    let red = hunter::attention::ObservedFixture {
+        failing_checks: vec!["ci".into()],
+        ..observed(Mergeable::Mergeable)
+    };
+    let flagged = record_open(
+        &store,
+        1,
+        &read_at(&pr_sync(&store), 1000, red.clone()).await,
+    )
+    .await;
+    assert_eq!(
+        flagged.now.as_deref(),
+        Some("changes_requested,checks_failing")
+    );
+    // Sync has begun reading the PR, which someone else pushed to since the
+    // last sync; the engage pushes after it and records its answer first.
+    let pass = pr_sync(&store);
+    let in_flight = read_at(
+        &pass,
+        2000,
+        hunter::attention::ObservedFixture {
+            head_sha: "0ddba11".into(),
+            ..red.clone()
+        },
+    )
+    .await;
+
+    let pr = pr_7();
+    let answered = store
+        .mark_pr_engaged(
+            1,
+            &EngageAnswer::pushed(&pr, Some(SeenActivity::fixture(0))),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        answered,
+        AnswerRecorded::Recorded(AttentionChange {
+            before: Some("changes_requested,checks_failing".into()),
+            now: None,
+        })
+    );
+    let waiting = record_open(&store, 1, &in_flight).await;
+    drop(pass);
+    assert_eq!(waiting.now, None, "a read begun before the push waits");
+
+    // A read begun after the push sees the pushed head, still red.
+    let pushed = hunter::attention::ObservedFixture {
+        head_sha: "cafe123".into(),
+        ..red
+    };
+    let seen = record_open(&store, 1, &read_at(&pr_sync(&store), 3000, pushed).await).await;
+    assert_eq!(
+        seen.now.as_deref(),
+        Some("changes_requested,checks_failing")
+    );
+}
+
+/// An answer without a push leaves the PR's head where it was, so a sync
+/// read in flight while it is recorded still counts: here a check that
+/// started failing after the decline flags the PR. Counted as a push, the
+/// answer made that read wait, and the new failure went unflagged until a
+/// later sync.
+#[tokio::test]
+async fn an_answer_without_a_push_leaves_an_in_flight_read_counting() {
+    use hunter::attention::{AnswerRecorded, EngageAnswer};
+    use hunter::forge::Mergeable;
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo_and_findings(&pool).await;
+    open_pr_for_finding_1(&pool).await;
+    let store = rw_store(&path).await;
+    let flagged = record_open(
+        &store,
+        1,
+        &read_at(&pr_sync(&store), 1000, observed(Mergeable::Mergeable)).await,
+    )
+    .await;
+    assert_eq!(flagged.now.as_deref(), Some("changes_requested"));
+    // Sync has begun reading the PR when the engage, which pushed nothing,
+    // records its decline of the change request.
+    let pass = pr_sync(&store);
+    let in_flight = read_at(
+        &pass,
+        2000,
+        hunter::attention::ObservedFixture {
+            failing_checks: vec!["ci".into()],
+            ..observed(Mergeable::Mergeable)
+        },
+    )
+    .await;
+    let started_on = store.get_pr_state(1).await.unwrap().unwrap();
+    let pr = pr_7();
+    let answered = store
+        .mark_pr_engaged(
+            1,
+            &EngageAnswer::without_push(&pr, Some(SeenActivity::fixture(0)), &started_on),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(answered, AnswerRecorded::Recorded(_)),
+        "{answered:?}"
+    );
+
+    let seen = record_open(&store, 1, &in_flight).await;
+    drop(pass);
+
+    assert_eq!(
+        seen.now.as_deref(),
+        Some("changes_requested,checks_failing"),
+        "nothing was pushed, so the read in flight saw the PR's head"
     );
 }
 
@@ -1195,7 +1759,7 @@ enum PrUpsert {
     SyncOpen,
     MarkClosed,
     MarkMerged,
-    SetNumber,
+    FillNumber,
 }
 
 impl PrUpsert {
@@ -1203,31 +1767,48 @@ impl PrUpsert {
         Self::SyncOpen,
         Self::MarkClosed,
         Self::MarkMerged,
-        Self::SetNumber,
+        Self::FillNumber,
     ];
 
-    async fn run(self, store: &Store, pr_number: i64) {
+    /// The upserts that record the number the forge reports, over any
+    /// number already there. `FillNumber` only fills in a missing one.
+    const OBSERVING: [Self; 3] = [Self::SyncOpen, Self::MarkClosed, Self::MarkMerged];
+
+    /// Run on finding 1, whose PR becomes `pr_number`. A sync observes the
+    /// PR the finding names, so `SyncOpen` first points the finding at it.
+    async fn run(self, store: &Store, pool: &SqlitePool, pr_number: i64) {
         match self {
-            Self::SyncOpen => store
-                .sync_pr_open(
-                    1,
-                    &hunter::store::SyncPrData {
-                        pr_number,
-                        ..sync_pr_data("fp", "new_comments", 6000, false)
-                    },
-                )
-                .await
-                .unwrap(),
+            Self::SyncOpen => {
+                let url = format!("https://github.com/o/r/pull/{pr_number}");
+                sqlx::query("UPDATE findings SET pr_url = ?1 WHERE id = 1")
+                    .bind(&url)
+                    .execute(pool)
+                    .await
+                    .unwrap();
+                let pass = pr_sync(store);
+                let read = pass
+                    .begin_read_at(1, &pr_ref(&url), 6000)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let pr = hunter::attention::ObservedOpenPr::fixture(
+                    read,
+                    observed(hunter::forge::Mergeable::Mergeable),
+                );
+                record_open(store, 1, &pr).await;
+            }
             Self::MarkClosed => store.mark_pr_closed(1, pr_number, 6000).await.unwrap(),
             Self::MarkMerged => store.mark_pr_merged(1, pr_number, 6000).await.unwrap(),
-            Self::SetNumber => store.set_pr_number(1, pr_number).await.unwrap(),
+            Self::FillNumber => store.fill_pr_number(1, pr_number).await.unwrap(),
         }
     }
 }
 
 /// Seed finding 1's `pr_state` row for `pr_number`, harvested at 4000 and
-/// two attempts into a failure streak.
+/// two attempts into a failure streak, with the finding `pr_open` again
+/// (re-fixed, or its PR still being worked) so a sync may record it.
 async fn seed_harvested_pr(pool: &SqlitePool, pr_number: Option<i64>) {
+    open_pr_for_finding_1(pool).await;
     sqlx::query(
         "INSERT INTO pr_state (finding_id, pr_number, state, harvested_at) \
          VALUES (1, ?1, 'CLOSED', 4000)",
@@ -1264,13 +1845,13 @@ async fn harvest_bookkeeping(pool: &SqlitePool) -> (Option<i64>, i64, Option<Str
 /// new PR out of `list_pending_harvest` for good.
 #[tokio::test]
 async fn a_new_pr_number_clears_the_old_prs_harvest_bookkeeping() {
-    for upsert in PrUpsert::ALL {
+    for upsert in PrUpsert::OBSERVING {
         let (_dir, path, pool) = fresh_db().await;
         seed_repo_and_findings(&pool).await;
         seed_harvested_pr(&pool, Some(5)).await;
         let store = rw_store(&path).await;
 
-        upsert.run(&store, 6).await;
+        upsert.run(&store, &pool, 6).await;
 
         assert_eq!(
             harvest_bookkeeping(&pool).await,
@@ -1278,6 +1859,27 @@ async fn a_new_pr_number_clears_the_old_prs_harvest_bookkeeping() {
             "{upsert:?}: PR #6 must start unharvested"
         );
     }
+}
+
+/// The self-heal fills in a missing number and never replaces one: its
+/// caller read NULL, and a sync that recorded the PR's number since then
+/// holds the observation that stands.
+#[tokio::test]
+async fn the_self_heal_never_replaces_a_recorded_pr_number() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo_and_findings(&pool).await;
+    seed_harvested_pr(&pool, Some(5)).await;
+    let store = rw_store(&path).await;
+
+    store.fill_pr_number(1, 6).await.unwrap();
+
+    let ps = store.get_pr_state(1).await.unwrap().unwrap();
+    assert_eq!(ps.pr_number, Some(5));
+    assert_eq!(
+        harvest_bookkeeping(&pool).await,
+        (Some(4000), 2, Some("gh: 502".into())),
+        "PR #5 keeps its stamp and streak"
+    );
 }
 
 /// Every sync rewrites the row with the PR's own number, so the same
@@ -1291,7 +1893,7 @@ async fn the_same_pr_number_keeps_its_harvest_bookkeeping() {
         seed_harvested_pr(&pool, Some(5)).await;
         let store = rw_store(&path).await;
 
-        upsert.run(&store, 5).await;
+        upsert.run(&store, &pool, 5).await;
 
         assert_eq!(
             harvest_bookkeeping(&pool).await,
@@ -1312,7 +1914,7 @@ async fn filling_in_a_missing_pr_number_keeps_the_harvest_bookkeeping() {
         seed_harvested_pr(&pool, None).await;
         let store = rw_store(&path).await;
 
-        upsert.run(&store, 5).await;
+        upsert.run(&store, &pool, 5).await;
 
         assert_eq!(
             harvest_bookkeeping(&pool).await,
@@ -2242,24 +2844,48 @@ async fn leaving_the_tier_releases_the_hold() {
 }
 
 /// Finding 1's PR closed, 3's merged, 4's open with attention; each one's
-/// harvest, resp. engage, held.
+/// harvest, resp. engage, held. Finding 4's open PR is recorded the way
+/// sync records one, so its attention is what settle derives from it.
 async fn pr_holds_fixture() -> (TempDir, Store) {
+    const PR_9: &str = "https://github.com/o/r/pull/9";
     let (dir, path, pool) = fresh_db().await;
     seed_repo_and_findings(&pool).await;
     sqlx::raw_sql(
         "UPDATE findings SET status = 'closed' WHERE id = 1; \
          UPDATE findings SET status = 'merged' WHERE id = 3; \
-         UPDATE findings SET status = 'pr_open' WHERE id = 4; \
-         INSERT INTO pr_state (finding_id, pr_number, state, last_activity_at, \
-             needs_attention, attention_fingerprint, head_sha) VALUES \
-         (1, 7, 'CLOSED', NULL, NULL, NULL, NULL), \
-         (3, 8, 'MERGED', NULL, NULL, NULL, NULL), \
-         (4, 9, 'OPEN', 4000, 'new_comments', 'fp-a', 'head1');",
+         INSERT INTO pr_state (finding_id, pr_number, state) VALUES \
+         (1, 7, 'CLOSED'), \
+         (3, 8, 'MERGED');",
     )
     .execute(&pool)
     .await
     .unwrap();
+    sqlx::query("UPDATE findings SET status = 'pr_open', pr_url = ?1 WHERE id = 4")
+        .bind(PR_9)
+        .execute(&pool)
+        .await
+        .unwrap();
     let store = rw_store(&path).await;
+    let pass = pr_sync(&store);
+    let read = pass
+        .begin_read_at(4, &pr_ref(PR_9), 4000)
+        .await
+        .unwrap()
+        .unwrap();
+    let open = hunter::attention::ObservedOpenPr::fixture(
+        read,
+        hunter::attention::ObservedFixture {
+            last_activity_at: 4000,
+            head_sha: "head1".into(),
+            ..observed(hunter::forge::Mergeable::Mergeable)
+        },
+    );
+    let flagged = record_open(&store, 4, &open).await;
+    assert_eq!(
+        flagged.now.as_deref(),
+        Some("new_comments,changes_requested")
+    );
+    drop(pass);
     for (fid, kind) in [
         (1, FindingJobKind::Harvest),
         (3, FindingJobKind::Harvest),
@@ -2402,12 +3028,17 @@ async fn assert_dismissed(store: &Store) {
     let ps = store.get_pr_state(4).await.unwrap().unwrap();
     assert_eq!(
         (
-            ps.needs_attention,
+            ps.needs_attention.as_deref(),
             ps.last_engaged_activity_at,
             ps.addressed_fingerprint.as_deref(),
             ps.addressed_head_sha.as_deref()
         ),
-        (None, Some(4000), Some("fp-a"), Some("head1"))
+        (
+            None,
+            Some(4000),
+            Some("review:CHANGES_REQUESTED"),
+            Some("head1")
+        )
     );
 }
 

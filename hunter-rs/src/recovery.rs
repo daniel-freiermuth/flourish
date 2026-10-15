@@ -56,7 +56,7 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::domain::{ClosureClass, FindingStatus, JobKind, JobState};
-use crate::store::{JobOutcome, Store, StoreWriteError, VerdictAnchor};
+use crate::store::{JobOutcome, PrSyncPass, Store, StoreWriteError, VerdictAnchor};
 use crate::transition::Moved;
 use crate::types::Job;
 use crate::workspace::{Workspace, tree_in_use};
@@ -218,6 +218,13 @@ impl Recovered {
     pub const fn store(&self) -> &Store {
         &self.store
     }
+
+    /// Begin the store's PR sync pass, or `None` while another is live
+    /// ([`PrSyncPass`]). Sync needs this proof so that only the daemon's
+    /// store, the one held under its [`DaemonLock`], can sync.
+    pub fn begin_pr_sync(&self) -> Option<PrSyncPass> {
+        PrSyncPass::begin(&self.store)
+    }
 }
 
 /// A `running` job nothing will finish: found with the startup token in
@@ -373,6 +380,12 @@ impl CycleScope {
 
     pub const fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// [`Recovered::begin_pr_sync`] for the cycle: a scope is opened only
+    /// from a [`Recovered`].
+    pub fn begin_pr_sync(&self) -> Option<PrSyncPass> {
+        PrSyncPass::begin(&self.store)
     }
 
     /// Create a job, owned by the [`RunningJob`] returned. The INSERT and

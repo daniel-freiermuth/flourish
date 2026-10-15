@@ -11,13 +11,14 @@ use std::path::Path;
 
 use anyhow::Context as _;
 
+use crate::attention::{AnswerRecorded, EngageAnswer, ObservedOpenPr, OpenPrRecorded};
 use crate::config::Config;
 use crate::domain::{
     BudgetOverride, ClosureClass, FindingJobKind, FindingStatus, FindingType, FinishedState,
     HoldReason, JobKind, JobState, RepoJobKind, RepoWorkKind, Severity,
 };
-use crate::store::{FindingFilter, JobOutcome, Store, StoreWriteError, SyncPrData};
-use crate::transition::{Moved, Transition, Unclaimed};
+use crate::store::{FindingFilter, JobOutcome, PrSyncPass, SeenActivity, Store, StoreWriteError};
+use crate::transition::{Moved, PrEnded, PrEnding, PrRef, Transition, Unclaimed};
 use crate::types::{Finding, Job, Repo};
 use crate::util::now_ms;
 
@@ -1127,7 +1128,7 @@ pub async fn anticipated_tokens(
 use std::path::PathBuf;
 
 use crate::backend::{Backend, JobClass, Verdict};
-use crate::forge::{self, CheckConclusion, GhCheckRun, Mergeable, PrView, ReviewDecision};
+use crate::forge::{self, PrView};
 use crate::ingest::{EntryTypes, IngestResult, ingest_findings, ingest_scan_findings};
 use crate::playbooks;
 use crate::recovery::{CreatedJob, CycleScope, FixClaim, RecordedJob, Recovered, RunningJob};
@@ -1943,21 +1944,39 @@ async fn log_not_moved(
         .await;
 }
 
-/// [`make_transition`] for the PR sync's merged and closed edges, which
-/// also record the PR's end in `pr_state`: a failed write is an `error`
-/// event and a sync error, and leaves the finding `pr_open` with its
-/// `pr_state` unchanged, so the next sync retries both.
+/// End `pr` for the PR sync ([`Store::end_pr`]), recording it in
+/// `pr_state` with the finding's move: a failed write is an `error` event
+/// and a sync error, and leaves the finding `pr_open` with its `pr_state`
+/// unchanged, so the next sync retries both. A conflict, or a finding that
+/// has shipped another PR since sync listed it, is logged as a `kind`
+/// event and left to whatever moved it; `true` only when the end was made.
 async fn sync_pr_end(
     store: &Store,
     fid: i64,
     kind: &str,
-    transition: &Transition<'_>,
+    pr: &PrRef,
+    ending: PrEnding<'_>,
     summary: &mut SyncResult,
 ) -> bool {
-    match store.transition(fid, transition).await {
-        Ok(Moved::Applied) => true,
-        Ok(Moved::Conflict { now }) => {
-            log_conflict(store, fid, None, kind, transition, now).await;
+    match store.end_pr(fid, pr, ending).await {
+        Ok(PrEnded::Applied) => true,
+        Ok(PrEnded::Conflict { now }) => {
+            log_not_moved(store, fid, None, kind, (ending.from(), ending.to()), now).await;
+            false
+        }
+        Ok(PrEnded::OtherPr) => {
+            let _ = store
+                .log_event(
+                    kind,
+                    &format!(
+                        "#{fid} PR #{} seen {}, not recorded: the finding has another PR now",
+                        pr.number(),
+                        ending.to()
+                    ),
+                    None,
+                    Some(fid),
+                )
+                .await;
             false
         }
         Err(err) => {
@@ -1966,7 +1985,7 @@ async fn sync_pr_end(
                     "error",
                     &format!(
                         "sync #{fid}: PR {} but not recorded: {err} (the next sync retries)",
-                        transition.to()
+                        ending.to()
                     ),
                     None,
                     Some(fid),
@@ -4889,7 +4908,7 @@ pub async fn run_fix(
 /// GitHub emits `2024-01-15T12:30:45Z`; GitLab may use `+00:00` suffix.
 /// Handles both, plus the offset-less variant (treated as UTC).
 #[allow(clippy::many_single_char_names)]
-fn iso_ms(ts: &str) -> i64 {
+pub(crate) fn iso_ms(ts: &str) -> i64 {
     if ts.is_empty() {
         return 0;
     }
@@ -4973,98 +4992,17 @@ fn civil_to_days(y: i64, m: u32, d: u32) -> i64 {
     era * 146_097 + i64::from(doe) - 719_468
 }
 
-/// Max of createdAt from comments + submittedAt from reviews -> epoch ms.
-///
-/// Over screened feedback only (`forge::screen_feedback`): a comment from
-/// someone who cannot push, and is not a configured bot, never raises
-/// `new_comments`, so it cannot start an engage run. Neither does hunter's
-/// own ([`Voice::Own`](forge::Voice::Own)): its reply answers the feedback.
-fn latest_activity_ms(pr: &PrView) -> i64 {
-    let theirs = |v: forge::Voice| v != forge::Voice::Own;
-    let comment_stamps = pr
-        .comments
-        .iter()
-        .filter(|c| theirs(c.voice))
-        .map(|c| iso_ms(&c.created_at));
-    let review_stamps = pr
-        .reviews
-        .iter()
-        .filter(|r| theirs(r.voice))
-        .map(|r| iso_ms(&r.submitted_at));
-    comment_stamps.chain(review_stamps).max().unwrap_or(0)
-}
-
-/// (human summary, `any_failing`, sorted-unique failing check names).
-fn checks_summary(rollup: &[GhCheckRun]) -> (Option<String>, bool, Vec<String>) {
-    if rollup.is_empty() {
-        return (None, false, Vec::new());
-    }
-    let named: Vec<(&str, CheckConclusion)> = rollup
-        .iter()
-        .map(|c| {
-            let name = c.name.as_deref().or(c.context.as_deref()).unwrap_or("?");
-            let raw = c.conclusion.as_deref().or(c.state.as_deref()).unwrap_or("");
-            (name, CheckConclusion::parse(raw))
-        })
-        .collect();
-
-    let mut failing_set: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-    let mut fail_count = 0usize;
-    let mut pass_count = 0usize;
-    for &(name, concl) in &named {
-        if concl.is_failing() {
-            failing_set.insert(name);
-            fail_count += 1;
-        } else if concl.is_passing() {
-            pass_count += 1;
-        }
-    }
-    let pending = named.len() - fail_count - pass_count;
-    let failing_names: Vec<String> = failing_set.iter().map(|s| (*s).to_owned()).collect();
-
-    let mut parts = vec![format!("{pass_count} pass")];
-    if !failing_names.is_empty() {
-        parts.push(format!("{fail_count} fail"));
-    }
-    if pending > 0 {
-        parts.push(format!("{pending} pending"));
-    }
-    (
-        Some(parts.join(" / ")),
-        !failing_names.is_empty(),
-        failing_names,
-    )
-}
-
-/// Fingerprint of static (non-comment) attention reasons.
-/// `review:CHANGES_REQUESTED` | mergeable:CONFLICTING | checks:name1,name2
-/// None when nothing static is wrong.
-fn attention_fingerprint(pr: &PrView, failing_names: &[String]) -> Option<String> {
-    let mut parts: Vec<String> = Vec::new();
-    if pr.review_decision == ReviewDecision::ChangesRequested {
-        parts.push("review:CHANGES_REQUESTED".to_owned());
-    }
-    if pr.mergeable == Mergeable::Conflicting {
-        parts.push("mergeable:CONFLICTING".to_owned());
-    }
-    if !failing_names.is_empty() {
-        parts.push(format!("checks:{}", failing_names.join(",")));
-    }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join("|"))
-    }
-}
-
-/// Sync PRs for all `pr_open` findings (`scheduler.sync_prs`).
+/// Sync PRs for all `pr_open` findings (`scheduler.sync_prs`), as `pass`:
+/// no other sync of the store runs meanwhile, and each PR is read once
+/// ([`PrSyncPass`]).
 #[allow(
     clippy::too_many_lines,
     reason = "one pass per open PR with a flat decision table over PR \
               state (merged, closed, review comments, checks); the arms \
               read as a table only while they sit together"
 )]
-pub async fn sync_prs(store: &Store, cfg: &Config) -> SyncResult {
+pub async fn sync_prs(pass: &PrSyncPass, cfg: &Config) -> SyncResult {
+    let store = pass.store();
     let mut summary = SyncResult::default();
     let findings = store
         .list_findings(&FindingFilter {
@@ -5107,7 +5045,7 @@ pub async fn sync_prs(store: &Store, cfg: &Config) -> SyncResult {
             continue;
         };
         let fg = forge::forge_for(repo.forge);
-        let Some((_slug, pr_number)) = fg.parse_pr_url(url) else {
+        let Some(read_pr) = PrRef::parse(&*fg, url) else {
             let _ = store
                 .log_event(
                     "error",
@@ -5118,6 +5056,36 @@ pub async fn sync_prs(store: &Store, cfg: &Config) -> SyncResult {
                 .await;
             summary.errors += 1;
             continue;
+        };
+        let pr_number = read_pr.number();
+        // Begun before the read, not after: the observation's `synced_at`
+        // is when the forge was asked, and the push count it carries is the
+        // one before the forge answered, so a push landing while the read
+        // is out leaves this observation counted as older than that push.
+        let begun = log_write_failure(
+            pass.begin_read(fid, &read_pr).await,
+            format_args!("#{fid}: beginning a PR read"),
+        );
+        let read = match begun {
+            Some(Some(read)) => read,
+            Some(None) => {
+                // `list_findings` lists each finding once, so this pass
+                // cannot reach a finding twice; refused if it ever does.
+                let _ = store
+                    .log_event(
+                        "error",
+                        &format!("sync #{fid}: PR already read in this pass"),
+                        None,
+                        Some(fid),
+                    )
+                    .await;
+                summary.errors += 1;
+                continue;
+            }
+            None => {
+                summary.errors += 1;
+                continue;
+            }
         };
         let pr = match fg.view_pr_sync(&repo.url, pr_number, &cfg.review_bots) {
             Ok(pr) => pr,
@@ -5140,8 +5108,8 @@ pub async fn sync_prs(store: &Store, cfg: &Config) -> SyncResult {
                 // The finding's move and the PR's record are one write: a
                 // failed write leaves both for the next sync, and a
                 // conflict leaves the finding to what moved it.
-                let merged = Transition::PrMerged { pr_number };
-                if !sync_pr_end(store, fid, "ship", &merged, &mut summary).await {
+                if !sync_pr_end(store, fid, "ship", &read_pr, PrEnding::Merged, &mut summary).await
+                {
                     continue;
                 }
                 let _ = store
@@ -5158,11 +5126,10 @@ pub async fn sync_prs(store: &Store, cfg: &Config) -> SyncResult {
                 // `closed` and `pr_state` CLOSED land together: sync_prs only
                 // revisits pr_open findings, so a finding set closed while
                 // pr_state still read OPEN would never be looked at again.
-                let closed = Transition::PrClosed {
+                let closed = PrEnding::Closed {
                     reason: "PR closed without merge; awaiting harvest",
-                    pr_number,
                 };
-                if !sync_pr_end(store, fid, "verdict", &closed, &mut summary).await {
+                if !sync_pr_end(store, fid, "verdict", &read_pr, closed, &mut summary).await {
                     continue;
                 }
                 let _ = store
@@ -5179,123 +5146,80 @@ pub async fn sync_prs(store: &Store, cfg: &Config) -> SyncResult {
             forge::PrState::Open => { /* fall through to attention logic below */ }
         }
 
-        // -- Open PR: full attention-flagging logic (open-PR branch of `scheduler.sync_prs`) --
-
-        let prev = store.get_pr_state(fid).await.ok().flatten();
-        let last_activity = latest_activity_ms(&pr);
-        let (checks, failing, failing_names) = checks_summary(&pr.status_check_rollup);
-
-        // A PR never engaged has answered nothing: every screened item on
-        // it is new. Hunter's own comments are not activity, so nothing
-        // has to be baselined away -- doing so hid the reviews that land
-        // on a PR before its first sync.
-        let engaged: i64 = prev
-            .as_ref()
-            .and_then(|p| p.last_engaged_activity_at)
-            .unwrap_or(0);
-
-        // Suppression: don't re-flag a static reason identical to the
-        // one an engage cycle already declined (same fingerprint AND
-        // same head_sha — a push resets suppression even if the static
-        // snapshot looks identical).
-        let fp = attention_fingerprint(&pr, &failing_names);
-        let addressed_fp = prev
-            .as_ref()
-            .and_then(|p| p.addressed_fingerprint.as_deref());
-        let addressed_sha = prev.as_ref().and_then(|p| p.addressed_head_sha.as_deref());
-        let head_sha = &pr.head_sha;
-        let suppressed = fp.is_some()
-            && fp.as_deref() == addressed_fp
-            && addressed_sha.is_some()
-            && Some(head_sha.as_str()) == addressed_sha;
-
-        let mut reasons: Vec<&str> = Vec::new();
-        if last_activity > engaged {
-            reasons.push("new_comments");
-        }
-        if !suppressed {
-            if pr.review_decision == ReviewDecision::ChangesRequested {
-                reasons.push("changes_requested");
-            }
-            if pr.mergeable == Mergeable::Conflicting {
-                reasons.push("conflict");
-            }
-            if failing {
-                reasons.push("checks_failing");
-            }
-        }
-        let attention: Option<String> = if reasons.is_empty() {
-            None
-        } else {
-            Some(reasons.join(","))
-        };
-
-        // attention_since fairness: only touch when the reason changes.
-        let prev_attention = prev.as_ref().and_then(|p| p.needs_attention.as_deref());
-        let mut attention_since_val: Option<Option<i64>> = None;
-        if attention.as_deref() != prev_attention {
-            attention_since_val = if attention.is_some() {
-                Some(Some(now_ms()))
-            } else {
-                Some(None)
-            };
-        }
-        let mut addr_fp: Option<Option<String>> = None;
-        if addressed_fp.is_some()
-            && (fp.as_deref() != addressed_fp || Some(head_sha.as_str()) != addressed_sha)
-        {
-            addr_fp = Some(None);
-        }
-        let clear_addressed = addr_fp.is_some();
-        let data = SyncPrData {
-            pr_number,
-            state: pr.state.as_str().into(),
-            mergeable: pr.mergeable.as_str().into(),
-            checks,
-            head_ref: pr.head_ref.clone(),
-            head_sha: head_sha.clone(),
-            last_activity_at: last_activity,
-            last_engaged_activity_at: engaged,
-            needs_attention: attention.clone(),
-            attention_fingerprint: fp,
-            synced_at: now_ms(),
-            attention_since: attention_since_val,
-            clear_addressed,
-        };
-        log_write_failure(
-            store.sync_pr_open(fid, &data).await,
+        // -- Open PR: record what the forge shows; the attention it calls
+        // for is settled from that and engage's last answer, in the same
+        // write (`crate::attention`). Nothing here reads the row first, so
+        // an engage answering meanwhile cannot be written over, and the
+        // write lands only while the finding is still `pr_open`, so an
+        // engage that withdrew the PR meanwhile is not undone either.
+        let observed = ObservedOpenPr::from_view(read, &pr);
+        // Bound first: the `format_args!` temporary is not `Send`, and the
+        // arms below await.
+        let recorded = log_write_failure(
+            store.record_open_pr(fid, &observed).await,
             format_args!("#{fid}: recording synced PR state"),
         );
+        let change = match recorded {
+            Some(OpenPrRecorded::Recorded(change)) => change,
+            Some(OpenPrRecorded::NotPrOpen { now }) => {
+                // Something else decided the finding since it was listed,
+                // and recorded the PR's end if it had one; that stands.
+                let now = now.map_or_else(|| "gone".to_owned(), |s| format!("'{s}'"));
+                let _ = store
+                    .log_event(
+                        "engage",
+                        &format!("#{fid} PR #{pr_number} seen open, not recorded: it is {now} now"),
+                        None,
+                        Some(fid),
+                    )
+                    .await;
+                continue;
+            }
+            Some(OpenPrRecorded::OtherPr) => {
+                // The PR read ended and the finding shipped a new one while
+                // the read was out; the new PR's next sync records that one.
+                let _ = store
+                    .log_event(
+                        "engage",
+                        &format!("#{fid} PR #{pr_number} seen open, not recorded: the finding has another PR now"),
+                        None,
+                        Some(fid),
+                    )
+                    .await;
+                continue;
+            }
+            None => {
+                summary.errors += 1;
+                continue;
+            }
+        };
 
-        if attention.is_some() && attention.as_deref() != prev_attention {
+        if let Some(reasons) = change.raised() {
             let _ = store
                 .log_event(
                     "engage",
-                    &format!(
-                        "#{fid} PR #{pr_number} needs attention: {}",
-                        attention.as_deref().unwrap_or("")
-                    ),
+                    &format!("#{fid} PR #{pr_number} needs attention: {reasons}"),
                     None,
                     Some(fid),
                 )
                 .await;
         }
         summary.synced += 1;
-        if attention.is_some() {
+        if change.now.is_some() {
             summary.attention += 1;
         }
     }
     summary
 }
 
-/// The repo and PR an engage works on: its `pr_state` row, branch and
-/// number, with the PR head fetched into the clone for a cold attempt.
+/// The repo and PR an engage works on: its `pr_state` row, branch, and the
+/// PR itself, with the PR head fetched into the clone for a cold attempt.
 /// Every way to lack one is logged and an error: sync records them first.
 async fn engage_target(
     store: &Store,
     finding: &Finding,
     resume: Option<&ResumePlan>,
-) -> anyhow::Result<(Repo, crate::types::PrState, String, i64)> {
+) -> anyhow::Result<(Repo, crate::store::RecordedPrState, String, PrRef)> {
     let fid = finding.id;
     let Ok(Some(repo)) = store.get_repo_by_id(finding.repo_id).await else {
         let _ = store
@@ -5333,33 +5257,8 @@ async fn engage_target(
             anyhow::bail!("no pr_state");
         }
     };
-    let pr_number = if let Some(n) = ps.pr_number {
-        n
-    } else {
-        let fg = forge::forge_for(repo.forge);
-        if let Some((_slug, num)) = finding.pr_url.as_deref().and_then(|u| fg.parse_pr_url(u)) {
-            tracing::warn!(
-                finding_id = fid,
-                pr_number = num,
-                "self-healed missing pr_number from pr_url"
-            );
-            log_write_failure(
-                store.set_pr_number(fid, num).await,
-                format_args!("#{fid}: self-healed pr_number -> {num}"),
-            );
-            num
-        } else {
-            let _ = store
-                .log_event(
-                    "error",
-                    &format!("engage #{fid}: no pr_number and no parseable pr_url"),
-                    None,
-                    Some(fid),
-                )
-                .await;
-            anyhow::bail!("no pr_number");
-        }
-    };
+    let pr = engage_pr(store, finding, &repo).await?;
+    check_row_is_of(store, fid, &ps, &pr).await?;
     if head_ref == repo.default_branch {
         let _ = store
             .log_event(
@@ -5395,15 +5294,91 @@ async fn engage_target(
             anyhow::bail!("fetch failed: {tail}");
         }
     }
-    Ok((repo, ps, head_ref, pr_number))
+    Ok((repo, ps, head_ref, pr))
+}
+
+/// Refuse an engage whose `pr_state` row `ps` is of another PR than `pr`,
+/// the finding's, or fill in the row's missing number from `pr`.
+///
+/// The row holds the head and problems sync last recorded for the
+/// finding. Only an observation of the finding's own PR writes its
+/// number, so a row naming another one is from before that rule; the next
+/// sync of the finding's PR rewrites it, and until then its head is not
+/// this PR's.
+async fn check_row_is_of(
+    store: &Store,
+    fid: i64,
+    ps: &crate::types::PrState,
+    pr: &PrRef,
+) -> anyhow::Result<()> {
+    let num = pr.number();
+    match ps.pr_number {
+        Some(n) if n != num => {
+            let _ = store
+                .log_event(
+                    "error",
+                    &format!(
+                        "engage #{fid}: pr_state is PR #{n}, the finding's PR is #{num} -- sync first"
+                    ),
+                    None,
+                    Some(fid),
+                )
+                .await;
+            anyhow::bail!("pr_state of another PR");
+        }
+        Some(_) => {}
+        None => {
+            tracing::warn!(
+                finding_id = fid,
+                pr_number = num,
+                "self-healed missing pr_number from pr_url"
+            );
+            log_write_failure(
+                store.fill_pr_number(fid, num).await,
+                format_args!("#{fid}: self-healed pr_number -> {num}"),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The PR an engage answers: the finding's `pr_url`, its number parsed
+/// from it. Its answer is recorded against it, and lands only while that
+/// is still the finding's PR (`AnswerRecorded::OtherPr`).
+async fn engage_pr(store: &Store, finding: &Finding, repo: &Repo) -> anyhow::Result<PrRef> {
+    let fid = finding.id;
+    let Some(url) = finding.pr_url.as_deref().filter(|u| !u.is_empty()) else {
+        let _ = store
+            .log_event(
+                "error",
+                &format!("engage #{fid}: no pr_url"),
+                None,
+                Some(fid),
+            )
+            .await;
+        anyhow::bail!("no pr_url");
+    };
+    let Some(pr) = PrRef::parse(&*forge::forge_for(repo.forge), url) else {
+        let _ = store
+            .log_event(
+                "error",
+                &format!("engage #{fid}: unparseable pr_url {url:?}"),
+                None,
+                Some(fid),
+            )
+            .await;
+        anyhow::bail!("unparseable pr_url");
+    };
+    Ok(pr)
 }
 
 /// An engage job with its PR read and a tree at the PR head.
 struct EngageStart {
     repo: Repo,
-    ps: crate::types::PrState,
+    ps: crate::store::RecordedPrState,
     head_ref: String,
-    pr_number: i64,
+    /// The PR answered: the finding's when this attempt started.
+    pr_ref: PrRef,
     /// The PR as the forge shows it, for the playbook: `None` on a resume,
     /// which sends no playbook and so does not ask the forge.
     pr: Option<PrView>,
@@ -5414,19 +5389,7 @@ struct EngageStart {
     /// The newest feedback the chain's worker was shown: read from the PR
     /// by a cold attempt, inherited by a resume (which is only told to
     /// carry on). None for a chain started before this was recorded.
-    seen_activity: Option<i64>,
-}
-
-impl EngageStart {
-    /// The engagement watermark a finished attempt leaves: the newest
-    /// feedback its worker saw, so anything posted since -- while it ran,
-    /// or while the chain was suspended -- is new activity at the next
-    /// sync. Never lowered: a chain with nothing recorded keeps the mark
-    /// it started with, which can only re-raise feedback, never hide it.
-    fn engaged_watermark(&self) -> i64 {
-        let before = self.ps.last_engaged_activity_at.unwrap_or(0);
-        self.seen_activity.map_or(before, |seen| seen.max(before))
-    }
+    seen_activity: Option<SeenActivity>,
 }
 
 /// The PR as the forge shows it, for a fresh engage's playbook. Only a
@@ -5480,7 +5443,7 @@ async fn start_engage(
     resume: Option<&ResumePlan>,
 ) -> anyhow::Result<Result<(EngageStart, RunningJob), CycleSummary>> {
     let (store, fid) = (scope.store(), finding.id);
-    let (repo, ps, head_ref, pr_number) = match engage_target(store, finding, resume).await {
+    let (repo, ps, head_ref, pr_ref) = match engage_target(store, finding, resume).await {
         Ok(target) => target,
         Err(e) => {
             if let Some(denied) =
@@ -5509,6 +5472,7 @@ async fn start_engage(
         BudgetDecision::Denied(d) => return Ok(Err(*d)),
     };
 
+    let pr_number = pr_ref.number();
     let pr = match engage_view(store, (cfg, backend), finding, &repo, pr_number, resume).await? {
         Ok(pr) => pr,
         Err(denied) => return Ok(Err(denied)),
@@ -5557,23 +5521,13 @@ async fn start_engage(
             return Ok(Err(count_unmade_engage_tree(store, fid, job, failed).await));
         }
     };
-    // Only a fresh attempt reads the PR, and its playbook shows the worker
-    // exactly that view; a resume inherits what its chain was shown.
-    let seen_activity = if let Some(pr) = &pr {
-        let seen = latest_activity_ms(pr);
-        // Unrecorded, a resume of this chain falls back to the mark the
-        // chain started with: a re-raised comment, never a hidden one.
-        let _ = store.set_seen_activity(job, seen).await;
-        Some(seen)
-    } else {
-        store.seen_activity(job).await.ok().flatten()
-    };
+    let seen_activity = engage_seen_activity(store, job, pr.as_ref()).await;
     Ok(Ok((
         EngageStart {
             repo,
             ps,
             head_ref,
-            pr_number,
+            pr_ref,
             pr,
             job,
             ws,
@@ -5583,6 +5537,24 @@ async fn start_engage(
         },
         running,
     )))
+}
+
+/// The newest feedback job `job`'s worker is shown. Only a fresh attempt
+/// reads the PR (`pr`), and its playbook shows the worker exactly that
+/// view; a resume inherits what its chain was shown.
+async fn engage_seen_activity(
+    store: &Store,
+    job: i64,
+    pr: Option<&PrView>,
+) -> Option<SeenActivity> {
+    let Some(pr) = pr else {
+        return store.seen_activity(job).await.ok().flatten();
+    };
+    let seen = SeenActivity::of(pr);
+    // Unrecorded, a resume of this chain falls back to the mark the
+    // chain started with: a re-raised comment, never a hidden one.
+    let _ = store.set_seen_activity(job, seen).await;
+    Some(seen)
 }
 
 /// The worker asked to withdraw the PR (`WITHDRAW.md`): close it on the
@@ -5596,7 +5568,7 @@ async fn withdraw_pr(
     reason: &str,
     summary: &mut CycleSummary,
 ) -> bool {
-    let (repo, job, pr_number) = (&start.repo, start.job, start.pr_number);
+    let (repo, job, pr_number) = (&start.repo, start.job, start.pr_ref.number());
     let fg = forge::forge_for(repo.forge);
     let mut forge_closed = false;
     if fg.owner_repo(&repo.url).is_some() {
@@ -5654,7 +5626,7 @@ async fn withdraw_pr(
     // FOLLOW-UPS.json.
     let reason_short: String = reason.chars().take(500).collect();
     let closed_on_forge =
-        set_withdrawn_closed(store, fid, job, pr_number, &reason_short).await && forge_closed;
+        set_withdrawn_closed(store, fid, job, &start.pr_ref, &reason_short).await && forge_closed;
     let first_line: String = reason
         .lines()
         .next()
@@ -5673,37 +5645,19 @@ async fn withdraw_pr(
 }
 
 /// Record a withdrawn PR's finding `closed` and its `pr_state` CLOSED, in
-/// one write; `true` when it was.
-async fn set_withdrawn_closed(
-    store: &Store,
-    fid: i64,
-    job: i64,
-    pr_number: i64,
-    reason: &str,
-) -> bool {
-    match store
-        .transition(fid, &Transition::PrClosed { reason, pr_number })
-        .await
-    {
-        Ok(Moved::Applied) => true,
+/// one write, only while `pr` is still the finding's; `true` when it was.
+async fn set_withdrawn_closed(store: &Store, fid: i64, job: i64, pr: &PrRef, reason: &str) -> bool {
+    let pr_number = pr.number();
+    let now = match store.end_pr(fid, pr, PrEnding::Closed { reason }).await {
+        Ok(PrEnded::Applied) => return true,
         // Something moved the finding off pr_open since the engage read it,
-        // and that decision owns the finding now: no handoff, the harvest
-        // it would start is that decision's to start.
-        Ok(Moved::Conflict { now }) => {
-            let now = now.map_or_else(|| "gone".to_owned(), |s| format!("'{s}'"));
-            let _ = store
-                .log_event(
-                    "verdict",
-                    &format!(
-                        "#{fid} PR #{pr_number} withdrawn, but the finding is {now} now: \
-                         left as it is"
-                    ),
-                    Some(job),
-                    Some(fid),
-                )
-                .await;
-            false
+        // or it went on to another PR, and that decision owns the finding
+        // now: no handoff, the harvest it would start is that decision's to
+        // start.
+        Ok(PrEnded::Conflict { now }) => {
+            now.map_or_else(|| "gone".to_owned(), |s| format!("'{s}'"))
         }
+        Ok(PrEnded::OtherPr) => "on another PR".to_owned(),
         Err(err) => {
             // Neither landed: the finding is still pr_open and pr_state
             // still OPEN, so no handoff. The harvest picks its playbook from
@@ -5724,15 +5678,49 @@ async fn set_withdrawn_closed(
                     Some(fid),
                 )
                 .await;
-            false
+            return false;
         }
-    }
+    };
+    let _ = store
+        .log_event(
+            "verdict",
+            &format!(
+                "#{fid} PR #{pr_number} withdrawn, but the finding is {now} now: left as it is"
+            ),
+            Some(job),
+            Some(fid),
+        )
+        .await;
+    false
 }
 
-/// Push the worker's commits to the PR branch and post its `PR-REPLY.md`:
-/// `(pushed, replied)`, or why the engage is incomplete. A worker that did
-/// not finish publishes nothing.
-async fn push_and_reply(start: &EngageStart, state: JobState) -> Result<(bool, bool), String> {
+/// What an engage put on the forge: whether its commits were pushed, and
+/// whether its `PR-REPLY.md` was posted, or why the publication is
+/// incomplete.
+///
+/// `pushed` stands on its own: a push that landed moved the PR's head
+/// whatever happens after it, so a reply that then fails must not hide it
+/// (`record_engage` counts it either way).
+struct Published {
+    pushed: bool,
+    replied: Result<bool, String>,
+}
+
+/// Push the worker's commits to the PR branch and post its `PR-REPLY.md`.
+/// A worker that did not finish publishes nothing.
+async fn push_and_reply(start: &EngageStart, state: JobState) -> Published {
+    let mut pushed = false;
+    let replied = push_then_reply(start, state, &mut pushed).await;
+    Published { pushed, replied }
+}
+
+/// [`push_and_reply`]'s steps: `pushed` is set the moment the push lands,
+/// so it holds even when a later step fails.
+async fn push_then_reply(
+    start: &EngageStart,
+    state: JobState,
+    pushed: &mut bool,
+) -> Result<bool, String> {
     if state != JobState::Done {
         return Err(format!("worker {state}"));
     }
@@ -5755,7 +5743,6 @@ async fn push_and_reply(start: &EngageStart, state: JobState) -> Result<(bool, b
     })
     .await
     .unwrap_or((127, String::new()));
-    let mut pushed = false;
     if rc == 0 && !commits.trim().is_empty() {
         let push_url = fg.ssh_url(&repo.url);
         let wts = worktree.to_string_lossy().to_string();
@@ -5791,13 +5778,13 @@ async fn push_and_reply(start: &EngageStart, state: JobState) -> Result<(bool, b
             let tail = crate::util::tail(&pout, 300);
             return Err(format!("push failed: {tail}"));
         }
-        pushed = true;
+        *pushed = true;
     }
     let reply = worktree.join("PR-REPLY.md");
     let mut replied = false;
     if reply.exists() {
         let body = std::fs::read_to_string(&reply).unwrap_or_default();
-        if let Err(e) = fg.comment_pr(&repo.url, start.pr_number, &body) {
+        if let Err(e) = fg.comment_pr(&repo.url, start.pr_ref.number(), &body) {
             return Err(format!(
                 "PR comment failed: {}",
                 crate::util::tail(&e.to_string(), 300)
@@ -5805,7 +5792,7 @@ async fn push_and_reply(start: &EngageStart, state: JobState) -> Result<(bool, b
         }
         replied = true;
     }
-    Ok((pushed, replied))
+    Ok(replied)
 }
 
 /// Record a finished engage: what it published, or why it is incomplete.
@@ -5815,15 +5802,22 @@ async fn record_engage(
     (net, finding): ((&Config, &dyn Backend), &Finding),
     start: &EngageStart,
     recorded: Option<RecordedJob>,
-    published: Result<(bool, bool), String>,
+    published: Published,
     stdout_tail: &str,
     summary: &mut CycleSummary,
 ) {
-    let (fid, job, ps, pr_number) = (finding.id, start.job, &start.ps, start.pr_number);
+    let (fid, job, pr_number) = (finding.id, start.job, start.pr_ref.number());
     // An outcome that could not be recorded reads as `failed`.
     let state = recorded.map_or(JobState::Failed, |r| r.state());
     let tail = crate::util::tail(stdout_tail, 300);
-    match published {
+    let Published { pushed, replied } = published;
+    if pushed && replied.is_err() {
+        // The push landed and the rest did not: nothing is answered, but
+        // the PR's head moved, and an observation of the head it replaced
+        // must not count against the new one.
+        record_engage_answer(store, fid, start, EngageAnswer::push_only(&start.pr_ref)).await;
+    }
+    match replied {
         // A pause, not a failure: the tree and transcript are kept, and
         // the engage tier continues it while the PR is open (§6.1).
         Err(fail) if state == JobState::Suspended => {
@@ -5878,22 +5872,13 @@ async fn record_engage(
             summary.outcome = Some(if held { "held" } else { "retry" }.into());
             summary.failure = Some(fail);
         }
-        Ok((pushed, replied)) => {
-            // What the worker saw, not "now": feedback that arrived while
-            // it ran stays new. Its own reply is no activity (`OWN_MARK`).
-            let engaged_mark = start.engaged_watermark();
-            let addressed_fp = if pushed {
-                None
+        Ok(replied) => {
+            let answer = if pushed {
+                EngageAnswer::pushed(&start.pr_ref, start.seen_activity)
             } else {
-                ps.attention_fingerprint.as_deref()
+                EngageAnswer::without_push(&start.pr_ref, start.seen_activity, &start.ps)
             };
-            let addressed_sha = if pushed { None } else { ps.head_sha.as_deref() };
-            log_write_failure(
-                store
-                    .mark_pr_engaged(fid, engaged_mark, now_ms(), addressed_fp, addressed_sha)
-                    .await,
-                format_args!("#{fid}: marking PR engaged"),
-            );
+            record_engage_answer(store, fid, start, answer).await;
             let did: Vec<&str> = [("pushed", pushed), ("replied", replied)]
                 .iter()
                 .filter(|(_, on)| *on)
@@ -5925,6 +5910,47 @@ async fn record_engage(
             format_args!("#{fid}: clearing one-shot budget override"),
         );
     }
+}
+
+/// Record what a published engage answered (`crate::attention`): the
+/// feedback its worker saw, not "now", so feedback that arrived while it
+/// ran stays new (its own reply is no activity, `OWN_MARK`); and, for a
+/// reply without a push, the problems it was started on as declined,
+/// which settle voids if they have moved since. Not recorded when the PR
+/// ended while the worker ran, which is logged.
+async fn record_engage_answer(
+    store: &Store,
+    fid: i64,
+    start: &EngageStart,
+    answer: EngageAnswer<'_>,
+) {
+    // Bound first: the `format_args!` temporary is not `Send`, and the
+    // arms below await.
+    let recorded = log_write_failure(
+        store.mark_pr_engaged(fid, &answer).await,
+        format_args!("#{fid}: marking PR engaged"),
+    );
+    let why = match recorded {
+        Some(AnswerRecorded::NotPrOpen { now }) => format!(
+            "it is {} now",
+            now.map_or_else(|| "gone".to_owned(), |s| format!("'{s}'"))
+        ),
+        Some(AnswerRecorded::OtherPr) => "the finding has another PR now".to_owned(),
+        Some(AnswerRecorded::Recorded(_)) | None => return,
+    };
+    // Whatever ended the PR recorded that; the answer was to a PR that
+    // needs none.
+    let _ = store
+        .log_event(
+            "engage",
+            &format!(
+                "#{fid} PR #{} answer not recorded: {why}",
+                start.pr_ref.number()
+            ),
+            Some(start.job),
+            Some(fid),
+        )
+        .await;
 }
 
 /// The streak key of a failed engage: what failed, without the forge's or
@@ -6155,7 +6181,7 @@ pub async fn run_engage(
         finding_id: Some(fid),
         job_id: Some(start.job),
         state: Some(state),
-        pr_number: Some(start.pr_number),
+        pr_number: Some(start.pr_ref.number()),
         tokens_new: Some(rr.tokens_new),
         ..Default::default()
     };
@@ -6560,7 +6586,7 @@ pub async fn run_harvest(
                 "self-healed missing pr_number from pr_url"
             );
             log_write_failure(
-                store.set_pr_number(fid, num).await,
+                store.fill_pr_number(fid, num).await,
                 format_args!("#{fid}: self-healed pr_number -> {num}"),
             );
             num
@@ -7513,7 +7539,14 @@ async fn run_cycle_inner(
         .await?
         .is_empty();
     let sync = if has_pr_open {
-        Some(sync_prs(store, cfg).await)
+        if let Some(pass) = scope.begin_pr_sync() {
+            Some(sync_prs(&pass, cfg).await)
+        } else {
+            // Another pass of this store is live; its observations stand.
+            // Nothing in the daemon runs one beside the cycle today.
+            tracing::warn!("PR sync skipped: another sync pass is running");
+            None
+        }
     } else {
         None
     };

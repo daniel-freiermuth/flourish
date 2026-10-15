@@ -11,8 +11,9 @@
 //!   together owns its transaction internally -- `add_repo` (the insert and
 //!   the id-derived clone path), `soft_delete_repo` (the findings/jobs
 //!   refusal checks and the flag, under `BEGIN IMMEDIATE` so the checks
-//!   cannot go stale before the write), `sync_pr_open` (the PR upsert and
-//!   the dependent `attention_since` update), `create_job` (the insert
+//!   cannot go stale before the write), `record_open_pr` and
+//!   `mark_pr_engaged` (a `pr_state` write and the attention settled from
+//!   it, `crate::attention`), `create_job` (the insert
 //!   and the end of the checkpoint it supersedes, with that event),
 //!   `complete_job` (the outcome and the work item's checkpoint), and
 //!   `record_closed_harvest` (a closed PR's classification and its harvest
@@ -25,6 +26,7 @@ use std::path::{Path, PathBuf};
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 
+use crate::attention::{AnswerRecorded, EngageAnswer, ObservedOpenPr, OpenPrRecorded};
 use crate::auth::CurrentUser;
 use crate::domain::{
     BudgetOverride, BugClass, ClosureClass, FindingJobKind, FindingStatus, FindingType,
@@ -35,13 +37,67 @@ use crate::recovery::{
     DaemonLock, Owner, RecordedJob, Recovery, StrandedClaim, StrandedJob, Unreconciled,
 };
 use crate::transition::{
-    Moved, PrEnd, Record, ReleaseVerdict, Transition, Unclaimed, decline_status,
+    Moved, PrEnded, PrEnding, PrRef, Record, ReleaseVerdict, Sources, Transition, Unclaimed,
+    decline_status,
 };
 use crate::types::{
     Event, Finding, Job, JobListEntry, PrState, Repo, SchedulerState, StatsByFinding, StatsByKind,
     StatsTotals,
 };
 use crate::util::now_ms;
+
+mod pr_state;
+
+pub use pr_state::{PrRead, PrSyncPass};
+
+/// A `pr_state` row as the store read it ([`Store::get_pr_state`]).
+///
+/// Only the store makes one, and it is read-only: its fields are read
+/// through [`Deref`](std::ops::Deref), never set. So whatever is built
+/// from one -- an engage's decline
+/// ([`Declined::as_read`](crate::attention::Declined::as_read)) -- names
+/// only what a write recorded, never a [`PrState`] put together elsewhere.
+#[derive(Debug, Clone)]
+pub struct RecordedPrState(PrState);
+
+impl RecordedPrState {
+    /// The row, for a caller that hands it on (the API's `/api/finding`).
+    pub fn into_inner(self) -> PrState {
+        self.0
+    }
+}
+
+impl std::ops::Deref for RecordedPrState {
+    type Target = PrState;
+
+    fn deref(&self) -> &PrState {
+        &self.0
+    }
+}
+
+/// The newest PR feedback (epoch ms) an engage's worker was shown: the
+/// mark its answer raises the engagement watermark to.
+///
+/// Made only from the forge's view of the PR ([`Self::of`]), or read back
+/// from the job that recorded it ([`Store::seen_activity`]), so no answer
+/// can raise the watermark past feedback that was actually shown. The
+/// watermark only ever rises: a mark taken from anywhere else -- a clock,
+/// a constant -- would hide every comment posted before it, for good.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeenActivity(i64);
+
+impl SeenActivity {
+    /// The newest screened feedback on `pr` (`attention::latest_activity_ms`).
+    pub fn of(pr: &crate::forge::PrView) -> Self {
+        Self(crate::attention::latest_activity_ms(pr))
+    }
+
+    /// A mark a test chose: only in a `test-support` build.
+    #[cfg(feature = "test-support")]
+    pub const fn fixture(at_ms: i64) -> Self {
+        Self(at_ms)
+    }
+}
 
 /// A write transaction that took SQLite's write lock when it began
 /// (`BEGIN IMMEDIATE`), not at its first write as sqlx's plain `begin()`
@@ -338,29 +394,6 @@ pub struct RepoUpdate {
     pub name: Option<String>,
 }
 
-/// All required fields for syncing an open PR's state.  The only
-/// conditional parts — `attention_since` and `clear_addressed` — are
-/// handled by two extra compile-time checked queries inside
-/// `sync_pr_open`, not dynamic SQL.
-#[derive(Debug)]
-pub struct SyncPrData {
-    pub pr_number: i64,
-    pub state: String,
-    pub mergeable: String,
-    pub checks: Option<String>,
-    pub head_ref: String,
-    pub head_sha: String,
-    pub last_activity_at: i64,
-    pub last_engaged_activity_at: i64,
-    pub needs_attention: Option<String>,
-    pub attention_fingerprint: Option<String>,
-    pub synced_at: i64,
-    /// None = don't touch; Some(None) = set NULL; Some(Some(v)) = set to v.
-    pub attention_since: Option<Option<i64>>,
-    /// When true, set `addressed_fingerprint` = NULL, `addressed_head_sha` = NULL.
-    pub clear_addressed: bool,
-}
-
 /// Typed insert for `upsert_finding` — compile-time field safety instead of
 /// runtime `.get()` on raw JSON.
 #[derive(Debug, Clone, Default)]
@@ -467,6 +500,10 @@ pub struct Store {
     /// recovered or drop owed work. Shared by clones, which are the same
     /// handle.
     recovery: Recovery,
+    /// Whether a [`PrSyncPass`] is live on this handle: set by its
+    /// `begin`, cleared by its drop. Shared by clones, which are the same
+    /// handle.
+    pr_sync: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// INSERT one event row on `ex` — the pool, or an open transaction when
@@ -489,49 +526,6 @@ async fn insert_event<'e, E: sqlx::SqliteExecutor<'e>>(
         job_id,
         finding_id,
         user_id
-    )
-    .execute(ex)
-    .await?;
-    Ok(())
-}
-
-/// Record on `ex` that `finding_id`'s PR `pr_number` ended (UPSERT). The
-/// daemon writes this only inside [`Store::transition`], with the status
-/// change it belongs to.
-///
-/// `pr_state` holds one row per finding, not per PR, and a finding can
-/// ship more than one PR: a closure harvested as `abandoned` sends it
-/// back to `new`, and its next fix opens a fresh PR on the same row.
-/// The harvest bookkeeping (`harvested_at`, and the harvest streak in
-/// `finding_work`, which migration 023's trigger resets) describes the
-/// PR it was recorded for, so a different `pr_number` clears it;
-/// otherwise the new PR inherits the old one's stamp and
-/// `list_pending_harvest` never selects it. The same number keeps it,
-/// so re-syncing a PR never un-harvests it. A stored NULL is an unknown
-/// number, not another PR (`set_pr_number` fills it in for the PR
-/// already being worked), hence `<>` and not `IS NOT`. Every `pr_state`
-/// upsert repeats this CASE: `query!` takes one literal, so the SQL
-/// cannot be shared.
-async fn upsert_pr_end<'e, E: sqlx::SqliteExecutor<'e>>(
-    ex: E,
-    finding_id: i64,
-    end: PrEnd,
-    pr_number: i64,
-    synced_at: i64,
-) -> sqlx::Result<()> {
-    let state = end.as_str();
-    sqlx::query!(
-        "INSERT INTO pr_state (finding_id, pr_number, state, needs_attention, synced_at) \
-         VALUES (?1, ?2, ?3, NULL, ?4) \
-         ON CONFLICT(finding_id) DO UPDATE SET \
-         pr_number = excluded.pr_number, state = excluded.state, \
-         needs_attention = NULL, synced_at = excluded.synced_at, \
-         harvested_at = CASE WHEN pr_state.pr_number <> excluded.pr_number \
-             THEN NULL ELSE pr_state.harvested_at END",
-        finding_id,
-        pr_number,
-        state,
-        synced_at
     )
     .execute(ex)
     .await?;
@@ -659,13 +653,7 @@ async fn write_release_verdict(
     }
     let to = release.to();
     if matches!(verdict, ReleaseVerdict::Classified(_)) {
-        sqlx::query!(
-            "UPDATE pr_state SET harvested_at = ?1 WHERE finding_id = ?2",
-            now,
-            finding_id
-        )
-        .execute(&mut **tx)
-        .await?;
+        pr_state::stamp_harvested(&mut **tx, finding_id, now).await?;
     }
     let message = format!("finding {finding_id} -> {to}: {text}");
     insert_event(
@@ -705,13 +693,7 @@ async fn apply_release(
             .await?;
         }
         ReleaseAction::MarkHarvested => {
-            sqlx::query!(
-                "UPDATE pr_state SET harvested_at = ?1 WHERE finding_id = ?2",
-                now,
-                finding_id
-            )
-            .execute(&mut **tx)
-            .await?;
+            pr_state::stamp_harvested(&mut **tx, finding_id, now).await?;
         }
         ReleaseAction::Dismiss => {
             // Dismissing ends the engage, as a no-op engage would: nothing
@@ -724,18 +706,7 @@ async fn apply_release(
             )
             .execute(&mut **tx)
             .await?;
-            sqlx::query!(
-                "UPDATE pr_state SET \
-                 last_engaged_activity_at = COALESCE(last_activity_at, ?1), \
-                 addressed_fingerprint = attention_fingerprint, \
-                 addressed_head_sha = head_sha, \
-                 needs_attention = NULL, attention_since = NULL \
-                 WHERE finding_id = ?2",
-                now,
-                finding_id
-            )
-            .execute(&mut **tx)
-            .await?;
+            pr_state::record_dismiss(tx, finding_id, now).await?;
         }
         // `continue` keeps the checkpoint; a verdict is written by the
         // caller, with its event.
@@ -939,8 +910,12 @@ impl Store {
         Ok(pool)
     }
 
-    const fn new(pool: SqlitePool, recovery: Recovery) -> Self {
-        Self { pool, recovery }
+    fn new(pool: SqlitePool, recovery: Recovery) -> Self {
+        Self {
+            pool,
+            recovery,
+            pr_sync: std::sync::Arc::default(),
+        }
     }
 
     /// This handle's recovery state, for `crate::recovery` alone: every
@@ -1065,8 +1040,8 @@ impl Store {
     /// Make `transition` on `finding_id`, only while the finding is still
     /// at one of the transition's sources. One transaction: the status, and
     /// what the transition records with it (a verdict's reason and anchor,
-    /// an analysis, how the finding's PR ended in `pr_state`), land together
-    /// or not at all. [`Moved::Conflict`] names where the finding is instead.
+    /// an analysis), land together or not at all. [`Moved::Conflict`] names
+    /// where the finding is instead. A PR's end is [`Self::end_pr`].
     pub async fn transition(
         &self,
         finding_id: i64,
@@ -1081,20 +1056,52 @@ impl Store {
     /// [`Self::transition`] inside a writer's own transaction, for an edge
     /// that lands with other writes (a hold's release, a harvest's stamp,
     /// the other half of a dep-update handover).
-    #[allow(
-        clippy::too_many_lines,
-        reason = "one guarded UPDATE per kind of record: `query!` takes one literal each, so \
-                  the arms cannot share their SQL"
-    )]
     async fn apply_transition(
         tx: &mut ImmediateTx,
         finding_id: i64,
         transition: &Transition<'_>,
     ) -> sqlx::Result<Moved> {
-        let (from_a, from_b) = transition.from().pair();
-        let to = FindingStatus::from(transition.to());
-        let now = now_ms();
-        let applied = match transition.record() {
+        let (from, to, record) = (transition.from(), transition.to(), transition.record());
+        if Self::apply_edge(tx, finding_id, from, to, record, now_ms()).await? {
+            return Ok(Moved::Applied);
+        }
+        let now = status_now(&mut **tx, finding_id).await?;
+        Ok(Moved::Conflict { now })
+    }
+
+    /// End `finding_id`'s PR `pr` ([`PrEnding`]): the finding's move and
+    /// the end in `pr_state`, in one write, only while the finding is still
+    /// `pr_open` with that PR (`pr_state::end`).
+    pub async fn end_pr(
+        &self,
+        finding_id: i64,
+        pr: &PrRef,
+        ending: PrEnding<'_>,
+    ) -> sqlx::Result<PrEnded> {
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
+        let ended = pr_state::end(&mut tx, finding_id, pr, ending).await?;
+        tx.commit().await?;
+        Ok(ended)
+    }
+
+    /// Move `finding_id` from one of `from` to `to`, writing `record` with
+    /// it; `true` when the finding was at one of `from` and moved.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one guarded UPDATE per kind of record: `query!` takes one literal each, so \
+                  the arms cannot share their SQL"
+    )]
+    async fn apply_edge(
+        tx: &mut ImmediateTx,
+        finding_id: i64,
+        from: Sources,
+        to: Unclaimed,
+        record: Record<'_>,
+        now: i64,
+    ) -> sqlx::Result<bool> {
+        let (from_a, from_b) = from.pair();
+        let to = FindingStatus::from(to);
+        let applied = match record {
             Record::StatusOnly => {
                 sqlx::query!(
                     "UPDATE findings SET status = ?1, updated_at = ?2 \
@@ -1213,14 +1220,7 @@ impl Store {
                     > 0
             }
         };
-        if applied {
-            if let Some((end, pr_number)) = transition.pr_end() {
-                upsert_pr_end(&mut **tx, finding_id, end, pr_number, now).await?;
-            }
-            return Ok(Moved::Applied);
-        }
-        let now = status_now(&mut **tx, finding_id).await?;
-        Ok(Moved::Conflict { now })
+        Ok(applied)
     }
 
     /// The verdict of a fix the worker declined, its classification's
@@ -2104,7 +2104,7 @@ impl Store {
         Ok(rows.into_iter().map(|r| (r.source, r.follow_up)).collect())
     }
 
-    pub async fn get_pr_state(&self, finding_id: i64) -> sqlx::Result<Option<PrState>> {
+    pub async fn get_pr_state(&self, finding_id: i64) -> sqlx::Result<Option<RecordedPrState>> {
         sqlx::query_as!(
             PrState,
             r#"
@@ -2120,6 +2120,7 @@ impl Store {
         )
         .fetch_optional(&self.pool)
         .await
+        .map(|row| row.map(RecordedPrState))
     }
 
     /// `pr_state` rows for all `pr_open` findings in one query:
@@ -3003,9 +3004,10 @@ impl Store {
         )
     }
 
-    /// Record the newest PR feedback (epoch ms) a cold engage attempt's
-    /// worker was shown. Resumes inherit it ([`CycleScope::create_job`](crate::recovery::CycleScope::create_job)) instead.
-    pub async fn set_seen_activity(&self, job_id: i64, at_ms: i64) -> sqlx::Result<()> {
+    /// Record the newest PR feedback a cold engage attempt's worker was
+    /// shown. Resumes inherit it ([`CycleScope::create_job`](crate::recovery::CycleScope::create_job)) instead.
+    pub async fn set_seen_activity(&self, job_id: i64, seen: SeenActivity) -> sqlx::Result<()> {
+        let at_ms = seen.0;
         sqlx::query!(
             "UPDATE jobs SET seen_activity_at = ?1 WHERE id = ?2",
             at_ms,
@@ -3018,12 +3020,13 @@ impl Store {
 
     /// The newest PR feedback `job_id`'s engage chain was shown, if its
     /// first attempt recorded it ([`Self::set_seen_activity`]).
-    pub async fn seen_activity(&self, job_id: i64) -> sqlx::Result<Option<i64>> {
+    pub async fn seen_activity(&self, job_id: i64) -> sqlx::Result<Option<SeenActivity>> {
         Ok(
             sqlx::query_scalar!("SELECT seen_activity_at FROM jobs WHERE id = ?1", job_id)
                 .fetch_optional(&self.pool)
                 .await?
-                .flatten(),
+                .flatten()
+                .map(SeenActivity),
         )
     }
     /// Whether the chain rooted at `origin_id` still needs its working
@@ -3889,7 +3892,7 @@ impl Store {
 
     /// Record PR `pr_number` merged whatever the finding's status: a
     /// fixture write, only in a `test-support` build. The daemon records
-    /// it with the finding's move ([`Transition::PrMerged`]).
+    /// it with the finding's move ([`Self::end_pr`], [`PrEnding::Merged`]).
     #[cfg(feature = "test-support")]
     pub async fn mark_pr_merged(
         &self,
@@ -3897,11 +3900,14 @@ impl Store {
         pr_number: i64,
         synced_at: i64,
     ) -> sqlx::Result<()> {
-        upsert_pr_end(&self.pool, finding_id, PrEnd::Merged, pr_number, synced_at).await
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
+        let end = crate::transition::PrEnd::Merged;
+        pr_state::record_end_unchecked(&mut tx, finding_id, end, pr_number, synced_at).await?;
+        tx.commit().await
     }
 
     /// [`Self::mark_pr_merged`] for a closed PR: a fixture write
-    /// ([`Transition::PrClosed`] in the daemon).
+    /// ([`Self::end_pr`], [`PrEnding::Closed`], in the daemon).
     #[cfg(feature = "test-support")]
     pub async fn mark_pr_closed(
         &self,
@@ -3909,120 +3915,46 @@ impl Store {
         pr_number: i64,
         synced_at: i64,
     ) -> sqlx::Result<()> {
-        upsert_pr_end(&self.pool, finding_id, PrEnd::Closed, pr_number, synced_at).await
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
+        let end = crate::transition::PrEnd::Closed;
+        pr_state::record_end_unchecked(&mut tx, finding_id, end, pr_number, synced_at).await?;
+        tx.commit().await
     }
 
-    /// Full sync of an open PR.  The main UPSERT sets all always-present
-    /// columns; two conditional queries handle `attention_since` and
-    /// clearing addressed state — three compile-time checked queries
-    /// instead of one dynamic one. A new `pr_number` clears the harvest
-    /// bookkeeping, as in `upsert_pr_end`.
-    ///
-    /// All three share one transaction because the conditional UPDATEs are
-    /// decided from the state the UPSERT writes: `attention_since` is only
-    /// stamped on the sync where the attention reason *changes*, so if the
-    /// UPSERT committed the new `attention_fingerprint` and the UPDATE then
-    /// failed, every later sync would see an unchanged reason and never
-    /// stamp it — leaving `scheduler::list_attention` ordering and the displayed
-    /// attention age permanently wrong.  `clear_addressed` has the same
-    /// shape.  A plain (deferred) `begin` suffices: the first statement is
-    /// a write, so the lock is taken before anything is read back.
-    pub async fn sync_pr_open(&self, finding_id: i64, d: &SyncPrData) -> sqlx::Result<()> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query!(
-            "INSERT INTO pr_state (finding_id, pr_number, state, mergeable, checks, \
-             head_ref, head_sha, last_activity_at, last_engaged_activity_at, \
-             needs_attention, attention_fingerprint, synced_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
-             ON CONFLICT(finding_id) DO UPDATE SET \
-             pr_number = excluded.pr_number, \
-             state = excluded.state, \
-             mergeable = excluded.mergeable, \
-             checks = excluded.checks, \
-             head_ref = excluded.head_ref, \
-             head_sha = excluded.head_sha, \
-             last_activity_at = excluded.last_activity_at, \
-             last_engaged_activity_at = excluded.last_engaged_activity_at, \
-             needs_attention = excluded.needs_attention, \
-             attention_fingerprint = excluded.attention_fingerprint, \
-             synced_at = excluded.synced_at, \
-             harvested_at = CASE WHEN pr_state.pr_number <> excluded.pr_number \
-                 THEN NULL ELSE pr_state.harvested_at END",
-            finding_id,
-            d.pr_number,
-            d.state,
-            d.mergeable,
-            d.checks,
-            d.head_ref,
-            d.head_sha,
-            d.last_activity_at,
-            d.last_engaged_activity_at,
-            d.needs_attention,
-            d.attention_fingerprint,
-            d.synced_at
-        )
-        .execute(&mut *tx)
-        .await?;
-        // Conditional: set attention_since when the reason changed.
-        if let Some(since) = d.attention_since {
-            sqlx::query!(
-                "UPDATE pr_state SET attention_since = ?1 WHERE finding_id = ?2",
-                since,
-                finding_id
-            )
-            .execute(&mut *tx)
-            .await?;
-        }
-        // Conditional: clear addressed state when the static snapshot changed.
-        if d.clear_addressed {
-            sqlx::query!(
-                "UPDATE pr_state SET addressed_fingerprint = NULL, \
-                 addressed_head_sha = NULL WHERE finding_id = ?1",
-                finding_id
-            )
-            .execute(&mut *tx)
-            .await?;
-        }
+    /// Record what sync observed on an open PR and settle its attention, in
+    /// one [`ImmediateTx`]: nothing is written once the finding has left
+    /// `pr_open` ([`OpenPrRecorded::NotPrOpen`]) or moved on to another PR
+    /// ([`OpenPrRecorded::OtherPr`]). See `pr_state::record_open` for why
+    /// each check is there.
+    pub async fn record_open_pr(
+        &self,
+        finding_id: i64,
+        pr: &ObservedOpenPr<'_>,
+    ) -> sqlx::Result<OpenPrRecorded> {
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
+        let recorded = pr_state::record_open(&mut tx, finding_id, pr).await?;
         tx.commit().await?;
-        Ok(())
+        Ok(recorded)
     }
 
-    /// Update engagement watermark and addressed state after a successful
-    /// engage cycle.  `addressed_fingerprint` / `addressed_head_sha` are
-    /// nullable: pass None to clear (pushed) or Some to set (replied-only).
+    /// Record an engage's answer and settle the PR's attention from it, in
+    /// one transaction, while the finding is still `pr_open` with the PR
+    /// answered ([`AnswerRecorded`]). Writes the answered columns only
+    /// (`crate::attention`); the watermark only ever rises.
     pub async fn mark_pr_engaged(
         &self,
         finding_id: i64,
-        last_engaged_activity_at: i64,
-        synced_at: i64,
-        addressed_fingerprint: Option<&str>,
-        addressed_head_sha: Option<&str>,
-    ) -> sqlx::Result<()> {
-        sqlx::query!(
-            "UPDATE pr_state SET last_engaged_activity_at = ?1, synced_at = ?2, \
-             addressed_fingerprint = ?3, addressed_head_sha = ?4 \
-             WHERE finding_id = ?5",
-            last_engaged_activity_at,
-            synced_at,
-            addressed_fingerprint,
-            addressed_head_sha,
-            finding_id
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        answer: &EngageAnswer<'_>,
+    ) -> sqlx::Result<AnswerRecorded> {
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
+        let recorded = pr_state::record_answer(&mut tx, finding_id, answer, now_ms()).await?;
+        tx.commit().await?;
+        Ok(recorded)
     }
 
     /// Mark a merged PR as harvested.
     pub async fn mark_pr_harvested(&self, finding_id: i64, harvested_at: i64) -> sqlx::Result<()> {
-        sqlx::query!(
-            "UPDATE pr_state SET harvested_at = ?1 WHERE finding_id = ?2",
-            harvested_at,
-            finding_id
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        pr_state::stamp_harvested(&self.pool, finding_id, harvested_at).await
     }
 
     /// Record a closed PR's harvest: the finding's classification and the
@@ -4061,32 +3993,14 @@ impl Store {
         };
         let classified =
             Self::apply_transition(&mut tx, finding_id, &classify).await? == Moved::Applied;
-        sqlx::query!(
-            "UPDATE pr_state SET harvested_at = ?1 WHERE finding_id = ?2",
-            harvested_at,
-            finding_id
-        )
-        .execute(&mut *tx)
-        .await?;
+        pr_state::stamp_harvested(&mut *tx, finding_id, harvested_at).await?;
         tx.commit().await?;
         Ok(classified)
     }
 
-    /// Self-heal a missing `pr_number` (UPSERT — row may not exist yet).
-    /// A new `pr_number` clears the harvest bookkeeping, as in
-    /// `upsert_pr_end`; filling in a NULL one does not.
-    pub async fn set_pr_number(&self, finding_id: i64, pr_number: i64) -> sqlx::Result<()> {
-        sqlx::query!(
-            "INSERT INTO pr_state (finding_id, pr_number) VALUES (?1, ?2) \
-             ON CONFLICT(finding_id) DO UPDATE SET pr_number = excluded.pr_number, \
-             harvested_at = CASE WHEN pr_state.pr_number <> excluded.pr_number \
-                 THEN NULL ELSE pr_state.harvested_at END",
-            finding_id,
-            pr_number
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+    /// Self-heal a missing `pr_number`; fill-only (`pr_state::fill_pr_number`).
+    pub async fn fill_pr_number(&self, finding_id: i64, pr_number: i64) -> sqlx::Result<()> {
+        pr_state::fill_pr_number(&self.pool, finding_id, pr_number).await
     }
 
     /// Findings whose pull request awaits its one-time harvest: merged, or

@@ -23,15 +23,50 @@ mod support;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
+use hunter::attention::{
+    AnswerRecorded, EngageAnswer, ObservedFixture, ObservedOpenPr, OpenPrRecorded,
+};
 use hunter::config::Config;
 use hunter::domain::{BudgetOverride, FindingStatus, ForgeName, RepoJobKind};
-use hunter::store::{FindingInsert, SyncPrData};
+use hunter::forge::Mergeable;
+use hunter::store::FindingInsert;
 use hunter::types::RunResult;
 use support::{FakeBins, GitRepo, ScriptedBackend, TempDir, done, fresh_store, git};
 
 const BRANCH: &str = "fix/some-bug";
 const PR_URL: &str = "https://github.com/acme/widget/pull/7";
 const REPO_URL: &str = "https://github.com/acme/widget";
+
+/// The fixture PR's static problems, as sync fingerprints them: its review
+/// asks for changes.
+const FP: &str = "review:CHANGES_REQUESTED";
+
+/// The fixture PR as `pass` read it, stamped `last_activity_at`, with
+/// feedback newer than any engage (`last_activity_at` past the watermark
+/// of 0) and changes requested ([`FP`]).
+async fn observed(
+    pass: &hunter::store::PrSyncPass,
+    fid: i64,
+    last_activity_at: i64,
+) -> ObservedOpenPr<'_> {
+    let read = pass
+        .begin_read_at(fid, &support::pr_ref(PR_URL), last_activity_at)
+        .await
+        .unwrap()
+        .expect("the pass's first read of the finding");
+    ObservedOpenPr::fixture(
+        read,
+        ObservedFixture {
+            mergeable: Mergeable::Mergeable,
+            changes_requested: true,
+            checks: None,
+            failing_checks: Vec::new(),
+            head_ref: BRANCH.to_owned(),
+            head_sha: "deadbeef".to_owned(),
+            last_activity_at,
+        },
+    )
+}
 
 /// Minimal `gh pr view --json` payload that `view_pr_engage` can parse.
 const PR_VIEW_JSON: &str = r#"{"state":"OPEN","mergeable":"MERGEABLE","title":"a fix","body":"because","comments":[],"reviews":[],"statusCheckRollup":[],"headRefName":"fix/some-bug","headRefOid":"deadbeef"}"#;
@@ -164,7 +199,7 @@ impl Fixture {
         sqlx::query(sql).execute(&pool).await.unwrap();
     }
 
-    async fn pr_row(&self) -> hunter::types::PrState {
+    async fn pr_row(&self) -> hunter::store::RecordedPrState {
         self.store.get_pr_state(self.fid).await.unwrap().unwrap()
     }
 
@@ -273,27 +308,14 @@ async fn fixture(label: &str) -> Fixture {
         .await
         .unwrap();
     store.set_finding_pr_open(fid, PR_URL).await.unwrap();
-    store
-        .sync_pr_open(
-            fid,
-            &SyncPrData {
-                pr_number: 7,
-                state: "open".to_owned(),
-                mergeable: "mergeable".to_owned(),
-                checks: None,
-                head_ref: BRANCH.to_owned(),
-                head_sha: "deadbeef".to_owned(),
-                last_activity_at: 1,
-                last_engaged_activity_at: 0,
-                needs_attention: Some("reviewer asked a question".to_owned()),
-                attention_fingerprint: Some("af-1".to_owned()),
-                synced_at: 1,
-                attention_since: Some(Some(1)),
-                clear_addressed: false,
-            },
-        )
+    let recorded = store
+        .record_open_pr(fid, &observed(&support::pr_sync(&store), fid, 1).await)
         .await
         .unwrap();
+    assert!(
+        matches!(recorded, OpenPrRecorded::Recorded(_)),
+        "{recorded:?}"
+    );
 
     // Hermetic: the playbook is a stub written into the scratch root, not
     // the repo's real one. Reading `../hunter` made the test depend on the
@@ -359,7 +381,7 @@ async fn failed_close_does_not_record_the_withdrawal() {
     );
     assert_eq!(
         f.pr_state().await.as_deref(),
-        Some("open"),
+        Some("OPEN"),
         "pr_state must keep the value sync wrote, not be flipped to closed"
     );
 }
@@ -443,7 +465,7 @@ async fn a_pr_closed_on_the_forge_waits_for_its_harvest() {
     let bins = FakeBins::acquire("sync-closed");
     bins.ok("gh", PR_CLOSED_JSON);
 
-    let result = hunter::scheduler::sync_prs(&f.store, &f.cfg).await;
+    let result = hunter::scheduler::sync_prs(&support::pr_sync(&f.store), &f.cfg).await;
 
     assert_eq!(result.closed, 1, "{result:?}");
     let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
@@ -482,7 +504,7 @@ async fn a_closure_that_cannot_be_recorded_is_retried_by_the_next_sync() {
     .await
     .unwrap();
 
-    let result = hunter::scheduler::sync_prs(&f.store, &f.cfg).await;
+    let result = hunter::scheduler::sync_prs(&support::pr_sync(&f.store), &f.cfg).await;
 
     assert_eq!(result.closed, 0, "{result:?}");
     assert_eq!(result.errors, 1, "{result:?}");
@@ -501,7 +523,7 @@ async fn a_closure_that_cannot_be_recorded_is_retried_by_the_next_sync() {
         .execute(&pool)
         .await
         .unwrap();
-    let result = hunter::scheduler::sync_prs(&f.store, &f.cfg).await;
+    let result = hunter::scheduler::sync_prs(&support::pr_sync(&f.store), &f.cfg).await;
 
     assert_eq!(result.closed, 1, "{result:?}");
     let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
@@ -540,7 +562,7 @@ async fn only_maintainers_and_configured_bots_flag_new_comments() {
             ),
         );
 
-        let result = hunter::scheduler::sync_prs(&f.store, &f.cfg).await;
+        let result = hunter::scheduler::sync_prs(&support::pr_sync(&f.store), &f.cfg).await;
 
         assert_eq!(result.errors, 0, "{author}: {result:?}");
         assert_eq!(
@@ -697,11 +719,20 @@ async fn pushed_commits_land_on_the_branch_and_clear_the_addressed_state() {
     let bins = FakeBins::acquire("engage-push");
     bins.ok("gh", PR_VIEW_JSON);
     let origin = push_to(&f, None).await;
-    // Something to clear, so clearing is observable.
-    f.store
-        .mark_pr_engaged(f.fid, 0, 0, Some("af-old"), Some("old-sha"))
+    // A decline of the PR's current problems to clear, so clearing is
+    // observable.
+    let ps = f.pr_row().await;
+    let pr = support::pr_ref(PR_URL);
+    let answered = f
+        .store
+        .mark_pr_engaged(f.fid, &EngageAnswer::without_push(&pr, None, &ps))
         .await
         .unwrap();
+    assert!(
+        matches!(answered, AnswerRecorded::Recorded(_)),
+        "{answered:?}"
+    );
+    assert_eq!(f.pr_row().await.addressed_fingerprint.as_deref(), Some(FP));
     let (backend, seen) = recording(commit_in);
 
     let summary = f.run(&backend).await.unwrap();
@@ -728,6 +759,58 @@ async fn pushed_commits_land_on_the_branch_and_clear_the_addressed_state() {
     assert!(released(&seen));
 }
 
+/// A push's answer leaves the problems sync saw on the head it replaced to
+/// a sync of the pushed head. Here sync saw a change request on the branch
+/// tip, and the engage pushed a commit over that tip: settled from the old
+/// head's change request as soon as the push was recorded, the PR was
+/// flagged again before any sync had seen the new commit.
+#[tokio::test]
+async fn a_pushed_engage_leaves_the_replaced_head_s_problems_to_the_next_sync() {
+    let f = fixture("engage-push-over").await;
+    let bins = FakeBins::acquire("engage-push-over");
+    bins.ok("gh", PR_VIEW_JSON);
+    let origin = push_to(&f, None).await;
+    // The last sync saw the PR at the tip the tree is made at, changes
+    // requested, with no feedback.
+    let tip = git(&origin, &["rev-parse", BRANCH]).trim().to_owned();
+    let pass = support::pr_sync(&f.store);
+    let at_tip = ObservedOpenPr::fixture(
+        pass.begin_read_at(f.fid, &support::pr_ref(PR_URL), 2)
+            .await
+            .unwrap()
+            .unwrap(),
+        ObservedFixture {
+            mergeable: Mergeable::Mergeable,
+            changes_requested: true,
+            checks: None,
+            failing_checks: Vec::new(),
+            head_ref: BRANCH.to_owned(),
+            head_sha: tip,
+            last_activity_at: 0,
+        },
+    );
+    let recorded = f.store.record_open_pr(f.fid, &at_tip).await.unwrap();
+    drop(pass);
+    assert!(
+        matches!(recorded, OpenPrRecorded::Recorded(_)),
+        "{recorded:?}"
+    );
+    assert_eq!(
+        f.pr_row().await.needs_attention.as_deref(),
+        Some("changes_requested")
+    );
+    let (backend, _seen) = recording(commit_in);
+
+    let summary = f.run(&backend).await.unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
+    assert_eq!(
+        f.pr_row().await.needs_attention,
+        None,
+        "the change request was seen on the head the push replaced"
+    );
+}
+
 /// A worker that neither commits nor replies still concludes the
 /// engagement: the attention reason is marked addressed so the finding
 /// is not re-picked until the PR changes.
@@ -747,7 +830,7 @@ async fn a_no_op_engage_marks_the_attention_addressed_and_touches_nothing() {
     assert_eq!(git(&origin, &["rev-parse", BRANCH]), head);
     assert!(!bins.called_with("gh", "comment"), "{:?}", bins.calls());
     let row = f.pr_row().await;
-    assert_eq!(row.addressed_fingerprint.as_deref(), Some("af-1"));
+    assert_eq!(row.addressed_fingerprint.as_deref(), Some(FP));
     assert_eq!(row.addressed_head_sha.as_deref(), Some("deadbeef"));
     assert_eq!(row.last_engaged_activity_at, Some(0));
     assert!(
@@ -782,6 +865,146 @@ async fn a_failed_reply_is_a_retry() {
     assert_eq!(f.jobs().await[0].2, "failed");
     assert_eq!(f.pr_row().await.addressed_fingerprint, None);
     assert!(released(&seen));
+}
+
+/// A push that landed counts even when the reply after it fails. The
+/// engage is a retry and answers nothing, but the PR's head moved: a sync
+/// read begun before the push saw the replaced head, and its change
+/// request must wait for a read of the pushed one. Uncounted, the stale
+/// observation flagged the PR again for a commit that was no longer its
+/// head.
+#[tokio::test]
+async fn a_push_whose_reply_fails_still_counts_as_a_push() {
+    let f = fixture("engage-push-then-reply-fails").await;
+    let bins = FakeBins::acquire("engage-push-then-reply-fails");
+    bins.ok_unless_action("gh", "pr comment", PR_VIEW_JSON);
+    let origin = push_to(&f, None).await;
+    let tip = git(&origin, &["rev-parse", BRANCH]).trim().to_owned();
+    let at_tip = |head_sha: String| ObservedFixture {
+        mergeable: Mergeable::Mergeable,
+        changes_requested: true,
+        checks: None,
+        failing_checks: Vec::new(),
+        head_ref: BRANCH.to_owned(),
+        head_sha,
+        last_activity_at: 0,
+    };
+    let pass = support::pr_sync(&f.store);
+    let seen = ObservedOpenPr::fixture(
+        pass.begin_read_at(f.fid, &support::pr_ref(PR_URL), 2)
+            .await
+            .unwrap()
+            .unwrap(),
+        at_tip(tip.clone()),
+    );
+    let recorded = f.store.record_open_pr(f.fid, &seen).await.unwrap();
+    assert!(
+        matches!(recorded, OpenPrRecorded::Recorded(_)),
+        "{recorded:?}"
+    );
+    drop(pass);
+    let watermark = f.pr_row().await.last_engaged_activity_at;
+    // The next sync asks the forge before the engage pushes, and still
+    // sees the change request on the old tip.
+    let pass = support::pr_sync(&f.store);
+    let in_flight = ObservedOpenPr::fixture(
+        pass.begin_read_at(f.fid, &support::pr_ref(PR_URL), 3)
+            .await
+            .unwrap()
+            .unwrap(),
+        at_tip(tip.clone()),
+    );
+    let (backend, _seen) = recording(|tree| {
+        commit_in(tree);
+        stage_reply(tree);
+    });
+
+    let summary = f.run(&backend).await.unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("retry"), "{summary:?}");
+    assert_ne!(
+        git(&origin, &["rev-parse", BRANCH]).trim(),
+        tip,
+        "the push landed"
+    );
+    let recorded = f.store.record_open_pr(f.fid, &in_flight).await.unwrap();
+    assert!(
+        matches!(recorded, OpenPrRecorded::Recorded(_)),
+        "{recorded:?}"
+    );
+    let row = f.pr_row().await;
+    assert_eq!(
+        row.needs_attention, None,
+        "the change request was read on the head the push replaced"
+    );
+    assert_eq!(
+        row.last_engaged_activity_at, watermark,
+        "an unpublished engage answers no feedback"
+    );
+}
+
+/// A reply that fails after no push counts as nothing at all: the PR's
+/// head did not move, so a sync read begun before the engage still saw it,
+/// and its change request still stands. Counted as a push, the failed
+/// reply made that read wait and unflagged a PR nobody had answered.
+#[tokio::test]
+async fn a_failed_reply_without_a_push_counts_as_no_push() {
+    let f = fixture("engage-reply-fails-no-push").await;
+    let bins = FakeBins::acquire("engage-reply-fails-no-push");
+    bins.ok_unless_action("gh", "pr comment", PR_VIEW_JSON);
+    let origin = push_to(&f, None).await;
+    let tip = git(&origin, &["rev-parse", BRANCH]).trim().to_owned();
+    let at_tip = || ObservedFixture {
+        mergeable: Mergeable::Mergeable,
+        changes_requested: true,
+        checks: None,
+        failing_checks: Vec::new(),
+        head_ref: BRANCH.to_owned(),
+        head_sha: tip.clone(),
+        last_activity_at: 0,
+    };
+    let pass = support::pr_sync(&f.store);
+    let seen = ObservedOpenPr::fixture(
+        pass.begin_read_at(f.fid, &support::pr_ref(PR_URL), 2)
+            .await
+            .unwrap()
+            .unwrap(),
+        at_tip(),
+    );
+    let recorded = f.store.record_open_pr(f.fid, &seen).await.unwrap();
+    assert!(
+        matches!(recorded, OpenPrRecorded::Recorded(_)),
+        "{recorded:?}"
+    );
+    drop(pass);
+    let pass = support::pr_sync(&f.store);
+    let in_flight = ObservedOpenPr::fixture(
+        pass.begin_read_at(f.fid, &support::pr_ref(PR_URL), 3)
+            .await
+            .unwrap()
+            .unwrap(),
+        at_tip(),
+    );
+    let (backend, _seen) = recording(stage_reply);
+
+    let summary = f.run(&backend).await.unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("retry"), "{summary:?}");
+    assert_eq!(
+        git(&origin, &["rev-parse", BRANCH]).trim(),
+        tip,
+        "nothing was pushed"
+    );
+    let recorded = f.store.record_open_pr(f.fid, &in_flight).await.unwrap();
+    assert!(
+        matches!(recorded, OpenPrRecorded::Recorded(_)),
+        "{recorded:?}"
+    );
+    assert_eq!(
+        f.pr_row().await.needs_attention.as_deref(),
+        Some("changes_requested"),
+        "the head the read saw is still the PR's"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -856,13 +1079,42 @@ async fn a_head_ref_equal_to_the_default_branch_is_refused() {
 }
 
 #[tokio::test]
-async fn a_missing_pr_number_without_a_parseable_url_bails() {
-    let f = fixture("engage-no-pr-number").await;
-    let bins = FakeBins::acquire("engage-no-pr-number");
+async fn an_unparseable_pr_url_bails() {
+    let f = fixture("engage-bad-pr-url").await;
+    let bins = FakeBins::acquire("engage-bad-pr-url");
     bins.ok("gh", PR_VIEW_JSON);
-    f.exec("UPDATE pr_state SET pr_number = NULL").await;
     f.exec("UPDATE findings SET pr_url = 'not a pr url'").await;
-    assert_bails(&f, &bins, "no pr_number", "no parseable pr_url").await;
+    assert_bails(&f, &bins, "unparseable pr_url", "unparseable pr_url").await;
+}
+
+/// The PR an engage answers, closes and replies on is the finding's, its
+/// number parsed from its URL. A `pr_state` row naming another PR holds
+/// that PR's head and problems, so the engage waits for the sync that
+/// rewrites it instead of working from it.
+#[tokio::test]
+async fn a_pr_state_row_of_another_pr_bails() {
+    let f = fixture("engage-row-of-other-pr").await;
+    let bins = FakeBins::acquire("engage-row-of-other-pr");
+    bins.ok("gh", PR_VIEW_JSON);
+    f.exec("UPDATE pr_state SET pr_number = 8").await;
+    assert_bails(
+        &f,
+        &bins,
+        "pr_state of another PR",
+        "pr_state is PR #8, the finding's PR is #7",
+    )
+    .await;
+}
+
+/// Without a PR URL there is no PR to record the answer against: it lands
+/// only while the finding's `pr_url` is still the one the engage started on.
+#[tokio::test]
+async fn an_empty_pr_url_bails() {
+    let f = fixture("engage-no-pr-url").await;
+    let bins = FakeBins::acquire("engage-no-pr-url");
+    bins.ok("gh", PR_VIEW_JSON);
+    f.exec("UPDATE findings SET pr_url = ''").await;
+    assert_bails(&f, &bins, "no pr_url", "no pr_url").await;
 }
 
 /// A PR branch that is gone from origin fails the fetch before any job
@@ -1460,7 +1712,7 @@ async fn an_unrecorded_closed_verdict_starts_no_harvest_and_waits_for_the_sync()
         .await
         .unwrap();
     bins.ok("gh", PR_CLOSED_JSON);
-    let result = hunter::scheduler::sync_prs(&f.store, &f.cfg).await;
+    let result = hunter::scheduler::sync_prs(&support::pr_sync(&f.store), &f.cfg).await;
     assert_eq!(result.closed, 1, "{result:?}");
     assert_eq!(f.pr_state().await.as_deref(), Some("CLOSED"));
     assert_left_for_the_cold_harvest(&f, &runs[0].tree).await;
@@ -1613,7 +1865,7 @@ async fn an_unrecorded_close_starts_no_harvest_and_waits_for_the_sync() {
         .await
         .unwrap();
     bins.ok("gh", PR_CLOSED_JSON);
-    let result = hunter::scheduler::sync_prs(&f.store, &f.cfg).await;
+    let result = hunter::scheduler::sync_prs(&support::pr_sync(&f.store), &f.cfg).await;
     assert_eq!(result.closed, 1, "{result:?}");
     assert_eq!(f.pr_state().await.as_deref(), Some("CLOSED"));
     assert_left_for_the_cold_harvest(&f, &runs[0].tree).await;
@@ -1729,7 +1981,7 @@ async fn a_reply_only_engage_marks_the_attention_addressed() {
     assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
     assert!(bins.called_with("gh", "comment"), "{:?}", bins.calls());
     assert_eq!(support::git(&origin, &["rev-parse", BRANCH]), head);
-    assert_eq!(f.addressed_fp().await.as_deref(), Some("af-1"));
+    assert_eq!(f.addressed_fp().await.as_deref(), Some(FP));
     let events = f.store.recent_events(20).await.unwrap();
     assert!(
         events
@@ -1797,7 +2049,7 @@ async fn attention_after_reply(
     assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
 
     pr_with_comments(&bins, afterwards);
-    let result = hunter::scheduler::sync_prs(&f.store, &f.cfg).await;
+    let result = hunter::scheduler::sync_prs(&support::pr_sync(&f.store), &f.cfg).await;
     assert_eq!(result.errors, 0, "{result:?}");
     f.attention().await
 }
@@ -1892,7 +2144,7 @@ async fn feedback_posted_while_an_engage_was_suspended_is_new_after_it_resumes()
     assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
     assert!(bins.called_with("gh", "comment"), "{:?}", bins.calls());
 
-    let result = hunter::scheduler::sync_prs(&f.store, &f.cfg).await;
+    let result = hunter::scheduler::sync_prs(&support::pr_sync(&f.store), &f.cfg).await;
     assert_eq!(result.errors, 0, "{result:?}");
     assert_eq!(f.attention().await.as_deref(), Some("new_comments"));
 }
@@ -1915,7 +2167,7 @@ async fn feedback_a_resumed_worker_was_shown_is_answered_by_its_reply() {
         &bins,
         &[asked, ("lead", hunter::forge::mark_own("renamed"))],
     );
-    let result = hunter::scheduler::sync_prs(&f.store, &f.cfg).await;
+    let result = hunter::scheduler::sync_prs(&support::pr_sync(&f.store), &f.cfg).await;
     assert_eq!(result.errors, 0, "{result:?}");
     assert_eq!(f.attention().await, None);
 }
@@ -1955,7 +2207,7 @@ async fn an_engage_whose_push_fails_posts_nothing_and_fails_its_job() {
     assert_eq!(jobs.last().unwrap().2, "failed", "{jobs:?}");
     let ps = f.pr_row().await;
     assert_eq!(ps.addressed_fingerprint, None);
-    assert_eq!(ps.last_engaged_activity_at, Some(0), "watermark untouched");
+    assert_eq!(ps.last_engaged_activity_at, None, "watermark untouched");
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     assert_eq!(finding.budget_override, None);
 }
@@ -2382,7 +2634,7 @@ async fn a_suspended_engage_that_did_not_withdraw_keeps_its_tree_for_the_resume(
         "the attention stays unaddressed"
     );
     let ps = f.store.get_pr_state(f.fid).await.unwrap().unwrap();
-    assert_eq!(ps.last_engaged_activity_at, Some(0));
+    assert_eq!(ps.last_engaged_activity_at, None, "never engaged");
     let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
     assert_eq!(after.status, FindingStatus::PrOpen);
 
@@ -2509,27 +2761,14 @@ async fn a_held_engage_stays_held_through_new_pr_activity() {
     assert!(!held.new_activity);
 
     // The reviewer answers: the next sync raises the PR's activity.
-    f.store
-        .sync_pr_open(
-            f.fid,
-            &SyncPrData {
-                pr_number: 7,
-                state: "open".to_owned(),
-                mergeable: "mergeable".to_owned(),
-                checks: None,
-                head_ref: BRANCH.to_owned(),
-                head_sha: "deadbeef".to_owned(),
-                last_activity_at: held.held_at + 1,
-                last_engaged_activity_at: 0,
-                needs_attention: Some("new_comments".to_owned()),
-                attention_fingerprint: Some("af-2".to_owned()),
-                synced_at: held.held_at + 1,
-                attention_since: Some(Some(held.held_at + 1)),
-                clear_addressed: false,
-            },
-        )
-        .await
-        .unwrap();
+    let pass = support::pr_sync(&f.store);
+    let reply = observed(&pass, f.fid, held.held_at + 1).await;
+    let recorded = f.store.record_open_pr(f.fid, &reply).await.unwrap();
+    drop(pass);
+    assert!(
+        matches!(recorded, OpenPrRecorded::Recorded(_)),
+        "{recorded:?}"
+    );
 
     let after = support::hold_of(&f.store, f.fid, hunter::domain::FindingJobKind::Engage)
         .await
@@ -2735,7 +2974,8 @@ async fn a_failed_pr_view_counts_only_while_the_forge_is_reachable() {
 /// at a `forge` on `host` and turn the network gate
 /// on, so failures are re-probed (#95 layer 2); the paused engage's resume.
 /// A resume reads no PR view, so the move only shows where the engage
-/// publishes.
+/// publishes. A GitLab repo's PR is a merge request, so the finding's
+/// `pr_url` moves with it: the engage reads its PR's number from the URL.
 async fn paused_then_served_at(
     f: &mut Fixture,
     forge: &str,
@@ -2756,6 +2996,13 @@ async fn paused_then_served_at(
         .execute(&pool)
         .await
         .unwrap();
+    if forge == "gitlab" {
+        sqlx::query("UPDATE findings SET pr_url = ?1")
+            .bind(format!("https://{host}/acme/widget/-/merge_requests/7"))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
     f.cfg.network_gate = true;
     match hunter::scheduler::pick_next(&f.store, &f.cfg, None)
         .await
