@@ -61,6 +61,20 @@ async fn sweep_workspaces(store: &Store, work_root: &Path) {
     }
 }
 
+/// Turn off automatic maintenance in every clone of the daemon's own on
+/// disk (`workspace::quiet_clones`). Startup only, before the first job;
+/// best effort, since a fetch runs with it off regardless.
+async fn quiet_clones(store: &Store, work_root: &Path) {
+    let quieted = store
+        .lane(async |lane| crate::workspace::quiet_clones(lane, work_root).await)
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|r| r.map_err(anyhow::Error::from));
+    if let Err(e) = quieted {
+        tracing::warn!("turning off automatic maintenance in the clones failed: {e}");
+    }
+}
+
 /// (`state_label`, detail) for `scheduler_state` (`server._describe_cycle`).
 pub fn describe_cycle(summary: &CycleSummary) -> (String, String) {
     use std::fmt::Write;
@@ -206,6 +220,7 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     if reaped > 0 {
         tracing::info!("reclaimed {reaped} repo director(ies) left by earlier deletions");
     }
+    quiet_clones(&store, &cfg.work_root).await;
     sweep_workspaces(&store, &cfg.work_root).await;
     anyhow::ensure!(
         cfg.backend_type == "omp-scavenge",
