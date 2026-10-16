@@ -20,7 +20,7 @@ use hunter::backend::{Backend, JobClass, Outlook, Verdict};
 use hunter::clones::ClonePermit;
 use hunter::config::Config;
 use hunter::domain::{FindingStatus, JobState};
-use hunter::scheduler::{Candidate, pick_next, run_fix, run_hunt, run_test_gap};
+use hunter::scheduler::{Attempt, Candidate, Resumed, pick_next, run_fix, run_hunt, run_test_gap};
 use hunter::store::{ChainRef, FindingInsert, Store};
 use hunter::types::RunResult;
 use hunter::workspace::{self, OpenWorkspace, SESSION_RETENTION_MS, TreeSpec, Workspace};
@@ -291,9 +291,8 @@ async fn suspend_then_resume_a_hunt(f: &Fixture) -> (String, String, Seen, Seen,
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &row,
+        Attempt::Cold(&row),
         &cold,
-        None,
     )
     .await
     .unwrap();
@@ -340,9 +339,8 @@ async fn suspend_then_resume_a_hunt(f: &Fixture) -> (String, String, Seen, Seen,
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &row,
+        Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
         &warm,
-        Some(&plan),
     )
     .await
     .unwrap();
@@ -1182,9 +1180,8 @@ async fn a_fresh_fix_superseding_a_suspended_fix_takes_over_its_branch() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &suspending,
-        None,
     )
     .await
     .unwrap();
@@ -1205,9 +1202,8 @@ async fn a_fresh_fix_superseding_a_suspended_fix_takes_over_its_branch() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &declining,
-        None,
     )
     .await
     .unwrap();
@@ -1374,9 +1370,8 @@ async fn a_cold_job_whose_tree_cannot_be_made_fails_and_leaves_nothing() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &row,
+        Attempt::Cold(&row),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -1466,9 +1461,8 @@ async fn a_cold_job_fetches_the_clone_but_never_moves_its_checkout() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &row,
+        Attempt::Cold(&row),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -1515,9 +1509,8 @@ async fn a_suspended_fix_whose_work_concluded_keeps_no_checkpoint_and_is_release
             &support::scope(&f.store),
             f.store.test_lane(),
             &f.cfg,
-            &finding,
+            Attempt::Cold(&finding),
             &concluded,
-            None,
         )
         .await
         .unwrap();
@@ -1584,9 +1577,8 @@ async fn a_suspended_harvest_keeps_its_tree() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &suspending,
-        None,
     )
     .await
     .unwrap();
@@ -1701,9 +1693,8 @@ async fn renovate_scans_a_tree_at_the_fetched_tip() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &row,
+        Attempt::Cold(&row),
         &ScriptedBackend::noop(),
-        None,
     )
     .await
     .unwrap();
@@ -1757,9 +1748,8 @@ async fn renovate_runs_holding_no_clone_and_the_sweep_keeps_its_tree() {
         &scope,
         f.store.test_lane(),
         &f.cfg,
-        &row,
+        Attempt::Cold(&row),
         &backend,
-        None,
     );
     let meanwhile = async {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {

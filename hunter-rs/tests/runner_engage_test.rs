@@ -29,6 +29,7 @@ use hunter::attention::{
 use hunter::config::Config;
 use hunter::domain::{BudgetOverride, FindingStatus, ForgeName, RepoJobKind};
 use hunter::forge::Mergeable;
+use hunter::scheduler::{Attempt, Resumed};
 use hunter::store::FindingInsert;
 use hunter::types::RunResult;
 use support::{FakeBins, GitRepo, ScriptedBackend, TempDir, done, fresh_store, git};
@@ -223,9 +224,8 @@ impl Fixture {
             &support::scope(&self.store),
             self.store.test_lane(),
             &self.cfg,
-            &finding,
+            Attempt::Cold(&finding),
             backend,
-            None,
         )
         .await
     }
@@ -362,9 +362,8 @@ async fn failed_close_does_not_record_the_withdrawal() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .expect("run_engage should not error, it should decline to record");
@@ -409,9 +408,8 @@ async fn successful_close_records_the_withdrawal() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -453,9 +451,8 @@ async fn a_withdrawal_files_no_follow_ups() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -616,9 +613,8 @@ async fn a_failed_withdrawal_counts_toward_the_engage_streak() {
             &support::scope(&f.store),
             f.store.test_lane(),
             &f.cfg,
-            &finding,
+            Attempt::Cold(&finding),
             &backend,
-            None,
         )
         .await
         .unwrap();
@@ -688,9 +684,8 @@ async fn a_withdrawal_spends_only_a_once_override() {
                 &support::scope(&f.store),
                 f.store.test_lane(),
                 &f.cfg,
-                &finding,
+                Attempt::Cold(&finding),
                 &backend,
-                None,
             )
             .await
             .unwrap();
@@ -1249,9 +1244,8 @@ async fn a_clone_of_a_different_repository_is_refused() {
         &support::scope(&store),
         store.test_lane(),
         &cfg,
-        &row,
+        Attempt::Cold(&row),
         &backend,
-        None,
     )
     .await
     .expect_err("a clone of another repository must not be hunted");
@@ -1318,9 +1312,8 @@ async fn an_insteadof_rewrite_of_the_origin_is_not_refused() {
         &support::scope(&store),
         store.test_lane(),
         &cfg,
-        &row,
+        Attempt::Cold(&row),
         &backend,
-        None,
     )
     .await
     .expect("the daemon's own clone must not be refused over an insteadOf rewrite");
@@ -1373,9 +1366,8 @@ async fn a_hunt_refused_because_its_repo_was_deleted_names_what_it_skipped() {
         &support::scope(&store),
         store.test_lane(),
         &cfg,
-        &picked,
+        Attempt::Cold(&picked),
         &backend,
-        None,
     )
     .await
     .expect("losing the race to a delete is a skipped cycle, not an error");
@@ -1507,9 +1499,8 @@ async fn a_withdrawal_continues_into_its_harvest_in_the_same_session() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -1604,9 +1595,8 @@ async fn a_sweep_during_the_handoff_keeps_the_tree_for_the_harvest() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -1647,9 +1637,8 @@ async fn a_denied_handoff_leaves_the_finding_closed_and_releases_the_tree() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -1681,9 +1670,8 @@ async fn an_unavailable_transcript_leaves_the_finding_closed_and_releases_the_tr
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -1730,9 +1718,8 @@ async fn a_failed_handoff_files_no_follow_ups() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -1774,9 +1761,8 @@ async fn a_handoff_whose_diff_fails_counts_no_harvest_attempt() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -1826,9 +1812,8 @@ async fn an_unrecorded_closed_verdict_starts_no_harvest_and_waits_for_the_sync()
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -1902,9 +1887,8 @@ async fn a_withdrawal_the_sync_recorded_first_keeps_the_syncs_verdict() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -1943,9 +1927,8 @@ async fn a_handoff_whose_view_fails_counts_no_harvest_attempt() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -2001,9 +1984,8 @@ async fn an_unrecorded_close_starts_no_harvest_and_waits_for_the_sync() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -2094,9 +2076,8 @@ async fn a_finished_engage_pushes_replies_and_records_it() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -2148,9 +2129,8 @@ async fn a_reply_only_engage_marks_the_attention_addressed() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -2223,9 +2203,8 @@ async fn attention_after_reply(
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -2376,9 +2355,8 @@ async fn an_engage_whose_push_fails_posts_nothing_and_fails_its_job() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -2424,9 +2402,8 @@ async fn an_unfinished_engage_publishes_nothing() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -2466,9 +2443,8 @@ async fn only_a_suspended_engage_reports_its_kept_worktree() {
             &support::scope(&f.store),
             f.store.test_lane(),
             &f.cfg,
-            &finding,
+            Attempt::Cold(&finding),
             &backend,
-            None,
         )
         .await
         .unwrap();
@@ -2539,9 +2515,8 @@ async fn suspend_and_resume(
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -2560,15 +2535,13 @@ async fn suspend_and_resume(
         Some(hunter::scheduler::Candidate::Resume { plan, .. }) => *plan,
         other => panic!("expected the suspended engage to be resumed, got {other:?}"),
     };
-    assert_eq!(plan.predecessor_id, first.job_id.unwrap());
-    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(plan.predecessor_id(), first.job_id.unwrap());
     hunter::scheduler::run_engage(
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
         &backend,
-        Some(&plan),
     )
     .await
     .unwrap()
@@ -2698,9 +2671,8 @@ async fn a_suspended_engage_that_withdrew_keeps_no_checkpoint_and_continues_into
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -2762,9 +2734,8 @@ async fn a_suspended_engage_whose_withdrawal_failed_keeps_no_checkpoint_and_is_r
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -2820,9 +2791,8 @@ async fn a_suspended_engage_that_did_not_withdraw_keeps_its_tree_for_the_resume(
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -2894,9 +2864,8 @@ async fn a_failing_engage_is_held_at_the_streak_limit() {
             &support::scope(&f.store),
             f.store.test_lane(),
             &f.cfg,
-            &finding,
+            Attempt::Cold(&finding),
             &failing,
-            None,
         )
         .await
         .unwrap();
@@ -2944,9 +2913,8 @@ async fn an_engage_whose_pr_will_not_load_is_held_at_the_streak_limit() {
             &support::scope(&f.store),
             f.store.test_lane(),
             &f.cfg,
-            &finding,
+            Attempt::Cold(&finding),
             &never,
-            None,
         )
         .await
         .expect_err("a PR that will not load fails the engage");
@@ -3026,15 +2994,13 @@ async fn a_paused_engage_continues_without_the_forge() {
     else {
         panic!("the paused engage resumes");
     };
-    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
 
     let resumed = hunter::scheduler::run_engage(
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
         &pausing,
-        Some(&plan),
     )
     .await
     .unwrap();
@@ -3253,7 +3219,6 @@ async fn a_failed_reply_counts_only_while_the_forge_is_reachable() {
         // A GitHub repo on a host that is not GitHub's: the reply cannot be
         // posted.
         let plan = paused_then_served_at(&mut f, "github", host).await;
-        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
         let down: &[&str] = if counted { &[] } else { &[host] };
         let replying = ScriptedBackend::new(|tree| {
             std::fs::write(tree.join("PR-REPLY.md"), "answered").unwrap();
@@ -3265,9 +3230,8 @@ async fn a_failed_reply_counts_only_while_the_forge_is_reachable() {
             &support::scope(&f.store),
             f.store.test_lane(),
             &f.cfg,
-            &finding,
+            Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
             &replying,
-            Some(&plan),
         )
         .await
         .unwrap();
@@ -3292,9 +3256,9 @@ async fn a_failed_reply_counts_only_while_the_forge_is_reachable() {
         else {
             panic!("the unpublished engage is continued");
         };
-        assert_eq!(Some(plan.predecessor_id), summary.job_id);
+        assert_eq!(Some(plan.predecessor_id()), summary.job_id);
         assert!(
-            plan.workspace.tree.join("PR-REPLY.md").exists(),
+            plan.workspace().tree.join("PR-REPLY.md").exists(),
             "the reply is kept"
         );
     }
@@ -3313,7 +3277,6 @@ async fn a_withdrawal_while_the_forge_is_unreachable_keeps_its_checkpoint() {
     let down = support::FORGE_HOST;
     // GitLab, which takes any host: the close is attempted, and fails.
     let plan = paused_then_served_at(&mut f, "gitlab", down).await;
-    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let withdrawing = ScriptedBackend::new(|tree| {
         std::fs::write(tree.join("WITHDRAW.md"), "superseded by #9").unwrap();
         support::done_with_transcript(tree)
@@ -3324,9 +3287,8 @@ async fn a_withdrawal_while_the_forge_is_unreachable_keeps_its_checkpoint() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
         &withdrawing,
-        Some(&plan),
     )
     .await
     .unwrap();
@@ -3375,9 +3337,8 @@ async fn an_engage_that_never_reaches_its_worker_is_held() {
                 &support::scope(&f.store),
                 f.store.test_lane(),
                 &f.cfg,
-                &finding,
+                Attempt::Cold(&finding),
                 &backend,
-                None,
             )
             .await;
             match case {
@@ -3432,9 +3393,8 @@ async fn an_engage_that_needs_a_maintainer_is_held_on_its_report() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -3544,15 +3504,13 @@ async fn a_continued_stuck_engage_resumes_with_its_reason() {
         panic!("a continued hold resumes its checkpoint");
     };
     let resumed = ScriptedBackend::new(|_| done());
-    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
 
     hunter::scheduler::run_engage(
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
         &resumed,
-        Some(&plan),
     )
     .await
     .unwrap();

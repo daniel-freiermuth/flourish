@@ -16,7 +16,7 @@ mod support;
 
 use hunter::config::Config;
 use hunter::domain::{FindingStatus, Severity};
-use hunter::scheduler::{CycleSummary, run_cycle, work_hosts};
+use hunter::scheduler::{Attempt, CycleSummary, run_cycle, work_hosts};
 use hunter::store::{FindingInsert, Store};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -372,9 +372,8 @@ async fn a_fetch_that_fails_while_offline_is_not_counted() {
         &support::scope(&store),
         store.test_lane(),
         &cfg,
-        &repo,
+        Attempt::Cold(&repo),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -392,9 +391,8 @@ async fn a_fetch_that_fails_while_offline_is_not_counted() {
         &support::scope(&store),
         store.test_lane(),
         &cfg,
-        &repo,
+        Attempt::Cold(&repo),
         &up,
-        None,
     )
     .await;
     assert!(failed.is_err(), "{failed:?}");
@@ -413,9 +411,8 @@ async fn a_runner_error_while_offline_is_not_counted() {
         &support::scope(&store),
         store.test_lane(),
         &cfg,
-        &repo,
+        Attempt::Cold(&repo),
         &backend,
-        None,
     )
     .await
     .unwrap();

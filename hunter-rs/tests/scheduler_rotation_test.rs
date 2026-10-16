@@ -18,7 +18,7 @@ use std::path::PathBuf;
 
 use hunter::config::Config;
 use hunter::domain::{HoldReason, JobState, ReleaseAction, RepoJobKind, RepoWorkKind};
-use hunter::scheduler::{Candidate, pick_next, run_cycle};
+use hunter::scheduler::{Attempt, Candidate, pick_next, run_cycle};
 use hunter::store::{RepoHold, Store};
 use hunter::types::RunResult;
 use support::{GitRepo, ScriptedBackend, TempDir};
@@ -284,8 +284,8 @@ async fn a_suspended_analysis_attempt_is_a_pause() {
         Some(Candidate::Resume { plan, .. }) => plan,
         other => panic!("the resume tier must claim the suspension, got {other:?}"),
     };
-    assert_eq!(plan.predecessor_id, summary.job_id.unwrap());
-    assert_eq!(plan.kind.to_string(), "test_gap");
+    assert_eq!(plan.predecessor_id(), summary.job_id.unwrap());
+    assert_eq!(plan.kind().to_string(), "test_gap");
 }
 
 /// A worker that exited unsuccessfully on its own, after doing work.
@@ -331,7 +331,7 @@ async fn an_attempt_that_died_after_doing_work_is_suspended_for_resume() {
     let picked = pick_next(&store, &cfg, None).await.unwrap();
     match picked {
         Some(Candidate::Resume { plan, .. }) => {
-            assert_eq!(plan.predecessor_id, summary.job_id.unwrap());
+            assert_eq!(plan.predecessor_id(), summary.job_id.unwrap());
         }
         other => panic!("the resume tier must claim the died attempt, got {other:?}"),
     }
@@ -456,9 +456,9 @@ async fn a_continued_scan_resumes_its_chain_past_the_ceiling() {
         Some(Candidate::Resume { plan, .. }) => plan,
         other => panic!("a continued hold resumes its chain, got {other:?}"),
     };
-    assert_eq!(Some(plan.predecessor_id), checkpoint);
+    assert_eq!(Some(plan.predecessor_id()), checkpoint);
     assert_eq!(
-        plan.after_hold.as_ref().map(|(reason, _)| *reason),
+        plan.after_hold().as_ref().map(|(reason, _)| *reason),
         Some(HoldReason::GaveUp)
     );
 }
@@ -1048,9 +1048,8 @@ async fn a_hunt_with_no_new_commits_ends_its_streak() {
         &support::scope(&store),
         store.test_lane(),
         &cfg,
-        &repo,
+        Attempt::Cold(&repo),
         &ScriptedBackend::noop(),
-        None,
     )
     .await
     .unwrap();
