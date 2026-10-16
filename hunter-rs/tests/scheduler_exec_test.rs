@@ -7,7 +7,7 @@ mod support;
 use std::path::{Path, PathBuf};
 
 use hunter::domain::{FindingJobKind, FindingType, ForgeName, RepoJobKind};
-use hunter::store::{JobOutcome, Store};
+use hunter::store::{JobOutcome, JobStart, Store};
 use hunter::transition::Moved;
 use hunter::types::RunResult;
 use sqlx::SqlitePool;
@@ -66,7 +66,11 @@ async fn record_job_done_state() {
     seed_repo(&pool).await;
     let store = rw_store(&path).await;
     let job = support::scope(&store)
-        .create_job(RepoJobKind::Hunt.into(), 1, None, Some(100_000), None, None)
+        .create_job(
+            JobStart::fresh_repo(RepoJobKind::Hunt, 1),
+            Some(100_000),
+            None,
+        )
         .await
         .unwrap()
         .job;
@@ -105,14 +109,12 @@ async fn record_job_done_state() {
 async fn record_job_failed_state() {
     let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
+    seed_findings(&pool).await;
     let store = rw_store(&path).await;
     let job = support::scope(&store)
         .create_job(
-            FindingJobKind::Fix.into(),
-            1,
-            None,
+            JobStart::fresh_finding(FindingJobKind::Fix, 1),
             Some(100_000),
-            None,
             None,
         )
         .await
@@ -153,7 +155,11 @@ async fn record_job_cap_kill_without_a_session_stays_killed() {
     seed_repo(&pool).await;
     let store = rw_store(&path).await;
     let job = support::scope(&store)
-        .create_job(RepoJobKind::Hunt.into(), 1, None, Some(50_000), None, None)
+        .create_job(
+            JobStart::fresh_repo(RepoJobKind::Hunt, 1),
+            Some(50_000),
+            None,
+        )
         .await
         .unwrap()
         .job;
@@ -193,7 +199,11 @@ async fn record_job_cap_kill_with_a_session_suspends() {
     seed_repo(&pool).await;
     let store = rw_store(&path).await;
     let job = support::scope(&store)
-        .create_job(RepoJobKind::Hunt.into(), 1, None, Some(50_000), None, None)
+        .create_job(
+            JobStart::fresh_repo(RepoJobKind::Hunt, 1),
+            Some(50_000),
+            None,
+        )
         .await
         .unwrap()
         .job;
@@ -238,7 +248,7 @@ async fn record_job_wallclock_kill_with_work_and_a_session_suspends() {
     for kind in [RepoJobKind::Hunt, RepoJobKind::TestGap] {
         jobs.push(
             support::scope(&store)
-                .create_job(kind.into(), 1, None, Some(50_000), None, None)
+                .create_job(JobStart::fresh_repo(kind, 1), Some(50_000), None)
                 .await
                 .unwrap()
                 .job,
@@ -284,16 +294,14 @@ async fn record_job_wallclock_kill_with_work_and_a_session_suspends() {
 async fn create_and_update_job_round_trip() {
     let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
+    seed_findings(&pool).await;
     let store = rw_store(&path).await;
 
     // Create job
     let job = support::scope(&store)
         .create_job(
-            FindingJobKind::Fix.into(),
-            1,
-            None,
+            JobStart::fresh_finding(FindingJobKind::Fix, 1),
             Some(150_000),
-            None,
             None,
         )
         .await
@@ -350,11 +358,8 @@ async fn reconcile_kills_the_orphaned_fix_and_requeues_its_finding() {
     let prior = rw_store(&path).await;
     let job_id = support::scope(&prior)
         .create_job(
-            FindingJobKind::Fix.into(),
-            1,
-            Some(3),
+            JobStart::fresh_finding(FindingJobKind::Fix, 3),
             Some(100_000),
-            None,
             None,
         )
         .await
@@ -458,7 +463,7 @@ async fn a_settle_takes_only_what_was_dropped_unended() {
     let store = rw_store(&path).await;
     let scope = support::scope(&store);
     let job = |kind: FindingJobKind, fid| {
-        scope.create_job(kind.into(), 1, Some(fid), Some(100_000), None, None)
+        scope.create_job(JobStart::fresh_finding(kind, fid), Some(100_000), None)
     };
     // The cycle's fix of #2 claimed it and abandoned its job.
     let abandoned_claim = scope.claim_fix(2).await.unwrap().unwrap();
@@ -589,7 +594,7 @@ async fn a_downgrade_fails_the_recorded_job_and_no_other() {
     let mut recorded = Vec::new();
     for _ in 0..2 {
         let job = scope
-            .create_job(RepoJobKind::Hunt.into(), 1, None, None, None, None)
+            .create_job(JobStart::fresh_repo(RepoJobKind::Hunt, 1), None, None)
             .await
             .unwrap()
             .job;
@@ -711,11 +716,8 @@ async fn a_settled_claim_spares_a_finding_a_running_job_works_on() {
     drop(scope.claim_fix(2).await.unwrap().unwrap());
     let running = scope
         .create_job(
-            FindingJobKind::Fix.into(),
-            1,
-            Some(2),
+            JobStart::fresh_finding(FindingJobKind::Fix, 2),
             Some(100_000),
-            None,
             None,
         )
         .await
@@ -779,7 +781,11 @@ async fn a_job_dropped_while_its_tree_is_in_use_stays_owed() {
     let store = rw_store(&path).await;
     let work_root = dir.subdir("work_root");
     let job = support::scope(&store)
-        .create_job(RepoJobKind::Hunt.into(), 1, None, Some(100_000), None, None)
+        .create_job(
+            JobStart::fresh_repo(RepoJobKind::Hunt, 1),
+            Some(100_000),
+            None,
+        )
         .await
         .unwrap()
         .job;
@@ -833,7 +839,11 @@ async fn a_job_dropped_unended_is_owed_to_the_next_settle() {
     seed_findings(&pool).await;
     let store = rw_store(&path).await;
     let job = support::scope(&store)
-        .create_job(RepoJobKind::Hunt.into(), 1, None, Some(100_000), None, None)
+        .create_job(
+            JobStart::fresh_repo(RepoJobKind::Hunt, 1),
+            Some(100_000),
+            None,
+        )
         .await
         .unwrap()
         .job;
@@ -1157,16 +1167,13 @@ async fn reconcile_suspends_an_orphan_that_did_work_and_kills_one_that_did_not()
     let prior = rw_store(&path).await;
     let work_root = dir.subdir("work_root");
     let mut ids = Vec::new();
-    for _ in 0..2 {
+    // Two kinds: one repo runs one job per kind at a time.
+    for kind in [
+        hunter::domain::RepoJobKind::TestGap,
+        hunter::domain::RepoJobKind::Refactor,
+    ] {
         let id = support::scope(&prior)
-            .create_job(
-                hunter::domain::RepoJobKind::TestGap.into(),
-                1,
-                None,
-                Some(100_000),
-                None,
-                None,
-            )
+            .create_job(JobStart::fresh_repo(kind, 1), Some(100_000), None)
             .await
             .unwrap()
             .job

@@ -19,7 +19,7 @@
 //!   `record_closed_harvest` (a closed PR's classification and its harvest
 //!   stamp). Those transactions close real races; do not unwind them to make a method look like the others.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -162,6 +162,137 @@ pub enum StoreWriteError {
     Refused(String),
     #[error(transparent)]
     Db(#[from] sqlx::Error),
+}
+
+/// Why [`CycleScope::create_job`](crate::recovery::CycleScope::create_job)
+/// wrote no job row.
+#[derive(Debug, thiserror::Error)]
+pub enum JobInsertError {
+    /// The repo was soft-deleted after the run was picked: ordinary
+    /// operator traffic, the cycle is skipped.
+    #[error("repo {repo_id} is deleted -- cannot start a {kind} job")]
+    RepoDeleted { repo_id: i64, kind: JobKind },
+    /// Another job is `running` on the same finding, or for repo-level
+    /// work on the same (repo, kind) (migration 031). Selection skips a
+    /// place a job is running on ([`Store::running_places`]), so this is a
+    /// fault to surface, not a race to absorb: the holder is named.
+    #[error("{place}: job {holder} is still running -- cannot start a {kind} job beside it")]
+    Occupied {
+        place: JobPlace,
+        holder: i64,
+        kind: JobKind,
+    },
+    /// The attempt a resume or handoff names can no longer be continued:
+    /// a resume's is not its work item's checkpoint any more (an operator
+    /// restarted the work, or another attempt continued it), a handoff's
+    /// engage is no engage or was already continued. Selection names only
+    /// a current checkpoint, by the same pointer this insert reads, so
+    /// meeting one means the work moved on between the pick and the
+    /// insert: the cycle is skipped, and the next selection reads where
+    /// the work is now.
+    #[error("{start} can no longer be continued")]
+    NotContinuable { start: JobStart },
+    /// Fresh finding work names a finding with no row. Findings are never
+    /// removed, so this is a fault, not a race.
+    #[error("finding {finding_id} does not exist -- cannot start a {kind} job")]
+    UnknownFinding {
+        finding_id: i64,
+        kind: FindingJobKind,
+    },
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
+}
+
+/// How a job starts, which decides where it runs.
+///
+/// Fresh work names its target; a resume or a handoff names the attempt
+/// it continues, and its place is read from that row inside the insert,
+/// so a successor can never run anywhere but where its chain does: on
+/// its predecessor's finding, or for repo-level work its (repo, kind).
+/// Together with migration 031's indexes that gives an attempt at most
+/// one live successor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobStart {
+    /// New work, superseding any checkpoint of the same work.
+    Fresh(FreshWork),
+    /// Continue `checkpoint`, which must still be its work item's
+    /// checkpoint (`finding_work`/`repo_work.checkpoint_job_id`): same
+    /// kind, repo and finding.
+    Resume { checkpoint: i64 },
+    /// Continue the finished engage `engage` into its finding's harvest,
+    /// in the same tree. Only once: an engage with a successor is refused.
+    Handoff { engage: i64 },
+}
+
+/// What fresh work is for: a finding-level kind on one finding, or a
+/// repo-level kind on one repo. Nothing else can be named, so a job row
+/// always has a finding exactly when its kind is a finding's. A finding's
+/// work runs in the finding's own repo, read from its row inside the
+/// insert, so no job can pair a finding with another repo's clone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreshWork {
+    Finding {
+        kind: FindingJobKind,
+        finding_id: i64,
+    },
+    Repo {
+        kind: RepoJobKind,
+        repo_id: i64,
+    },
+}
+
+impl JobStart {
+    /// Fresh `kind` work on finding `finding_id`.
+    pub const fn fresh_finding(kind: FindingJobKind, finding_id: i64) -> Self {
+        Self::Fresh(FreshWork::Finding { kind, finding_id })
+    }
+
+    /// Fresh `kind` work on repo `repo_id`.
+    pub const fn fresh_repo(kind: RepoJobKind, repo_id: i64) -> Self {
+        Self::Fresh(FreshWork::Repo { kind, repo_id })
+    }
+}
+
+impl std::fmt::Display for JobStart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fresh(FreshWork::Finding { kind, finding_id }) => {
+                write!(f, "fresh {kind} of #{finding_id}")
+            }
+            Self::Fresh(FreshWork::Repo { kind, repo_id }) => {
+                write!(f, "fresh {kind} of repo {repo_id}")
+            }
+            Self::Resume { checkpoint } => write!(f, "resume of job {checkpoint}"),
+            Self::Handoff { engage } => write!(f, "handoff of engage job {engage}"),
+        }
+    }
+}
+
+/// What one `running` job holds: its finding, or for repo-level work its
+/// (repo, kind). Migration 031's indexes allow one `running` job per place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum JobPlace {
+    Finding(i64),
+    RepoWork { repo_id: i64, kind: JobKind },
+}
+
+impl JobPlace {
+    /// The place migration 031's indexes give a job row of `kind` in repo
+    /// `repo_id`, on `finding_id` if any. Keyed on the finding, as the
+    /// indexes are: [`FreshWork`] and the rows a successor copies its
+    /// place from make every row the daemon writes agree with its kind.
+    pub fn of(kind: JobKind, repo_id: i64, finding_id: Option<i64>) -> Self {
+        finding_id.map_or(Self::RepoWork { repo_id, kind }, Self::Finding)
+    }
+}
+
+impl std::fmt::Display for JobPlace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Finding(fid) => write!(f, "#{fid}"),
+            Self::RepoWork { repo_id, kind } => write!(f, "repo {repo_id} {kind}"),
+        }
+    }
 }
 
 /// How far [`Store::resume_chain_stats`] will walk a resume chain.
@@ -2815,10 +2946,13 @@ impl Store {
     /// read back from that column, so a job that omits it is invisible
     /// to the budget for as long as it runs.
     ///
-    /// `resumed_from` names the suspended attempt this job continues, or
-    /// `None` for work starting fresh. It is written here and never
-    /// updated, so a row can only ever point at an id that already
-    /// existed — which is what keeps the chain acyclic.
+    /// `start` says what the job continues, if anything ([`JobStart`]).
+    /// A resume or handoff records its predecessor as `resumed_from` and
+    /// runs on the predecessor's place, both read from that row here; a
+    /// predecessor that can no longer be continued is refused as
+    /// [`JobInsertError::NotContinuable`]. `resumed_from` is written here
+    /// and never updated, so a row can only ever point at an id that
+    /// already existed — which is what keeps the chain acyclic.
     ///
     /// Fresh work supersedes a checkpoint of the same work, in the same
     /// transaction: the work item's checkpoint pointer is cleared, for a
@@ -2838,50 +2972,33 @@ impl Store {
     /// names the commit its shared tree was created at and the newest PR
     /// feedback an engage chain's worker was shown.
     ///
+    /// At most one job is `running` per finding, and per (repo, kind) for
+    /// repo-level work (migration 031's indexes). An insert that would be
+    /// a second is refused as [`JobInsertError::Occupied`], naming the job
+    /// that holds the place.
+    ///
     /// Takes an [`Owner`], which only `crate::recovery` makes, inside
     /// [`CycleScope::create_job`](crate::recovery::CycleScope::create_job): every job is recorded in the scope that
     /// settles it.
     pub(crate) async fn insert_job(
         &self,
         _owner: &Owner,
-        kind: JobKind,
-        repo_id: i64,
-        finding_id: Option<i64>,
+        start: JobStart,
         cap_tokens: Option<i64>,
         estimated_tokens: Option<i64>,
-        resumed_from: Option<i64>,
-    ) -> Result<InsertedJob, StoreWriteError> {
-        let now = now_ms();
+    ) -> Result<InsertedJob, JobInsertError> {
         // IMMEDIATE so the supersession below reads the suspensions under
-        // the same write lock that inserts their replacement.
+        // the same write lock that inserts their replacement, and the
+        // predecessor is read under the lock that inserts its successor.
         let mut tx = ImmediateTx::begin(&self.pool).await?;
-        let result = sqlx::query!(
-            "INSERT INTO jobs \
-             (kind, repo_id, finding_id, cap_tokens, state, started_at, estimated_tokens, \
-              resumed_from, pinned_sha, seen_activity_at, full_history, full_hunt_request) \
-             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, \
-                    (SELECT p.pinned_sha FROM jobs p WHERE p.id = ?8), \
-                    (SELECT p.seen_activity_at FROM jobs p WHERE p.id = ?8), \
-                    COALESCE((SELECT p.full_history FROM jobs p WHERE p.id = ?8), 0), \
-                    (SELECT p.full_hunt_request FROM jobs p WHERE p.id = ?8) \
-             WHERE EXISTS (SELECT 1 FROM repos WHERE id = ?2 AND deleted_at IS NULL)",
-            kind,
-            repo_id,
-            finding_id,
-            cap_tokens,
-            JobState::Running,
-            now,
-            estimated_tokens,
-            resumed_from
+        let (kind, repo_id, finding_id, resumed_from) = Self::start_place(&mut tx, start).await?;
+        let id = Self::insert_running_row(
+            &mut tx,
+            (kind, repo_id, finding_id),
+            (cap_tokens, estimated_tokens),
+            resumed_from,
         )
-        .execute(&mut *tx)
         .await?;
-        if result.rows_affected() == 0 {
-            return Err(StoreWriteError::Refused(format!(
-                "repo {repo_id} is deleted -- cannot start a {kind} job"
-            )));
-        }
-        let id = result.last_insert_rowid();
         let mut retired = Vec::new();
 
         if resumed_from.is_none()
@@ -2956,6 +3073,168 @@ impl Store {
             id,
             superseded: retired,
         })
+    }
+
+    /// Where `start` runs: (kind, repo, finding, `resumed_from`). Fresh
+    /// repo work names its repo; fresh finding work runs in its finding's
+    /// repo, read here. A resume runs where its checkpoint ran, and only
+    /// while that job is still its work item's checkpoint; a handoff is
+    /// its engage's finding's harvest, and only while that engage has no
+    /// successor. Read in the insert's transaction, so neither the
+    /// finding nor the predecessor can move between this read and the
+    /// INSERT.
+    async fn start_place(
+        tx: &mut ImmediateTx,
+        start: JobStart,
+    ) -> Result<(JobKind, i64, Option<i64>, Option<i64>), JobInsertError> {
+        match start {
+            JobStart::Fresh(FreshWork::Repo { kind, repo_id }) => {
+                Ok((kind.into(), repo_id, None, None))
+            }
+            JobStart::Fresh(FreshWork::Finding { kind, finding_id }) => {
+                let repo_id = sqlx::query_scalar!(
+                    r#"SELECT repo_id AS "repo_id!: i64" FROM findings WHERE id = ?1"#,
+                    finding_id
+                )
+                .fetch_optional(&mut **tx)
+                .await?
+                .ok_or(JobInsertError::UnknownFinding { finding_id, kind })?;
+                Ok((kind.into(), repo_id, Some(finding_id), None))
+            }
+            JobStart::Resume { checkpoint } => {
+                let row = sqlx::query!(
+                    r#"
+                    SELECT j.kind AS "kind!: JobKind", j.repo_id AS "repo_id!: i64", j.finding_id
+                    FROM jobs j
+                    WHERE j.id = ?1
+                      AND (EXISTS (SELECT 1 FROM finding_work w
+                                   WHERE w.checkpoint_job_id = j.id
+                                     AND w.finding_id = j.finding_id AND w.kind = j.kind)
+                        OR (j.finding_id IS NULL
+                            AND EXISTS (SELECT 1 FROM repo_work w
+                                        WHERE w.checkpoint_job_id = j.id
+                                          AND w.repo_id = j.repo_id AND w.kind = j.kind)))
+                    "#,
+                    checkpoint
+                )
+                .fetch_optional(&mut **tx)
+                .await?;
+                let row = row.ok_or(JobInsertError::NotContinuable { start })?;
+                Ok((row.kind, row.repo_id, row.finding_id, Some(checkpoint)))
+            }
+            JobStart::Handoff { engage } => {
+                let engage_kind: JobKind = FindingJobKind::Engage.into();
+                let row = sqlx::query!(
+                    r#"
+                    SELECT j.repo_id AS "repo_id!: i64", j.finding_id AS "finding_id!: i64"
+                    FROM jobs j
+                    WHERE j.id = ?1 AND j.kind = ?2 AND j.finding_id IS NOT NULL
+                      AND NOT EXISTS (SELECT 1 FROM jobs s WHERE s.resumed_from = j.id)
+                    "#,
+                    engage,
+                    engage_kind
+                )
+                .fetch_optional(&mut **tx)
+                .await?;
+                let row = row.ok_or(JobInsertError::NotContinuable { start })?;
+                Ok((
+                    FindingJobKind::Harvest.into(),
+                    row.repo_id,
+                    Some(row.finding_id),
+                    Some(engage),
+                ))
+            }
+        }
+    }
+
+    /// [`Self::insert_job`]'s INSERT: the `running` row, its chain's pins
+    /// copied from `resumed_from`. Refused for a deleted repo, and for a
+    /// place another `running` job holds.
+    async fn insert_running_row(
+        tx: &mut ImmediateTx,
+        (kind, repo_id, finding_id): (JobKind, i64, Option<i64>),
+        (cap_tokens, estimated_tokens): (Option<i64>, Option<i64>),
+        resumed_from: Option<i64>,
+    ) -> Result<i64, JobInsertError> {
+        let now = now_ms();
+        let result = sqlx::query!(
+            "INSERT INTO jobs \
+             (kind, repo_id, finding_id, cap_tokens, state, started_at, estimated_tokens, \
+              resumed_from, pinned_sha, seen_activity_at, full_history, full_hunt_request) \
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, \
+                    (SELECT p.pinned_sha FROM jobs p WHERE p.id = ?8), \
+                    (SELECT p.seen_activity_at FROM jobs p WHERE p.id = ?8), \
+                    COALESCE((SELECT p.full_history FROM jobs p WHERE p.id = ?8), 0), \
+                    (SELECT p.full_hunt_request FROM jobs p WHERE p.id = ?8) \
+             WHERE EXISTS (SELECT 1 FROM repos WHERE id = ?2 AND deleted_at IS NULL)",
+            kind,
+            repo_id,
+            finding_id,
+            cap_tokens,
+            JobState::Running,
+            now,
+            estimated_tokens,
+            resumed_from
+        )
+        .execute(&mut **tx)
+        .await;
+        match result {
+            Ok(r) if r.rows_affected() == 0 => Err(JobInsertError::RepoDeleted { repo_id, kind }),
+            Ok(r) => Ok(r.last_insert_rowid()),
+            Err(e) => Err(Self::insert_refused(tx, e, (kind, repo_id, finding_id)).await),
+        }
+    }
+
+    /// What a failed job INSERT means: a unique-index violation is the
+    /// place being held (migration 031), named by the `running` job read in
+    /// the same transaction, so it is the row the index saw.
+    async fn insert_refused(
+        tx: &mut ImmediateTx,
+        err: sqlx::Error,
+        (kind, repo_id, finding_id): (JobKind, i64, Option<i64>),
+    ) -> JobInsertError {
+        let sqlx::Error::Database(db) = &err else {
+            return err.into();
+        };
+        if !db.is_unique_violation() {
+            return err.into();
+        }
+        let place = JobPlace::of(kind, repo_id, finding_id);
+        match Self::running_holder(tx, place).await {
+            Ok(holder) => JobInsertError::Occupied {
+                place,
+                holder,
+                kind,
+            },
+            Err(e) => e.into(),
+        }
+    }
+
+    /// The `running` job holding `place`.
+    async fn running_holder(tx: &mut ImmediateTx, place: JobPlace) -> sqlx::Result<i64> {
+        let running = JobState::Running;
+        match place {
+            JobPlace::Finding(fid) => {
+                sqlx::query_scalar!(
+                    r#"SELECT id AS "id!: i64" FROM jobs WHERE state = ?1 AND finding_id = ?2"#,
+                    running,
+                    fid
+                )
+                .fetch_one(&mut **tx)
+                .await
+            }
+            JobPlace::RepoWork { repo_id, kind } => {
+                sqlx::query_scalar!(
+                    r#"SELECT id AS "id!: i64" FROM jobs
+                       WHERE state = ?1 AND finding_id IS NULL AND repo_id = ?2 AND kind = ?3"#,
+                    running,
+                    repo_id,
+                    kind
+                )
+                .fetch_one(&mut **tx)
+                .await
+            }
+        }
     }
 
     /// Record a job that never ran: `failed`, finished now, with `notes`
@@ -4187,6 +4466,23 @@ impl Store {
             }
         }
         Ok(held)
+    }
+
+    /// The place every `running` job holds ([`JobPlace`]): what selection
+    /// skips, since a second attempt there is refused at insert.
+    pub async fn running_places(&self) -> sqlx::Result<HashSet<JobPlace>> {
+        let running = JobState::Running;
+        let rows = sqlx::query!(
+            r#"SELECT kind AS "kind!: JobKind", repo_id, finding_id
+               FROM jobs WHERE state = ?1"#,
+            running
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| JobPlace::of(r.kind, r.repo_id, r.finding_id))
+            .collect())
     }
 
     /// Every active hold with the facts its release depends on, oldest

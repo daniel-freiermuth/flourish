@@ -11,7 +11,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use hunter::config::Config;
 use hunter::server::{AppState, router};
-use hunter::store::Store;
+use hunter::store::{JobStart, Store};
 use serde_json::{Value, json};
 use tower::util::ServiceExt;
 
@@ -2180,12 +2180,9 @@ async fn held_fix_state() -> (TestState, i64, String) {
         .unwrap();
     let job_id = support::scope(&state.store)
         .create_job(
-            FindingJobKind::Fix.into(),
-            1,
-            Some(1),
+            JobStart::fresh_finding(FindingJobKind::Fix, 1),
             Some(5000),
             Some(1000),
-            None,
         )
         .await
         .unwrap()

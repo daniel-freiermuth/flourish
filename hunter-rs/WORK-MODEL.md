@@ -298,6 +298,10 @@ The states aren't stored as an enum. They are derived from the work item's field
 | Paused | not held, `checkpoint_job_id IS NOT NULL` |
 | Idle | none of the above, finding in the tier |
 
+A finding has at most one `running` job, whatever the kind, and repo-level work at most one per (repo, kind). The schema enforces both (migration 031, §10), so a second attempt beside a live one is refused at insert (`JobInsertError::Occupied`, naming the holder) instead of being scheduled. Selection never offers such a place: every finding tier, the resume tier and the repo rotation skip a place a `running` job holds (`Store::running_places`), as they skip held work, so a job a stray worker keeps `running` stops only its own place.
+
+A successor names only the attempt it continues (`JobStart::Resume` / `JobStart::Handoff`), and `insert_job` reads its place from that row in the insert's transaction: a resume runs on its checkpoint's own work item, and only while that job is still the work item's checkpoint; a handoff is its engage's finding's harvest, and only while that engage has no successor (G3). Anything else is refused as `JobInsertError::NotContinuable`, which skips the cycle: selection names a checkpoint by the same pointer, so only a write between the pick and the insert (an operator restarting the work, another attempt continuing it) parts them, and the next selection reads where the work is now. With migration 031's indexes, an attempt therefore has at most one live successor, and never one on another finding or repo.
+
 ### 6.3 Transitions
 
 | Trigger | Streak | Checkpoint | Hold | Event |
@@ -451,6 +455,13 @@ CREATE TABLE work_holds (
 );
 CREATE UNIQUE INDEX work_holds_one_active
   ON work_holds(finding_id, kind) WHERE released_at IS NULL;
+
+-- At most one running attempt per finding, and per (repo, kind) for
+-- repo-level work (migration 031).
+CREATE UNIQUE INDEX jobs_one_running_per_finding
+  ON jobs(finding_id) WHERE state = 'running' AND finding_id IS NOT NULL;
+CREATE UNIQUE INDEX jobs_one_running_per_repo_kind
+  ON jobs(repo_id, kind) WHERE state = 'running' AND finding_id IS NULL;
 ```
 
 - `kind`, `reason` and `release_action` are Rust enums mapped via `sqlx::Type`, as `CODING_STANDARDS.md` requires.

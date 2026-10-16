@@ -1235,3 +1235,83 @@ async fn upgrading_derives_pr_problems_from_the_old_fingerprint() {
     );
     pool.close().await;
 }
+
+/// Upgrading settles the `running` rows that already break the one
+/// running job rule, so the indexes can be created.
+///
+/// Before 031 a runner whose write ending its job failed left the row
+/// `running` until its cycle settled it; a crash before that left two
+/// `running` rows on one place for the next startup. The newest of each
+/// place is left for the startup reconcile; the older ones are killed as
+/// orphans. Running rows on different places, and every finished row,
+/// are left alone.
+#[tokio::test]
+async fn upgrading_kills_all_but_the_newest_running_job_of_each_place() {
+    let (_dir, path) = scratch("mig-one-running");
+
+    let before_031 = sqlx::migrate!("./migrations")
+        .iter()
+        .position(|m| m.version == 31)
+        .expect("migration 031 exists");
+    let pool = seed_state(&path, before_031).await;
+    sqlx::raw_sql(
+        "INSERT INTO repos (id, name, url, path, forge, default_branch, added_at) VALUES \
+         (1, 'widget', 'https://e/w.git', '/wr/repos/repo-1', 'github', 'main', 1); \
+         INSERT INTO findings (id, type, repo_id, fingerprint, severity, confidence, summary, \
+                               status, created_at, updated_at) VALUES \
+         (1, 'bug', 1, 'fp1', 'low', 0.9, 'one', 'closed', 1, 1), \
+         (2, 'bug', 1, 'fp2', 'low', 0.9, 'two', 'pr_open', 1, 1); \
+         INSERT INTO jobs (id, kind, repo_id, finding_id, state, started_at, finished_at) VALUES \
+         (1, 'engage',   1, 1,    'running', 100, NULL), \
+         (2, 'harvest',  1, 1,    'running', 200, NULL), \
+         (3, 'engage',   1, 2,    'running', 300, NULL), \
+         (4, 'hunt',     1, NULL, 'running', 400, NULL), \
+         (5, 'hunt',     1, NULL, 'running', 500, NULL), \
+         (6, 'test_gap', 1, NULL, 'running', 600, NULL), \
+         (7, 'hunt',     1, NULL, 'done',    700, 800);",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let store = Store::connect(&path).await.expect("roll forward");
+    let mut got: Vec<(i64, JobState)> = store
+        .list_jobs(10)
+        .await
+        .unwrap()
+        .iter()
+        .map(|j| (j.job.id, j.job.state))
+        .collect();
+    got.sort_unstable_by_key(|(id, _)| *id);
+    assert_eq!(
+        got,
+        vec![
+            (1, JobState::Killed),
+            (2, JobState::Running),
+            (3, JobState::Running),
+            (4, JobState::Killed),
+            (5, JobState::Running),
+            (6, JobState::Running),
+            (7, JobState::Done),
+        ]
+    );
+    drop(store);
+
+    let pool = open(&path).await;
+    let killed: Vec<(i64, Option<String>, bool)> = sqlx::query_as(
+        "SELECT id, killed_reason, finished_at IS NOT NULL FROM jobs \
+         WHERE state = 'killed' ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        killed,
+        [
+            (1, Some("orphaned".to_owned()), true),
+            (4, Some("orphaned".to_owned()), true)
+        ]
+    );
+    pool.close().await;
+}
