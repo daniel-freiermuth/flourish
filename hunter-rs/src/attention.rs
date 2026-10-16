@@ -704,4 +704,27 @@ mod tests {
         };
         assert_eq!(cleared.raised(), None);
     }
+
+    #[test]
+    fn errored_github_checks_count_as_failing_not_pending() {
+        let run = |name: &str, conclusion: &str| GhCheckRun {
+            name: Some(name.into()),
+            conclusion: Some(conclusion.into()),
+            ..GhCheckRun::default()
+        };
+        let rollup = [
+            // A legacy commit status (GitHub's StatusContext) in `ERROR`.
+            GhCheckRun {
+                context: Some("ci/legacy".into()),
+                state: Some("ERROR".into()),
+                ..GhCheckRun::default()
+            },
+            // A check run whose workflow never started.
+            run("build", "STARTUP_FAILURE"),
+            run("lint", "SUCCESS"),
+        ];
+        let (summary, failing) = checks_summary(&rollup);
+        assert_eq!(failing, ["build", "ci/legacy"]);
+        assert_eq!(summary.as_deref(), Some("1 pass / 2 fail"));
+    }
 }
