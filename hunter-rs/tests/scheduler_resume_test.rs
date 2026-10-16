@@ -18,8 +18,8 @@ use hunter::backend::{Backend, JobClass, Outlook, Verdict};
 use hunter::config::Config;
 use hunter::domain::{FindingJobKind, FindingStatus, JobKind, JobState, RepoJobKind};
 use hunter::scheduler::{
-    Candidate, ResumePlan, pick_next, preview_next, record_job, run_fix, run_harvest, run_hunt,
-    run_recheck,
+    Attempt, Candidate, ResumePlan, Resumed, kind, pick_next, preview_next, record_job, run_fix,
+    run_harvest, run_hunt, run_recheck,
 };
 use hunter::server::{AppState, SchedulerHandle, router};
 use hunter::store::{FindingInsert, JobStart, Store};
@@ -366,11 +366,15 @@ async fn resume_reserves_context_plus_the_remaining_estimate() {
 
     let plan = resume_plan_of(pick_next(&store, &cfg, None).await.unwrap());
 
-    assert_eq!(plan.predecessor_id, 10);
-    assert_eq!(plan.origin_job_id, 10, "a first resume continues the root");
-    assert_eq!(plan.session_file, session);
+    assert_eq!(plan.predecessor_id(), 10);
     assert_eq!(
-        plan.anticipated,
+        plan.origin_job_id(),
+        10,
+        "a first resume continues the root"
+    );
+    assert_eq!(plan.session_file(), session);
+    assert_eq!(
+        plan.anticipated(),
         ctx + (Z - spent),
         "ctx {ctx} + max({Z} - {spent}, 25_000)"
     );
@@ -400,9 +404,10 @@ async fn a_resume_reserves_at_least_as_much_work_as_it_resends_context() {
 
     let plan = resume_plan_of(pick_next(&store, &cfg, None).await.unwrap());
 
-    assert_eq!(plan.ctx, 100_000);
+    assert_eq!(plan.ctx(), 100_000);
     assert_eq!(
-        plan.anticipated, 200_000,
+        plan.anticipated(),
+        200_000,
         "100_000 of context + at least 100_000 of work"
     );
 }
@@ -425,11 +430,12 @@ async fn resume_falls_back_to_the_per_kind_estimate_when_the_transcript_is_unrea
     let plan = resume_plan_of(pick_next(&store, &cfg, None).await.unwrap());
 
     assert_eq!(
-        plan.ctx, Z,
+        plan.ctx(),
+        Z,
         "the per-kind typical stands in for the context"
     );
     assert_eq!(
-        plan.anticipated,
+        plan.anticipated(),
         2 * Z,
         "ctx {Z} + max({Z} - {spent}, as much work as context)"
     );
@@ -484,9 +490,9 @@ async fn resume_measures_context_from_the_last_real_call_not_the_killed_one() {
         hunter::backends::omp_scavenge::harness::ctx_at_suspension(&session),
         Some(2 + 76_466 + 423)
     );
-    assert_eq!(plan.ctx, 76_891);
+    assert_eq!(plan.ctx(), 76_891);
     assert_eq!(
-        plan.anticipated,
+        plan.anticipated(),
         2 * 76_891,
         "ctx 76_891 + max({Z} - {spent}, as much work as context)"
     );
@@ -517,10 +523,11 @@ async fn resume_falls_back_to_the_per_kind_estimate_when_every_call_was_killed()
         None
     );
     assert_eq!(
-        plan.ctx, Z,
+        plan.ctx(),
+        Z,
         "the per-kind typical stands in for the context"
     );
-    assert_eq!(plan.anticipated, 2 * Z);
+    assert_eq!(plan.anticipated(), 2 * Z);
 }
 
 // -- the give-up ceiling -----------------------------------------------------
@@ -555,7 +562,7 @@ async fn zero_progress_handoffs_do_not_exhaust_the_useful_work_retry_limit() {
         .await
         .unwrap();
     assert!(
-        matches!(picked, Some(Candidate::Resume { plan, .. }) if plan.predecessor_id == newest)
+        matches!(picked, Some(Candidate::Resume { plan, .. }) if plan.predecessor_id() == newest)
     );
 }
 
@@ -691,7 +698,7 @@ async fn a_chain_of_one_attempt_is_never_retired() {
 
     let plan = resume_plan_of(pick_next(&store, &cfg, None).await.unwrap());
 
-    assert_eq!(plan.predecessor_id, 10);
+    assert_eq!(plan.predecessor_id(), 10);
     let (state, _, _) = job_row(&pool, 10).await;
     assert_eq!(state, JobState::Suspended.as_str());
 }
@@ -716,8 +723,12 @@ async fn the_biggest_attempt_is_set_aside_before_the_chain_is_judged() {
 
     let plan = resume_plan_of(pick_next(&store, &cfg, None).await.unwrap());
 
-    assert_eq!(plan.predecessor_id, newest);
-    assert_eq!(plan.chain_spent, 510_000, "5x the typical, and still fine");
+    assert_eq!(plan.predecessor_id(), newest);
+    assert_eq!(
+        plan.chain_spent(),
+        510_000,
+        "5x the typical, and still fine"
+    );
 }
 
 /// Exactly at the ceiling is still resumable: "more than three times the
@@ -734,7 +745,7 @@ async fn the_give_up_ceiling_is_exclusive() {
     let cfg = test_config(dir.path());
 
     let plan = resume_plan_of(pick_next(&store, &cfg, None).await.unwrap());
-    assert_eq!(plan.predecessor_id, newest);
+    assert_eq!(plan.predecessor_id(), newest);
 }
 
 // -- selection order ---------------------------------------------------------
@@ -776,7 +787,7 @@ async fn a_queued_fix_outranks_a_resume_which_outranks_rotation() {
         .await
         .unwrap();
     let plan = resume_plan_of(pick_next(&store, &cfg, None).await.unwrap());
-    assert_eq!(plan.predecessor_id, 10);
+    assert_eq!(plan.predecessor_id(), 10);
 }
 
 /// A suspension whose chain tree is gone is retired, not merely
@@ -856,14 +867,40 @@ async fn a_flagged_pr_resumes_its_suspended_engage_instead_of_starting_fresh() {
     let Some(Candidate::Resume { label, plan, .. }) = picked else {
         panic!("expected a resume of the suspended engage, got {picked:?}");
     };
-    assert_eq!(plan.predecessor_id, 20);
-    assert_eq!(plan.kind, JobKind::from(FindingJobKind::Engage));
-    assert_eq!(plan.finding_id, Some(5));
+    assert_eq!(plan.predecessor_id(), 20);
+    assert_eq!(plan.kind(), JobKind::from(FindingJobKind::Engage));
+    assert_eq!(plan.finding_id(), Some(5));
     assert_eq!(
         label.as_deref(),
         Some("bug 5"),
         "the tier keeps its own label"
     );
+}
+
+/// A plan reaches a runner only as a [`Resumed`] of its own kind: an
+/// engage's plan loaded for the fix runner is refused, where handed to
+/// `run_fix` beside its finding it would have started a row of the
+/// engage's kind and run the fix's logic in it. Loaded as an engage, its
+/// subject is the finding the plan names.
+#[tokio::test]
+async fn a_plan_loads_only_as_its_own_kind() {
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo(&pool, &dir).await;
+    let cfg = test_config(dir.path());
+    seed_flagged_finding(&pool, 5).await;
+    let session = seed_session_in(&dir, 20, CTX);
+    seed_finding_suspension(&pool, 20, "engage", 5, &session).await;
+    let store = rw_store(&path).await;
+    let plan = resume_plan_of(pick_next(&store, &cfg, None).await.unwrap());
+    assert_eq!(plan.kind(), JobKind::from(FindingJobKind::Engage));
+
+    assert!(
+        Resumed::<kind::Fix>::load(&store, &plan).await.is_err(),
+        "an engage's plan must not load as a fix"
+    );
+
+    let engage = Resumed::<kind::Engage>::load(&store, &plan).await.unwrap();
+    assert_eq!(Attempt::Resume(&engage).subject().id, 5);
 }
 
 /// A budget-overridden finding with a suspended attempt resumes it and
@@ -893,7 +930,7 @@ async fn an_overridden_finding_resumes_its_suspended_attempt_under_the_override(
         picked.budget_override(),
         Some(hunter::domain::BudgetOverride::Once)
     );
-    assert_eq!(resume_plan_of(Some(picked)).predecessor_id, 20);
+    assert_eq!(resume_plan_of(Some(picked)).predecessor_id(), 20);
 }
 
 /// The same flagged pull request, but the suspended engage's tree is
@@ -1110,7 +1147,7 @@ async fn a_forced_cycle_resumes_only_the_forced_repos_suspension() {
             Some(repo_id),
             "forcing {forced} must stay on {forced}, got {picked:?}"
         );
-        assert_eq!(resume_plan_of(picked).predecessor_id, suspended);
+        assert_eq!(resume_plan_of(picked).predecessor_id(), suspended);
     }
 }
 
@@ -1155,6 +1192,13 @@ async fn resume_unavailable_fails_the_attempt_and_gives_up_the_checkpoint() {
     let session = seed_session(&dir);
     seed_suspension(&pool, 10, &session, 40_000).await;
     let store = rw_store(&path).await;
+    // Picked before the attempt exists: selection skips a place a running
+    // job holds.
+    let plan = resume_plan_of(
+        pick_next(&store, &test_config(dir.path()), None)
+            .await
+            .unwrap(),
+    );
 
     let attempt = support::scope(&store)
         .create_job(JobStart::Resume { checkpoint: 10 }, None, Some(260_000))
@@ -1162,27 +1206,6 @@ async fn resume_unavailable_fails_the_attempt_and_gives_up_the_checkpoint() {
         .unwrap()
         .job;
     let attempt_id = attempt.id();
-    let plan = ResumePlan {
-        kind: RepoJobKind::Hunt.into(),
-        repo_id: 1,
-        repo: "alpha".to_owned(),
-        finding_id: None,
-        predecessor_id: 10,
-        origin_job_id: 10,
-        session_file: session,
-        workspace: hunter::workspace::Workspace::for_chain(
-            &test_config(dir.path()).work_root,
-            &dir.path().join("repo-1"),
-            10,
-        ),
-        pinned_sha: "pinned".to_owned(),
-        anticipated: 260_000,
-        ctx: CTX,
-        typical: Z,
-        chain_spent: 40_000,
-        handoff: false,
-        after_hold: None,
-    };
     // What the harness returns when it refuses to hand omp a path it
     // cannot resolve: nothing spawned, no exit code, no transcript.
     let rr = RunResult {
@@ -1402,15 +1425,13 @@ async fn a_resumed_hunt_continues_the_session_and_ingests_the_origin_output_path
         cfg.work_root.join("out").join("job10.findings.json"),
         one_finding(),
     );
-    let row = store.get_repo_by_id(1).await.unwrap().unwrap();
 
     let summary = run_hunt(
         &support::scope(&store),
         store.test_lane(),
         &cfg,
-        &row,
+        Attempt::Resume(&Resumed::load(&store, &plan).await.unwrap()),
         &backend,
-        Some(&plan),
     )
     .await
     .unwrap();
@@ -1444,7 +1465,7 @@ async fn a_resumed_hunt_continues_the_session_and_ingests_the_origin_output_path
     assert_eq!(resumed_from, Some(10));
     assert_eq!(
         estimated,
-        Some(plan.anticipated),
+        Some(plan.anticipated()),
         "the row records the resume's reservation, not a cold estimate"
     );
 
@@ -1482,9 +1503,8 @@ async fn a_resumed_hunt_does_not_sync_the_clone() {
         &support::scope(&store),
         store.test_lane(),
         &cfg,
-        &row,
+        Attempt::Cold(&row),
         &cold,
-        None,
     )
     .await
     .expect_err("a cold hunt has to sync, and cannot without a remote");
@@ -1497,9 +1517,8 @@ async fn a_resumed_hunt_does_not_sync_the_clone() {
         &support::scope(&store),
         store.test_lane(),
         &cfg,
-        &row,
+        Attempt::Resume(&Resumed::load(&store, &plan).await.unwrap()),
         &warm,
-        Some(&plan),
     )
     .await
     .expect("a resume must not touch the remote at all");
@@ -1524,7 +1543,6 @@ async fn a_resume_whose_checkpoint_moved_on_skips_the_cycle() {
         .execute(&pool)
         .await
         .unwrap();
-    let row = store.get_repo_by_id(1).await.unwrap().unwrap();
     let backend = RecordingBackend::new(
         cfg.work_root.join("out").join("job10.findings.json"),
         one_finding(),
@@ -1535,9 +1553,8 @@ async fn a_resume_whose_checkpoint_moved_on_skips_the_cycle() {
         &support::scope(&store),
         store.test_lane(),
         &cfg,
-        &row,
+        Attempt::Resume(&Resumed::load(&store, &plan).await.unwrap()),
         &backend,
-        Some(&plan),
     )
     .await
     .expect("a checkpoint that moved on is a skip, not the cycle's error");
@@ -1663,9 +1680,8 @@ async fn a_cold_start_reserves_at_least_the_efficiency_floor() {
         &support::scope(&store),
         store.test_lane(),
         &cfg,
-        &row,
+        Attempt::Cold(&row),
         &collapsed,
-        None,
     )
     .await
     .unwrap();
@@ -1679,9 +1695,8 @@ async fn a_cold_start_reserves_at_least_the_efficiency_floor() {
         &support::scope(&store),
         store.test_lane(),
         &cfg,
-        &row,
+        Attempt::Cold(&row),
         &healthy,
-        None,
     )
     .await
     .unwrap();
@@ -1847,9 +1862,8 @@ async fn repeated_suspensions_of_a_fix_are_not_a_stuck_streak() {
             &support::scope(&store),
             store.test_lane(),
             &cfg,
-            &finding,
+            Attempt::Cold(&finding),
             &suspending,
-            None,
         )
         .await
         .unwrap();
@@ -1884,9 +1898,8 @@ async fn repeated_suspensions_of_a_recheck_are_not_a_stuck_streak() {
             &support::scope(&store),
             store.test_lane(),
             &cfg,
-            &finding,
+            Attempt::Cold(&finding),
             &suspending,
-            None,
         )
         .await
         .unwrap();
@@ -1924,9 +1937,8 @@ async fn confirmed_recheck_with_severity(raw: &'static str) -> hunter::types::Fi
         &support::scope(&store),
         store.test_lane(),
         &cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &worker,
-        None,
     )
     .await
     .unwrap();
@@ -1995,9 +2007,8 @@ async fn a_stale_recheck_supersedes_and_only_an_invalid_one_suppresses() {
             &support::scope(&store),
             store.test_lane(),
             &cfg,
-            &finding,
+            Attempt::Cold(&finding),
             &worker,
-            None,
         )
         .await
         .unwrap();
@@ -2057,9 +2068,8 @@ async fn a_recheck_without_a_verdict_retries_then_is_held() {
             &support::scope(&store),
             store.test_lane(),
             &cfg,
-            &finding,
+            Attempt::Cold(&finding),
             &silent,
-            None,
         )
         .await
         .unwrap();
@@ -2106,9 +2116,8 @@ async fn a_recheck_whose_tree_can_never_be_made_is_held() {
             &support::scope(&store),
             store.test_lane(),
             &cfg,
-            &finding,
+            Attempt::Cold(&finding),
             &never,
-            None,
         )
         .await
         .unwrap();
@@ -2178,9 +2187,8 @@ async fn every_end_of_a_recheck_attempt_spends_only_a_once_override() {
                 &support::scope(&store),
                 store.test_lane(),
                 &cfg,
-                &finding,
+                Attempt::Cold(&finding),
                 &worker,
-                None,
             )
             .await
             .unwrap();
@@ -2232,9 +2240,8 @@ async fn repeated_suspensions_of_a_harvest_are_not_a_stuck_streak() {
             &support::scope(&store),
             store.test_lane(),
             &cfg,
-            &finding,
+            Attempt::Cold(&finding),
             &suspending,
-            None,
         )
         .await
         .unwrap();
@@ -2279,7 +2286,7 @@ async fn a_checkpoint_whose_finding_moved_on_is_dropped_and_its_tree_released() 
         let store = rw_store(&path).await;
 
         let picked = resume_plan_of(pick_next(&store, &cfg, None).await.unwrap());
-        assert_eq!(picked.predecessor_id, 20, "{kind} resumes at {at}");
+        assert_eq!(picked.predecessor_id(), 20, "{kind} resumes at {at}");
         hunter::workspace::sweep(store.test_lane(), &cfg.work_root, hunter::util::now_ms())
             .await
             .unwrap();
@@ -2335,9 +2342,8 @@ async fn a_no_commit_hunt_whose_watermark_cannot_be_written_fails() {
         &support::scope(&store),
         store.test_lane(),
         &cfg,
-        &row,
+        Attempt::Cold(&row),
         &never,
-        None,
     )
     .await
     .unwrap_err();
@@ -2379,7 +2385,7 @@ async fn resume_with_a_zero_cost_estimate_uses_the_attempt_limit_not_a_zero_cost
         .await
         .unwrap();
     assert!(
-        matches!(picked, Some(Candidate::Resume { plan, .. }) if plan.predecessor_id == newest)
+        matches!(picked, Some(Candidate::Resume { plan, .. }) if plan.predecessor_id() == newest)
     );
 }
 
@@ -2729,7 +2735,7 @@ async fn a_continued_fix_resumes_past_the_ceiling() {
     .await;
     let plan = resume_plan_of(pick_next(&store, &cfg, None).await.unwrap());
 
-    assert_eq!(plan.predecessor_id, 33);
+    assert_eq!(plan.predecessor_id(), 33);
     assert_eq!(job_row(&pool, 33).await.0, "suspended");
 }
 
@@ -2854,8 +2860,8 @@ async fn a_paused_engage_continues_while_its_pr_is_open_whatever_the_flag() {
 
     let plan = resume_plan_of(pick_next(&store, &cfg, None).await.unwrap());
 
-    assert_eq!(plan.predecessor_id, 20);
-    assert_eq!(plan.kind, JobKind::from(FindingJobKind::Engage));
+    assert_eq!(plan.predecessor_id(), 20);
+    assert_eq!(plan.kind(), JobKind::from(FindingJobKind::Engage));
 }
 
 /// The flag still gates a fresh start: a flagless PR whose engage

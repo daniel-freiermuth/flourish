@@ -26,6 +26,9 @@ use crate::transition::{Moved, PrEnded, PrEnding, PrRef, Transition, Unclaimed};
 use crate::types::{Finding, Job, Repo};
 use crate::util::now_ms;
 
+mod attempt;
+pub use attempt::{Attempt, Kind, Resumed, kind};
+
 /// Everything a resumed attempt needs and a cold one does not.
 ///
 /// A resume is not a seventh job kind: it runs through the executor of
@@ -35,39 +38,44 @@ use crate::util::now_ms;
 /// back at, which transcript omp is handed, which output path the
 /// continuing worker is still writing to, and the chain's workspace and
 /// pinned commit, reused untouched.
+///
+/// Built only here, from the predecessor's row ([`resume_plan`],
+/// [`continue_into_harvest`]), so its fields agree with that row; it
+/// reaches a runner only through [`Resumed::load`], which matches its
+/// kind to the runner's and reads its subject from it.
 #[derive(Debug, Clone)]
 pub struct ResumePlan {
-    pub kind: JobKind,
-    pub repo_id: i64,
+    kind: JobKind,
+    repo_id: i64,
     /// Repo name, carried because the events this plan's outcome logs
     /// fire from `record_job`, which never reads a repo row.
-    pub repo: String,
-    pub finding_id: Option<i64>,
+    repo: String,
+    finding_id: Option<i64>,
     /// The suspended attempt being continued.
-    pub predecessor_id: i64,
+    predecessor_id: i64,
     /// The first attempt in the chain. Its id is the one the playbook
     /// baked into the output path, and a continuing worker is still
     /// writing there (`Store::resume_origin_job`).
-    pub origin_job_id: i64,
+    origin_job_id: i64,
     /// The predecessor's transcript, handed to omp verbatim. Lives in
     /// `workspace.session`.
-    pub session_file: PathBuf,
+    session_file: PathBuf,
     /// The chain's workspace. A resume runs in it as it is: nothing is
     /// fetched, checked out or created.
-    pub workspace: crate::workspace::Workspace,
+    workspace: crate::workspace::Workspace,
     /// The commit the chain's tree was created at (`jobs.pinned_sha`).
-    pub pinned_sha: String,
+    pinned_sha: String,
     /// The reservation from [`resume_reservation`], standing in for the
     /// per-kind estimate at the budget gate.
-    pub anticipated: i64,
+    anticipated: i64,
     /// The three terms `anticipated` was computed from, kept so the
     /// event logged at dispatch can show its arithmetic. An operator
     /// looking at a large reservation needs to see whether it is a large
     /// context or a chain that has overrun, and re-deriving them at the
     /// log site would mean re-reading the transcript and the chain.
-    pub ctx: i64,
-    pub typical: i64,
-    pub chain_spent: i64,
+    ctx: i64,
+    typical: i64,
+    chain_spent: i64,
     /// A handoff rather than a resume: the predecessor finished, and its
     /// session carries on into a DIFFERENT job in the same tree — an
     /// engage that withdrew its PR continuing into the closed PR's
@@ -76,11 +84,11 @@ pub struct ResumePlan {
     /// the new job's playbook where a resume gets a one-line "carry on";
     /// and a failed handoff changes nothing, since the cold harvest still
     /// runs later.
-    pub handoff: bool,
+    handoff: bool,
     /// The hold an operator released with `continue` to get here, if this
     /// is the first attempt since: its reason and detail. The resume prompt
     /// is chosen from the reason (WORK-MODEL.md §9.1).
-    pub after_hold: Option<(HoldReason, String)>,
+    after_hold: Option<(HoldReason, String)>,
 }
 
 impl ResumePlan {
@@ -97,6 +105,46 @@ impl ResumePlan {
                 checkpoint: self.predecessor_id,
             }
         }
+    }
+
+    pub const fn kind(&self) -> JobKind {
+        self.kind
+    }
+
+    pub const fn finding_id(&self) -> Option<i64> {
+        self.finding_id
+    }
+
+    pub const fn predecessor_id(&self) -> i64 {
+        self.predecessor_id
+    }
+
+    pub const fn origin_job_id(&self) -> i64 {
+        self.origin_job_id
+    }
+
+    pub fn session_file(&self) -> &Path {
+        &self.session_file
+    }
+
+    pub const fn workspace(&self) -> &crate::workspace::Workspace {
+        &self.workspace
+    }
+
+    pub const fn anticipated(&self) -> i64 {
+        self.anticipated
+    }
+
+    pub const fn ctx(&self) -> i64 {
+        self.ctx
+    }
+
+    pub const fn chain_spent(&self) -> i64 {
+        self.chain_spent
+    }
+
+    pub const fn after_hold(&self) -> Option<&(HoldReason, String)> {
+        self.after_hold.as_ref()
     }
 }
 
@@ -2228,10 +2276,10 @@ async fn prior_findings(
 
 /// Run a hunt job (`scheduler.run_hunt`).
 ///
-/// `resume` continues a suspended attempt: no sync, the diff range ending
-/// at the chain's pinned commit, the same ingest and the same watermark
-/// rule, but the worker is handed its own transcript and a one-line
-/// "carry on" instead of a fresh playbook.
+/// A resumed `attempt` continues a suspended one: no sync, the diff
+/// range ending at the chain's pinned commit, the same ingest and the
+/// same watermark rule, but the worker is handed its own transcript and
+/// a one-line "carry on" instead of a fresh playbook.
 #[allow(
     clippy::too_many_lines,
     reason = "linear job pipeline: sync, resolve diff range, gate budget, \
@@ -2243,14 +2291,14 @@ pub async fn run_hunt(
     scope: &CycleScope,
     lane: &mut Lane,
     cfg: &Config,
-    repo: &Repo,
+    attempt: Attempt<'_, kind::Hunt>,
     backend: &dyn Backend,
-    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
     // Git's empty tree — the implicit parent of all root commits.
     // Using this as diff base includes the root commit itself.
     const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
+    let (repo, resume) = (attempt.subject(), attempt.plan());
     let store = scope.store();
     let rid = repo.id;
     let rname = &repo.name;
@@ -2772,9 +2820,8 @@ pub async fn run_recheck(
     scope: &CycleScope,
     lane: &mut Lane,
     cfg: &Config,
-    finding: &Finding,
+    attempt: Attempt<'_, kind::Recheck>,
     backend: &dyn Backend,
-    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
     #[derive(Debug, Clone)]
     enum RecheckOutcome {
@@ -2818,6 +2865,7 @@ pub async fn run_recheck(
         depends_on: Vec<String>,
     }
 
+    let (finding, resume) = (attempt.subject(), attempt.plan());
     let store = scope.store();
     let fid = finding.id;
     if finding.status != FindingStatus::Rechecking {
@@ -3300,6 +3348,29 @@ const STANDARDS_SPEC: AnalysisSpec = AnalysisSpec {
     prompt_builder: playbooks::build_standards_prompt,
 };
 
+/// A repo kind run by [`run_analysis_job`], with its spec. The spec comes
+/// from the attempt's kind rather than from the caller, so the body cannot
+/// run one kind's attempt under another kind's playbook and output path.
+trait AnalysisKind: Kind<Subject = Repo> {
+    const SPEC: &'static AnalysisSpec;
+}
+
+impl AnalysisKind for kind::TestGap {
+    const SPEC: &'static AnalysisSpec = &TEST_GAP_SPEC;
+}
+impl AnalysisKind for kind::DepUpdate {
+    const SPEC: &'static AnalysisSpec = &DEP_UPDATE_SPEC;
+}
+impl AnalysisKind for kind::Refactor {
+    const SPEC: &'static AnalysisSpec = &REFACTOR_SPEC;
+}
+impl AnalysisKind for kind::Modernization {
+    const SPEC: &'static AnalysisSpec = &MODERNIZATION_SPEC;
+}
+impl AnalysisKind for kind::Standards {
+    const SPEC: &'static AnalysisSpec = &STANDARDS_SPEC;
+}
+
 /// Shared body for the four repo-level analysis job types (`scheduler._run_analysis_job`).
 #[allow(
     clippy::too_many_lines,
@@ -3307,15 +3378,15 @@ const STANDARDS_SPEC: AnalysisSpec = AnalysisSpec {
               are already factored into `AnalysisJobSpec`, so what remains \
               is a single non-branching sequence"
 )]
-async fn run_analysis_job(
+async fn run_analysis_job<K: AnalysisKind>(
     scope: &CycleScope,
     lane: &mut Lane,
     cfg: &Config,
-    repo: &Repo,
-    spec: &AnalysisSpec,
+    attempt: Attempt<'_, K>,
     backend: &dyn Backend,
-    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
+    let (repo, resume) = (attempt.subject(), attempt.plan());
+    let spec = K::SPEC;
     let store = scope.store();
     let rid = repo.id;
     let rname = &repo.name;
@@ -3522,11 +3593,10 @@ pub async fn run_test_gap(
     scope: &CycleScope,
     lane: &mut Lane,
     cfg: &Config,
-    repo: &Repo,
+    attempt: Attempt<'_, kind::TestGap>,
     backend: &dyn Backend,
-    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
-    run_analysis_job(scope, lane, cfg, repo, &TEST_GAP_SPEC, backend, resume).await
+    run_analysis_job(scope, lane, cfg, attempt, backend).await
 }
 /// The zero-token Renovate scan of `tree`, the repo's scan tree at its
 /// fetched tip, with the GitHub token the repo's forge qualifies for.
@@ -3607,10 +3677,10 @@ pub async fn run_dep_update(
     scope: &CycleScope,
     lane: &mut Lane,
     cfg: &Config,
-    repo: &Repo,
+    attempt: Attempt<'_, kind::DepUpdate>,
     backend: &dyn Backend,
-    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
+    let (repo, resume) = (attempt.subject(), attempt.plan());
     let store = scope.store();
     // A resume continues a suspended AI worker, so the Renovate
     // shortcut below is not an option for it: that path spends no
@@ -3619,7 +3689,7 @@ pub async fn run_dep_update(
     // clone check and the sync, so nothing is skipped by going straight
     // there.
     if resume.is_some() {
-        return run_analysis_job(scope, lane, cfg, repo, &DEP_UPDATE_SPEC, backend, resume).await;
+        return run_analysis_job(scope, lane, cfg, attempt, backend).await;
     }
     let rpath = std::path::PathBuf::from(&repo.path);
     if !rpath.exists() {
@@ -3661,7 +3731,7 @@ pub async fn run_dep_update(
             "dep_update {}: renovate unavailable, falling back to AI",
             repo.name
         );
-        return run_analysis_job(scope, lane, cfg, repo, &DEP_UPDATE_SPEC, backend, resume).await;
+        return run_analysis_job(scope, lane, cfg, attempt, backend).await;
     };
 
     // Write candidates to JSON and ingest via the standard path
@@ -3762,31 +3832,28 @@ pub async fn run_refactor(
     scope: &CycleScope,
     lane: &mut Lane,
     cfg: &Config,
-    repo: &Repo,
+    attempt: Attempt<'_, kind::Refactor>,
     backend: &dyn Backend,
-    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
-    run_analysis_job(scope, lane, cfg, repo, &REFACTOR_SPEC, backend, resume).await
+    run_analysis_job(scope, lane, cfg, attempt, backend).await
 }
 pub async fn run_modernize(
     scope: &CycleScope,
     lane: &mut Lane,
     cfg: &Config,
-    repo: &Repo,
+    attempt: Attempt<'_, kind::Modernization>,
     backend: &dyn Backend,
-    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
-    run_analysis_job(scope, lane, cfg, repo, &MODERNIZATION_SPEC, backend, resume).await
+    run_analysis_job(scope, lane, cfg, attempt, backend).await
 }
 pub async fn run_standards(
     scope: &CycleScope,
     lane: &mut Lane,
     cfg: &Config,
-    repo: &Repo,
+    attempt: Attempt<'_, kind::Standards>,
     backend: &dyn Backend,
-    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
-    run_analysis_job(scope, lane, cfg, repo, &STANDARDS_SPEC, backend, resume).await
+    run_analysis_job(scope, lane, cfg, attempt, backend).await
 }
 
 fn extract_pr_url(text: &str) -> Option<String> {
@@ -3887,10 +3954,10 @@ async fn start_fix(
     scope: &CycleScope,
     lane: &mut Lane,
     cfg: &Config,
-    finding: &Finding,
+    attempt: Attempt<'_, kind::Fix>,
     backend: &dyn Backend,
-    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<Result<(FixStart, RunningJob, FixClaim), CycleSummary>> {
+    let (finding, resume) = (attempt.subject(), attempt.plan());
     let store = scope.store();
     let fid = finding.id;
     if finding.status != FindingStatus::Queued {
@@ -4070,10 +4137,10 @@ async fn hold_on_report(
 /// configuration fault worth surfacing on either path.
 fn fix_prompt(
     cfg: &Config,
-    finding: &Finding,
+    attempt: Attempt<'_, kind::Fix>,
     start: &FixStart,
-    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<String> {
+    let (finding, resume) = (attempt.subject(), attempt.plan());
     let worktree = &start.ws.tree;
     let repo_notes = Store::repo_notes(&cfg.work_root, start.repo.id);
     let built = match finding.kind {
@@ -4905,20 +4972,19 @@ pub async fn run_fix(
     scope: &CycleScope,
     lane: &mut Lane,
     cfg: &Config,
-    finding: &Finding,
+    attempt: Attempt<'_, kind::Fix>,
     backend: &dyn Backend,
-    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
+    let (finding, resume) = (attempt.subject(), attempt.plan());
     let store = scope.store();
     let fid = finding.id;
-    let (start, running, claim) =
-        match start_fix(scope, lane, cfg, finding, backend, resume).await? {
-            Ok(start) => start,
-            Err(ended) => return Ok(ended),
-        };
+    let (start, running, claim) = match start_fix(scope, lane, cfg, attempt, backend).await? {
+        Ok(start) => start,
+        Err(ended) => return Ok(ended),
+    };
     // Any early return from here on drops `running`: the cycle's settle
     // records the abandoned job.
-    let prompt = match fix_prompt(cfg, finding, &start, resume) {
+    let prompt = match fix_prompt(cfg, attempt, &start) {
         Ok(prompt) => prompt,
         Err(e) => {
             release_claim(claim).await;
@@ -5377,13 +5443,13 @@ async fn engage_target(
 async fn fetch_pr_head<'l>(
     lane: &'l mut Lane,
     repo: &Repo,
-    fid: i64,
+    attempt: Attempt<'_, kind::Engage>,
     head_ref: &str,
-    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<ClonePermit<'l>> {
     let store = lane.store().clone();
     let permit = lane.lock_clone(repo.id).await?;
-    if resume.is_none() {
+    if let Attempt::Cold(finding) = attempt {
+        let fid = finding.id;
         let (rc, out) = fetch_held(&permit, &[head_ref]).await;
         if rc != 0 {
             let tail = crate::util::tail(&out, 300);
@@ -5505,14 +5571,13 @@ struct EngageStart {
 async fn engage_view(
     store: &Store,
     (cfg, backend): (&Config, &dyn Backend),
-    finding: &Finding,
+    attempt: Attempt<'_, kind::Engage>,
     repo: &Repo,
     pr_number: i64,
-    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<Result<Option<PrView>, CycleSummary>> {
-    if resume.is_some() {
+    let Attempt::Cold(finding) = attempt else {
         return Ok(Ok(None));
-    }
+    };
     let fg = forge::forge_for(repo.forge);
     match fg.view_pr_engage(&repo.url, pr_number, &cfg.review_bots) {
         Ok(p) => Ok(Ok(Some(p))),
@@ -5561,10 +5626,10 @@ async fn start_engage(
     scope: &CycleScope,
     lane: &mut Lane,
     cfg: &Config,
-    finding: &Finding,
+    attempt: Attempt<'_, kind::Engage>,
     backend: &dyn Backend,
-    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<Result<(EngageStart, RunningJob), CycleSummary>> {
+    let (finding, resume) = (attempt.subject(), attempt.plan());
     let (store, fid) = (scope.store(), finding.id);
     let target = engage_target(store, finding).await;
     let (repo, ps, head_ref, pr_ref) =
@@ -5591,11 +5656,11 @@ async fn start_engage(
     };
 
     let pr_number = pr_ref.number();
-    let pr = match engage_view(store, (cfg, backend), finding, &repo, pr_number, resume).await? {
+    let pr = match engage_view(store, (cfg, backend), attempt, &repo, pr_number).await? {
         Ok(pr) => pr,
         Err(denied) => return Ok(Err(denied)),
     };
-    let fetched = fetch_pr_head(lane, &repo, fid, &head_ref, resume).await;
+    let fetched = fetch_pr_head(lane, &repo, attempt, &head_ref).await;
     let permit = match engage_prefetch(store, (cfg, backend), finding, fetched).await? {
         Ok(permit) => permit,
         Err(denied) => return Ok(Err(denied)),
@@ -6202,10 +6267,10 @@ async fn engage_prefetch_failed(
 /// and which read no PR to build one from).
 fn engage_prompt(
     cfg: &Config,
-    finding: &Finding,
+    attempt: Attempt<'_, kind::Engage>,
     start: &EngageStart,
-    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<String> {
+    let (finding, resume) = (attempt.subject(), attempt.plan());
     let Some(pr) = &start.pr else {
         return Ok(resume.map_or_else(
             || RESUME_PROMPT.to_owned(),
@@ -6232,18 +6297,18 @@ pub async fn run_engage(
     scope: &CycleScope,
     lane: &mut Lane,
     cfg: &Config,
-    finding: &Finding,
+    attempt: Attempt<'_, kind::Engage>,
     backend: &dyn Backend,
-    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
+    let (finding, resume) = (attempt.subject(), attempt.plan());
     let store = scope.store();
     let fid = finding.id;
     remove_stale_report(resume)?;
-    let (start, running) = match start_engage(scope, lane, cfg, finding, backend, resume).await? {
+    let (start, running) = match start_engage(scope, lane, cfg, attempt, backend).await? {
         Ok(started) => started,
         Err(ended) => return Ok(ended),
     };
-    let prompt = engage_prompt(cfg, finding, &start, resume)?;
+    let prompt = engage_prompt(cfg, attempt, &start)?;
     let model = cfg.model_for("fix");
     let rr = match backend
         .run(
@@ -6445,7 +6510,7 @@ async fn continue_into_harvest(
         handoff: true,
         after_hold: None,
     };
-    let Ok(Some(finding)) = store.get_finding(fid).await else {
+    let Ok(resumed) = Resumed::<kind::Harvest>::load(store, &plan).await else {
         return;
     };
     // The harvest reads its outputs from this tree, which the engage
@@ -6467,7 +6532,7 @@ async fn continue_into_harvest(
             Some(fid),
         )
         .await;
-    if let Err(e) = run_harvest(scope, lane, cfg, &finding, backend, Some(&plan)).await {
+    if let Err(e) = run_harvest(scope, lane, cfg, Attempt::Resume(&resumed), backend).await {
         let _ = store
             .log_event(
                 "error",
@@ -6653,10 +6718,10 @@ pub async fn run_harvest(
     scope: &CycleScope,
     lane: &mut Lane,
     cfg: &Config,
-    finding: &Finding,
+    attempt: Attempt<'_, kind::Harvest>,
     backend: &dyn Backend,
-    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
+    let (finding, resume) = (attempt.subject(), attempt.plan());
     let store = scope.store();
     let fid = finding.id;
     let Ok(Some(repo)) = store.get_repo_by_id(finding.repo_id).await else {
@@ -7552,9 +7617,9 @@ async fn dispatch(
     match candidate {
         Candidate::Finding {
             kind, finding_id, ..
-        } => run_finding_job(scope, lane, cfg, backend, *kind, *finding_id, None).await,
+        } => run_finding_job(scope, lane, cfg, backend, *kind, *finding_id).await,
         Candidate::Repo { kind, repo_id, .. } => {
-            run_repo_job(scope, lane, cfg, backend, *kind, *repo_id, None).await
+            run_repo_job(scope, lane, cfg, backend, *kind, *repo_id).await
         }
         // A resume runs through the executor of the kind that was
         // suspended — so ingest, watermarks and PR handling are that
@@ -7580,20 +7645,62 @@ async fn dispatch(
                     plan.finding_id,
                 )
                 .await;
-            let resume = Some(plan.as_ref());
-            match plan.kind {
-                JobKind::Repo(kind) => {
-                    run_repo_job(scope, lane, cfg, backend, kind, plan.repo_id, resume).await
-                }
-                JobKind::Finding(kind) => {
-                    // A finding-kind job always recorded its target, so a
-                    // row without one is corrupt rather than merely odd.
-                    let fid = plan
-                        .finding_id
-                        .ok_or_else(|| anyhow::anyhow!("resume of a {kind} job with no finding"))?;
-                    run_finding_job(scope, lane, cfg, backend, kind, fid, resume).await
-                }
-            }
+            run_resume(scope, lane, cfg, backend, plan).await
+        }
+    }
+}
+
+/// Run `plan` through the executor of its own kind, on the subject it
+/// names. Each arm loads the plan as a [`Resumed`] of the kind it matched,
+/// so a runner is only ever handed its own kind's plans.
+async fn run_resume(
+    scope: &CycleScope,
+    lane: &mut Lane,
+    cfg: &Config,
+    backend: &dyn Backend,
+    plan: &ResumePlan,
+) -> anyhow::Result<CycleSummary> {
+    let store = scope.store();
+    match plan.kind {
+        JobKind::Repo(RepoJobKind::Hunt) => {
+            let resumed = Resumed::<kind::Hunt>::load(store, plan).await?;
+            run_hunt(scope, lane, cfg, Attempt::Resume(&resumed), backend).await
+        }
+        JobKind::Repo(RepoJobKind::TestGap) => {
+            let resumed = Resumed::<kind::TestGap>::load(store, plan).await?;
+            run_test_gap(scope, lane, cfg, Attempt::Resume(&resumed), backend).await
+        }
+        JobKind::Repo(RepoJobKind::DepUpdate) => {
+            let resumed = Resumed::<kind::DepUpdate>::load(store, plan).await?;
+            run_dep_update(scope, lane, cfg, Attempt::Resume(&resumed), backend).await
+        }
+        JobKind::Repo(RepoJobKind::Refactor) => {
+            let resumed = Resumed::<kind::Refactor>::load(store, plan).await?;
+            run_refactor(scope, lane, cfg, Attempt::Resume(&resumed), backend).await
+        }
+        JobKind::Repo(RepoJobKind::Modernization) => {
+            let resumed = Resumed::<kind::Modernization>::load(store, plan).await?;
+            run_modernize(scope, lane, cfg, Attempt::Resume(&resumed), backend).await
+        }
+        JobKind::Repo(RepoJobKind::Standards) => {
+            let resumed = Resumed::<kind::Standards>::load(store, plan).await?;
+            run_standards(scope, lane, cfg, Attempt::Resume(&resumed), backend).await
+        }
+        JobKind::Finding(FindingJobKind::Recheck) => {
+            let resumed = Resumed::<kind::Recheck>::load(store, plan).await?;
+            run_recheck(scope, lane, cfg, Attempt::Resume(&resumed), backend).await
+        }
+        JobKind::Finding(FindingJobKind::Fix) => {
+            let resumed = Resumed::<kind::Fix>::load(store, plan).await?;
+            run_fix(scope, lane, cfg, Attempt::Resume(&resumed), backend).await
+        }
+        JobKind::Finding(FindingJobKind::Engage) => {
+            let resumed = Resumed::<kind::Engage>::load(store, plan).await?;
+            run_engage(scope, lane, cfg, Attempt::Resume(&resumed), backend).await
+        }
+        JobKind::Finding(FindingJobKind::Harvest) => {
+            let resumed = Resumed::<kind::Harvest>::load(store, plan).await?;
+            run_harvest(scope, lane, cfg, Attempt::Resume(&resumed), backend).await
         }
     }
 }
@@ -7605,7 +7712,6 @@ async fn run_repo_job(
     backend: &dyn Backend,
     kind: RepoJobKind,
     repo_id: i64,
-    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
     let store = scope.store();
     let repo = store
@@ -7613,12 +7719,20 @@ async fn run_repo_job(
         .await?
         .ok_or_else(|| anyhow::anyhow!("repo {repo_id} not found"))?;
     match kind {
-        RepoJobKind::Hunt => run_hunt(scope, lane, cfg, &repo, backend, resume).await,
-        RepoJobKind::TestGap => run_test_gap(scope, lane, cfg, &repo, backend, resume).await,
-        RepoJobKind::DepUpdate => run_dep_update(scope, lane, cfg, &repo, backend, resume).await,
-        RepoJobKind::Refactor => run_refactor(scope, lane, cfg, &repo, backend, resume).await,
-        RepoJobKind::Modernization => run_modernize(scope, lane, cfg, &repo, backend, resume).await,
-        RepoJobKind::Standards => run_standards(scope, lane, cfg, &repo, backend, resume).await,
+        RepoJobKind::Hunt => run_hunt(scope, lane, cfg, Attempt::Cold(&repo), backend).await,
+        RepoJobKind::TestGap => run_test_gap(scope, lane, cfg, Attempt::Cold(&repo), backend).await,
+        RepoJobKind::DepUpdate => {
+            run_dep_update(scope, lane, cfg, Attempt::Cold(&repo), backend).await
+        }
+        RepoJobKind::Refactor => {
+            run_refactor(scope, lane, cfg, Attempt::Cold(&repo), backend).await
+        }
+        RepoJobKind::Modernization => {
+            run_modernize(scope, lane, cfg, Attempt::Cold(&repo), backend).await
+        }
+        RepoJobKind::Standards => {
+            run_standards(scope, lane, cfg, Attempt::Cold(&repo), backend).await
+        }
     }
 }
 
@@ -7629,7 +7743,6 @@ async fn run_finding_job(
     backend: &dyn Backend,
     kind: FindingJobKind,
     finding_id: i64,
-    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
     let store = scope.store();
     let finding = store
@@ -7637,10 +7750,16 @@ async fn run_finding_job(
         .await?
         .ok_or_else(|| anyhow::anyhow!("finding {finding_id} not found"))?;
     match kind {
-        FindingJobKind::Engage => run_engage(scope, lane, cfg, &finding, backend, resume).await,
-        FindingJobKind::Harvest => run_harvest(scope, lane, cfg, &finding, backend, resume).await,
-        FindingJobKind::Recheck => run_recheck(scope, lane, cfg, &finding, backend, resume).await,
-        FindingJobKind::Fix => run_fix(scope, lane, cfg, &finding, backend, resume).await,
+        FindingJobKind::Engage => {
+            run_engage(scope, lane, cfg, Attempt::Cold(&finding), backend).await
+        }
+        FindingJobKind::Harvest => {
+            run_harvest(scope, lane, cfg, Attempt::Cold(&finding), backend).await
+        }
+        FindingJobKind::Recheck => {
+            run_recheck(scope, lane, cfg, Attempt::Cold(&finding), backend).await
+        }
+        FindingJobKind::Fix => run_fix(scope, lane, cfg, Attempt::Cold(&finding), backend).await,
     }
 }
 

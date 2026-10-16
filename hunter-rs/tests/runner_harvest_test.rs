@@ -18,7 +18,7 @@ use hunter::config::Config;
 use hunter::domain::{
     BudgetOverride, FindingJobKind, FindingStatus, ForgeName, JobState, ReleaseAction,
 };
-use hunter::scheduler::{Candidate, pick_next, run_harvest};
+use hunter::scheduler::{Attempt, Candidate, Resumed, pick_next, run_harvest};
 use hunter::store::{FindingInsert, Store};
 use hunter::types::RunResult;
 use support::{FakeBins, GitRepo, ScriptedBackend, TempDir, fresh_store};
@@ -224,9 +224,8 @@ async fn a_refix_of_an_abandoned_pr_is_harvested_when_it_merges() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &classifying(close_reason("abandoned")),
-        None,
     )
     .await
     .unwrap();
@@ -280,9 +279,8 @@ async fn each_classification_lands_as_its_status() {
             &support::scope(&f.store),
             f.store.test_lane(),
             &f.cfg,
-            &finding,
+            Attempt::Cold(&finding),
             &classifying(close_reason(class)),
-            None,
         )
         .await
         .unwrap();
@@ -352,9 +350,8 @@ async fn a_wrong_without_a_maintainer_quote_lands() {
             &support::scope(&f.store),
             f.store.test_lane(),
             &f.cfg,
-            &finding,
+            Attempt::Cold(&finding),
             &classifying(body.to_owned()),
-            None,
         )
         .await
         .unwrap();
@@ -388,9 +385,8 @@ async fn follow_ups_are_filed_with_their_provenance() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -476,9 +472,8 @@ async fn a_follow_up_never_reopens_a_rejected_finding() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -514,9 +509,8 @@ async fn an_invalid_close_reason_counts_toward_the_streak() {
             &support::scope(&f.store),
             f.store.test_lane(),
             &f.cfg,
-            &finding,
+            Attempt::Cold(&finding),
             &classifying(close_reason("maybe")),
-            None,
         )
         .await
         .unwrap();
@@ -628,9 +622,8 @@ async fn a_retried_harvest_files_no_follow_ups() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &classifying_with_follow_up(close_reason("maybe"), "widget:src/lib.rs:left-open"),
-        None,
     )
     .await
     .unwrap();
@@ -650,9 +643,8 @@ async fn a_retried_harvest_files_no_follow_ups() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &classifying_with_follow_up(close_reason("superseded"), "widget:src/lib.rs:still-open"),
-        None,
     )
     .await
     .unwrap();
@@ -682,9 +674,8 @@ async fn a_held_harvest_files_no_follow_ups() {
             &support::scope(&f.store),
             f.store.test_lane(),
             &f.cfg,
-            &finding,
+            Attempt::Cold(&finding),
             &classifying_with_follow_up(close_reason("maybe"), "widget:src/lib.rs:left-open"),
-            None,
         )
         .await
         .unwrap();
@@ -722,14 +713,12 @@ async fn resume_harvest(f: &Fixture, worker: &ScriptedBackend) -> hunter::schedu
         Some(Candidate::Resume { plan, .. }) => *plan,
         other => panic!("expected the suspended harvest to be resumed, got {other:?}"),
     };
-    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     run_harvest(
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
         worker,
-        Some(&plan),
     )
     .await
     .unwrap()
@@ -750,9 +739,8 @@ async fn a_suspended_harvest_files_its_follow_ups_once() {
             &support::scope(&f.store),
             f.store.test_lane(),
             &f.cfg,
-            &finding,
+            Attempt::Cold(&finding),
             &suspending_with_follow_up(),
-            None,
         )
         .await
         .unwrap();
@@ -784,9 +772,8 @@ async fn a_suspended_harvest_files_its_follow_ups_once() {
             &support::scope(&f.store),
             f.store.test_lane(),
             &f.cfg,
-            &finding,
+            Attempt::Cold(&finding),
             &classifying_with_follow_up(close_reason("superseded"), "widget:src/lib.rs:still-open"),
-            None,
         )
         .await
         .unwrap();
@@ -828,9 +815,8 @@ async fn a_classification_that_cannot_be_recorded_is_retried() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &classifying(close_reason("superseded")),
-        None,
     )
     .await
     .unwrap();
@@ -870,9 +856,8 @@ async fn a_classification_that_cannot_be_recorded_is_retried() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &classifying(close_reason("superseded")),
-        None,
     )
     .await
     .unwrap();
@@ -921,9 +906,8 @@ async fn a_classification_that_cannot_be_recorded_spends_only_a_once_override() 
             &support::scope(&f.store),
             f.store.test_lane(),
             &f.cfg,
-            &finding,
+            Attempt::Cold(&finding),
             &classifying(close_reason("superseded")),
-            None,
         )
         .await
         .unwrap();
@@ -970,9 +954,8 @@ async fn every_end_of_a_harvest_attempt_spends_only_a_once_override() {
                 &support::scope(&f.store),
                 f.store.test_lane(),
                 &f.cfg,
-                &finding,
+                Attempt::Cold(&finding),
                 &worker,
-                None,
             )
             .await
             .unwrap();
@@ -1015,9 +998,8 @@ async fn a_verdict_set_while_the_harvest_ran_is_kept() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -1055,9 +1037,8 @@ async fn a_failing_pr_diff_counts_toward_the_streak() {
             &support::scope(&f.store),
             f.store.test_lane(),
             &f.cfg,
-            &finding,
+            Attempt::Cold(&finding),
             &never_runs,
-            None,
         )
         .await
         .expect_err("a failed diff fails the harvest");
@@ -1111,9 +1092,8 @@ async fn a_failing_pr_view_counts_toward_the_streak() {
             &support::scope(&f.store),
             f.store.test_lane(),
             &f.cfg,
-            &finding,
+            Attempt::Cold(&finding),
             &never_runs,
-            None,
         )
         .await
         .expect_err("a failed view fails the harvest");
@@ -1168,9 +1148,8 @@ async fn a_failing_fetch_counts_toward_the_streak() {
             &support::scope(&f.store),
             f.store.test_lane(),
             &f.cfg,
-            &finding,
+            Attempt::Cold(&finding),
             &never_runs,
-            None,
         )
         .await
         .expect_err("a failed fetch fails the harvest");
@@ -1229,9 +1208,8 @@ async fn a_harvest_whose_tree_can_never_be_made_is_held() {
             &support::scope(&f.store),
             f.store.test_lane(),
             &f.cfg,
-            &finding,
+            Attempt::Cold(&finding),
             &never,
-            None,
         )
         .await
         .unwrap();
@@ -1281,9 +1259,8 @@ async fn the_prompt_carries_the_diff_and_what_the_tree_holds() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -1314,9 +1291,8 @@ async fn a_huge_diff_is_cut_with_a_marker() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -1398,9 +1374,8 @@ async fn a_diff_containing_fences_stays_one_block() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -1440,9 +1415,8 @@ async fn a_merged_harvest_fetches_no_diff() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -1469,9 +1443,8 @@ async fn a_resumed_closed_harvest_gets_neither_the_playbook_nor_the_diff_again()
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &suspending,
-        None,
     )
     .await
     .unwrap();
@@ -1482,16 +1455,13 @@ async fn a_resumed_closed_harvest_gets_neither_the_playbook_nor_the_diff_again()
         Some(Candidate::Resume { plan, .. }) => *plan,
         other => panic!("expected the suspended harvest to be resumed, got {other:?}"),
     };
-    assert!(!plan.handoff);
-    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let backend = classifying(close_reason("superseded"));
     run_harvest(
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
         &backend,
-        Some(&plan),
     )
     .await
     .unwrap();
@@ -1503,10 +1473,7 @@ async fn a_resumed_closed_harvest_gets_neither_the_playbook_nor_the_diff_again()
         "Continue the work you were doing in this session. You were interrupted; \
          pick up where you left off."
     );
-    assert_eq!(
-        runs[0].resume_from.as_deref(),
-        Some(plan.session_file.as_path())
-    );
+    assert_eq!(runs[0].resume_from.as_deref(), Some(plan.session_file()));
     assert_eq!(diff_fetches(&bins), 1, "{:?}", bins.calls_to("gh"));
 }
 
@@ -1547,9 +1514,8 @@ async fn a_failed_pr_view_counts_only_while_the_forge_is_reachable() {
             &support::scope(&f.store),
             f.store.test_lane(),
             &f.cfg,
-            &finding,
+            Attempt::Cold(&finding),
             &never,
-            None,
         )
         .await;
 
@@ -1595,9 +1561,8 @@ async fn a_worker_that_never_reached_its_provider_keeps_the_checkpoint() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &suspending(),
-        None,
     )
     .await
     .unwrap();
@@ -1622,9 +1587,8 @@ async fn a_worker_that_never_reached_its_provider_keeps_the_checkpoint() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
         &unmetered,
-        Some(&plan),
     )
     .await
     .unwrap();
@@ -1666,9 +1630,8 @@ async fn a_paused_harvest_continues_without_the_forge() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &suspending(),
-        None,
     )
     .await
     .unwrap();
@@ -1716,9 +1679,8 @@ async fn a_held_harvest_ended_by_the_operator_files_its_follow_ups() {
                 &support::scope(&f.store),
                 f.store.test_lane(),
                 &f.cfg,
-                &finding,
+                Attempt::Cold(&finding),
                 &unclassifiable,
-                None,
             )
             .await
             .unwrap();
@@ -1777,9 +1739,8 @@ async fn a_failing_fetch_while_the_forge_is_unreachable_counts_nothing() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &never_runs,
-        None,
     )
     .await
     .unwrap();
@@ -1813,9 +1774,8 @@ async fn a_held_merged_harvest_marked_harvested_files_its_follow_ups() {
             &support::scope(&f.store),
             f.store.test_lane(),
             &f.cfg,
-            &finding,
+            Attempt::Cold(&finding),
             &killed,
-            None,
         )
         .await
         .unwrap();
@@ -1863,9 +1823,8 @@ async fn a_harvest_whose_backend_keeps_failing_is_held() {
             &support::scope(&f.store),
             f.store.test_lane(),
             &f.cfg,
-            &finding,
+            Attempt::Cold(&finding),
             &failing,
-            None,
         )
         .await
         .unwrap_err();
@@ -1902,9 +1861,8 @@ async fn a_harvest_that_cannot_classify_is_held_on_its_report() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -1967,9 +1925,8 @@ async fn a_suspended_harvest_that_wrote_blocked_is_held() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .unwrap();
