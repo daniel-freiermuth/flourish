@@ -323,7 +323,7 @@ What counts as the outcome and as a failure, per kind. Pauses never count as fai
 
 | Kind | Outcome (work concluded) | Failure |
 |---|---|---|
-| recheck | a verdict: confirmed, stale or invalid | tree not made, no or invalid verdict file, worker not `Done` without a pause, runner error |
+| recheck | a verdict: confirmed, stale or invalid | clone sync failure (before a job exists; under the sync's fixed key), tree not made, no or invalid verdict file, worker not `Done` without a pause, runner error |
 | fix | a PR shipped, or a decline (`NOT-A-BUG.md`/`DECLINED.md`) | tree not made, nothing to ship, push or PR failure, worker not `Done` without a pause, runner error |
 | engage | the reply posted and/or the push done, or a no-op engage, or `WITHDRAW.md` carried out | tree not made, worker not `Done` without a pause, push failure, reply failure, PR close failure on withdraw, any pre-worker error (`engage_target`, PR view), runner error |
 | harvest | a classification recorded, or the merged PR reviewed | tree not made, PR view or diff failure (before a job exists), unusable `CLOSE-REASON.json` or verdict, worker not `Done` without a pause, runner error |

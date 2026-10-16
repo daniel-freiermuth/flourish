@@ -702,9 +702,15 @@ async fn a_recheck_whose_clone_cannot_sync_is_held() {
     let never_runs = ScriptedBackend::new(|_| panic!("no worker without a synced clone"));
     for attempt in 1..=3 {
         let finding = f.finding().await;
-        let err = run_recheck(&support::scope(&f.store), &f.cfg, &finding, &never_runs, None)
-            .await
-            .unwrap_err();
+        let err = run_recheck(
+            &support::scope(&f.store),
+            &f.cfg,
+            &finding,
+            &never_runs,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("git fetch origin failed"), "{err}");
         if attempt < 3 {
             let streak = f.streak().await;
@@ -716,7 +722,10 @@ async fn a_recheck_whose_clone_cannot_sync_is_held() {
         .await
         .expect("held at the limit");
     assert_eq!(hold.reason, hunter::domain::HoldReason::Stuck);
-    assert!(hold.detail.starts_with("git fetch origin failed"), "{hold:?}");
+    assert!(
+        hold.detail.starts_with("git fetch origin failed"),
+        "{hold:?}"
+    );
     assert_eq!(hold.checkpoint_job_id, None);
     assert_eq!(f.job_count().await, 0);
     assert_eq!(f.finding().await.status, FindingStatus::Rechecking);
@@ -745,7 +754,11 @@ async fn a_failing_sync_while_a_host_is_unreachable_counts_nothing() {
 
     let summary = f.recheck(&never_runs).await;
 
-    assert_eq!(summary.unreachable.as_deref(), Some(provider), "{summary:?}");
+    assert_eq!(
+        summary.unreachable.as_deref(),
+        Some(provider),
+        "{summary:?}"
+    );
     assert_eq!(f.streak().await, WorkStreak::default());
     assert_eq!(f.job_count().await, 0);
 }
