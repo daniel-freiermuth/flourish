@@ -200,6 +200,13 @@ pub enum JobInsertError {
         finding_id: i64,
         kind: FindingJobKind,
     },
+    /// A harvest of a finding whose PR no longer awaits one: it was
+    /// harvested since the pick, or the finding moved off `merged` and a
+    /// closed PR's `closed`. The queue a harvest is picked from
+    /// ([`Store::list_pending_harvest`]) no longer lists it, so losing
+    /// that race is a skip.
+    #[error("finding {finding_id} awaits no harvest -- cannot start one")]
+    NoHarvestDue { finding_id: i64 },
     #[error(transparent)]
     Db(#[from] sqlx::Error),
 }
@@ -3110,6 +3117,9 @@ impl Store {
     /// a second is refused as [`JobInsertError::Occupied`], naming the job
     /// that holds the place.
     ///
+    /// A harvest, however it starts, goes in only while its finding's PR
+    /// still awaits one ([`JobInsertError::NoHarvestDue`]).
+    ///
     /// Takes an [`Owner`], which only `crate::recovery` makes, inside
     /// [`CycleScope::create_job`](crate::recovery::CycleScope::create_job): every job is recorded in the scope that
     /// settles it.
@@ -3125,6 +3135,9 @@ impl Store {
         // predecessor is read under the lock that inserts its successor.
         let mut tx = ImmediateTx::begin(&self.pool).await?;
         let (kind, repo_id, finding_id, resumed_from) = Self::start_place(&mut tx, start).await?;
+        if let (JobKind::Finding(FindingJobKind::Harvest), Some(fid)) = (kind, finding_id) {
+            Self::ensure_harvest_due(&mut tx, fid).await?;
+        }
         let id = Self::insert_running_row(
             &mut tx,
             (kind, repo_id, finding_id),
@@ -3278,6 +3291,37 @@ impl Store {
                 ))
             }
         }
+    }
+
+    /// Refuse a harvest of `finding_id` unless its PR still awaits one, by
+    /// [`Self::list_pending_harvest`]'s rule, read under the insert's write
+    /// lock. A harvest is picked, handed over or resumed some forge calls
+    /// before its row goes in, so without this a second attempt -- another
+    /// picker's, or a cold harvest that finished before an engage's handoff
+    /// arrived -- would harvest the PR again after the first had stamped it.
+    async fn ensure_harvest_due(
+        tx: &mut ImmediateTx,
+        finding_id: i64,
+    ) -> Result<(), JobInsertError> {
+        let merged = FindingStatus::Merged;
+        let closed = FindingStatus::Closed;
+        let due = sqlx::query_scalar!(
+            r#"
+            SELECT 1 AS "due!: i64"
+            FROM findings f
+            JOIN pr_state p ON p.finding_id = f.id
+            WHERE f.id = ?1
+              AND p.harvested_at IS NULL
+              AND (f.status = ?2 OR (p.state = 'CLOSED' AND f.status = ?3))
+            "#,
+            finding_id,
+            merged,
+            closed
+        )
+        .fetch_optional(&mut **tx)
+        .await?;
+        due.map(|_| ())
+            .ok_or(JobInsertError::NoHarvestDue { finding_id })
     }
 
     /// [`Self::insert_job`]'s INSERT: the `running` row, its chain's pins
