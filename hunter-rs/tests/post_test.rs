@@ -1369,6 +1369,174 @@ async fn changing_the_url_repoints_the_existing_clone() {
     );
 }
 
+/// A URL update takes the clone's permit before it writes the new URL.
+///
+/// Written first, a runner taking the permit in between read the new URL
+/// while the clone still had the old origin: `sync_repo` refused it as
+/// somebody else's checkout and counted that against the repo. So while
+/// another holder (a runner mid-fetch) has the clone, the update waits
+/// with the row untouched, then writes and repoints together.
+#[tokio::test]
+async fn a_url_update_waits_for_the_clones_holder_before_writing() {
+    let state = test_state().await;
+    let (status, body) = post(
+        &state,
+        "/api/repos",
+        json!({ "name": "busy", "url": "https://example.com/old.git" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    let rid = body["repo"]["id"].as_i64().expect("new repo id");
+    let dir = state
+        .config
+        .work_root
+        .join("repos")
+        .join(format!("repo-{rid}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = dir.to_string_lossy().to_string();
+    for argv in [
+        vec!["git", "-C", &d, "init", "-q"],
+        vec![
+            "git",
+            "-C",
+            &d,
+            "remote",
+            "add",
+            "origin",
+            "https://example.com/old.git",
+        ],
+    ] {
+        let (rc, out) = hunter::util::run_cmd(&argv, 30);
+        assert_eq!(rc, 0, "fixture: {argv:?} failed: {out}");
+    }
+    let url_now = || async { state.store.get_repo_by_id(rid).await.unwrap().unwrap().url };
+
+    let held = state.store.test_lane().lock_clone(rid).await.unwrap();
+    let update = tokio::spawn({
+        let app = AppState::clone(&state);
+        async move {
+            post(
+                &app,
+                "/api/repo",
+                json!({ "id": rid, "url": "https://example.com/new.git" }),
+            )
+            .await
+        }
+    });
+    support::until_waiting(&state.store, rid, 1).await;
+    assert!(!update.is_finished(), "the update waits for the clone");
+    assert_eq!(
+        url_now().await,
+        "https://example.com/old.git",
+        "nothing is written while another holder has the clone"
+    );
+
+    drop(held);
+    let (status, body) = update.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(url_now().await, "https://example.com/new.git");
+    let (_, out) = hunter::util::run_cmd(&["git", "-C", &d, "remote", "get-url", "origin"], 30);
+    assert_eq!(out.trim(), "https://example.com/new.git");
+    // What a sync checks the clone's origin against, read under the
+    // permit: the URL the clone was just moved to.
+    let permit = state.store.test_lane().lock_clone(rid).await.unwrap();
+    assert_eq!(
+        state.store.origin_url(&permit).await.unwrap(),
+        "https://example.com/new.git"
+    );
+}
+
+/// Two URL updates that overlap leave the row and the clone's origin on
+/// the same URL. Both read the repo before either takes the clone; the
+/// second used to repoint from that stale read, found the clone already
+/// moved by the first, left it, and wrote its own URL beside the first's
+/// origin -- so every later sync refused the clone as somebody else's.
+/// The old URL of a repoint is the one the row has under the permit.
+#[tokio::test]
+async fn overlapping_url_updates_leave_the_row_and_the_origin_agreeing() {
+    let state = test_state().await;
+    let (status, body) = post(
+        &state,
+        "/api/repos",
+        json!({ "name": "contested", "url": "https://example.com/u0.git" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    let rid = body["repo"]["id"].as_i64().expect("new repo id");
+    let dir = state
+        .config
+        .work_root
+        .join("repos")
+        .join(format!("repo-{rid}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = dir.to_string_lossy().to_string();
+    for argv in [
+        vec!["git", "-C", &d, "init", "-q"],
+        vec![
+            "git",
+            "-C",
+            &d,
+            "remote",
+            "add",
+            "origin",
+            "https://example.com/u0.git",
+        ],
+    ] {
+        let (rc, out) = hunter::util::run_cmd(&argv, 30);
+        assert_eq!(rc, 0, "fixture: {argv:?} failed: {out}");
+    }
+    let update = |url: &'static str| {
+        let app = AppState::clone(&state);
+        tokio::spawn(async move { post(&app, "/api/repo", json!({ "id": rid, "url": url })).await })
+    };
+
+    // Both queue behind a runner holding the clone, each having read U0.
+    let held = state.store.test_lane().lock_clone(rid).await.unwrap();
+    let first = update("https://example.com/u1.git");
+    support::until_waiting(&state.store, rid, 1).await;
+    let second = update("https://example.com/u2.git");
+    support::until_waiting(&state.store, rid, 2).await;
+    drop(held);
+    for done in [first, second] {
+        let (status, body) = done.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+    }
+
+    let row = state.store.get_repo_by_id(rid).await.unwrap().unwrap().url;
+    let (_, origin) = hunter::util::run_cmd(
+        &["git", "-C", &d, "config", "--get", "remote.origin.url"],
+        30,
+    );
+    assert_eq!(origin.trim(), row, "the clone's origin is the row's URL");
+}
+
+/// Only a URL change touches the clone. An update that sends the URL the
+/// repo already has, beside a field that is not the clone's, does not
+/// wait for a runner holding the clone mid-fetch.
+#[tokio::test]
+async fn an_update_keeping_the_url_does_not_wait_for_the_clone() {
+    let state = test_state().await;
+    let held = state.store.test_lane().lock_clone(1).await.unwrap();
+    let update = tokio::spawn({
+        let app = AppState::clone(&state);
+        async move {
+            post(
+                &app,
+                "/api/repo",
+                json!({ "id": 1, "url": "https://example.com/demo.git", "enabled": false }),
+            )
+            .await
+        }
+    });
+    let (status, body) = tokio::time::timeout(std::time::Duration::from_secs(5), update)
+        .await
+        .expect("the update waited for a clone it does not change")
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["repo"]["enabled"], 0);
+    drop(held);
+}
+
 /// The repoint reads the origin the way `sync_repo` does, so an insteadOf
 /// rule in the user's gitconfig does not stop it.
 ///

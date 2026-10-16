@@ -92,6 +92,25 @@ async fn a_crashing_cycle_returns_the_error_and_logs_it() {
     );
 }
 
+/// A cycle is a lane of its own. Started inside another lane of the same
+/// task it could wait on a clone that lane holds, so it is refused, and
+/// the refusal is the cycle's error: the daemon sees it rather than an
+/// empty cycle.
+#[tokio::test]
+async fn a_cycle_started_inside_a_lane_returns_the_refusal() {
+    let (_dir, store, cfg) = fixture("cycle-nested").await;
+    let recovered = support::recovered(&store);
+
+    let summary = store
+        .lane(async |_| run_cycle(&recovered, &cfg, &NullBackend, None).await)
+        .await
+        .unwrap();
+
+    assert!(summary.error.is_some(), "{summary:?}");
+    assert_eq!(summary.idle, None);
+    assert!(store.list_jobs(10).await.unwrap().is_empty());
+}
+
 /// A cycle whose hunt is due on repo 1 and returns between creating its
 /// job and recording the outcome: its playbook is missing, so the prompt
 /// fails after the job row and its tree exist. `seed` runs on the

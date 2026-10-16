@@ -1404,9 +1404,16 @@ async fn a_hunt_whose_suppressions_cannot_be_read_is_refused() {
         repo_with_an_undecodable_finding(&dir, FindingType::Bug.as_str()).await;
     let backend = ScriptedBackend::noop();
 
-    let err = hunter::scheduler::run_hunt(&support::scope(&store), &cfg, &row, &backend, None)
-        .await
-        .expect_err("an unreadable suppression list must refuse the hunt");
+    let err = hunter::scheduler::run_hunt(
+        &support::scope(&store),
+        store.test_lane(),
+        &cfg,
+        &row,
+        &backend,
+        None,
+    )
+    .await
+    .expect_err("an unreadable suppression list must refuse the hunt");
 
     assert!(
         format!("{err:#}").contains("hunt widget: loading suppressed bug findings"),
@@ -1439,12 +1446,38 @@ async fn an_analysis_job_whose_suppressions_cannot_be_read_is_refused() {
 
         let result = match kind {
             RepoJobKind::Refactor => {
-                hunter::scheduler::run_refactor(&scope, &cfg, &row, &backend, None).await
+                hunter::scheduler::run_refactor(
+                    &scope,
+                    store.test_lane(),
+                    &cfg,
+                    &row,
+                    &backend,
+                    None,
+                )
+                .await
             }
             RepoJobKind::Modernization => {
-                hunter::scheduler::run_modernize(&scope, &cfg, &row, &backend, None).await
+                hunter::scheduler::run_modernize(
+                    &scope,
+                    store.test_lane(),
+                    &cfg,
+                    &row,
+                    &backend,
+                    None,
+                )
+                .await
             }
-            _ => hunter::scheduler::run_standards(&scope, &cfg, &row, &backend, None).await,
+            _ => {
+                hunter::scheduler::run_standards(
+                    &scope,
+                    store.test_lane(),
+                    &cfg,
+                    &row,
+                    &backend,
+                    None,
+                )
+                .await
+            }
         };
         let err = result.expect_err("an unreadable suppression list must refuse the job");
 
@@ -1473,9 +1506,16 @@ async fn a_test_gap_whose_bug_suppressions_cannot_be_read_is_refused() {
         repo_with_an_undecodable_finding(&dir, FindingType::Bug.as_str()).await;
     let backend = ScriptedBackend::noop();
 
-    let err = hunter::scheduler::run_test_gap(&support::scope(&store), &cfg, &row, &backend, None)
-        .await
-        .expect_err("an unreadable bug suppression list must refuse the job");
+    let err = hunter::scheduler::run_test_gap(
+        &support::scope(&store),
+        store.test_lane(),
+        &cfg,
+        &row,
+        &backend,
+        None,
+    )
+    .await
+    .expect_err("an unreadable bug suppression list must refuse the job");
 
     assert!(
         format!("{err:#}").contains("test_gap widget: loading suppressed bug findings"),

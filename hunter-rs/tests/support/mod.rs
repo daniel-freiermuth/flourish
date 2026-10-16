@@ -187,6 +187,20 @@ pub fn live_job(created: hunter::recovery::CreatedJob) -> i64 {
     created.job.disown()
 }
 
+/// Wait until `n` lanes wait for repo `repo_id`'s clone
+/// (`Store::clone_waiters`). Polled, not slept: the count says a lane is
+/// blocked on the lock, which elapsed time alone cannot. Fails after 10 s
+/// instead of hanging.
+pub async fn until_waiting(store: &Store, repo_id: i64, n: usize) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while store.clone_waiters(repo_id) < n {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{n} lane(s) never waited for repo {repo_id}'s clone"));
+}
+
 // ---------------------------------------------------------------------------
 // Fake executables on PATH
 // ---------------------------------------------------------------------------
@@ -417,6 +431,7 @@ fn set_executable(_path: &Path) {}
 // ---------------------------------------------------------------------------
 
 type RunFn = Box<dyn Fn(&Path, Option<&Path>) -> RunResult + Send + Sync>;
+type DecideHook = Box<dyn Fn() -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// What one `run()` of a [`ScriptedBackend`] was handed.
 #[derive(Debug, Clone)]
@@ -450,6 +465,9 @@ pub struct ScriptedBackend {
     /// The hosts the reachability probe reports unreachable.
     offline: Vec<String>,
     runs: Mutex<Vec<Run>>,
+    /// Awaited at the start of every `decide()`: whatever a test needs to
+    /// happen while a runner stands at its budget gate.
+    on_decide: Option<DecideHook>,
 }
 
 impl ScriptedBackend {
@@ -469,6 +487,7 @@ impl ScriptedBackend {
             hosts: Vec::new(),
             offline: Vec::new(),
             runs: Mutex::new(Vec::new()),
+            on_decide: None,
         }
     }
 
@@ -499,6 +518,20 @@ impl ScriptedBackend {
     #[must_use]
     pub fn offline(mut self, hosts: &[&str]) -> Self {
         self.offline = hosts.iter().map(|&h| h.to_owned()).collect();
+        self
+    }
+
+    /// Await `hook` at the start of every `decide()`, before the verdict:
+    /// what runs beside a runner standing at its budget gate -- between
+    /// an engage's outcome being recorded and the harvest it continues
+    /// into being created, for one.
+    #[must_use]
+    pub fn on_decide<F, Fut>(mut self, hook: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.on_decide = Some(Box::new(move || Box::pin(hook())));
         self
     }
 
@@ -561,6 +594,9 @@ pub fn done_with_transcript(tree: &Path) -> RunResult {
 #[async_trait::async_trait]
 impl Backend for ScriptedBackend {
     async fn decide(&self, anticipated_tokens: i64) -> anyhow::Result<Outlook> {
+        if let Some(hook) = &self.on_decide {
+            hook().await;
+        }
         let verdict = if self
             .deny_above
             .is_some_and(|limit| anticipated_tokens > limit)

@@ -222,6 +222,7 @@ async fn a_refix_of_an_abandoned_pr_is_harvested_when_it_merges() {
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let summary = run_harvest(
         &support::scope(&f.store),
+        f.store.test_lane(),
         &f.cfg,
         &finding,
         &classifying(close_reason("abandoned")),
@@ -277,6 +278,7 @@ async fn each_classification_lands_as_its_status() {
 
         let summary = run_harvest(
             &support::scope(&f.store),
+            f.store.test_lane(),
             &f.cfg,
             &finding,
             &classifying(close_reason(class)),
@@ -348,6 +350,7 @@ async fn a_wrong_without_a_maintainer_quote_lands() {
 
         let summary = run_harvest(
             &support::scope(&f.store),
+            f.store.test_lane(),
             &f.cfg,
             &finding,
             &classifying(body.to_owned()),
@@ -381,9 +384,16 @@ async fn follow_ups_are_filed_with_their_provenance() {
         support::done()
     });
 
-    let summary = run_harvest(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
-        .await
-        .unwrap();
+    let summary = run_harvest(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &finding,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
 
     let job = summary.job_id.unwrap();
     assert_eq!(
@@ -462,9 +472,16 @@ async fn a_follow_up_never_reopens_a_rejected_finding() {
         support::done()
     });
 
-    let summary = run_harvest(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
-        .await
-        .unwrap();
+    let summary = run_harvest(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &finding,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
 
     let ingest = summary.ingest.as_ref().expect("follow-ups ingested");
     assert_eq!(
@@ -495,6 +512,7 @@ async fn an_invalid_close_reason_counts_toward_the_streak() {
         let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
         let summary = run_harvest(
             &support::scope(&f.store),
+            f.store.test_lane(),
             &f.cfg,
             &finding,
             &classifying(close_reason("maybe")),
@@ -608,6 +626,7 @@ async fn a_retried_harvest_files_no_follow_ups() {
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let first = run_harvest(
         &support::scope(&f.store),
+        f.store.test_lane(),
         &f.cfg,
         &finding,
         &classifying_with_follow_up(close_reason("maybe"), "widget:src/lib.rs:left-open"),
@@ -629,6 +648,7 @@ async fn a_retried_harvest_files_no_follow_ups() {
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let second = run_harvest(
         &support::scope(&f.store),
+        f.store.test_lane(),
         &f.cfg,
         &finding,
         &classifying_with_follow_up(close_reason("superseded"), "widget:src/lib.rs:still-open"),
@@ -660,6 +680,7 @@ async fn a_held_harvest_files_no_follow_ups() {
         let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
         let summary = run_harvest(
             &support::scope(&f.store),
+            f.store.test_lane(),
             &f.cfg,
             &finding,
             &classifying_with_follow_up(close_reason("maybe"), "widget:src/lib.rs:left-open"),
@@ -704,6 +725,7 @@ async fn resume_harvest(f: &Fixture, worker: &ScriptedBackend) -> hunter::schedu
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     run_harvest(
         &support::scope(&f.store),
+        f.store.test_lane(),
         &f.cfg,
         &finding,
         worker,
@@ -726,6 +748,7 @@ async fn a_suspended_harvest_files_its_follow_ups_once() {
         let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
         let suspended = run_harvest(
             &support::scope(&f.store),
+            f.store.test_lane(),
             &f.cfg,
             &finding,
             &suspending_with_follow_up(),
@@ -759,6 +782,7 @@ async fn a_suspended_harvest_files_its_follow_ups_once() {
         let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
         let cold = run_harvest(
             &support::scope(&f.store),
+            f.store.test_lane(),
             &f.cfg,
             &finding,
             &classifying_with_follow_up(close_reason("superseded"), "widget:src/lib.rs:still-open"),
@@ -802,6 +826,7 @@ async fn a_classification_that_cannot_be_recorded_is_retried() {
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let summary = run_harvest(
         &support::scope(&f.store),
+        f.store.test_lane(),
         &f.cfg,
         &finding,
         &classifying(close_reason("superseded")),
@@ -843,6 +868,7 @@ async fn a_classification_that_cannot_be_recorded_is_retried() {
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let summary = run_harvest(
         &support::scope(&f.store),
+        f.store.test_lane(),
         &f.cfg,
         &finding,
         &classifying(close_reason("superseded")),
@@ -893,6 +919,7 @@ async fn a_classification_that_cannot_be_recorded_spends_only_a_once_override() 
         let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
         let summary = run_harvest(
             &support::scope(&f.store),
+            f.store.test_lane(),
             &f.cfg,
             &finding,
             &classifying(close_reason("superseded")),
@@ -939,9 +966,16 @@ async fn every_end_of_a_harvest_attempt_spends_only_a_once_override() {
                 _ => classifying(close_reason("superseded")),
             };
             let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-            let summary = run_harvest(&support::scope(&f.store), &f.cfg, &finding, &worker, None)
-                .await
-                .unwrap();
+            let summary = run_harvest(
+                &support::scope(&f.store),
+                f.store.test_lane(),
+                &f.cfg,
+                &finding,
+                &worker,
+                None,
+            )
+            .await
+            .unwrap();
 
             assert_eq!(summary.outcome.as_deref(), Some(end), "{end} {mode}");
             let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
@@ -977,9 +1011,16 @@ async fn a_verdict_set_while_the_harvest_ran_is_kept() {
     });
 
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-    let summary = run_harvest(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
-        .await
-        .unwrap();
+    let summary = run_harvest(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &finding,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(summary.outcome.as_deref(), Some("harvested"), "{summary:?}");
     let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
@@ -1012,6 +1053,7 @@ async fn a_failing_pr_diff_counts_toward_the_streak() {
         let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
         let err = run_harvest(
             &support::scope(&f.store),
+            f.store.test_lane(),
             &f.cfg,
             &finding,
             &never_runs,
@@ -1067,6 +1109,7 @@ async fn a_failing_pr_view_counts_toward_the_streak() {
         let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
         let err = run_harvest(
             &support::scope(&f.store),
+            f.store.test_lane(),
             &f.cfg,
             &finding,
             &never_runs,
@@ -1123,6 +1166,7 @@ async fn a_failing_fetch_counts_toward_the_streak() {
         let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
         let err = run_harvest(
             &support::scope(&f.store),
+            f.store.test_lane(),
             &f.cfg,
             &finding,
             &never_runs,
@@ -1181,9 +1225,16 @@ async fn a_harvest_whose_tree_can_never_be_made_is_held() {
     let mut outcomes = Vec::new();
     for attempt in 1..=3 {
         let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-        let summary = run_harvest(&support::scope(&f.store), &f.cfg, &finding, &never, None)
-            .await
-            .unwrap();
+        let summary = run_harvest(
+            &support::scope(&f.store),
+            f.store.test_lane(),
+            &f.cfg,
+            &finding,
+            &never,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(
             summary
                 .failure
@@ -1226,9 +1277,16 @@ async fn the_prompt_carries_the_diff_and_what_the_tree_holds() {
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let backend = classifying(close_reason("superseded"));
 
-    run_harvest(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
-        .await
-        .unwrap();
+    run_harvest(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &finding,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
 
     let runs = backend.runs();
     assert_eq!(runs.len(), 1);
@@ -1252,9 +1310,16 @@ async fn a_huge_diff_is_cut_with_a_marker() {
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let backend = classifying(close_reason("superseded"));
 
-    run_harvest(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
-        .await
-        .unwrap();
+    run_harvest(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &finding,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
 
     let prompt = &backend.runs()[0].prompt;
     assert!(
@@ -1329,9 +1394,16 @@ async fn a_diff_containing_fences_stays_one_block() {
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let backend = classifying(close_reason("superseded"));
 
-    run_harvest(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
-        .await
-        .unwrap();
+    run_harvest(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &finding,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
 
     let prompt = &backend.runs()[0].prompt;
     assert!(
@@ -1359,14 +1431,21 @@ fn diff_fetches(bins: &FakeBins) -> usize {
 async fn a_merged_harvest_fetches_no_diff() {
     let bins = FakeBins::acquire("harvest-merged-no-diff");
     gh_default(&bins);
-    let f = fixture("harvest-merged-no-diff", FindingStatus::PrOpen).await;
+    let f = fixture("harvest-merged-no-diff", FindingStatus::Merged).await;
     f.store.mark_pr_merged(f.fid, 7, 2).await.unwrap();
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let backend = ScriptedBackend::noop();
 
-    run_harvest(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
-        .await
-        .unwrap();
+    run_harvest(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &finding,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
 
     let runs = backend.runs();
     assert_eq!(runs.len(), 1);
@@ -1388,6 +1467,7 @@ async fn a_resumed_closed_harvest_gets_neither_the_playbook_nor_the_diff_again()
     let suspending = suspending();
     let cold = run_harvest(
         &support::scope(&f.store),
+        f.store.test_lane(),
         &f.cfg,
         &finding,
         &suspending,
@@ -1407,6 +1487,7 @@ async fn a_resumed_closed_harvest_gets_neither_the_playbook_nor_the_diff_again()
     let backend = classifying(close_reason("superseded"));
     run_harvest(
         &support::scope(&f.store),
+        f.store.test_lane(),
         &f.cfg,
         &finding,
         &backend,
@@ -1462,7 +1543,15 @@ async fn a_failed_pr_view_counts_only_while_the_forge_is_reachable() {
         let down: &[&str] = if counted { &[] } else { &[host] };
         let never = ScriptedBackend::new(|_| panic!("no worker without the PR")).offline(down);
 
-        let result = run_harvest(&support::scope(&f.store), &f.cfg, &finding, &never, None).await;
+        let result = run_harvest(
+            &support::scope(&f.store),
+            f.store.test_lane(),
+            &f.cfg,
+            &finding,
+            &never,
+            None,
+        )
+        .await;
 
         if counted {
             assert!(result.is_err(), "{result:?}");
@@ -1504,6 +1593,7 @@ async fn a_worker_that_never_reached_its_provider_keeps_the_checkpoint() {
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let paused = run_harvest(
         &support::scope(&f.store),
+        f.store.test_lane(),
         &f.cfg,
         &finding,
         &suspending(),
@@ -1530,6 +1620,7 @@ async fn a_worker_that_never_reached_its_provider_keeps_the_checkpoint() {
     // after; either way it is the provider that is down.
     let summary = run_harvest(
         &support::scope(&f.store),
+        f.store.test_lane(),
         &f.cfg,
         &finding,
         &unmetered,
@@ -1573,6 +1664,7 @@ async fn a_paused_harvest_continues_without_the_forge() {
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let paused = run_harvest(
         &support::scope(&f.store),
+        f.store.test_lane(),
         &f.cfg,
         &finding,
         &suspending(),
@@ -1622,6 +1714,7 @@ async fn a_held_harvest_ended_by_the_operator_files_its_follow_ups() {
             let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
             run_harvest(
                 &support::scope(&f.store),
+                f.store.test_lane(),
                 &f.cfg,
                 &finding,
                 &unclassifiable,
@@ -1682,6 +1775,7 @@ async fn a_failing_fetch_while_the_forge_is_unreachable_counts_nothing() {
 
     let summary = run_harvest(
         &support::scope(&f.store),
+        f.store.test_lane(),
         &f.cfg,
         &finding,
         &never_runs,
@@ -1715,9 +1809,16 @@ async fn a_held_merged_harvest_marked_harvested_files_its_follow_ups() {
     });
     for _ in 0..3 {
         let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-        run_harvest(&support::scope(&f.store), &f.cfg, &finding, &killed, None)
-            .await
-            .unwrap();
+        run_harvest(
+            &support::scope(&f.store),
+            f.store.test_lane(),
+            &f.cfg,
+            &finding,
+            &killed,
+            None,
+        )
+        .await
+        .unwrap();
     }
     assert!(
         support::hold_of(&f.store, f.fid, FindingJobKind::Harvest)
@@ -1758,9 +1859,16 @@ async fn a_harvest_whose_backend_keeps_failing_is_held() {
     let failing = ScriptedBackend::failing();
     for _ in 0..3 {
         let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-        let err = run_harvest(&support::scope(&f.store), &f.cfg, &finding, &failing, None)
-            .await
-            .unwrap_err();
+        let err = run_harvest(
+            &support::scope(&f.store),
+            f.store.test_lane(),
+            &f.cfg,
+            &finding,
+            &failing,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("backend failed"), "{err}");
     }
     assert_held(&f, ReleaseAction::Classify).await;
@@ -1790,9 +1898,16 @@ async fn a_harvest_that_cannot_classify_is_held_on_its_report() {
         support::done_with_transcript(tree)
     });
 
-    let summary = run_harvest(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
-        .await
-        .unwrap();
+    let summary = run_harvest(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &finding,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         (
@@ -1848,9 +1963,16 @@ async fn a_suspended_harvest_that_wrote_blocked_is_held() {
         suspended_at(tree)
     });
 
-    let summary = run_harvest(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
-        .await
-        .unwrap();
+    let summary = run_harvest(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &finding,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(summary.outcome.as_deref(), Some("held"), "{summary:?}");
     let hold = support::hold_of(&f.store, f.fid, FindingJobKind::Harvest)

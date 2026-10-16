@@ -1404,9 +1404,16 @@ async fn a_resumed_hunt_continues_the_session_and_ingests_the_origin_output_path
     );
     let row = store.get_repo_by_id(1).await.unwrap().unwrap();
 
-    let summary = run_hunt(&support::scope(&store), &cfg, &row, &backend, Some(&plan))
-        .await
-        .unwrap();
+    let summary = run_hunt(
+        &support::scope(&store),
+        store.test_lane(),
+        &cfg,
+        &row,
+        &backend,
+        Some(&plan),
+    )
+    .await
+    .unwrap();
 
     let seen = backend.seen();
     assert_eq!(
@@ -1471,17 +1478,31 @@ async fn a_resumed_hunt_does_not_sync_the_clone() {
     let row = store.get_repo_by_id(1).await.unwrap().unwrap();
 
     let cold = RecordingBackend::new(cfg.work_root.join("out").join("cold.json"), String::new());
-    run_hunt(&support::scope(&store), &cfg, &row, &cold, None)
-        .await
-        .expect_err("a cold hunt has to sync, and cannot without a remote");
+    run_hunt(
+        &support::scope(&store),
+        store.test_lane(),
+        &cfg,
+        &row,
+        &cold,
+        None,
+    )
+    .await
+    .expect_err("a cold hunt has to sync, and cannot without a remote");
 
     let warm = RecordingBackend::new(
         cfg.work_root.join("out").join("job10.findings.json"),
         one_finding(),
     );
-    let summary = run_hunt(&support::scope(&store), &cfg, &row, &warm, Some(&plan))
-        .await
-        .expect("a resume must not touch the remote at all");
+    let summary = run_hunt(
+        &support::scope(&store),
+        store.test_lane(),
+        &cfg,
+        &row,
+        &warm,
+        Some(&plan),
+    )
+    .await
+    .expect("a resume must not touch the remote at all");
     assert_eq!(summary.state, Some(JobState::Done));
 }
 
@@ -1510,9 +1531,16 @@ async fn a_resume_whose_checkpoint_moved_on_skips_the_cycle() {
     );
     let jobs_before = store.list_jobs(10).await.unwrap().len();
 
-    let summary = run_hunt(&support::scope(&store), &cfg, &row, &backend, Some(&plan))
-        .await
-        .expect("a checkpoint that moved on is a skip, not the cycle's error");
+    let summary = run_hunt(
+        &support::scope(&store),
+        store.test_lane(),
+        &cfg,
+        &row,
+        &backend,
+        Some(&plan),
+    )
+    .await
+    .expect("a checkpoint that moved on is a skip, not the cycle's error");
 
     assert!(
         summary.skipped.is_some(),
@@ -1631,18 +1659,32 @@ async fn a_cold_start_reserves_at_least_the_efficiency_floor() {
     let row = store.get_repo_by_id(1).await.unwrap().unwrap();
 
     let collapsed = GateProbe::default();
-    let summary = run_hunt(&support::scope(&store), &cfg, &row, &collapsed, None)
-        .await
-        .unwrap();
+    let summary = run_hunt(
+        &support::scope(&store),
+        store.test_lane(),
+        &cfg,
+        &row,
+        &collapsed,
+        None,
+    )
+    .await
+    .unwrap();
     assert!(summary.denied.is_some(), "the probe refuses: {summary:?}");
     sqlx::query("UPDATE jobs SET tokens_new = 100000 WHERE state = 'done'")
         .execute(&pool)
         .await
         .unwrap();
     let healthy = GateProbe::default();
-    run_hunt(&support::scope(&store), &cfg, &row, &healthy, None)
-        .await
-        .unwrap();
+    run_hunt(
+        &support::scope(&store),
+        store.test_lane(),
+        &cfg,
+        &row,
+        &healthy,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         (collapsed.reserved(), healthy.reserved()),
@@ -1801,9 +1843,16 @@ async fn repeated_suspensions_of_a_fix_are_not_a_stuck_streak() {
     let mut outcomes = Vec::new();
     for _ in 0..3 {
         let finding = store.get_finding(fid).await.unwrap().unwrap();
-        let summary = run_fix(&support::scope(&store), &cfg, &finding, &suspending, None)
-            .await
-            .unwrap();
+        let summary = run_fix(
+            &support::scope(&store),
+            store.test_lane(),
+            &cfg,
+            &finding,
+            &suspending,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(summary.state, Some(JobState::Suspended), "{summary:?}");
         outcomes.push(summary.outcome);
     }
@@ -1831,9 +1880,16 @@ async fn repeated_suspensions_of_a_recheck_are_not_a_stuck_streak() {
     let mut outcomes = Vec::new();
     for _ in 0..3 {
         let finding = store.get_finding(fid).await.unwrap().unwrap();
-        let summary = run_recheck(&support::scope(&store), &cfg, &finding, &suspending, None)
-            .await
-            .unwrap();
+        let summary = run_recheck(
+            &support::scope(&store),
+            store.test_lane(),
+            &cfg,
+            &finding,
+            &suspending,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(summary.state, Some(JobState::Suspended), "{summary:?}");
         outcomes.push(summary.outcome);
     }
@@ -1864,9 +1920,16 @@ async fn confirmed_recheck_with_severity(raw: &'static str) -> hunter::types::Fi
     });
 
     let finding = store.get_finding(fid).await.unwrap().unwrap();
-    let summary = run_recheck(&support::scope(&store), &cfg, &finding, &worker, None)
-        .await
-        .unwrap();
+    let summary = run_recheck(
+        &support::scope(&store),
+        store.test_lane(),
+        &cfg,
+        &finding,
+        &worker,
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(summary.outcome.as_deref(), Some("confirmed"), "{summary:?}");
 
     // The reads are whole-list queries decoding `severity` as a
@@ -1928,9 +1991,16 @@ async fn a_stale_recheck_supersedes_and_only_an_invalid_one_suppresses() {
         });
 
         let finding = store.get_finding(fid).await.unwrap().unwrap();
-        let summary = run_recheck(&support::scope(&store), &cfg, &finding, &worker, None)
-            .await
-            .unwrap();
+        let summary = run_recheck(
+            &support::scope(&store),
+            store.test_lane(),
+            &cfg,
+            &finding,
+            &worker,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(summary.outcome.as_deref(), Some(verdict));
         let after = store.get_finding(fid).await.unwrap().unwrap();
@@ -1983,9 +2053,16 @@ async fn a_recheck_without_a_verdict_retries_then_is_held() {
     let mut seen = Vec::new();
     for _ in 0..3 {
         let finding = store.get_finding(fid).await.unwrap().unwrap();
-        let summary = run_recheck(&support::scope(&store), &cfg, &finding, &silent, None)
-            .await
-            .unwrap();
+        let summary = run_recheck(
+            &support::scope(&store),
+            store.test_lane(),
+            &cfg,
+            &finding,
+            &silent,
+            None,
+        )
+        .await
+        .unwrap();
         let after = store.get_finding(fid).await.unwrap().unwrap();
         seen.push((
             summary.outcome,
@@ -2025,9 +2102,16 @@ async fn a_recheck_whose_tree_can_never_be_made_is_held() {
     let mut seen = Vec::new();
     for _ in 0..3 {
         let finding = store.get_finding(fid).await.unwrap().unwrap();
-        let summary = run_recheck(&support::scope(&store), &cfg, &finding, &never, None)
-            .await
-            .unwrap();
+        let summary = run_recheck(
+            &support::scope(&store),
+            store.test_lane(),
+            &cfg,
+            &finding,
+            &never,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(
             summary
                 .failure
@@ -2090,9 +2174,16 @@ async fn every_end_of_a_recheck_attempt_spends_only_a_once_override() {
             });
 
             let finding = store.get_finding(fid).await.unwrap().unwrap();
-            let summary = run_recheck(&support::scope(&store), &cfg, &finding, &worker, None)
-                .await
-                .unwrap();
+            let summary = run_recheck(
+                &support::scope(&store),
+                store.test_lane(),
+                &cfg,
+                &finding,
+                &worker,
+                None,
+            )
+            .await
+            .unwrap();
 
             assert_eq!(summary.outcome.as_deref(), Some(end), "{end} {mode}");
             let after = store.get_finding(fid).await.unwrap().unwrap();
@@ -2113,7 +2204,7 @@ async fn repeated_suspensions_of_a_harvest_are_not_a_stuck_streak() {
     bins.ok("gh", PR_VIEW_JSON);
     let (dir, path, pool) = fresh_db().await;
     let store = rw_store(&path).await;
-    let fid = repo_with_finding(&dir, &pool, &store, FindingStatus::PrOpen).await;
+    let fid = repo_with_finding(&dir, &pool, &store, FindingStatus::Merged).await;
     // `gh` is handed the repo URL, so it has to be one the forge parses;
     // the clone still fetches from its own origin.
     sqlx::query("UPDATE repos SET url = 'https://github.com/acme/widget' WHERE id = 1")
@@ -2137,9 +2228,16 @@ async fn repeated_suspensions_of_a_harvest_are_not_a_stuck_streak() {
     let mut outcomes = Vec::new();
     for _ in 0..3 {
         let finding = store.get_finding(fid).await.unwrap().unwrap();
-        let summary = run_harvest(&support::scope(&store), &cfg, &finding, &suspending, None)
-            .await
-            .unwrap();
+        let summary = run_harvest(
+            &support::scope(&store),
+            store.test_lane(),
+            &cfg,
+            &finding,
+            &suspending,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(summary.state, Some(JobState::Suspended), "{summary:?}");
         outcomes.push(summary.outcome);
     }
@@ -2182,7 +2280,7 @@ async fn a_checkpoint_whose_finding_moved_on_is_dropped_and_its_tree_released() 
 
         let picked = resume_plan_of(pick_next(&store, &cfg, None).await.unwrap());
         assert_eq!(picked.predecessor_id, 20, "{kind} resumes at {at}");
-        hunter::workspace::sweep(&store, &cfg.work_root, hunter::util::now_ms())
+        hunter::workspace::sweep(store.test_lane(), &cfg.work_root, hunter::util::now_ms())
             .await
             .unwrap();
         assert!(tree.is_dir(), "{kind} at {at} keeps its tree");
@@ -2193,7 +2291,7 @@ async fn a_checkpoint_whose_finding_moved_on_is_dropped_and_its_tree_released() 
             !matches!(picked, Some(Candidate::Resume { .. })),
             "{kind} at {moved_to} must not resume, got {picked:?}"
         );
-        hunter::workspace::sweep(&store, &cfg.work_root, hunter::util::now_ms())
+        hunter::workspace::sweep(store.test_lane(), &cfg.work_root, hunter::util::now_ms())
             .await
             .unwrap();
         let (state, reason, notes) = job_row(&pool, 20).await;
@@ -2233,9 +2331,16 @@ async fn a_no_commit_hunt_whose_watermark_cannot_be_written_fails() {
     let row = store.get_repo_by_id(1).await.unwrap().unwrap();
     let never = ScriptedBackend::new(|_| panic!("no new commits: nothing may run"));
 
-    let err = run_hunt(&support::scope(&store), &cfg, &row, &never, None)
-        .await
-        .unwrap_err();
+    let err = run_hunt(
+        &support::scope(&store),
+        store.test_lane(),
+        &cfg,
+        &row,
+        &never,
+        None,
+    )
+    .await
+    .unwrap_err();
     assert!(err.to_string().contains("injected write failure"), "{err}");
 }
 

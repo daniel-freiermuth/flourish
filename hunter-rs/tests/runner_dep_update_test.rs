@@ -105,6 +105,7 @@ impl Rig {
         self.bins.ok("renovate", renovate_output);
         let result = hunter::scheduler::run_dep_update(
             &support::scope(&self.store),
+            self.store.test_lane(),
             &self.cfg,
             &self.repo,
             &self.backend,

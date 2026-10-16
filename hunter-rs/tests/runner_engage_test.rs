@@ -221,6 +221,7 @@ impl Fixture {
         let finding = self.store.get_finding(self.fid).await.unwrap().unwrap();
         hunter::scheduler::run_engage(
             &support::scope(&self.store),
+            self.store.test_lane(),
             &self.cfg,
             &finding,
             backend,
@@ -357,10 +358,16 @@ async fn failed_close_does_not_record_the_withdrawal() {
 
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let backend = ScriptedBackend::writing("WITHDRAW.md", "not worth pursuing");
-    let summary =
-        hunter::scheduler::run_engage(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
-            .await
-            .expect("run_engage should not error, it should decline to record");
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &finding,
+        &backend,
+        None,
+    )
+    .await
+    .expect("run_engage should not error, it should decline to record");
 
     assert_eq!(summary.outcome.as_deref(), Some("withdraw-failed"));
     assert!(
@@ -398,10 +405,16 @@ async fn successful_close_records_the_withdrawal() {
 
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let backend = ScriptedBackend::writing("WITHDRAW.md", "superseded by #9");
-    let summary =
-        hunter::scheduler::run_engage(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
-            .await
-            .unwrap();
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &finding,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(summary.outcome.as_deref(), Some("withdrawn"));
     assert!(
@@ -436,10 +449,16 @@ async fn a_withdrawal_files_no_follow_ups() {
         std::fs::write(tree.join("FOLLOW-UPS.json"), FOLLOW_UP).unwrap();
         support::done()
     });
-    let summary =
-        hunter::scheduler::run_engage(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
-            .await
-            .unwrap();
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &finding,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(summary.outcome.as_deref(), Some("withdrawn"));
     assert!(summary.ingest.is_none(), "{summary:?}");
@@ -595,6 +614,7 @@ async fn a_failed_withdrawal_counts_toward_the_engage_streak() {
         let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
         let summary = hunter::scheduler::run_engage(
             &support::scope(&f.store),
+            f.store.test_lane(),
             &f.cfg,
             &finding,
             &backend,
@@ -666,6 +686,7 @@ async fn a_withdrawal_spends_only_a_once_override() {
             let backend = ScriptedBackend::writing("WITHDRAW.md", "superseded by #9");
             let summary = hunter::scheduler::run_engage(
                 &support::scope(&f.store),
+                f.store.test_lane(),
                 &f.cfg,
                 &finding,
                 &backend,
@@ -1118,14 +1139,26 @@ async fn an_empty_pr_url_bails() {
 }
 
 /// A PR branch that is gone from origin fails the fetch before any job
-/// is created.
+/// is created. The PR view has run by then: the fetch comes after every
+/// forge read, so the clone is not held across them.
 #[tokio::test]
 async fn a_head_ref_missing_from_origin_bails_at_the_fetch() {
     let f = fixture("engage-fetch-fails").await;
     let bins = FakeBins::acquire("engage-fetch-fails");
     bins.ok("gh", PR_VIEW_JSON);
     f.exec("UPDATE pr_state SET head_ref = 'gone/branch'").await;
-    assert_bails(&f, &bins, "fetch failed", "fetch gone/branch failed").await;
+    let (backend, seen) = recording(|_| {});
+    let err = f.run(&backend).await.expect_err("engage must refuse");
+    assert!(err.to_string().starts_with("fetch failed"), "{err:#}");
+    let errors = f.events("error").await;
+    assert!(
+        errors
+            .iter()
+            .any(|m| m.contains("fetch gone/branch failed")),
+        "{errors:?}"
+    );
+    assert!(f.jobs().await.is_empty(), "no job row may be written");
+    assert!(seen.get().is_none(), "the worker must not run");
 }
 
 /// The PR could not be read from the forge: no job, no worker.
@@ -1212,9 +1245,16 @@ async fn a_clone_of_a_different_repository_is_refused() {
     // Never reached: the sync refuses before any worker is spawned, which
     // is itself part of the contract.
     let backend = ScriptedBackend::writing("findings.json", "[]");
-    let err = hunter::scheduler::run_hunt(&support::scope(&store), &cfg, &row, &backend, None)
-        .await
-        .expect_err("a clone of another repository must not be hunted");
+    let err = hunter::scheduler::run_hunt(
+        &support::scope(&store),
+        store.test_lane(),
+        &cfg,
+        &row,
+        &backend,
+        None,
+    )
+    .await
+    .expect_err("a clone of another repository must not be hunted");
     let msg = err.to_string();
     assert!(
         msg.contains("but its origin is") && msg.contains("somebody-elses-repo"),
@@ -1274,9 +1314,16 @@ async fn an_insteadof_rewrite_of_the_origin_is_not_refused() {
     let mut cfg = support::load_config(dir.path());
     cfg.work_root = dir.subdir("work_root");
     let backend = ScriptedBackend::writing("findings.json", "[]");
-    let summary = hunter::scheduler::run_hunt(&support::scope(&store), &cfg, &row, &backend, None)
-        .await
-        .expect("the daemon's own clone must not be refused over an insteadOf rewrite");
+    let summary = hunter::scheduler::run_hunt(
+        &support::scope(&store),
+        store.test_lane(),
+        &cfg,
+        &row,
+        &backend,
+        None,
+    )
+    .await
+    .expect("the daemon's own clone must not be refused over an insteadOf rewrite");
     assert!(
         summary.job_id.is_some(),
         "the hunt must get past the sync and run: {summary:?}"
@@ -1322,10 +1369,16 @@ async fn a_hunt_refused_because_its_repo_was_deleted_names_what_it_skipped() {
     cfg.work_root = dir.subdir("work_root");
     // Never reached: the job row is refused before any worker is spawned.
     let backend = ScriptedBackend::writing("findings.json", "[]");
-    let summary =
-        hunter::scheduler::run_hunt(&support::scope(&store), &cfg, &picked, &backend, None)
-            .await
-            .expect("losing the race to a delete is a skipped cycle, not an error");
+    let summary = hunter::scheduler::run_hunt(
+        &support::scope(&store),
+        store.test_lane(),
+        &cfg,
+        &picked,
+        &backend,
+        None,
+    )
+    .await
+    .expect("losing the race to a delete is a skipped cycle, not an error");
 
     assert_eq!(
         (
@@ -1450,10 +1503,16 @@ async fn a_withdrawal_continues_into_its_harvest_in_the_same_session() {
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let backend = withdraw_then_classify(true);
 
-    let summary =
-        hunter::scheduler::run_engage(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
-            .await
-            .unwrap();
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &finding,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(summary.outcome.as_deref(), Some("withdrawn"));
     let engage_job = summary.job_id.unwrap();
@@ -1514,6 +1573,64 @@ async fn a_withdrawal_continues_into_its_harvest_in_the_same_session() {
     assert!(!runs[0].tree.exists(), "the chain's tree must be released");
 }
 
+/// A sweep while the handoff stands at the harvest's budget gate keeps
+/// the engage's tree. At that moment the engage is recorded `done` and
+/// the harvest has no row yet, so the job table says no attempt of the
+/// chain is live: only the engage's lease on the tree, held across the
+/// handoff, keeps the sweep from releasing it. The harvest then runs in
+/// that tree, and the tree is released once both are done with it.
+#[tokio::test]
+async fn a_sweep_during_the_handoff_keeps_the_tree_for_the_harvest() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let f = fixture("handoff-sweep").await;
+    let bins = FakeBins::acquire("handoff-sweep");
+    gh_for_handoff(&bins);
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let sweeps = Arc::new(AtomicUsize::new(0));
+    let backend = withdraw_then_classify(true).on_decide({
+        let (store, root, sweeps) = (f.store.clone(), f.cfg.work_root.clone(), sweeps.clone());
+        move || {
+            let (store, root, sweeps) = (store.clone(), root.clone(), sweeps.clone());
+            async move {
+                hunter::workspace::sweep(store.test_lane(), &root, hunter::util::now_ms())
+                    .await
+                    .unwrap();
+                sweeps.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    });
+
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &finding,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
+
+    // The engage's gate, then the harvest's: the second ran in the gap.
+    assert_eq!(sweeps.load(Ordering::SeqCst), 2);
+    assert_eq!(summary.outcome.as_deref(), Some("withdrawn"));
+    let runs = backend.runs();
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    assert_eq!(
+        runs[1].tree, runs[0].tree,
+        "the harvest runs in the engage's tree"
+    );
+    let jobs = f.jobs().await;
+    assert_eq!(
+        (jobs[1].1.as_str(), jobs[1].2.as_str()),
+        ("harvest", "done"),
+        "{jobs:?}"
+    );
+    let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(after.status, FindingStatus::Superseded);
+    assert!(!runs[0].tree.exists(), "the chain's tree must be released");
+}
+
 /// A window with room for the engage but not for continuing its
 /// transcript into the harvest: nothing else happens. No harvest job, the
 /// finding stays `closed` for the cold harvest, and the tree is released.
@@ -1526,10 +1643,16 @@ async fn a_denied_handoff_leaves_the_finding_closed_and_releases_the_tree() {
     // Engage reserves its cold 40,000; the handoff reserves 200,000.
     let backend = withdraw_then_classify(true).denying_above(150_000);
 
-    let summary =
-        hunter::scheduler::run_engage(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
-            .await
-            .unwrap();
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &finding,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(summary.outcome.as_deref(), Some("withdrawn"));
     let runs = backend.runs();
@@ -1554,10 +1677,16 @@ async fn an_unavailable_transcript_leaves_the_finding_closed_and_releases_the_tr
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let backend = withdraw_then_classify(false);
 
-    let summary =
-        hunter::scheduler::run_engage(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
-            .await
-            .unwrap();
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &finding,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(summary.outcome.as_deref(), Some("withdrawn"));
     let runs = backend.runs();
@@ -1597,10 +1726,16 @@ async fn a_failed_handoff_files_no_follow_ups() {
         }
     });
 
-    let summary =
-        hunter::scheduler::run_engage(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
-            .await
-            .unwrap();
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &finding,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(summary.outcome.as_deref(), Some("withdrawn"));
     let runs = backend.runs();
@@ -1635,10 +1770,16 @@ async fn a_handoff_whose_diff_fails_counts_no_harvest_attempt() {
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let backend = withdraw_then_classify(true);
 
-    let summary =
-        hunter::scheduler::run_engage(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
-            .await
-            .unwrap();
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &finding,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(summary.outcome.as_deref(), Some("withdrawn"));
     let runs = backend.runs();
@@ -1681,10 +1822,16 @@ async fn an_unrecorded_closed_verdict_starts_no_harvest_and_waits_for_the_sync()
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let backend = withdraw_then_classify(true);
 
-    let summary =
-        hunter::scheduler::run_engage(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
-            .await
-            .unwrap();
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &finding,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(summary.outcome.as_deref(), Some("withdrawn"));
     let engage_job = summary.job_id.unwrap();
@@ -1751,10 +1898,16 @@ async fn a_withdrawal_the_sync_recorded_first_keeps_the_syncs_verdict() {
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let backend = withdraw_then_classify(true);
 
-    let summary =
-        hunter::scheduler::run_engage(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
-            .await
-            .unwrap();
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &finding,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(summary.outcome.as_deref(), Some("withdrawn"));
     let engage_job = summary.job_id.unwrap();
@@ -1786,10 +1939,16 @@ async fn a_handoff_whose_view_fails_counts_no_harvest_attempt() {
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let backend = withdraw_then_classify(true);
 
-    let summary =
-        hunter::scheduler::run_engage(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
-            .await
-            .unwrap();
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &finding,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(summary.outcome.as_deref(), Some("withdrawn"));
     let runs = backend.runs();
@@ -1838,10 +1997,16 @@ async fn an_unrecorded_close_starts_no_harvest_and_waits_for_the_sync() {
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let backend = withdraw_then_classify(true);
 
-    let summary =
-        hunter::scheduler::run_engage(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
-            .await
-            .unwrap();
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &finding,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(summary.outcome.as_deref(), Some("withdrawn"));
     let engage_job = summary.job_id.unwrap();
@@ -1925,10 +2090,16 @@ async fn a_finished_engage_pushes_replies_and_records_it() {
     let backend = committing_and_replying();
 
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-    let summary =
-        hunter::scheduler::run_engage(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
-            .await
-            .unwrap();
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &finding,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
     assert_eq!(
@@ -1973,10 +2144,16 @@ async fn a_reply_only_engage_marks_the_attention_addressed() {
     let backend = ScriptedBackend::writing("PR-REPLY.md", "thanks, answered inline");
 
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-    let summary =
-        hunter::scheduler::run_engage(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
-            .await
-            .unwrap();
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &finding,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
     assert!(bins.called_with("gh", "comment"), "{:?}", bins.calls());
@@ -2042,10 +2219,16 @@ async fn attention_after_reply(
     push_to(&f, None).await;
     let backend = ScriptedBackend::writing("PR-REPLY.md", "answered");
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-    let summary =
-        hunter::scheduler::run_engage(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
-            .await
-            .unwrap();
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &finding,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
 
     pr_with_comments(&bins, afterwards);
@@ -2189,10 +2372,16 @@ async fn an_engage_whose_push_fails_posts_nothing_and_fails_its_job() {
     let backend = committing_and_replying();
 
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-    let summary =
-        hunter::scheduler::run_engage(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
-            .await
-            .unwrap();
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &finding,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(summary.outcome.as_deref(), Some("retry"), "{summary:?}");
     assert!(
@@ -2231,10 +2420,16 @@ async fn an_unfinished_engage_publishes_nothing() {
     });
 
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-    let summary =
-        hunter::scheduler::run_engage(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
-            .await
-            .unwrap();
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &finding,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(summary.outcome.as_deref(), Some("retry"), "{summary:?}");
     let state = summary.state.unwrap();
@@ -2269,6 +2464,7 @@ async fn only_a_suspended_engage_reports_its_kept_worktree() {
         let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
         let summary = hunter::scheduler::run_engage(
             &support::scope(&f.store),
+            f.store.test_lane(),
             &f.cfg,
             &finding,
             &backend,
@@ -2339,10 +2535,16 @@ async fn suspend_and_resume(
     meanwhile: impl FnOnce(),
 ) -> hunter::scheduler::CycleSummary {
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-    let first =
-        hunter::scheduler::run_engage(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
-            .await
-            .unwrap();
+    let first = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &finding,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         first.state,
         Some(hunter::domain::JobState::Suspended),
@@ -2362,6 +2564,7 @@ async fn suspend_and_resume(
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     hunter::scheduler::run_engage(
         &support::scope(&f.store),
+        f.store.test_lane(),
         &f.cfg,
         &finding,
         &backend,
@@ -2491,10 +2694,16 @@ async fn a_suspended_engage_that_withdrew_keeps_no_checkpoint_and_continues_into
         }
     });
 
-    let summary =
-        hunter::scheduler::run_engage(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
-            .await
-            .unwrap();
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &finding,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(summary.outcome.as_deref(), Some("withdrawn"), "{summary:?}");
     assert_eq!(summary.state, Some(hunter::domain::JobState::Suspended));
@@ -2549,10 +2758,16 @@ async fn a_suspended_engage_whose_withdrawal_failed_keeps_no_checkpoint_and_is_r
         suspended_by(tree, "cap")
     });
 
-    let summary =
-        hunter::scheduler::run_engage(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
-            .await
-            .unwrap();
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &finding,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         summary.outcome.as_deref(),
@@ -2601,10 +2816,16 @@ async fn a_suspended_engage_that_did_not_withdraw_keeps_its_tree_for_the_resume(
         suspended_by(tree, "cap")
     });
 
-    let summary =
-        hunter::scheduler::run_engage(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
-            .await
-            .unwrap();
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &finding,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(summary.outcome.as_deref(), Some("suspended"), "{summary:?}");
     assert_eq!(summary.failure, None, "a pause is not a failure");
@@ -2671,6 +2892,7 @@ async fn a_failing_engage_is_held_at_the_streak_limit() {
         let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
         let summary = hunter::scheduler::run_engage(
             &support::scope(&f.store),
+            f.store.test_lane(),
             &f.cfg,
             &finding,
             &failing,
@@ -2720,6 +2942,7 @@ async fn an_engage_whose_pr_will_not_load_is_held_at_the_streak_limit() {
         let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
         let err = hunter::scheduler::run_engage(
             &support::scope(&f.store),
+            f.store.test_lane(),
             &f.cfg,
             &finding,
             &never,
@@ -2807,6 +3030,7 @@ async fn a_paused_engage_continues_without_the_forge() {
 
     let resumed = hunter::scheduler::run_engage(
         &support::scope(&f.store),
+        f.store.test_lane(),
         &f.cfg,
         &finding,
         &pausing,
@@ -3039,6 +3263,7 @@ async fn a_failed_reply_counts_only_while_the_forge_is_reachable() {
 
         let summary = hunter::scheduler::run_engage(
             &support::scope(&f.store),
+            f.store.test_lane(),
             &f.cfg,
             &finding,
             &replying,
@@ -3097,6 +3322,7 @@ async fn a_withdrawal_while_the_forge_is_unreachable_keeps_its_checkpoint() {
 
     let summary = hunter::scheduler::run_engage(
         &support::scope(&f.store),
+        f.store.test_lane(),
         &f.cfg,
         &finding,
         &withdrawing,
@@ -3147,6 +3373,7 @@ async fn an_engage_that_never_reaches_its_worker_is_held() {
             let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
             let result = hunter::scheduler::run_engage(
                 &support::scope(&f.store),
+                f.store.test_lane(),
                 &f.cfg,
                 &finding,
                 &backend,
@@ -3201,10 +3428,16 @@ async fn an_engage_that_needs_a_maintainer_is_held_on_its_report() {
     });
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
 
-    let summary =
-        hunter::scheduler::run_engage(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
-            .await
-            .unwrap();
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &finding,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(summary.outcome.as_deref(), Some("held"));
     let hold = support::hold_of(&f.store, f.fid, hunter::domain::FindingJobKind::Engage)
@@ -3315,6 +3548,7 @@ async fn a_continued_stuck_engage_resumes_with_its_reason() {
 
     hunter::scheduler::run_engage(
         &support::scope(&f.store),
+        f.store.test_lane(),
         &f.cfg,
         &finding,
         &resumed,

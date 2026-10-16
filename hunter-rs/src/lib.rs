@@ -2,6 +2,7 @@ pub mod attention;
 pub mod auth;
 pub mod backend;
 pub mod backends;
+pub mod clones;
 pub mod config;
 pub mod daemon;
 pub mod dep_scan;
