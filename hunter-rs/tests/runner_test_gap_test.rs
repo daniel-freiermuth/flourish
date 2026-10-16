@@ -8,6 +8,7 @@
 mod support;
 
 use hunter::domain::{FindingStatus, FindingType, ForgeName, Severity};
+use hunter::scheduler::Attempt;
 use hunter::store::FindingInsert;
 use support::{GitRepo, ScriptedBackend, TempDir, done, fresh_store, git};
 
@@ -140,9 +141,8 @@ async fn a_test_gap_scan_sees_the_repos_bugs_and_may_file_one() {
         &support::scope(&store),
         store.test_lane(),
         &cfg,
-        &repo,
+        Attempt::Cold(&repo),
         &backend,
-        None,
     )
     .await
     .unwrap();

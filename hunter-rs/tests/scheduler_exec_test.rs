@@ -7,6 +7,7 @@ mod support;
 use std::path::{Path, PathBuf};
 
 use hunter::domain::{FindingJobKind, FindingType, ForgeName, RepoJobKind};
+use hunter::scheduler::Attempt;
 use hunter::store::{JobOutcome, JobStart, Store};
 use hunter::transition::Moved;
 use hunter::types::RunResult;
@@ -1408,9 +1409,8 @@ async fn a_hunt_whose_suppressions_cannot_be_read_is_refused() {
         &support::scope(&store),
         store.test_lane(),
         &cfg,
-        &row,
+        Attempt::Cold(&row),
         &backend,
-        None,
     )
     .await
     .expect_err("an unreadable suppression list must refuse the hunt");
@@ -1450,9 +1450,8 @@ async fn an_analysis_job_whose_suppressions_cannot_be_read_is_refused() {
                     &scope,
                     store.test_lane(),
                     &cfg,
-                    &row,
+                    Attempt::Cold(&row),
                     &backend,
-                    None,
                 )
                 .await
             }
@@ -1461,9 +1460,8 @@ async fn an_analysis_job_whose_suppressions_cannot_be_read_is_refused() {
                     &scope,
                     store.test_lane(),
                     &cfg,
-                    &row,
+                    Attempt::Cold(&row),
                     &backend,
-                    None,
                 )
                 .await
             }
@@ -1472,9 +1470,8 @@ async fn an_analysis_job_whose_suppressions_cannot_be_read_is_refused() {
                     &scope,
                     store.test_lane(),
                     &cfg,
-                    &row,
+                    Attempt::Cold(&row),
                     &backend,
-                    None,
                 )
                 .await
             }
@@ -1510,9 +1507,8 @@ async fn a_test_gap_whose_bug_suppressions_cannot_be_read_is_refused() {
         &support::scope(&store),
         store.test_lane(),
         &cfg,
-        &row,
+        Attempt::Cold(&row),
         &backend,
-        None,
     )
     .await
     .expect_err("an unreadable bug suppression list must refuse the job");

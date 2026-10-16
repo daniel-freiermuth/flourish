@@ -14,6 +14,7 @@ mod support;
 
 use hunter::config::Config;
 use hunter::domain::{FindingJobKind, ForgeName, HoldReason, ReleaseAction};
+use hunter::scheduler::{Attempt, Resumed};
 use hunter::store::{FindingInsert, WorkStreak};
 use support::{GitRepo, ScriptedBackend, TempDir, fresh_store, git};
 
@@ -125,9 +126,8 @@ async fn leftover_branch_without_a_worktree_does_not_wedge_the_fix() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .expect("a leftover branch is reclaimable, not a permanent failure");
@@ -164,9 +164,8 @@ async fn leftover_branch_held_by_a_killed_worktree_add_does_not_wedge_the_fix() 
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -191,9 +190,8 @@ async fn clean_repo_runs_the_fix() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -252,9 +250,8 @@ async fn a_tree_that_can_never_be_made_ends_held_as_stuck() {
             &support::scope(&f.store),
             f.store.test_lane(),
             &f.cfg,
-            &finding,
+            Attempt::Cold(&finding),
             &never,
-            None,
         )
         .await
         .unwrap();
@@ -318,9 +315,8 @@ async fn granted_cap_is_the_backend_headroom_verbatim() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -349,9 +345,8 @@ async fn backend_without_a_ceiling_leaves_the_job_unbounded() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -379,9 +374,8 @@ async fn fix_whose_tree_cannot_be_made_returns_the_finding_to_queued() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &never,
-        None,
     )
     .await
     .unwrap();
@@ -429,9 +423,8 @@ async fn a_finished_fix_ships_and_records_its_draft_pr() {
             &support::scope(&f.store),
             f.store.test_lane(),
             &f.cfg,
-            &finding,
+            Attempt::Cold(&finding),
             &worker,
-            None,
         )
         .await
         .unwrap();
@@ -481,9 +474,8 @@ async fn verdict_after_selection_stops_the_fix_before_its_job() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &capped,
-        None,
     )
     .await
     .unwrap();
@@ -495,7 +487,7 @@ async fn verdict_after_selection_stops_the_fix_before_its_job() {
     else {
         panic!("a cap suspension must resume");
     };
-    let stale = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let stale = Resumed::load(&f.store, &plan).await.unwrap();
     f.store
         .set_finding_verdict(
             f.fid,
@@ -510,9 +502,8 @@ async fn verdict_after_selection_stops_the_fix_before_its_job() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &stale,
+        Attempt::Resume(&stale),
         &never,
-        Some(&plan),
     )
     .await
     .unwrap();
@@ -592,9 +583,8 @@ async fn held_fixture() -> (
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &blocked,
-        None,
     )
     .await
     .unwrap();
@@ -685,20 +675,18 @@ async fn a_continued_fix_resumes_its_checkpoint_and_is_ordinary_again() {
     else {
         panic!("continued work must resume, not start cold");
     };
-    assert_eq!(plan.predecessor_id, summary.job_id.unwrap());
+    assert_eq!(plan.predecessor_id(), summary.job_id.unwrap());
     assert_eq!(
-        plan.after_hold,
-        Some((HoldReason::Prerequisite, expected_reason.clone()))
+        plan.after_hold(),
+        Some(&(HoldReason::Prerequisite, expected_reason.clone()))
     );
-    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let denied = ScriptedBackend::noop().denying_above(0);
     let result = hunter::scheduler::run_fix(
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
         &denied,
-        Some(&plan),
     )
     .await
     .unwrap();
@@ -728,9 +716,8 @@ async fn a_continued_fix_resumes_its_checkpoint_and_is_ordinary_again() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
         &provider_failure,
-        Some(&plan),
     )
     .await
     .unwrap();
@@ -771,7 +758,6 @@ async fn an_interrupted_continue_resumes_as_an_ordinary_resume() {
     else {
         panic!("continued work must resume");
     };
-    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
 
     // The process dies after the worker has metered work of its own.
     let crashing = ScriptedBackend::staged(|_, session| {
@@ -789,9 +775,8 @@ async fn an_interrupted_continue_resumes_as_an_ordinary_resume() {
             &support::scope(&store),
             store.test_lane(),
             &cfg,
-            &finding,
+            Attempt::Resume(&Resumed::load(&store, &plan).await.unwrap()),
             &crashing,
-            Some(&plan),
         )
         .await
     })
@@ -812,8 +797,7 @@ async fn an_interrupted_continue_resumes_as_an_ordinary_resume() {
     else {
         panic!("the interrupted attempt must resume");
     };
-    assert_eq!(plan.after_hold, None, "an ordinary resume");
-    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(plan.after_hold(), None, "an ordinary resume");
     let provider_failure = ScriptedBackend::staged(|_, session| {
         let mut result = support::done();
         result.exit_code = Some(1);
@@ -825,9 +809,8 @@ async fn an_interrupted_continue_resumes_as_an_ordinary_resume() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
         &provider_failure,
-        Some(&plan),
     )
     .await
     .unwrap();
@@ -885,7 +868,6 @@ async fn a_continued_fix_that_concludes_ends_ordinarily() {
         else {
             panic!("continued work must resume");
         };
-        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
         let worker = ScriptedBackend::staged(move |tree, session| {
             let mut result = support::done();
             if case == "finished" {
@@ -905,9 +887,8 @@ async fn a_continued_fix_that_concludes_ends_ordinarily() {
             &support::scope(&f.store),
             f.store.test_lane(),
             &f.cfg,
-            &finding,
+            Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
             &worker,
-            Some(&plan),
         )
         .await
         .unwrap();
@@ -932,9 +913,8 @@ async fn repeated_identical_fix_failures_are_held_at_the_limit() {
             &support::scope(&f.store),
             f.store.test_lane(),
             &f.cfg,
-            &finding,
+            Attempt::Cold(&finding),
             &empty,
-            None,
         )
         .await
         .unwrap();
@@ -976,7 +956,6 @@ async fn resumed_hold_prompt(f: &Fixture) -> String {
     else {
         panic!("continued held work must resume");
     };
-    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let worker = ScriptedBackend::staged(|_, session| {
         let mut result = support::done();
         result.session_file = session.map(|path| path.to_string_lossy().into_owned());
@@ -986,9 +965,8 @@ async fn resumed_hold_prompt(f: &Fixture) -> String {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
         &worker,
-        Some(&plan),
     )
     .await
     .unwrap();
@@ -1024,9 +1002,8 @@ async fn a_held_fix_resumes_against_what_held_it() {
             &support::scope(&f.store),
             f.store.test_lane(),
             &f.cfg,
-            &finding,
+            Attempt::Cold(&finding),
             &unfinished,
-            None,
         )
         .await
         .unwrap();
@@ -1074,9 +1051,8 @@ async fn fix_resume_without_a_blocker_runs_the_plain_continuation() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &capped,
-        None,
     )
     .await
     .unwrap();
@@ -1088,7 +1064,6 @@ async fn fix_resume_without_a_blocker_runs_the_plain_continuation() {
     else {
         panic!("a cap suspension must resume");
     };
-    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let resumed = ScriptedBackend::staged(|_, session| {
         let mut result = support::done();
         result.session_file = session.map(|path| path.to_string_lossy().into_owned());
@@ -1098,9 +1073,8 @@ async fn fix_resume_without_a_blocker_runs_the_plain_continuation() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
         &resumed,
-        Some(&plan),
     )
     .await
     .unwrap();
@@ -1132,15 +1106,13 @@ async fn an_unremovable_stale_report_stops_the_resume_before_its_job() {
     };
     let jobs_before = f.store.jobs_by_finding(f.fid).await.unwrap().len();
     std::fs::create_dir(tree.join("BLOCKED.md")).unwrap();
-    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let never = ScriptedBackend::new(|_| panic!("must not run beside a stale report"));
     let err = hunter::scheduler::run_fix(
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
         &never,
-        Some(&plan),
     )
     .await
     .unwrap_err();
@@ -1164,7 +1136,7 @@ async fn an_unremovable_stale_report_stops_the_resume_before_its_job() {
     else {
         panic!("the checkpoint must still resume");
     };
-    assert_eq!(again.predecessor_id, plan.predecessor_id);
+    assert_eq!(again.predecessor_id(), plan.predecessor_id());
 }
 
 /// Rejecting a held fix ends its work item: the release records the
@@ -1248,18 +1220,21 @@ async fn a_fix_whose_backend_keeps_failing_is_held() {
             _ => None,
         };
         assert_eq!(
-            plan.as_ref().map(|p| p.predecessor_id),
+            plan.as_ref()
+                .map(hunter::scheduler::ResumePlan::predecessor_id),
             summary.job_id,
             "the continued checkpoint: attempt {attempt}"
         );
-        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
         let err = hunter::scheduler::run_fix(
             &support::scope(&f.store),
             f.store.test_lane(),
             &f.cfg,
-            &finding,
+            Attempt::Resume(
+                &Resumed::load(&f.store, plan.as_ref().unwrap())
+                    .await
+                    .unwrap(),
+            ),
             &failing,
-            plan.as_ref(),
         )
         .await
         .unwrap_err();
@@ -1307,9 +1282,8 @@ async fn a_report_that_is_not_utf8_still_counts() {
             &support::scope(&f.store),
             f.store.test_lane(),
             &f.cfg,
-            &finding,
+            Attempt::Cold(&finding),
             &worker,
-            None,
         )
         .await
         .unwrap();
@@ -1391,9 +1365,8 @@ async fn a_decline_lands_as_its_classification() {
             &support::scope(&f.store),
             f.store.test_lane(),
             &f.cfg,
-            &finding,
+            Attempt::Cold(&finding),
             &backend,
-            None,
         )
         .await
         .unwrap();
@@ -1426,9 +1399,8 @@ async fn an_unreadable_report_returns_the_finding_to_queued() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &worker,
-        None,
     )
     .await
     .unwrap_err();
@@ -1461,7 +1433,7 @@ async fn a_verdict_after_selection_wins_over_a_stale_report() {
     else {
         panic!("continued work must resume");
     };
-    let picked = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let picked = Resumed::load(&f.store, &plan).await.unwrap();
     std::fs::create_dir(tree.join("BLOCKED.md")).unwrap();
     f.store
         .set_finding_status(f.fid, hunter::domain::FindingStatus::Rejected)
@@ -1472,9 +1444,8 @@ async fn a_verdict_after_selection_wins_over_a_stale_report() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &picked,
+        Attempt::Resume(&picked),
         &never,
-        Some(&plan),
     )
     .await
     .unwrap();
@@ -1509,9 +1480,8 @@ async fn a_hold_that_cannot_be_recorded_returns_the_finding_to_queued() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &worker,
-        None,
     )
     .await
     .unwrap_err();
@@ -1564,9 +1534,8 @@ async fn each_fix_kind_gets_its_branch_and_playbook_with_the_decline_classes() {
             &support::scope(&f.store),
             f.store.test_lane(),
             &f.cfg,
-            &finding,
+            Attempt::Cold(&finding),
             &worker,
-            None,
         )
         .await
         .unwrap();
@@ -1608,9 +1577,8 @@ async fn a_one_shot_override_is_spent_by_its_fix_attempt() {
             &support::scope(&f.store),
             f.store.test_lane(),
             &f.cfg,
-            &finding,
+            Attempt::Cold(&finding),
             &ScriptedBackend::noop(),
-            None,
         )
         .await
         .unwrap();
@@ -1635,9 +1603,8 @@ async fn a_fix_for_a_finding_no_longer_queued_is_skipped() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &never,
-        None,
     )
     .await
     .unwrap();
@@ -1674,9 +1641,8 @@ async fn a_description_without_commits_ships_nothing() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &worker,
-        None,
     )
     .await
     .unwrap();
@@ -1720,9 +1686,8 @@ async fn fix(f: &Fixture, backend: &ScriptedBackend) -> hunter::scheduler::Cycle
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         backend,
-        None,
     )
     .await
     .unwrap()
@@ -1987,9 +1952,9 @@ async fn a_failed_push_counts_only_while_the_forge_is_reachable() {
         else {
             panic!("the unpublished attempt is continued");
         };
-        assert_eq!(Some(plan.predecessor_id), summary.job_id);
+        assert_eq!(Some(plan.predecessor_id()), summary.job_id);
         assert_eq!(
-            git(&plan.workspace.tree, &["log", "-1", "--format=%s"]).trim(),
+            git(&plan.workspace().tree, &["log", "-1", "--format=%s"]).trim(),
             "fix: the real bug",
             "its commits are kept"
         );
@@ -2030,7 +1995,6 @@ async fn a_runner_error_while_the_provider_is_unreachable_counts_nothing() {
     else {
         panic!("the continued fix resumes");
     };
-    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let failing = ScriptedBackend::failing()
         .needing(&[provider])
         .offline(&[provider]);
@@ -2039,9 +2003,8 @@ async fn a_runner_error_while_the_provider_is_unreachable_counts_nothing() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
         &failing,
-        Some(&plan),
     )
     .await
     .expect("the network's failure ends the cycle denied, not failed");
@@ -2087,9 +2050,8 @@ async fn a_blocked_fix_keeps_its_one_shot_override() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &blocked,
-        None,
     )
     .await
     .unwrap();

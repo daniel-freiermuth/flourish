@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use hunter::config::Config;
 use hunter::domain::FindingStatus;
-use hunter::scheduler::{run_fix, run_hunt};
+use hunter::scheduler::{Attempt, run_fix, run_hunt};
 use hunter::store::{FindingInsert, Store, VerdictAnchor};
 use hunter::suppression::reconfirmed_path;
 use hunter::types::Repo;
@@ -158,9 +158,8 @@ impl Fixture {
             &support::scope(&self.store),
             self.store.test_lane(),
             &self.cfg,
-            &self.repo().await,
+            Attempt::Cold(&self.repo().await),
             worker,
-            None,
         )
         .await
         .unwrap();
@@ -219,9 +218,8 @@ async fn decline_phantom(f: &Fixture, fid: i64) -> String {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Cold(&finding),
         &decline,
-        None,
     )
     .await
     .unwrap();

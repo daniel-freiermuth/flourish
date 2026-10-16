@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use hunter::domain::{ForgeName, JobKind, JobState, RepoJobKind};
-use hunter::scheduler::CycleSummary;
+use hunter::scheduler::{Attempt, CycleSummary};
 use support::{FakeBins, GitRepo, ScriptedBackend, TempDir, done, fresh_store, git};
 
 /// One cycle of `run_dep_update` over a real clone, with the installed
@@ -107,9 +107,8 @@ impl Rig {
             &support::scope(&self.store),
             self.store.test_lane(),
             &self.cfg,
-            &self.repo,
+            Attempt::Cold(&self.repo),
             &self.backend,
-            None,
         )
         .await;
         assert_eq!(

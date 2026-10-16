@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use hunter::config::Config;
 use hunter::domain::{JobState, RepoJobKind};
-use hunter::scheduler::{Candidate, pick_next, run_cycle, run_hunt};
+use hunter::scheduler::{Attempt, Candidate, Resumed, pick_next, run_cycle, run_hunt};
 use hunter::store::Store;
 use hunter::types::{Repo, RunResult};
 use hunter::util::now_ms;
@@ -208,9 +208,8 @@ async fn a_resumed_periodic_rehunt_records_its_full_hunt() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &row,
+        Attempt::Cold(&row),
         &cold,
-        None,
     )
     .await
     .unwrap();
@@ -222,9 +221,8 @@ async fn a_resumed_periodic_rehunt_records_its_full_hunt() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &f.repo().await,
+        Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
         &f.clean_worker(),
-        Some(&plan),
     )
     .await
     .unwrap();
@@ -251,9 +249,8 @@ async fn a_resumed_periodic_rehunt_records_its_full_hunt() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &after,
+        Attempt::Cold(&after),
         &f.clean_worker(),
-        None,
     )
     .await
     .unwrap();
@@ -292,9 +289,8 @@ async fn a_requested_rehunt_runs_now_over_the_complete_history() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &before,
+        Attempt::Cold(&before),
         &backend,
-        None,
     )
     .await
     .unwrap();
@@ -337,9 +333,8 @@ async fn a_request_made_during_a_full_chain_outlives_it() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &row,
+        Attempt::Cold(&row),
         &ScriptedBackend::new(suspended_at_cap),
-        None,
     )
     .await
     .unwrap();
@@ -354,9 +349,8 @@ async fn a_request_made_during_a_full_chain_outlives_it() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &f.repo().await,
+        Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
         &f.clean_worker(),
-        Some(&plan),
     )
     .await
     .unwrap();
@@ -398,9 +392,8 @@ async fn an_incremental_chain_neither_settles_nor_delays_a_request() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &row,
+        Attempt::Cold(&row),
         &ScriptedBackend::new(suspended_at_cap),
-        None,
     )
     .await
     .unwrap();
@@ -413,9 +406,8 @@ async fn an_incremental_chain_neither_settles_nor_delays_a_request() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &f.repo().await,
+        Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
         &f.clean_worker(),
-        Some(&plan),
     )
     .await
     .unwrap();
@@ -464,9 +456,8 @@ async fn a_failed_requested_hunt_waits_for_the_next_hunt_turn() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &row,
+        Attempt::Cold(&row),
         &f.clean_worker(),
-        None,
     )
     .await
     .unwrap();
@@ -494,9 +485,8 @@ async fn a_full_rehunt_that_is_denied_or_fails_keeps_the_watermark() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &f.repo().await,
+        Attempt::Cold(&f.repo().await),
         &denying,
-        None,
     )
     .await
     .unwrap();
@@ -511,9 +501,8 @@ async fn a_full_rehunt_that_is_denied_or_fails_keeps_the_watermark() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &f.repo().await,
+        Attempt::Cold(&f.repo().await),
         &failing,
-        None,
     )
     .await
     .unwrap();
@@ -536,9 +525,8 @@ async fn a_never_hunted_repo_keeps_a_requested_full_scope_across_a_resume() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &f.repo().await,
+        Attempt::Cold(&f.repo().await),
         &ScriptedBackend::new(suspended_at_cap),
-        None,
     )
     .await
     .unwrap();
@@ -550,9 +538,8 @@ async fn a_never_hunted_repo_keeps_a_requested_full_scope_across_a_resume() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &f.repo().await,
+        Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
         &f.clean_worker(),
-        Some(&plan),
     )
     .await
     .unwrap();
@@ -579,9 +566,8 @@ async fn a_never_hunted_repo_without_a_request_takes_a_bounded_first_hunt() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &f.repo().await,
+        Attempt::Cold(&f.repo().await),
         &f.clean_worker(),
-        None,
     )
     .await
     .unwrap();
@@ -610,9 +596,8 @@ async fn a_request_made_while_an_incremental_hunt_is_prepared_stays_unanswered()
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &picked,
+        Attempt::Cold(&picked),
         &f.clean_worker(),
-        None,
     )
     .await
     .unwrap();
@@ -646,9 +631,8 @@ async fn a_request_replaced_while_a_full_hunt_is_prepared_survives_it() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &picked,
+        Attempt::Cold(&picked),
         &f.clean_worker(),
-        None,
     )
     .await
     .unwrap();
@@ -703,9 +687,8 @@ async fn a_resumed_bounded_first_hunt_stays_bounded() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &f.repo().await,
+        Attempt::Cold(&f.repo().await),
         &ScriptedBackend::new(suspended_at_cap),
-        None,
     )
     .await
     .unwrap();
@@ -717,9 +700,8 @@ async fn a_resumed_bounded_first_hunt_stays_bounded() {
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &f.repo().await,
+        Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
         &f.clean_worker(),
-        Some(&plan),
     )
     .await
     .unwrap();
