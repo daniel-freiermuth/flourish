@@ -744,6 +744,193 @@ async fn the_sweep_removes_the_scan_tree_of_a_repo_no_longer_listed() {
     assert!(!orphan.exists(), "the leftover scan tree is removed");
 }
 
+/// The pack files in `clone`'s object store.
+fn packs(clone: &Path) -> usize {
+    std::fs::read_dir(clone.join(".git/objects/pack")).map_or(0, |dir| {
+        dir.flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "pack"))
+            .count()
+    })
+}
+
+/// Make `clone`'s housekeeping due: a threshold of one, and thousands of
+/// loose objects. Returns the clone's pack count before any runs.
+fn housekeeping_due(f: &Fixture) -> usize {
+    git(&f.clone, &["config", "gc.auto", "1"]);
+    let loose = f.dir.subdir("loose");
+    let paths: Vec<String> = (0..3000)
+        .map(|i| {
+            let p = loose.join(i.to_string());
+            std::fs::write(&p, format!("loose {i}\n")).unwrap();
+            p.to_string_lossy().into_owned()
+        })
+        .collect();
+    let mut hashed = std::process::Command::new("git")
+        .args([
+            "-C",
+            &f.clone.to_string_lossy(),
+            "hash-object",
+            "-w",
+            "--stdin-paths",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(hashed.stdin.as_mut().unwrap(), paths.join("\n").as_bytes()).unwrap();
+    drop(hashed.stdin.take());
+    assert!(hashed.wait().unwrap().success());
+    packs(&f.clone)
+}
+
+/// Git ends a fetch by starting its housekeeping detached: a repack that
+/// outlives the fetch, and so the permit, and would run under the next
+/// holder's `worktree add` or `branch -D`. The daemon's fetch runs it
+/// inside the hold instead: when the fetch returns, the repack it was due
+/// is done, and nothing goes on changing the clone after it.
+#[tokio::test]
+async fn a_fetch_finishes_the_clones_housekeeping_before_it_returns() {
+    let f = fixture("ws-fetch-maintenance", "main").await;
+    let before = housekeeping_due(&f);
+
+    let (rc, out) = permit(&f)
+        .await
+        .blocking(|hold| workspace::fetch(hold, &[], 60))
+        .await
+        .unwrap();
+
+    assert_eq!(rc, 0, "{out}");
+    let at_return = packs(&f.clone);
+    assert!(at_return > before, "the fetch's housekeeping never ran");
+    // Detached, the repack is still writing when the fetch returns: its
+    // last pack appears after that, under whoever holds the clone next.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert_eq!(
+        packs(&f.clone),
+        at_return,
+        "the clone's housekeeping went on after the fetch returned"
+    );
+}
+
+/// A worker's commit in its tree starts the same detached housekeeping in
+/// the clone, and a fix or a resume starts its worker without fetching
+/// first. So startup turns automatic maintenance off in every clone of
+/// the daemon's own on disk, also in one no fetch has reached since: after
+/// it, a commit in a tree leaves the clone as it found it.
+#[tokio::test]
+async fn after_startup_a_commit_in_a_tree_leaves_its_clone_alone() {
+    let f = fixture("ws-quiet-clones", "main").await;
+    let before = housekeeping_due(&f);
+    let tree = f.cfg.work_root.join("jobs").join("77").join("tree");
+    let t = tree.to_string_lossy().into_owned();
+    git(
+        &f.clone,
+        &["worktree", "add", "--detach", &t, "origin/main"],
+    );
+
+    // The fixture's clone is `<dir>/repos/repo-1`: the daemon's own clone
+    // for a work root of `<dir>`.
+    workspace::quiet_clones(f.store.test_lane(), f.dir.path())
+        .await
+        .unwrap();
+    git(
+        &tree,
+        &[
+            "-c",
+            "user.name=worker",
+            "-c",
+            "user.email=worker@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "work",
+        ],
+    );
+
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert_eq!(
+        packs(&f.clone),
+        before,
+        "the commit started housekeeping that went on in the clone"
+    );
+}
+
+/// A repo row may name the operator's own checkout instead of a clone
+/// under `<work_root>/repos`. Its config is the operator's: startup turns
+/// nothing off there.
+#[tokio::test]
+async fn startup_leaves_the_config_of_an_operators_checkout_alone() {
+    let f = fixture("ws-quiet-foreign", "main").await;
+    // `f.cfg.work_root` is `<dir>/work_root`, so `<dir>/repos/repo-1` is
+    // not under its `repos/`: to this daemon, an operator's checkout.
+    workspace::quiet_clones(f.store.test_lane(), &f.cfg.work_root)
+        .await
+        .unwrap();
+
+    let set = std::process::Command::new("git")
+        .args(["config", "--local", "--get", "maintenance.auto"])
+        .current_dir(&f.clone)
+        .output()
+        .unwrap();
+    assert_eq!(
+        set.status.code(),
+        Some(1),
+        "startup wrote maintenance.auto into the operator's checkout: {}",
+        String::from_utf8_lossy(&set.stdout)
+    );
+}
+
+/// A clone made after startup is never reached by `quiet_clones`, and a
+/// fix starts its worker without fetching: the clone has automatic
+/// maintenance off from the moment it is made.
+#[tokio::test]
+async fn a_new_clone_starts_with_automatic_maintenance_off() {
+    let f = fixture("ws-clone-config", "main").await;
+    let fresh = f.dir.subdir("repos").join("repo-2");
+    sqlx::query(
+        "INSERT INTO repos (id, name, url, path, forge, default_branch, enabled, added_at) \
+         VALUES (2, 'beta', ?1, ?2, 'github', 'main', 1, 1000)",
+    )
+    .bind(f.repo.origin.to_string_lossy().to_string())
+    .bind(fresh.to_string_lossy().to_string())
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    let url = f.repo.origin.to_string_lossy().into_owned();
+
+    let (rc, out) = f
+        .store
+        .test_lane()
+        .lock_clone(2)
+        .await
+        .unwrap()
+        .blocking(move |hold| hold.clone_from(&url, 60))
+        .await
+        .unwrap();
+
+    assert_eq!(rc, 0, "{out}");
+    assert_eq!(
+        git(&fresh, &["config", "--local", "--get", "maintenance.auto"]).trim(),
+        "false"
+    );
+}
+
+/// A fetch writes no config: a clone whose config cannot be rewritten
+/// (a `config.lock` a killed `git config` left behind) still fetches.
+#[tokio::test]
+async fn a_fetch_works_in_a_clone_whose_config_is_locked() {
+    let f = fixture("ws-fetch-config-lock", "main").await;
+    std::fs::write(f.clone.join(".git").join("config.lock"), "").unwrap();
+
+    let (rc, out) = permit(&f)
+        .await
+        .blocking(|hold| workspace::fetch(hold, &[], 60))
+        .await
+        .unwrap();
+
+    assert_eq!(rc, 0, "the fetch failed on the locked config: {out}");
+}
+
 /// Under one repo's permit, git runs only in trees of that repo's clone. A
 /// chain's tree path names no clone, so a tree of another clone would be
 /// changed under a permit that does not cover it.

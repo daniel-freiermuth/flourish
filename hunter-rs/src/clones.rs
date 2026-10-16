@@ -448,12 +448,26 @@ impl CloneHold {
         std::fs::canonicalize(self.clone_dir()).is_ok_and(|held| held == dir)
     }
 
-    /// `git clone -- <url> <clone>`: make the held clone.
+    /// `git clone -- <url> <clone>`: make the held clone, with automatic
+    /// maintenance off in its config from the start, so a worker's commit
+    /// in one of its trees starts no detached housekeeping
+    /// (`crate::workspace::fetch` says why).
     pub fn clone_from(&self, url: &str, timeout_s: u64) -> (i32, String) {
         let dir = self.clone_dir().to_string_lossy();
         // `--` before the operands: even a URL that slipped past
         // validation cannot be read as an option here.
-        crate::util::run_cmd(&["git", "clone", "--", url, &dir], timeout_s)
+        crate::util::run_cmd(
+            &[
+                "git",
+                "clone",
+                "--config",
+                "maintenance.auto=false",
+                "--",
+                url,
+                &dir,
+            ],
+            timeout_s,
+        )
     }
 }
 

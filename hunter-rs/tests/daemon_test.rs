@@ -282,6 +282,67 @@ async fn a_starting_daemon_reclaims_leftover_trees() {
     daemon.abort();
 }
 
+/// A starting daemon turns git's automatic maintenance off in its own
+/// clones before any job, also in one no fetch has reached since: a fix or
+/// a resume starts its worker without fetching, and the worker's commit
+/// would otherwise start detached housekeeping in the clone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_starting_daemon_turns_automatic_maintenance_off_in_its_clones() {
+    let dir = TempDir::new("daemon-quiet");
+    let bins = FakeBins::acquire("daemon-quiet");
+    bins.fail("omp", 1, "fake omp: no usage data here");
+    let _home = bins.env("HOME", dir.path());
+    let mut cfg = support::load_config(dir.path());
+    cfg.work_root = dir.subdir("work_root");
+    cfg.serve_port = free_port();
+    cfg.omp_bin = "omp".to_owned();
+    let clone = cfg.work_root.join("repos").join("repo-1");
+    std::fs::create_dir_all(&clone).unwrap();
+    let git_config = |clone: &std::path::Path| {
+        std::process::Command::new("git")
+            .args(["config", "--local", "--get", "maintenance.auto"])
+            .current_dir(clone)
+            .output()
+            .unwrap()
+    };
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&clone)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let (db, pool) = support::fresh_pool(&dir, "hunter").await;
+    sqlx::query(
+        "INSERT INTO repos (id, name, url, path, forge, default_branch, enabled, added_at) \
+         VALUES (1, 'alpha', 'https://example.com/r.git', ?1, 'github', 'main', 0, 1000)",
+    )
+    .bind(clone.to_string_lossy().to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    cfg.db_path = db;
+
+    let daemon = tokio::spawn(hunter::daemon::run_daemon(cfg));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while String::from_utf8_lossy(&git_config(&clone).stdout).trim() != "false" {
+        assert!(
+            !daemon.is_finished(),
+            "the daemon exited instead of running: {:?}",
+            daemon.await
+        );
+        assert!(
+            Instant::now() < deadline,
+            "a running daemon never turned maintenance off in {}",
+            clone.display()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    daemon.abort();
+}
+
 /// A skipped cycle did no work: its pick was stale (the finding left
 /// `queued`), so the next cycle starts at once rather than idling the
 /// queue for the 15-minute default (or the 5-minute PR-sync cap).

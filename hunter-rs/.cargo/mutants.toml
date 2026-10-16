@@ -85,6 +85,13 @@ exclude_re = [
     # nothing else. Whether the daemon sweeps at all is tested
     # (`daemon_test`), and that mutant is not excluded.
     "(match guard .*|replace != with ==) in sweep_workspaces",
+    # The failure checks after `workspace::fetch`'s housekeeping and after
+    # `quiet_clones`' config write only decide whether to log a warning:
+    # neither failure changes what either returns or does next (the fetch
+    # succeeded and the next one retries; startup goes on). Whether the
+    # housekeeping runs and startup quiets the clones is tested, and those
+    # mutants are not excluded.
+    "replace != with == in (fetch|quiet_clones)$",
     # `OverdriveBackend` only changes `decide`; every other method forwards
     # to the provider backend verbatim. `decide` is not excluded.
     "<impl Backend for OverdriveBackend>::(keep_fresh|status_html|run) ",

@@ -1620,7 +1620,7 @@ async fn sync_repo(
 }
 
 /// [`crate::workspace::fetch`] of `refs` on a blocking thread that holds
-/// `permit` until the fetch ends. The only way the
+/// `permit` until the fetch and its housekeeping end. The only way the
 /// daemon fetches into a clone.
 async fn fetch_held(permit: &ClonePermit<'_>, refs: &[&str]) -> (i32, String) {
     let refs: Vec<String> = refs.iter().map(|&r| r.to_owned()).collect();
