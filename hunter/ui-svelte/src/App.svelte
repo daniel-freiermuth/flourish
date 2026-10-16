@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, onDestroy } from "svelte";
+  import { onMount, onDestroy, untrack } from "svelte";
   import { store } from "./lib/api.svelte";
   import { navigation } from "./lib/navigation.svelte";
   import * as scrollMemory from "./lib/scrollMemory";
@@ -71,7 +71,13 @@
     const el = scroller;
     if (!el) return;
     cancelRestore();
-    if (arrival.saved) cancelRestore = scrollMemory.restore(el, arrival.saved, () => store.summary !== null);
+    // Untracked: restore runs its first attempt synchronously, and that
+    // reads `store.summary` through `ready`. Tracked, every poll re-ran
+    // this effect and pulled the page back to the saved position.
+    if (arrival.saved) {
+      const saved = arrival.saved;
+      cancelRestore = untrack(() => scrollMemory.restore(el, saved, () => store.summary !== null));
+    }
     // A deep link places its finding itself (AllFindingsPage).
     else if (arrival.fresh && navigation.route.focusId == null) el.scrollTo({ top: 0, behavior: "instant" });
   });
