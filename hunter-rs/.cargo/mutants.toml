@@ -72,9 +72,13 @@ exclude_globs = [
 
 # Trait method bodies that only forward, and Display impls, generate
 # mutants whose "correct" behaviour is untestable in isolation.
+#
+# Matched against the names cargo-mutants gives them, which spell the
+# trait as written (`<impl std::fmt::Display for JobStart>::fmt`) and
+# never contain `fn`: the `impl Display` and `fn fmt` this list held
+# before matched no mutant at all (`cargo mutants --list` showed them).
 exclude_re = [
-    "impl Display",
-    "fn fmt",
+    "<impl (std::)?(fmt::)?Display for [^>]+>::fmt ",
     # The match guard in `sweep_workspaces` only decides whether a pass
     # is worth a log line: both arms have already swept, so forcing the
     # guard either way or inverting it changes what is logged and
