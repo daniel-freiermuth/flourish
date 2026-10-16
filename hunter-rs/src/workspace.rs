@@ -180,12 +180,110 @@ fn missing_worktrees(porcelain: &str) -> impl Iterator<Item = &str> {
         .filter(|p| !Path::new(p).exists())
 }
 
-/// `git fetch origin <refs>` into the held clone, on the caller's
-/// blocking thread and so inside the hold.
+/// `git fetch origin <refs>` into the held clone, then the housekeeping
+/// git would have run after it, both on the caller's blocking thread and
+/// so both inside the hold.
+///
+/// Git ends a fetch -- and a commit, which workers make in their trees of
+/// this clone -- by starting `git maintenance run --auto --detach`: a
+/// process of its own that repacks, packs refs, expires reflogs and
+/// prunes worktrees in the clone after the command that started it has
+/// returned, so after the permit is let go. Under the next holder that
+/// takes `packed-refs.lock` from a `branch -D`, or prunes the
+/// registration of a `worktree add` still under way. So the fetch runs
+/// with automatic maintenance off for that one command
+/// (`-c maintenance.auto=false`, which its children inherit), and runs the
+/// housekeeping here instead, attached. `--auto` keeps git's own
+/// thresholds: most fetches find nothing worth doing.
+///
+/// Per command, not written to the clone's config: a fetch must not fail
+/// because the config cannot be rewritten (a stale `config.lock` left by a
+/// killed `git config`), and a repo row may name the operator's own
+/// checkout, whose config is not ours to change. Worker commits, which
+/// pass no such flag, are covered in the daemon's own clones by their
+/// config ([`quiet_clones`], [`CloneHold::clone_from`]).
 pub fn fetch(hold: &CloneHold, refs: &[&str], timeout_s: u64) -> (i32, String) {
-    let mut args = vec!["fetch", "origin"];
+    let mut args = vec!["-c", "maintenance.auto=false", "fetch", "origin"];
     args.extend_from_slice(refs);
-    hold.git(&args, timeout_s)
+    let fetched = hold.git(&args, timeout_s);
+    if fetched.0 == 0 {
+        let (rc, out) = hold.git(
+            &[
+                "-c",
+                "maintenance.autoDetach=false",
+                "-c",
+                "gc.autoDetach=false",
+                "maintenance",
+                "run",
+                "--auto",
+            ],
+            timeout_s,
+        );
+        if rc != 0 {
+            // The fetch itself succeeded; housekeeping is retried by the
+            // next one.
+            tracing::warn!(
+                "maintenance in {} failed: {}",
+                hold.clone_dir().display(),
+                crate::util::tail(&out, 300)
+            );
+        }
+    }
+    fetched
+}
+
+/// Turn off git's automatic maintenance in the held clone:
+/// `maintenance.auto`, written to the clone's own config, which its
+/// worktrees share, so a worker's commit in its tree starts none either.
+/// See [`fetch`] for why.
+fn disable_auto_maintenance(hold: &CloneHold) -> (i32, String) {
+    hold.git(&["config", "maintenance.auto", "false"], GIT_TIMEOUT_S)
+}
+
+/// [`disable_auto_maintenance`] in every clone of the daemon's own on
+/// disk, each under its permit. Runs once at daemon startup, before any
+/// job.
+///
+/// A clone made from now on gets the setting when it is made
+/// ([`CloneHold::clone_from`]). But a fix, and every resume, makes or
+/// reuses a tree without fetching: in a clone that predates the setting,
+/// a worker's commit would still start detached maintenance under the
+/// next holder.
+///
+/// Only the daemon's own clones (`<work_root>/repos/repo-<id>`): a repo
+/// row whose path names the operator's own checkout (kept by migration
+/// 007) keeps the operator's config. Best effort per clone, as the sweep
+/// is: a clone whose config cannot be written is logged.
+pub async fn quiet_clones(lane: &mut Lane, work_root: &Path) -> sqlx::Result<()> {
+    let repos_dir = work_root.join("repos");
+    for repo_id in lane.store().clone_ids().await? {
+        let permit = match lane.lock_clone(repo_id).await {
+            Ok(permit) => permit,
+            // Gone since it was listed: its clone went with it.
+            Err(CloneLockError::NoRepo(_)) => continue,
+            Err(CloneLockError::Db(e)) => return Err(e),
+        };
+        // Ours when the row's path is `<work_root>/repos/repo-<id>`, as
+        // the filesystem resolves both. A clone not made yet fails to
+        // resolve too: the sync that makes it sets the config.
+        let ours = std::fs::canonicalize(Store::repo_dir(&repos_dir, repo_id))
+            .is_ok_and(|own| std::fs::canonicalize(permit.clone_dir()).is_ok_and(|dir| dir == own));
+        if !ours {
+            continue;
+        }
+        let (rc, out) = permit
+            .blocking(disable_auto_maintenance)
+            .await
+            .unwrap_or((127, "spawn error".to_owned()));
+        if rc != 0 {
+            tracing::warn!(
+                "{}: disabling automatic maintenance: {}",
+                permit.clone_dir().display(),
+                crate::util::tail(&out, 300)
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The commit `rev` names in `clone` (or one of its trees), or `None`.
