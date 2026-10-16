@@ -3,7 +3,7 @@
   // lib/findingFilter.ts: pages derive their list from the URL themselves.
   import type { FindingOut } from "../lib/types";
   import { SEV_RANK } from "../lib/format";
-  import { Filter, needsSelector } from "../lib/filter.svelte";
+  import { Filter, needsSelector, restoreFilter } from "../lib/filter.svelte";
   import { navigation } from "../lib/navigation.svelte";
   import { hidingParams } from "../lib/findingFilter";
   import { readConfidence, readSelection, readSort, writeSelection, type FilterKey } from "../lib/filterUrl";
@@ -30,11 +30,16 @@
 
   // Rebuild from the URL, never from the current options: filters survive
   // loading, polling, refreshes, and same-page browser history navigation.
-  const repoFilter = $derived(new Filter(readSelection(navigation.route.params, "repo")));
-  const typeFilter = $derived(new Filter(readSelection(navigation.route.params, "type")));
-  const categoryFilter = $derived(new Filter(readSelection(navigation.route.params, "class")));
-  const severityFilter = $derived(new Filter(readSelection(navigation.route.params, "severity")));
-  const statusFilter = $derived(new Filter(readSelection(navigation.route.params, "status")));
+  // A plain object, not state: it only remembers what each derived last returned.
+  const shown: Partial<Record<FilterKey, Filter>> = {};
+  function fromUrl(key: FilterKey): Filter {
+    return (shown[key] = restoreFilter(shown[key], readSelection(navigation.route.params, key)));
+  }
+  const repoFilter = $derived(fromUrl("repo"));
+  const typeFilter = $derived(fromUrl("type"));
+  const categoryFilter = $derived(fromUrl("class"));
+  const severityFilter = $derived(fromUrl("severity"));
+  const statusFilter = $derived(fromUrl("status"));
   const minConfidence = $derived(readConfidence(navigation.route.params));
   const sortBy = $derived(readSort(navigation.route.params));
 

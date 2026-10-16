@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { Filter } from "./filter.svelte";
+import { Filter, restoreFilter } from "./filter.svelte";
 import { readConfidence, readSelection, readSort, writeSelection } from "./filterUrl";
 import { parseHash } from "./navigation.svelte";
 
@@ -65,6 +65,35 @@ describe("deep-linked filter semantics", () => {
     expect(restored.accepts("test_gap")).toBe(true);
     expect(restored.accepts("standards")).toBe(false);
     expect(params.has("type")).toBe(true);
+  });
+
+  it("puts an option back after the URL round trip of unchecking it", () => {
+    // FilterBar's flow: every click writes the URL, and the shown Filter
+    // is restored from it before the next click.
+    const options = ["bug", "perf", "style"];
+    const params = new URLSearchParams();
+    let shown = restoreFilter(undefined, readSelection(params, "type"));
+    shown.toggle("perf", options);
+    writeSelection(params, "type", shown.selection);
+    shown = restoreFilter(shown, readSelection(params, "type"));
+    shown.toggle("perf", options);
+    writeSelection(params, "type", shown.selection);
+    shown = restoreFilter(shown, readSelection(params, "type"));
+    expect(params.has("type")).toBe(false);
+    expect(shown.filtering).toBe(false);
+    expect(shown.accepts("brand_new_type")).toBe(true);
+  });
+
+  it("restores a list the shown filter did not write as an explicit link", () => {
+    // Back/Forward or a pasted link: the narrowing made from All in this
+    // session does not carry over to a different list.
+    const options = ["bug", "perf"];
+    const shown = restoreFilter(undefined, null);
+    shown.toggle("perf", options);
+    const linked = restoreFilter(shown, ["perf"]);
+    linked.toggle("bug", options);
+    expect(linked.selection).toEqual(["bug", "perf"]);
+    expect(linked.accepts("brand_new_type")).toBe(false);
   });
 
   it("parses filters independently of the existing focused-finding route", () => {
