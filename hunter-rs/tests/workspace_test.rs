@@ -17,12 +17,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use hunter::backend::{Backend, JobClass, Outlook, Verdict};
+use hunter::clones::ClonePermit;
 use hunter::config::Config;
 use hunter::domain::{FindingStatus, JobState};
 use hunter::scheduler::{Candidate, pick_next, run_fix, run_hunt, run_test_gap};
-use hunter::store::{FindingInsert, Store};
+use hunter::store::{ChainRef, FindingInsert, Store};
 use hunter::types::RunResult;
-use hunter::workspace::{self, SESSION_RETENTION_MS, TreeSpec, Workspace};
+use hunter::workspace::{self, OpenWorkspace, SESSION_RETENTION_MS, TreeSpec, Workspace};
 use sqlx::SqlitePool;
 use support::{FakeBins, GitRepo, ScriptedBackend, TempDir, git};
 
@@ -84,6 +85,26 @@ async fn fixture(label: &str, default_branch: &str) -> Fixture {
     }
 }
 
+/// The right to change repo 1's clone.
+async fn permit(f: &Fixture) -> ClonePermit<'_> {
+    f.store.test_lane().lock_clone(1).await.unwrap()
+}
+
+/// [`workspace::create`] of chain `id`'s workspace in repo 1's clone.
+async fn create(f: &Fixture, work_root: &Path, id: i64, spec: TreeSpec) -> Result<String, String> {
+    let work_root = work_root.to_owned();
+    permit(f)
+        .await
+        .blocking(move |hold| workspace::create(hold, &work_root, id, &spec))
+        .await
+        .unwrap()
+}
+
+/// Chain `origin_id` as the store names it.
+async fn chain(f: &Fixture, origin_id: i64) -> ChainRef {
+    f.store.chain_ref(origin_id).await.unwrap().unwrap()
+}
+
 /// Git changes directory to the clone before adding a worktree. A relative
 /// project root must not relocate that tree away from the worker's cwd.
 #[tokio::test]
@@ -95,13 +116,16 @@ async fn relative_project_root_creates_tree_at_worker_cwd() {
     std::env::set_current_dir(f.dir.path()).unwrap();
     let cfg = Config::load(Path::new("hunter")).unwrap();
     let ws = Workspace::for_chain(&cfg.work_root, &f.clone, 1);
-    let pinned = workspace::create(
-        &ws,
-        &TreeSpec::Branch {
+    let pinned = create(
+        &f,
+        &cfg.work_root,
+        1,
+        TreeSpec::Branch {
             name: "fix/relative-root".to_owned(),
             at: "origin/main".to_owned(),
         },
     )
+    .await
     .unwrap();
 
     assert_eq!(git(&ws.tree, &["rev-parse", "HEAD"]).trim(), pinned);
@@ -263,9 +287,16 @@ async fn suspend_then_resume_a_hunt(f: &Fixture) -> (String, String, Seen, Seen,
     let row = f.store.get_repo_by_id(1).await.unwrap().unwrap();
 
     let cold = StagedBackend::new(|ws, _| suspended_at_cap(&ws.session));
-    let first = run_hunt(&support::scope(&f.store), &f.cfg, &row, &cold, None)
-        .await
-        .unwrap();
+    let first = run_hunt(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &row,
+        &cold,
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(first.state, Some(JobState::Suspended), "{first:?}");
     let origin_id = first.job_id.unwrap();
 
@@ -305,9 +336,16 @@ async fn suspend_then_resume_a_hunt(f: &Fixture) -> (String, String, Seen, Seen,
             usage_delta: None,
         }
     });
-    let second = run_hunt(&support::scope(&f.store), &f.cfg, &row, &warm, Some(&plan))
-        .await
-        .unwrap();
+    let second = run_hunt(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &row,
+        &warm,
+        Some(&plan),
+    )
+    .await
+    .unwrap();
     assert_eq!(second.state, Some(JobState::Done), "{second:?}");
     (pinned, moved, cold.only_run(), warm.only_run(), origin_id)
 }
@@ -373,12 +411,15 @@ async fn made_workspace(f: &Fixture, id: i64, state: &str, finished_at: i64) -> 
     .await
     .unwrap();
     let ws = Workspace::for_chain(&f.cfg.work_root, &f.clone, id);
-    workspace::create(
-        &ws,
-        &TreeSpec::Detached {
+    create(
+        f,
+        &f.cfg.work_root,
+        id,
+        TreeSpec::Detached {
             at: "origin/main".to_owned(),
         },
     )
+    .await
     .expect("create the workspace");
     std::fs::write(ws.session.join("session.jsonl"), format!("{USAGE}\n")).unwrap();
     ws
@@ -394,7 +435,7 @@ async fn the_sweep_releases_only_finished_chains_and_ages_out_their_sessions() {
     let ws = made_workspace(&f, 10, "suspended", now - 1_000).await;
     support::point_repo_checkpoint(&f.pool, 1, "hunt", Some(10)).await;
 
-    workspace::sweep(&f.store, &f.cfg.work_root, now)
+    workspace::sweep(f.store.test_lane(), &f.cfg.work_root, now)
         .await
         .unwrap();
     assert!(ws.tree.is_dir(), "a checkpoint's tree is its resume");
@@ -402,7 +443,7 @@ async fn the_sweep_releases_only_finished_chains_and_ages_out_their_sessions() {
     // The work item lets go of it: given up, superseded, or the repo's
     // work started over. The row stays `suspended`, as it ended.
     support::point_repo_checkpoint(&f.pool, 1, "hunt", None).await;
-    let report = workspace::sweep(&f.store, &f.cfg.work_root, now)
+    let report = workspace::sweep(f.store.test_lane(), &f.cfg.work_root, now)
         .await
         .unwrap();
     assert_eq!(report.trees_released, 1);
@@ -418,16 +459,20 @@ async fn the_sweep_releases_only_finished_chains_and_ages_out_their_sessions() {
     );
 
     workspace::sweep(
-        &f.store,
+        f.store.test_lane(),
         &f.cfg.work_root,
         now + SESSION_RETENTION_MS - 10_000,
     )
     .await
     .unwrap();
     assert!(ws.root.is_dir(), "inside retention the workspace stays");
-    let report = workspace::sweep(&f.store, &f.cfg.work_root, now + SESSION_RETENTION_MS)
-        .await
-        .unwrap();
+    let report = workspace::sweep(
+        f.store.test_lane(),
+        &f.cfg.work_root,
+        now + SESSION_RETENTION_MS,
+    )
+    .await
+    .unwrap();
     assert_eq!(report.workspaces_removed, 1);
     assert!(!ws.root.exists(), "past retention the workspace goes");
     assert!(
@@ -501,7 +546,7 @@ async fn the_sweep_ages_a_resumed_chain_by_its_newest_attempt() {
     let ws = made_workspace(&f, 10, "suspended", origin_finished).await;
     resumed_link(&f, 11, 10, "running", None).await;
 
-    let report = workspace::sweep(&f.store, &f.cfg.work_root, now)
+    let report = workspace::sweep(f.store.test_lane(), &f.cfg.work_root, now)
         .await
         .unwrap();
     assert_eq!(report.trees_released, 0);
@@ -520,7 +565,7 @@ async fn the_sweep_ages_a_resumed_chain_by_its_newest_attempt() {
         "the newest attempt's finish"
     );
 
-    let report = workspace::sweep(&f.store, &f.cfg.work_root, now)
+    let report = workspace::sweep(f.store.test_lane(), &f.cfg.work_root, now)
         .await
         .unwrap();
     assert_eq!(report.trees_released, 1);
@@ -533,9 +578,13 @@ async fn the_sweep_ages_a_resumed_chain_by_its_newest_attempt() {
         "the origin's old finish does not age out a chain that just ended"
     );
 
-    let report = workspace::sweep(&f.store, &f.cfg.work_root, now + SESSION_RETENTION_MS + 1)
-        .await
-        .unwrap();
+    let report = workspace::sweep(
+        f.store.test_lane(),
+        &f.cfg.work_root,
+        now + SESSION_RETENTION_MS + 1,
+    )
+    .await
+    .unwrap();
     assert_eq!(report.workspaces_removed, 1);
     assert!(!ws.root.exists(), "past retention the workspace goes");
 }
@@ -554,7 +603,7 @@ async fn a_chain_given_up_after_several_attempts_releases_its_tree() {
     resumed_link(&f, 13, 12, "suspended", Some(now - 1_000)).await;
     support::point_repo_checkpoint(&f.pool, 1, "hunt", Some(13)).await;
 
-    let report = workspace::sweep(&f.store, &f.cfg.work_root, now)
+    let report = workspace::sweep(f.store.test_lane(), &f.cfg.work_root, now)
         .await
         .unwrap();
     assert_eq!(report.trees_released, 0);
@@ -564,7 +613,14 @@ async fn a_chain_given_up_after_several_attempts_releases_its_tree() {
     let status = f.store.chain_status(10).await.unwrap();
     assert_eq!((status.attempts, status.live), (4, 0), "{status:?}");
     assert!(
-        workspace::release_if_idle(&f.store, &ws).await.unwrap(),
+        workspace::release_if_idle(
+            &f.store,
+            &permit(&f).await,
+            &f.cfg.work_root,
+            &chain(&f, 10).await
+        )
+        .await
+        .unwrap(),
         "a given-up chain is released"
     );
     assert!(!ws.tree.exists());
@@ -592,9 +648,13 @@ async fn the_sweep_prunes_a_locked_registration_whose_tree_is_gone() {
     }
     std::fs::remove_dir_all(gone.parent().unwrap()).unwrap();
 
-    workspace::sweep(&f.store, &f.cfg.work_root, hunter::util::now_ms())
-        .await
-        .unwrap();
+    workspace::sweep(
+        f.store.test_lane(),
+        &f.cfg.work_root,
+        hunter::util::now_ms(),
+    )
+    .await
+    .unwrap();
 
     let listed = git(&f.clone, &["worktree", "list", "--porcelain"]);
     assert!(
@@ -610,6 +670,287 @@ async fn the_sweep_prunes_a_locked_registration_whose_tree_is_gone() {
         kept_record.contains("locked initializing"),
         "and keeps its lock: {kept_record}"
     );
+}
+
+/// A runner still uses its tree after its job is recorded: it reads the
+/// worker's outputs, and an engage hands the tree to its harvest before
+/// the harvest has a row. The job table then says the chain is finished,
+/// so only the runner's lease keeps the sweep off the tree.
+#[tokio::test]
+async fn the_sweep_keeps_a_finished_chains_tree_while_a_runner_leases_it() {
+    let f = fixture("ws-leased", "main").await;
+    let now = hunter::util::now_ms();
+    let ws = made_workspace(&f, 10, "done", now - 1_000).await;
+    let lease = OpenWorkspace::lease(
+        &permit(&f).await,
+        &f.cfg.work_root,
+        &chain(&f, ws.origin_id).await,
+    )
+    .unwrap();
+
+    let report = workspace::sweep(f.store.test_lane(), &f.cfg.work_root, now)
+        .await
+        .unwrap();
+    assert_eq!(report.trees_released, 0);
+    assert!(ws.tree.is_dir(), "a leased tree is kept");
+
+    drop(lease);
+    let report = workspace::sweep(f.store.test_lane(), &f.cfg.work_root, now)
+        .await
+        .unwrap();
+    assert_eq!(report.trees_released, 1, "and released once the lease ends");
+    assert!(!ws.tree.exists());
+}
+
+/// A release made on another chain's behalf -- a fresh job releasing the
+/// trees of the chains it superseded -- holds no lease of its own, so any
+/// lease on the tree keeps it: a runner still reading its outputs.
+#[tokio::test]
+async fn a_release_with_no_lease_of_its_own_keeps_a_leased_tree() {
+    let f = fixture("ws-release-leased", "main").await;
+    let ws = made_workspace(&f, 10, "done", hunter::util::now_ms() - 1_000).await;
+    let permit = permit(&f).await;
+    let chain = chain(&f, ws.origin_id).await;
+    let lease = OpenWorkspace::lease(&permit, &f.cfg.work_root, &chain).unwrap();
+
+    let released = workspace::release_if_idle(&f.store, &permit, &f.cfg.work_root, &chain)
+        .await
+        .unwrap();
+    assert!(!released && ws.tree.is_dir(), "a leased tree is kept");
+
+    drop(lease);
+    let released = workspace::release_if_idle(&f.store, &permit, &f.cfg.work_root, &chain)
+        .await
+        .unwrap();
+    assert!(released && !ws.tree.exists(), "and released once unleased");
+}
+
+/// A Renovate scan interrupted before its repo was deleted leaves a scan
+/// tree no listed repo's pass removes. The sweep removes it anyway, as a
+/// tree whose clone only git can name.
+#[tokio::test]
+async fn the_sweep_removes_the_scan_tree_of_a_repo_no_longer_listed() {
+    let f = fixture("ws-scan-orphan", "main").await;
+    let orphan = f.cfg.work_root.join("scan").join("repo-99");
+    std::fs::create_dir_all(orphan.join("half-written")).unwrap();
+
+    workspace::sweep(
+        f.store.test_lane(),
+        &f.cfg.work_root,
+        hunter::util::now_ms(),
+    )
+    .await
+    .unwrap();
+    assert!(!orphan.exists(), "the leftover scan tree is removed");
+}
+
+/// Under one repo's permit, git runs only in trees of that repo's clone. A
+/// chain's tree path names no clone, so a tree of another clone would be
+/// changed under a permit that does not cover it.
+#[tokio::test]
+async fn a_hold_runs_git_only_in_trees_of_its_own_clone() {
+    let f = fixture("ws-git-in-foreign", "main").await;
+    let stranger = f.dir.subdir("stranger");
+    git(&stranger, &["init", "-q"]);
+    std::fs::write(stranger.join("README.md"), "not repo 1\n").unwrap();
+    git(&stranger, &["add", "-A"]);
+    git(&stranger, &["commit", "-q", "-m", "seed"]);
+    let foreign = f.dir.join("foreign-tree");
+    let own = f.dir.join("own-tree");
+    let (ft, ot) = (
+        foreign.to_string_lossy().into_owned(),
+        own.to_string_lossy().into_owned(),
+    );
+    git(
+        &stranger,
+        &["worktree", "add", "-q", "--detach", &ft, "HEAD"],
+    );
+    git(
+        &f.clone,
+        &["worktree", "add", "-q", "--detach", &ot, "origin/main"],
+    );
+
+    let (foreign_rc, own_rc) = permit(&f)
+        .await
+        .blocking(move |hold| {
+            (
+                hold.git_in(&foreign, &["checkout", "-q", "-B", "intruder"], 30)
+                    .0,
+                hold.git_in(&own, &["checkout", "-q", "-B", "mine"], 30).0,
+            )
+        })
+        .await
+        .unwrap();
+
+    assert_ne!(foreign_rc, 0, "git ran in a tree of another clone");
+    assert!(
+        !git(&stranger, &["branch", "--list", "intruder"]).contains("intruder"),
+        "the other clone got a branch under repo 1's permit"
+    );
+    assert_eq!(own_rc, 0, "a tree of the held clone is refused");
+    assert!(git(&f.clone, &["branch", "--list", "mine"]).contains("mine"));
+}
+
+/// A `worktree add` under way looks exactly like the killed one above: a
+/// registration locked `initializing` whose directory is not there yet.
+/// The sweep's prune would unlock and drop it under the add. So the sweep
+/// changes a clone only under its permit, and waits while another holder
+/// (the runner making that tree) has it.
+#[tokio::test]
+async fn the_sweep_waits_for_the_clones_holder_before_pruning() {
+    let f = fixture("ws-permit", "main").await;
+    let adding = f.cfg.work_root.join("jobs").join("42").join("tree");
+    let a = adding.to_string_lossy().into_owned();
+    git(
+        &f.clone,
+        &["worktree", "add", "-b", "adding-branch", &a, "origin/main"],
+    );
+    git(
+        &f.clone,
+        &["worktree", "lock", "--reason", "initializing", &a],
+    );
+    std::fs::remove_dir_all(adding.parent().unwrap()).unwrap();
+    let registered = || git(&f.clone, &["worktree", "list", "--porcelain"]).contains(a.as_str());
+
+    let held = permit(&f).await;
+    let sweep = tokio::spawn({
+        let (store, root) = (f.store.clone(), f.cfg.work_root.clone());
+        async move { workspace::sweep(store.test_lane(), &root, hunter::util::now_ms()).await }
+    });
+    support::until_waiting(&f.store, 1, 1).await;
+    assert!(!sweep.is_finished(), "the sweep waits for the clone");
+    assert!(registered(), "the add under way keeps its registration");
+
+    drop(held);
+    sweep.await.unwrap().unwrap();
+    assert!(
+        !registered(),
+        "once the clone is free the stale registration goes"
+    );
+}
+
+/// A repo flagged deleted keeps its clone until it is reaped, and its
+/// clone has a permit like any other: a Renovate scan of it, or the
+/// reaper removing it, may hold that permit right now. The sweep holds it
+/// too before it touches that repo's scan tree, so it waits for the
+/// holder instead of removing the tree as a leftover under it.
+#[tokio::test]
+async fn the_sweep_waits_for_a_deleted_repos_clone_before_its_scan_tree() {
+    let f = fixture("ws-deleted-scan", "main").await;
+    let gone = f.dir.subdir("repos").join("repo-2");
+    sqlx::query(
+        "INSERT INTO repos (id, name, url, path, forge, default_branch, enabled, added_at, deleted_at) \
+         VALUES (2, 'gone', 'https://example.com/gone.git', ?1, 'github', 'main', 1, 1000, 2000)",
+    )
+    .bind(gone.to_string_lossy().to_string())
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    let scan = f.cfg.work_root.join("scan").join("repo-2");
+    std::fs::create_dir_all(scan.join("package.json.d")).unwrap();
+
+    let held = f.store.test_lane().lock_clone(2).await.unwrap();
+    let sweep = tokio::spawn({
+        let (store, root) = (f.store.clone(), f.cfg.work_root.clone());
+        async move { workspace::sweep(store.test_lane(), &root, hunter::util::now_ms()).await }
+    });
+    support::until_waiting(&f.store, 2, 1).await;
+    assert!(scan.is_dir(), "the scan tree stays while its clone is held");
+
+    drop(held);
+    sweep.await.unwrap().unwrap();
+    assert!(!scan.exists(), "once the clone is free the leftover goes");
+}
+
+/// A repo can be reaped while its Renovate scan runs: the scan holds only
+/// its scan lease, not the clone, so the reaper gets the permit and the
+/// repo row goes. Its scan tree is then one no listed repo's pass covers.
+/// The sweep keeps it while the scan's lease lives, and removes a leftover
+/// no scan leases beside it.
+#[tokio::test]
+async fn the_sweep_keeps_the_live_scan_tree_of_a_reaped_repo() {
+    let f = fixture("ws-reaped-scan", "main").await;
+    sqlx::query(
+        "INSERT INTO repos (id, name, url, path, forge, default_branch, enabled, added_at) \
+         VALUES (2, 'reaped', 'https://example.com/reaped.git', ?1, 'github', 'main', 1, 1000)",
+    )
+    .bind(
+        f.dir
+            .subdir("repos")
+            .join("repo-2")
+            .to_string_lossy()
+            .to_string(),
+    )
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    let scan = f.cfg.work_root.join("scan").join("repo-2");
+    let leftover = f.cfg.work_root.join("scan").join("repo-99");
+    std::fs::create_dir_all(scan.join("package.json.d")).unwrap();
+    std::fs::create_dir_all(leftover.join("half-written")).unwrap();
+    let lease = f
+        .store
+        .test_lane()
+        .lock_clone(2)
+        .await
+        .unwrap()
+        .lease_scan()
+        .unwrap();
+    sqlx::query("DELETE FROM repos WHERE id = 2")
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    let sweep = async || {
+        workspace::sweep(
+            f.store.test_lane(),
+            &f.cfg.work_root,
+            hunter::util::now_ms(),
+        )
+        .await
+        .unwrap();
+    };
+
+    sweep().await;
+    assert!(scan.is_dir(), "the sweep removed a live scan tree");
+    assert!(!leftover.exists(), "a scan tree no scan leases is removed");
+
+    drop(lease);
+    sweep().await;
+    assert!(!scan.exists(), "once the scan ends its tree goes");
+}
+
+/// A legacy tree of a clone no repo row names is one no permit covers: the
+/// sweep removes the directory but never runs git in that clone, so the
+/// clone's registration is only ever dropped by a prune of a clone someone
+/// holds. Before, the sweep took every listed repo's permit as leave to
+/// run `worktree remove` in whatever clone the tree named.
+#[tokio::test]
+async fn the_sweep_changes_no_clone_it_holds_no_permit_for() {
+    let f = fixture("ws-foreign-clone", "main").await;
+    let stranger = f.dir.subdir("stranger");
+    git(&stranger, &["init", "-q"]);
+    std::fs::write(stranger.join("README.md"), "not a repo of ours\n").unwrap();
+    git(&stranger, &["add", "-A"]);
+    git(&stranger, &["commit", "-q", "-m", "seed"]);
+    let tree = f.cfg.work_root.join("wt").join("x9");
+    let t = tree.to_string_lossy().into_owned();
+    git(
+        &stranger,
+        &["worktree", "add", "-q", "--detach", &t, "HEAD"],
+    );
+    let registered = || git(&stranger, &["worktree", "list", "--porcelain"]).contains(t.as_str());
+    assert!(registered());
+
+    workspace::sweep(
+        f.store.test_lane(),
+        &f.cfg.work_root,
+        hunter::util::now_ms(),
+    )
+    .await
+    .unwrap();
+
+    assert!(!tree.exists(), "the legacy tree's directory goes");
+    assert!(registered(), "the stranger's registration is not touched");
 }
 
 // -- invariant 4: a fresh fix takes over a suspended fix's branch ------------
@@ -652,6 +993,7 @@ async fn a_fresh_fix_superseding_a_suspended_fix_takes_over_its_branch() {
         ScriptedBackend::new(|tree| suspended_at_cap(&tree.parent().unwrap().join("session")));
     let first = run_fix(
         &support::scope(&f.store),
+        f.store.test_lane(),
         &f.cfg,
         &finding,
         &suspending,
@@ -674,6 +1016,7 @@ async fn a_fresh_fix_superseding_a_suspended_fix_takes_over_its_branch() {
         ScriptedBackend::writing("NOT-A-BUG.md", "Classification: wrong\nmisread the code");
     let fresh = run_fix(
         &support::scope(&f.store),
+        f.store.test_lane(),
         &f.cfg,
         &finding,
         &declining,
@@ -742,9 +1085,13 @@ async fn the_sweep_removes_legacy_trees_no_live_job_uses() {
     .unwrap();
     support::point_checkpoint(&f.pool, 5, "engage", 30).await;
 
-    let report = workspace::sweep(&f.store, &f.cfg.work_root, hunter::util::now_ms())
-        .await
-        .unwrap();
+    let report = workspace::sweep(
+        f.store.test_lane(),
+        &f.cfg.work_root,
+        hunter::util::now_ms(),
+    )
+    .await
+    .unwrap();
 
     assert!(!leftover.exists(), "an unreferenced leftover is removed");
     assert!(!registered.exists(), "an unreferenced worktree is removed");
@@ -757,6 +1104,69 @@ async fn the_sweep_removes_legacy_trees_no_live_job_uses() {
         (report.legacy_trees_removed, report.legacy_trees_kept),
         (2, 1)
     );
+}
+
+/// A pass whose legacy trees a live job all keeps has nothing to remove,
+/// so it takes no clone's permit for them: while it waits for a clone a
+/// runner holds, every other clone stays free. Before, any pass with a
+/// kept tree took every clone's permit in id order, and waiting for one
+/// held all those before it.
+#[tokio::test]
+async fn a_sweep_that_keeps_every_legacy_tree_holds_no_clone_while_it_waits() {
+    let f = fixture("ws-legacy-kept", "main").await;
+    sqlx::query(
+        "INSERT INTO repos (id, name, url, path, forge, default_branch, enabled, added_at) \
+         VALUES (2, 'beta', 'https://example.com/beta.git', ?1, 'github', 'main', 1, 1000)",
+    )
+    .bind(
+        f.dir
+            .subdir("repos")
+            .join("repo-2")
+            .to_string_lossy()
+            .to_string(),
+    )
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    let in_use = f.cfg.work_root.join("wt").join("e5");
+    std::fs::create_dir_all(&in_use).unwrap();
+    sqlx::query(
+        "INSERT INTO findings (id, type, repo_id, fingerprint, severity, confidence, summary, \
+         status, created_at, updated_at) \
+         VALUES (5, 'bug', 1, 'fp5', 'high', 0.9, 'bug 5', 'pr_open', 1000, 1000)",
+    )
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO jobs (id, kind, repo_id, finding_id, state, session_file, started_at) \
+         VALUES (30, 'engage', 1, 5, 'suspended', '/legacy/sessions/x/s.jsonl', 1000)",
+    )
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    support::point_checkpoint(&f.pool, 5, "engage", 30).await;
+
+    let held = f.store.test_lane().lock_clone(2).await.unwrap();
+    let sweep = tokio::spawn({
+        let (store, root) = (f.store.clone(), f.cfg.work_root.clone());
+        async move { workspace::sweep(store.test_lane(), &root, hunter::util::now_ms()).await }
+    });
+    support::until_waiting(&f.store, 2, 1).await;
+    let other = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        f.store.test_lane().lock_clone(1),
+    )
+    .await;
+    assert!(
+        other.is_ok_and(|p| p.is_ok()),
+        "repo 1's clone was held while the sweep waited for repo 2's"
+    );
+
+    drop(held);
+    let report = sweep.await.unwrap().unwrap();
+    assert!(in_use.is_dir(), "the checkpoint's legacy tree is kept");
+    assert_eq!(report.legacy_trees_kept, 1);
 }
 
 // -- invariant 6: a tree that cannot be made ---------------------------------
@@ -773,9 +1183,16 @@ async fn a_cold_job_whose_tree_cannot_be_made_fails_and_leaves_nothing() {
     let row = f.store.get_repo_by_id(1).await.unwrap().unwrap();
     let backend = ScriptedBackend::new(|_| panic!("nothing may run without a tree"));
 
-    let summary = run_test_gap(&support::scope(&f.store), &f.cfg, &row, &backend, None)
-        .await
-        .unwrap();
+    let summary = run_test_gap(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &row,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(summary.state, Some(JobState::Failed), "{summary:?}");
     let job = summary
@@ -817,12 +1234,15 @@ async fn creating_over_an_existing_workspace_is_refused() {
     std::fs::create_dir_all(&ws.session).unwrap();
     std::fs::write(ws.session.join("other.jsonl"), "someone else's\n").unwrap();
 
-    let made = workspace::create(
-        &ws,
-        &TreeSpec::Detached {
+    let made = create(
+        &f,
+        &f.cfg.work_root,
+        7,
+        TreeSpec::Detached {
             at: "origin/main".to_owned(),
         },
-    );
+    )
+    .await;
 
     assert!(made.is_err(), "{made:?}");
     assert!(!ws.tree.exists());
@@ -855,9 +1275,16 @@ async fn a_cold_job_fetches_the_clone_but_never_moves_its_checkout() {
         usage_delta: None,
     });
 
-    run_hunt(&support::scope(&f.store), &f.cfg, &row, &backend, None)
-        .await
-        .unwrap();
+    run_hunt(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &row,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
 
     let seen = backend.only_run();
     assert_eq!(seen.head, moved, "the tree is built at the fetched tip");
@@ -899,6 +1326,7 @@ async fn a_suspended_fix_whose_work_concluded_keeps_no_checkpoint_and_is_release
 
         let summary = run_fix(
             &support::scope(&f.store),
+            f.store.test_lane(),
             &f.cfg,
             &finding,
             &concluded,
@@ -967,6 +1395,7 @@ async fn a_suspended_harvest_keeps_its_tree() {
 
     let summary = hunter::scheduler::run_harvest(
         &support::scope(&f.store),
+        f.store.test_lane(),
         &f.cfg,
         &finding,
         &suspending,
@@ -1035,7 +1464,7 @@ async fn the_sweep_ages_out_legacy_session_dirs_no_live_job_recorded() {
         .unwrap();
     }
 
-    let report = workspace::sweep(&f.store, &f.cfg.work_root, now)
+    let report = workspace::sweep(f.store.test_lane(), &f.cfg.work_root, now)
         .await
         .unwrap();
 
@@ -1083,6 +1512,7 @@ async fn renovate_scans_a_tree_at_the_fetched_tip() {
 
     hunter::scheduler::run_dep_update(
         &support::scope(&f.store),
+        f.store.test_lane(),
         &f.cfg,
         &row,
         &ScriptedBackend::noop(),
@@ -1104,5 +1534,74 @@ async fn renovate_scans_a_tree_at_the_fetched_tip() {
             .any(|l| l == "LATER.md"),
         "the scan sees the fetched tip, which only origin has"
     );
+    assert!(!scan.exists(), "the scan tree does not outlive the scan");
+}
+
+/// Renovate's lookups go to the network, so the scan holds the clone only
+/// to make and remove its tree: while Renovate runs, another lane gets
+/// the clone at once, and the sweep, under that same permit, keeps the
+/// live scan tree.
+#[tokio::test]
+async fn renovate_runs_holding_no_clone_and_the_sweep_keeps_its_tree() {
+    let bins = FakeBins::acquire("ws-renovate-free");
+    let f = fixture("ws-renovate-free", "main").await;
+    let started = f.dir.join("renovate-started");
+    let release = f.dir.join("renovate-release");
+    bins.script(
+        "renovate",
+        &format!(
+            // Bounded, so a failing assertion below cannot leave it waiting.
+            "touch '{}'\ni=0\nwhile [ ! -e '{}' ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done\nexit 1",
+            started.display(),
+            release.display()
+        ),
+    );
+    std::fs::write(
+        f.dir.join("playbooks").join("dep_update.md"),
+        "deps {{REPO_PATH}} -> {{OUT_PATH}}\n",
+    )
+    .unwrap();
+    let row = f.store.get_repo_by_id(1).await.unwrap().unwrap();
+    let scan = f.cfg.work_root.join("scan").join("repo-1");
+
+    let scope = support::scope(&f.store);
+    let backend = ScriptedBackend::noop();
+    let runner = hunter::scheduler::run_dep_update(
+        &scope,
+        f.store.test_lane(),
+        &f.cfg,
+        &row,
+        &backend,
+        None,
+    );
+    let meanwhile = async {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !started.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("renovate started");
+        let free = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            f.store.test_lane().lock_clone(1),
+        )
+        .await;
+        assert!(
+            free.is_ok_and(|p| p.is_ok()),
+            "the clone is held while Renovate runs"
+        );
+        workspace::sweep(
+            f.store.test_lane(),
+            &f.cfg.work_root,
+            hunter::util::now_ms(),
+        )
+        .await
+        .unwrap();
+        assert!(scan.is_dir(), "the sweep removed a live scan tree");
+        std::fs::write(&release, "").unwrap();
+    };
+    let (ran, ()) = tokio::join!(runner, meanwhile);
+    ran.unwrap();
     assert!(!scan.exists(), "the scan tree does not outlive the scan");
 }

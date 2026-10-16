@@ -47,7 +47,12 @@ async fn next_signal(sig: Option<Signal>) {
 /// only, so no job is mid-flight; best effort, since a failed pass is
 /// retried before the next cycle.
 async fn sweep_workspaces(store: &Store, work_root: &Path) {
-    match crate::workspace::sweep(store, work_root, crate::util::now_ms()).await {
+    let swept = store
+        .lane(async |lane| crate::workspace::sweep(lane, work_root, crate::util::now_ms()).await)
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|r| r);
+    match swept {
         Ok(r) if r != crate::workspace::SweepReport::default() => {
             tracing::info!("workspace sweep: {r:?}");
         }

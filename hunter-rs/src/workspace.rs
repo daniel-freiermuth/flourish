@@ -18,21 +18,26 @@
 //!
 //! The clone under `repos/repo-<id>` is only an object store: it is
 //! fetched, never checked out, so no job can move HEAD under another.
+//! Every git command here that changes a clone runs under that clone's
+//! [`ClonePermit`] (`crate::clones`).
 //!
-//! Every removal here is gated on the job table. [`release_if_idle`] and
-//! [`sweep`] read the chain's state from the database before touching a
-//! tree, and a chain with a `running` attempt or a checkpoint (a finding
-//! work item's `checkpoint_job_id`, or a repo-level `suspended` attempt) is
-//! never touched. The one exception is [`create`] cleaning up a workspace it
-//! made itself a moment earlier for a job that has not run.
+//! Every removal here is gated on the job table and on the runners'
+//! [`TreeLease`]s. [`release_if_idle`] and [`sweep`] read the chain's
+//! state from the database before touching a tree, and a chain with a
+//! `running` attempt or a checkpoint (a finding work item's
+//! `checkpoint_job_id`, or a repo-level `suspended` attempt), or a tree a
+//! runner still holds, is never touched. The one exception is [`create`]
+//! cleaning up a workspace it made itself a moment earlier for a job that
+//! has not run.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
+use crate::clones::{CloneHold, ClonePermit, ForeignChain, Lane, TreeLease, Unheld};
 use crate::domain::{FindingJobKind, JobKind, JobState};
-use crate::store::Store;
+use crate::store::{ChainRef, ChainStatus, CloneLockError, CloneRef, Store};
 
 /// How long a finished chain's transcript is kept.
 ///
@@ -71,6 +76,14 @@ impl Workspace {
             root,
             clone: clone.to_owned(),
         }
+    }
+
+    /// Chain `origin_id`'s workspace in `clone`: how every function that
+    /// changes a tree names it, from the permit or hold it changes it
+    /// under, so the tree they change and the clone they hold are one by
+    /// construction.
+    pub fn in_clone(work_root: &Path, clone: &CloneRef, origin_id: i64) -> Self {
+        Self::for_chain(work_root, clone.dir(), origin_id)
     }
 
     /// The per-repo cargo build cache a worker compiles into.
@@ -129,10 +142,6 @@ pub enum TreeSpec {
     PrHead { head_ref: String },
 }
 
-fn git(argv: &[&str]) -> (i32, String) {
-    crate::util::run_cmd(argv, GIT_TIMEOUT_S)
-}
-
 /// `git worktree prune`, after unlocking every registration whose
 /// directory is gone.
 ///
@@ -151,14 +160,14 @@ fn git(argv: &[&str]) -> (i32, String) {
 /// is gone but was never locked is unlocked too, which git refuses
 /// harmlessly; telling the two apart would buy nothing, since prune
 /// removes both.
-fn prune_worktrees(clone: &str) {
-    let (rc, out) = git(&["git", "-C", clone, "worktree", "list", "--porcelain", "-z"]);
+fn prune_worktrees(permit: &CloneHold) {
+    let (rc, out) = permit.git(&["worktree", "list", "--porcelain", "-z"], GIT_TIMEOUT_S);
     if rc == 0 {
         for path in missing_worktrees(&out) {
-            git(&["git", "-C", clone, "worktree", "unlock", path]);
+            permit.git(&["worktree", "unlock", path], GIT_TIMEOUT_S);
         }
     }
-    git(&["git", "-C", clone, "worktree", "prune"]);
+    permit.git(&["worktree", "prune"], GIT_TIMEOUT_S);
 }
 
 /// Paths in `git worktree list --porcelain -z` output whose directory does
@@ -171,16 +180,24 @@ fn missing_worktrees(porcelain: &str) -> impl Iterator<Item = &str> {
         .filter(|p| !Path::new(p).exists())
 }
 
-/// The commit `rev` names in `clone`, or `None`.
+/// `git fetch origin <refs>` into the held clone, on the caller's
+/// blocking thread and so inside the hold.
+pub fn fetch(hold: &CloneHold, refs: &[&str], timeout_s: u64) -> (i32, String) {
+    let mut args = vec!["fetch", "origin"];
+    args.extend_from_slice(refs);
+    hold.git(&args, timeout_s)
+}
+
+/// The commit `rev` names in `clone` (or one of its trees), or `None`.
 pub fn resolve(clone: &Path, rev: &str) -> Option<String> {
-    let c = clone.to_string_lossy();
-    let spec = format!("{rev}^{{commit}}");
-    let (rc, out) = git(&["git", "-C", &c, "rev-parse", "--verify", "--quiet", &spec]);
+    let (rc, out) = Unheld::Commit { rev }.run(clone, GIT_TIMEOUT_S);
     let sha = out.trim();
     (rc == 0 && !sha.is_empty()).then(|| sha.to_owned())
 }
 
-/// Make a cold chain's workspace and return the commit its tree is at.
+/// Make chain `origin_id`'s workspace in the held clone, and return the
+/// commit its tree is at. The workspace is the hold's
+/// ([`Workspace::in_clone`]): no caller names the clone a tree goes in.
 ///
 /// Refuses a workspace that already exists rather than reusing or clearing
 /// it: `origin_id` is a job row inserted a moment ago, so a directory
@@ -192,7 +209,13 @@ pub fn resolve(clone: &Path, rev: &str) -> Option<String> {
 /// On any failure after the directory was made, everything it made is
 /// removed before returning, so a job whose tree could not be built leaves
 /// nothing behind.
-pub fn create(ws: &Workspace, spec: &TreeSpec) -> Result<String, String> {
+pub fn create(
+    permit: &CloneHold,
+    work_root: &Path,
+    origin_id: i64,
+    spec: &TreeSpec,
+) -> Result<String, String> {
+    let ws = Workspace::in_clone(work_root, permit.clone_ref(), origin_id);
     if ws.root.exists() {
         return Err(format!("workspace {} already exists", ws.root.display()));
     }
@@ -200,25 +223,26 @@ pub fn create(ws: &Workspace, spec: &TreeSpec) -> Result<String, String> {
         let _ = std::fs::remove_dir_all(&ws.root);
         return Err(format!("cannot create {}: {e}", ws.session.display()));
     }
-    let made = add_tree(ws, spec);
+    let made = add_tree(permit, &ws.tree, spec);
     if made.is_err() {
-        release_tree(ws);
+        release_tree(Some(permit), &ws.tree);
         let _ = std::fs::remove_dir_all(&ws.root);
     }
     made
 }
 
-fn add_tree(ws: &Workspace, spec: &TreeSpec) -> Result<String, String> {
-    let c = ws.clone.to_string_lossy();
-    let t = ws.tree.to_string_lossy();
+fn add_tree(permit: &CloneHold, tree: &Path, spec: &TreeSpec) -> Result<String, String> {
+    let t = tree.to_string_lossy();
     let failed = |what: &str, out: &str| format!("{what} failed: {}", crate::util::tail(out, 300));
     let commit = |rev: &str| {
-        resolve(&ws.clone, rev).ok_or_else(|| format!("{rev} does not resolve to a commit"))
+        resolve(permit.clone_dir(), rev)
+            .ok_or_else(|| format!("{rev} does not resolve to a commit"))
     };
+    let git = |args: &[&str]| permit.git(args, GIT_TIMEOUT_S);
     match spec {
         TreeSpec::Detached { at } => {
             let at = commit(at)?;
-            let (rc, out) = git(&["git", "-C", &c, "worktree", "add", "--detach", &t, &at]);
+            let (rc, out) = git(&["worktree", "add", "--detach", &t, &at]);
             if rc != 0 {
                 return Err(failed("worktree add", &out));
             }
@@ -226,7 +250,7 @@ fn add_tree(ws: &Workspace, spec: &TreeSpec) -> Result<String, String> {
         }
         TreeSpec::Branch { name, at } => {
             let at = commit(at)?;
-            let add = || git(&["git", "-C", &c, "worktree", "add", "-b", name, &t, &at]);
+            let add = || git(&["worktree", "add", "-b", name, &t, &at]);
             let (rc, _) = add();
             if rc == 0 {
                 return Ok(at);
@@ -242,9 +266,9 @@ fn add_tree(ws: &Workspace, spec: &TreeSpec) -> Result<String, String> {
             // PR is `pr_open` and never re-enters `fix`. A tree half-made
             // by the failed attempt is removed first, or the retry's add
             // would fail on the directory instead.
-            let _ = std::fs::remove_dir_all(&ws.tree);
-            prune_worktrees(&c);
-            git(&["git", "-C", &c, "branch", "-D", name]);
+            let _ = std::fs::remove_dir_all(tree);
+            prune_worktrees(permit);
+            git(&["branch", "-D", name]);
             let (rc, out) = add();
             if rc != 0 {
                 return Err(failed("worktree add", &out));
@@ -254,7 +278,7 @@ fn add_tree(ws: &Workspace, spec: &TreeSpec) -> Result<String, String> {
         TreeSpec::PrHead { head_ref } => {
             let remote = format!("origin/{head_ref}");
             let sha = commit(&remote)?;
-            let (rc, out) = git(&["git", "-C", &c, "worktree", "add", "--detach", &t, &sha]);
+            let (rc, out) = git(&["worktree", "add", "--detach", &t, &sha]);
             if rc != 0 {
                 return Err(failed("worktree add", &out));
             }
@@ -262,7 +286,7 @@ fn add_tree(ws: &Workspace, spec: &TreeSpec) -> Result<String, String> {
             // HEAD at the same commit still works, and the push names its
             // refspec (`HEAD:<head_ref>`) explicitly. `origin/<head_ref>`
             // rather than the sha so the local branch tracks the remote.
-            git(&["git", "-C", &t, "checkout", "-B", head_ref, &remote]);
+            permit.git_in(tree, &["checkout", "-B", head_ref, &remote], GIT_TIMEOUT_S);
             Ok(sha)
         }
     }
@@ -275,43 +299,116 @@ fn add_tree(ws: &Workspace, spec: &TreeSpec) -> Result<String, String> {
 /// undoing its own work. A missing tree is not an error; a tree git will
 /// not remove (a clone that is gone, a corrupt registration) is deleted
 /// outright and its registration pruned, since the chain is finished
-/// either way.
-fn release_tree(ws: &Workspace) {
-    // Git only when the clone is really there: `git -C ""` runs in the
-    // daemon's own cwd, which may be some unrelated repository whose
-    // worktrees are not ours to prune.
-    let clone = ws.clone.is_dir().then(|| ws.clone.to_string_lossy());
-    if ws.tree.exists() {
-        if let Some(c) = &clone {
-            let t = ws.tree.to_string_lossy();
-            git(&["git", "-C", c, "worktree", "remove", "--force", &t]);
+/// either way. `clone` is `None` for a chain whose repo is gone: there is
+/// no registration left to remove, only the directory.
+fn release_tree(clone: Option<&CloneHold>, tree: &Path) {
+    // Git only when the clone is really there: `git -C <missing>` fails,
+    // and nothing would be left to prune.
+    let clone = clone.filter(|p| p.clone_dir().is_dir());
+    if tree.exists() {
+        if let Some(p) = clone {
+            let t = tree.to_string_lossy();
+            p.git(&["worktree", "remove", "--force", &t], GIT_TIMEOUT_S);
         }
-        if ws.tree.exists() {
-            let _ = std::fs::remove_dir_all(&ws.tree);
+        if tree.exists() {
+            let _ = std::fs::remove_dir_all(tree);
         }
     }
-    if let Some(c) = &clone {
-        prune_worktrees(c);
+    if let Some(p) = clone {
+        prune_worktrees(p);
     }
 }
 
-/// Release a chain's tree if, according to the database, no attempt of the
-/// chain is `running` or a checkpoint awaiting resume (see
-/// [`Store::chain_status`]). Returns whether it released.
+/// Release `chain`'s tree in the permit's clone if, according to the
+/// database, no attempt of the chain is `running` or a checkpoint awaiting
+/// resume (see [`Store::chain_status`]), and no runner holds a lease on
+/// it. Returns whether it released.
 ///
-/// The executors call this after recording a job's outcome, and for every
-/// chain a fresh job superseded; both are the moment a chain becomes
-/// terminal. Reading the state back rather than trusting the caller's
-/// local copy is what keeps a suspended chain's tree safe from every
-/// caller, including ones written later.
-pub async fn release_if_idle(store: &Store, ws: &Workspace) -> anyhow::Result<bool> {
-    let status = store.chain_status(ws.origin_id).await?;
-    if status.live > 0 {
+/// The executors call this for every chain a fresh job superseded, and
+/// [`OpenWorkspace::close`] the same check with the runner's own lease
+/// discounted, after recording a job's outcome; both are the moment a
+/// chain becomes terminal. Reading the state back rather than trusting the
+/// caller's local copy is what keeps a suspended chain's tree safe from
+/// every caller, including ones written later; the leases are what keep a
+/// tree safe between a job being recorded and its runner being done with
+/// it. A chain of another clone is refused ([`ForeignChain`]): its leases
+/// are taken under its own clone's permit, not this one.
+pub async fn release_if_idle(
+    store: &Store,
+    permit: &ClonePermit<'_>,
+    work_root: &Path,
+    chain: &ChainRef,
+) -> anyhow::Result<bool> {
+    permit.holds_chain(chain)?;
+    let leased = store.clones().chain_leases(chain.origin_id()) > 0;
+    let ws = Workspace::in_clone(work_root, permit.clone_ref(), chain.origin_id());
+    release_unless_live(store, permit, &ws, leased).await
+}
+
+/// [`release_if_idle`] once whether another runner leases the tree is
+/// known.
+async fn release_unless_live(
+    store: &Store,
+    permit: &ClonePermit<'_>,
+    ws: &Workspace,
+    leased: bool,
+) -> anyhow::Result<bool> {
+    if leased || store.chain_status(ws.origin_id).await?.live > 0 {
         return Ok(false);
     }
-    let ws = ws.clone();
-    tokio::task::spawn_blocking(move || release_tree(&ws)).await?;
+    let tree = ws.tree.clone();
+    permit
+        .blocking(move |hold| release_tree(Some(hold), &tree))
+        .await?;
     Ok(true)
+}
+
+/// A chain's workspace as the runner of one of its attempts holds it: the
+/// paths, which repo's clone the tree is in, and the runner's
+/// [`TreeLease`], taken before the tree exists. Ended by [`Self::close`]
+/// once the runner is done with the tree, or by being dropped, which ends
+/// the lease and leaves the tree to the sweep.
+pub struct OpenWorkspace {
+    ws: Workspace,
+    clone: CloneRef,
+    lease: TreeLease,
+}
+
+impl OpenWorkspace {
+    /// Hold `chain`'s tree in the permit's clone ([`ClonePermit::lease`],
+    /// which refuses a chain of another clone). Its paths are the
+    /// permit's ([`Workspace::in_clone`]), so the lease, the tree and the
+    /// clone [`Self::close`] locks again are one.
+    pub fn lease(
+        permit: &ClonePermit<'_>,
+        work_root: &Path,
+        chain: &ChainRef,
+    ) -> Result<Self, ForeignChain> {
+        Ok(Self {
+            lease: permit.lease(chain)?,
+            clone: permit.clone_ref().clone(),
+            ws: Workspace::in_clone(work_root, permit.clone_ref(), chain.origin_id()),
+        })
+    }
+
+    /// Release the tree unless the chain is still live or another runner
+    /// holds it ([`release_if_idle`], this runner's own lease discounted),
+    /// taking the clone's permit for it in the runner's `lane`. Consumes
+    /// the workspace: once closed, its tree may be gone, so nothing can
+    /// reach it through this value again, nor close it twice.
+    pub async fn close(self, lane: &mut Lane) -> anyhow::Result<bool> {
+        let store = lane.store().clone();
+        let permit = lane.lock(&self.clone).await;
+        release_unless_live(&store, &permit, &self.ws, self.lease.shared()).await
+    }
+}
+
+impl std::ops::Deref for OpenWorkspace {
+    type Target = Workspace;
+
+    fn deref(&self) -> &Workspace {
+        &self.ws
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -323,61 +420,106 @@ pub async fn release_if_idle(store: &Store, ws: &Workspace) -> anyhow::Result<bo
 /// Renovate reads the manifests of a working tree, and the clone's own
 /// working tree is never updated now that the clone is fetch-only. The scan
 /// creates no job row, so it has no chain and no workspace; it gets this
-/// tree at `<work_root>/scan/repo-<id>` instead, made and removed within
-/// the one call. Nothing in the job table ever refers to it, and a leftover
-/// from a crash mid-scan is removed by [`sweep`], which only runs between
-/// cycles, when no scan can be in progress.
+/// tree at `<work_root>/scan/repo-<id>` instead.
+///
+/// The tree is made and removed under the clone's permit, and kept in
+/// between by the repo's scan lease ([`ClonePermit::lease_scan`]) rather
+/// than by the permit: Renovate's local dry-run lookup only reads the
+/// tree, and its lookups go to registries and the forge, so the clone
+/// stays free for others while they run. The lease, taken under the
+/// permit, refuses a second scan of the repo, which would share the path,
+/// and keeps the sweep, which removes scan leftovers under the same
+/// permit, off a live tree.
+///
+/// Removed by [`Self::discard`]. One dropped instead (a cancelled cycle)
+/// ends its lease and leaves the tree as a leftover, which the next scan
+/// of the repo or the sweep removes.
 pub struct ScanTree {
     path: PathBuf,
-    clone: PathBuf,
+    clone: CloneRef,
+    _lease: TreeLease,
 }
 
 impl ScanTree {
-    pub fn create(work_root: &Path, clone: &Path, repo_id: i64, at: &str) -> Result<Self, String> {
-        let path = scan_root(work_root).join(format!("repo-{repo_id}"));
-        let tree = Self {
+    /// Make the permit's repo's scan tree at `at`, and let the clone go:
+    /// the permit is consumed once the tree exists.
+    pub async fn create(
+        work_root: &Path,
+        permit: ClonePermit<'_>,
+        at: &str,
+    ) -> Result<Self, String> {
+        let lease = permit.lease_scan().map_err(|e| e.to_string())?;
+        let path = scan_tree_path(work_root, permit.repo_id());
+        let (p, at) = (path.clone(), at.to_owned());
+        permit
+            .blocking(move |hold| make_scan_tree(hold, &p, &at))
+            .await
+            .map_err(|e| format!("scan worktree add: {e}"))??;
+        Ok(Self {
             path,
-            clone: clone.to_owned(),
-        };
-        // A leftover from an interrupted scan of this repo: same owner,
-        // same purpose, and no job refers to it.
-        tree.discard();
-        if let Some(parent) = tree.path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let c = tree.clone.to_string_lossy();
-        let p = tree.path.to_string_lossy();
-        let (rc, out) = git(&["git", "-C", &c, "worktree", "add", "--detach", &p, at]);
-        if rc != 0 {
-            tree.discard();
-            return Err(format!(
-                "scan worktree add failed: {}",
-                crate::util::tail(&out, 300)
-            ));
-        }
-        Ok(tree)
+            clone: permit.clone_ref().clone(),
+            _lease: lease,
+        })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    fn discard(&self) {
-        let c = self.clone.to_string_lossy();
-        if self.path.exists() {
-            let p = self.path.to_string_lossy();
-            git(&["git", "-C", &c, "worktree", "remove", "--force", &p]);
-            let _ = std::fs::remove_dir_all(&self.path);
+    /// Remove the tree, taking the clone's permit again in `lane`. The
+    /// lease ends after the removal, still under the permit.
+    pub async fn discard(self, lane: &mut Lane) {
+        let Self {
+            path,
+            clone,
+            _lease: lease,
+        } = self;
+        let permit = lane.lock(&clone).await;
+        let p = path.clone();
+        if let Err(e) = permit
+            .blocking(move |hold| discard_scan_tree(hold, &p))
+            .await
+        {
+            tracing::warn!("removing scan tree {}: {e}", path.display());
         }
-        if self.clone.is_dir() {
-            prune_worktrees(&c);
-        }
+        drop(lease);
+        drop(permit);
     }
 }
 
-impl Drop for ScanTree {
-    fn drop(&mut self) {
-        self.discard();
+/// Make the scan tree at `path` in the held clone, first removing any
+/// leftover of an interrupted scan: same owner, same purpose, and the
+/// caller's lease says no scan is using it.
+fn make_scan_tree(hold: &CloneHold, path: &Path, at: &str) -> Result<(), String> {
+    discard_scan_tree(hold, path);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let p = path.to_string_lossy();
+    let (rc, out) = hold.git(&["worktree", "add", "--detach", &p, at], GIT_TIMEOUT_S);
+    if rc != 0 {
+        discard_scan_tree(hold, path);
+        return Err(format!(
+            "scan worktree add failed: {}",
+            crate::util::tail(&out, 300)
+        ));
+    }
+    Ok(())
+}
+
+/// `<work_root>/scan/repo-<id>`: the one scan tree repo `repo_id` has.
+fn scan_tree_path(work_root: &Path, repo_id: i64) -> PathBuf {
+    scan_root(work_root).join(format!("repo-{repo_id}"))
+}
+
+fn discard_scan_tree(permit: &CloneHold, path: &Path) {
+    if path.exists() {
+        let p = path.to_string_lossy();
+        permit.git(&["worktree", "remove", "--force", &p], GIT_TIMEOUT_S);
+        let _ = std::fs::remove_dir_all(path);
+    }
+    if permit.clone_dir().is_dir() {
+        prune_worktrees(permit);
     }
 }
 
@@ -400,83 +542,108 @@ pub struct SweepReport {
 }
 
 /// Reclaim what finished chains, and the layouts before this one, left on
-/// disk. Runs at daemon startup and before every cycle, never during one.
+/// disk. Runs at daemon startup and before every cycle.
 ///
 /// Nothing is removed without first reading from the database that no
-/// `running` job or checkpoint needs it. A finding's checkpoint goes when
-/// the finding leaves its kind's tier (migration 024's trigger), so a
-/// checkpoint nothing will ever resume does not hold its tree forever:
+/// `running` job or checkpoint needs it, and no tree a runner leases. A
+/// finding's checkpoint goes when the finding leaves its kind's tier
+/// (migration 024's trigger), so a checkpoint nothing will ever resume
+/// does not hold its tree forever. Every change of a clone is made under
+/// that clone's [`ClonePermit`]:
 ///
-/// (a) `<work_root>/jobs/<id>/`: a chain with no live attempt has its tree
-///     released (normally the executor already did; this catches a job
-///     that crashed between recording its outcome and releasing). Once the
-///     chain's latest attempt finished more than [`SESSION_RETENTION_MS`]
-///     ago the whole workspace, transcript included, goes. A workspace no
-///     job row owns is aged by its directory's mtime.
+/// (a) `<work_root>/jobs/<id>/`: a chain with no live attempt and no lease
+///     has its tree released (normally the executor already did; this
+///     catches a job that crashed between recording its outcome and
+///     releasing). Once the chain's latest attempt finished more than
+///     [`SESSION_RETENTION_MS`] ago the whole workspace, transcript
+///     included, goes. A workspace no job row owns is aged by its
+///     directory's mtime.
 /// (b) `<work_root>/wt/*`, the finding-keyed trees of the previous layout:
 ///     removed, unless a live job's session file lies inside one or the
 ///     old per-kind naming (`f`/`e`/`h` + finding id) says a live job ran
-///     there. Those are kept and logged once.
+///     there. Those are kept and logged once. The owning clone of such a
+///     tree is only known to git, so this step holds every repo's permit.
 /// (c) `<work_root>/sessions/<run-dir>`, the per-run transcripts of the
 ///     previous layout: removed once older than [`SESSION_RETENTION_MS`],
 ///     aged by the finish time of the jobs that recorded a transcript in
 ///     it, else by its mtime. Never one a live job recorded.
 /// (d) `git worktree prune` on every repo clone, so a tree removed by hand
 ///     or by a killed `worktree add` does not keep its branch checked out.
-/// (e) `<work_root>/scan/*`: leftovers of an interrupted Renovate scan.
+///     Every clone means every repo row's, including one flagged deleted:
+///     its clone stays on disk until it is reaped.
+/// (e) `<work_root>/scan/*`: leftovers of an interrupted Renovate scan. A
+///     live scan holds its repo's permit, so one is never removed.
 ///
 /// Kept, always, whatever the job table says: the clones under
 /// `<work_root>/repos/`, including each clone's `target/`, which is the
 /// per-repo cargo build cache every worker compiles into (see
 /// [`Workspace::build_cache`]); `<work_root>/out/`; and a chain's
 /// `session/` while its workspace is inside retention.
-pub async fn sweep(store: &Store, work_root: &Path, now_ms: i64) -> anyhow::Result<SweepReport> {
+pub async fn sweep(lane: &mut Lane, work_root: &Path, now_ms: i64) -> anyhow::Result<SweepReport> {
     let mut report = SweepReport::default();
-    sweep_chains(store, work_root, now_ms, &mut report).await?;
-    sweep_legacy_trees(store, work_root, &mut report).await?;
-    sweep_legacy_sessions(store, work_root, now_ms, &mut report).await?;
-    prune_clones_and_scans(store, work_root).await?;
+    sweep_chains(lane, work_root, now_ms, &mut report).await?;
+    sweep_legacy_trees(lane, work_root, &mut report).await?;
+    sweep_legacy_sessions(lane.store(), work_root, now_ms, &mut report).await?;
+    prune_clones_and_scans(lane, work_root).await?;
     Ok(report)
 }
 
 /// Step (a) of [`sweep`].
 async fn sweep_chains(
-    store: &Store,
+    lane: &mut Lane,
     work_root: &Path,
     now_ms: i64,
     report: &mut SweepReport,
 ) -> anyhow::Result<()> {
+    let store = lane.store().clone();
+    let in_use = |status: &ChainStatus, origin_id| {
+        status.live > 0 || store.clones().chain_leases(origin_id) > 0
+    };
     for (origin_id, root) in numbered_dirs(&jobs_root(work_root)) {
         let status = store.chain_status(origin_id).await?;
-        if status.live > 0 {
+        if in_use(&status, origin_id) {
             continue;
         }
-        let clone = status
-            .clone
-            .as_deref()
-            .map_or_else(PathBuf::new, PathBuf::from);
-        let ws = Workspace::for_chain(work_root, &clone, origin_id);
+        let permit = match &status.clone {
+            Some(clone) => Some(lane.lock(clone).await),
+            None => None,
+        };
+        // Again under the permit: the first look only named the clone.
+        let status = store.chain_status(origin_id).await?;
+        if in_use(&status, origin_id) {
+            continue;
+        }
+        let ws = Workspace::for_chain(
+            work_root,
+            permit.as_ref().map_or(Path::new(""), |p| p.clone_dir()),
+            origin_id,
+        );
         // A workspace no row owns, or whose rows never finished, is aged by
         // its directory instead.
         let last = status.last_finished_at.or_else(|| mtime_ms(&root));
         let expired = last.is_some_and(|t| now_ms - t > SESSION_RETENTION_MS);
         let had_tree = ws.tree.exists();
-        tokio::task::spawn_blocking(move || {
-            release_tree(&ws);
+        let release = move |hold: Option<&CloneHold>| {
+            release_tree(hold, &ws.tree);
             if expired {
                 let _ = std::fs::remove_dir_all(&ws.root);
             }
-        })
-        .await?;
+        };
+        match &permit {
+            Some(p) => p.blocking(move |hold| release(Some(hold))).await?,
+            None => tokio::task::spawn_blocking(move || release(None)).await?,
+        }
         report.trees_released += usize::from(had_tree);
         report.workspaces_removed += usize::from(expired && !root.exists());
     }
     Ok(())
 }
 
-/// Step (b) of [`sweep`].
+/// Step (b) of [`sweep`]. Every clone's permit is taken only when there is
+/// a tree to remove, not for one a live job keeps: a pass that removes
+/// nothing waits for no runner.
 async fn sweep_legacy_trees(
-    store: &Store,
+    lane: &mut Lane,
     work_root: &Path,
     report: &mut SweepReport,
 ) -> anyhow::Result<()> {
@@ -486,7 +653,8 @@ async fn sweep_legacy_trees(
         let _ = std::fs::remove_dir(&wt_root);
         return Ok(());
     }
-    let live = store.live_jobs().await?;
+    let live = lane.store().live_jobs().await?;
+    let mut removable = Vec::new();
     for entry in entries {
         let name = entry
             .file_name()
@@ -506,10 +674,19 @@ async fn sweep_legacy_trees(
                     entry.display()
                 );
             });
-            continue;
+        } else {
+            removable.push(entry);
         }
+    }
+    if removable.is_empty() {
+        return Ok(());
+    }
+    let every = lane.lock_every().await?;
+    for entry in removable {
         let path = entry.clone();
-        tokio::task::spawn_blocking(move || remove_legacy_tree(&path)).await?;
+        every
+            .blocking(move |held| remove_legacy_tree(held, &path))
+            .await?;
         report.legacy_trees_removed += usize::from(!entry.exists());
     }
     let _ = std::fs::remove_dir(&wt_root);
@@ -569,26 +746,57 @@ async fn sweep_legacy_sessions(
     Ok(())
 }
 
-/// Steps (d) and (e) of [`sweep`].
-async fn prune_clones_and_scans(store: &Store, work_root: &Path) -> anyhow::Result<()> {
-    let clones: Vec<PathBuf> = store
-        .list_repos()
-        .await?
-        .into_iter()
-        .map(|r| PathBuf::from(r.path))
-        .filter(|p| p.is_dir())
-        .collect();
-    let scans = child_dirs(&scan_root(work_root));
-    tokio::task::spawn_blocking(move || {
-        for scan in &scans {
-            remove_legacy_tree(scan);
-        }
-        for clone in &clones {
-            prune_worktrees(&clone.to_string_lossy());
-        }
-    })
-    .await?;
+/// Steps (d) and (e) of [`sweep`], one clone at a time under its permit.
+/// A scan tree of a repo no longer listed is removed with every clone
+/// held, as its clone is only known to git. A scan tree a running scan
+/// leases is kept: the lease is taken under the same permit.
+async fn prune_clones_and_scans(lane: &mut Lane, work_root: &Path) -> anyhow::Result<()> {
+    let store = lane.store().clone();
+    let mut scans: BTreeSet<PathBuf> = child_dirs(&scan_root(work_root)).into_iter().collect();
+    for repo_id in store.clone_ids().await? {
+        let permit = match lane.lock_clone(repo_id).await {
+            Ok(permit) => permit,
+            // Gone since it was listed: its clone went with it.
+            Err(CloneLockError::NoRepo(_)) => continue,
+            Err(e) => return Err(e.into()),
+        };
+        let scan = scan_tree_path(work_root, repo_id);
+        scans.remove(&scan);
+        let leased = store.clones().scan_leased(repo_id);
+        permit
+            .blocking(move |hold| {
+                if !leased {
+                    discard_scan_tree(hold, &scan);
+                }
+                if hold.clone_dir().is_dir() {
+                    prune_worktrees(hold);
+                }
+            })
+            .await?;
+    }
+    scans.retain(|scan| {
+        scan_tree_repo(scan).is_none_or(|repo_id| !store.clones().scan_leased(repo_id))
+    });
+    if !scans.is_empty() {
+        let every = lane.lock_every().await?;
+        every
+            .blocking(move |held| {
+                for scan in &scans {
+                    remove_legacy_tree(held, scan);
+                }
+            })
+            .await?;
+    }
     Ok(())
+}
+
+/// The repo id a `scan/repo-<id>` directory is named for.
+fn scan_tree_repo(scan: &Path) -> Option<i64> {
+    scan.file_name()?
+        .to_str()?
+        .strip_prefix("repo-")?
+        .parse()
+        .ok()
 }
 
 /// The directory the previous layout ran a finding kind in, by name.
@@ -603,33 +811,21 @@ fn legacy_wt_name(kind: JobKind, finding_id: Option<i64>) -> Option<String> {
 }
 
 /// Remove a worktree whose owning clone is not known: ask it for its
-/// clone, let git unregister it, and delete whatever is left — including a
-/// half-removed leftover with no `.git` entry at all.
-fn remove_legacy_tree(path: &Path) {
+/// clone, let git unregister it there if `held` holds that clone, and
+/// delete whatever is left -- including a half-removed leftover with no
+/// `.git` entry at all.
+///
+/// The clone could be any repo's, so the caller holds every one it knows.
+/// One it does not hold (a clone no repo row names) is never changed: the
+/// directory still goes, and its registration is left for git to drop as
+/// prunable from a clone whose permit someone holds.
+fn remove_legacy_tree(held: &[CloneHold], path: &Path) {
     let p = path.to_string_lossy();
-    if path.join(".git").exists() {
-        let (rc, out) = git(&[
-            "git",
-            "-C",
-            &p,
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-common-dir",
-        ]);
-        let common = PathBuf::from(out.trim());
-        if rc == 0
-            && let Some(clone) = common.parent()
-        {
-            git(&[
-                "git",
-                "-C",
-                &clone.to_string_lossy(),
-                "worktree",
-                "remove",
-                "--force",
-                &p,
-            ]);
-        }
+    if path.join(".git").exists()
+        && let Some(clone) = crate::clones::clone_of_tree(path)
+        && let Some(hold) = held.iter().find(|h| h.is_clone(&clone))
+    {
+        hold.git(&["worktree", "remove", "--force", &p], GIT_TIMEOUT_S);
     }
     if path.exists() {
         let _ = std::fs::remove_dir_all(path);

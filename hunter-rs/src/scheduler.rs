@@ -12,6 +12,7 @@ use std::path::Path;
 use anyhow::Context as _;
 
 use crate::attention::{AnswerRecorded, EngageAnswer, ObservedOpenPr, OpenPrRecorded};
+use crate::clones::{ClonePermit, Force, Lane, Unheld};
 use crate::config::Config;
 use crate::domain::{
     BudgetOverride, ClosureClass, FindingJobKind, FindingStatus, FindingType, FinishedState,
@@ -1174,7 +1175,7 @@ use crate::ingest::{EntryTypes, IngestResult, ingest_findings, ingest_scan_findi
 use crate::playbooks;
 use crate::recovery::{CreatedJob, CycleScope, FixClaim, RecordedJob, Recovered, RunningJob};
 use crate::types::RunResult;
-use crate::workspace::{TreeSpec, Workspace};
+use crate::workspace::{OpenWorkspace, TreeSpec, Workspace};
 use serde::{Deserialize, Serialize};
 
 /// Sync PR results — typed replacement for raw JSON blobs.
@@ -1521,11 +1522,6 @@ async fn ingest_followups(
     Some(counts)
 }
 
-/// Blocking git command wrapper for use inside `spawn_blocking`.
-fn run_cmd_sync(argv: &[&str], timeout_s: u64) -> (i32, String) {
-    crate::util::run_cmd(argv, timeout_s)
-}
-
 /// Why a repo could not be synced: the fixed key its `sync` work item's
 /// streak counts (WORK-MODEL.md §17), git's words as the detail, and
 /// whether the network can cause it (a clone or a fetch), so that a host
@@ -1545,14 +1541,26 @@ const ORIGIN_MISMATCH: &str = "origin mismatch";
 const BRANCH_NOT_FOUND: &str = "branch not found";
 const REPO_NOT_CLONED: &str = "repo not cloned";
 
-/// Clone the repo if it is not cloned yet, then fetch.
+/// Clone the repo if it is not cloned yet, then fetch, under its clone's
+/// permit (`crate::clones`); each command holds the permit on its blocking
+/// thread, so one outliving its dropped future still holds the clone.
 ///
 /// Fetch only — never checkout or pull. The clone is the object store
 /// every chain's worktree is added from, not a working tree anyone runs
 /// in: moving its HEAD would do nothing for the trees, and moving the
 /// trees is exactly what must never happen under a suspended chain.
 /// Logs nothing: the caller says whose work failed.
-async fn sync_repo(repo_url: &str, rpath: &Path) -> Result<(), SyncFailure> {
+///
+/// The URL is the repo row's as read under the permit
+/// ([`Store::origin_url`]), not one the caller read before taking it: a
+/// URL update holds the permit across its write and the clone's repoint,
+/// so under the permit the row's URL and the clone's origin agree.
+async fn sync_repo(
+    store: &Store,
+    permit: &ClonePermit<'_>,
+) -> sqlx::Result<Result<(), SyncFailure>> {
+    let repo_url = &store.origin_url(permit).await?;
+    let rpath = permit.clone_dir();
     if rpath.exists() {
         // The directory already exists, so the clone is skipped -- which is
         // only safe if it is a clone of *this* repo. `repos/repo-<id>` is
@@ -1566,18 +1574,13 @@ async fn sync_repo(repo_url: &str, rpath: &Path) -> Result<(), SyncFailure> {
         // through `url.<base>.insteadOf`, while `git clone -- <url>` stored
         // `repo_url` as given, so a matching rule in the user's gitconfig
         // would make the daemon's own clone look like somebody else's.
-        let rp = rpath.to_string_lossy().to_string();
-        let (rc, out) = tokio::task::spawn_blocking(move || {
-            run_cmd_sync(
-                &["git", "-C", &rp, "config", "--get", "remote.origin.url"],
-                60,
-            )
-        })
-        .await
-        .unwrap_or((127, "spawn error".to_owned()));
+        let (rc, out) = permit
+            .blocking(|hold| hold.git(&["config", "--get", "remote.origin.url"], 60))
+            .await
+            .unwrap_or((127, "spawn error".to_owned()));
         let origin = out.trim();
         if rc != 0 || origin != repo_url {
-            return Err(SyncFailure {
+            return Ok(Err(SyncFailure {
                 key: ORIGIN_MISMATCH,
                 detail: format!(
                     "{} exists but its origin is {} -- expected {repo_url}; \
@@ -1586,68 +1589,79 @@ async fn sync_repo(repo_url: &str, rpath: &Path) -> Result<(), SyncFailure> {
                     if rc == 0 { origin } else { "unreadable" }
                 ),
                 network: false,
-            });
+            }));
         }
     } else {
         if let Some(parent) = rpath.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let url = repo_url.to_owned();
-        let rp = rpath.to_owned();
-        let (rc, out) = tokio::task::spawn_blocking(move || {
-            // `--` before the operands: even a URL that slipped past
-            // validation cannot be read as an option here.
-            run_cmd_sync(&["git", "clone", "--", &url, &rp.to_string_lossy()], 600)
-        })
-        .await
-        .unwrap_or((127, "spawn error".to_owned()));
+        let url = repo_url.clone();
+        let (rc, out) = permit
+            .blocking(move |hold| hold.clone_from(&url, 600))
+            .await
+            .unwrap_or((127, "spawn error".to_owned()));
         if rc != 0 {
-            return Err(SyncFailure {
+            return Ok(Err(SyncFailure {
                 key: CLONE_FAILED,
                 detail: format!("clone failed: {}", crate::util::tail(&out, 300)),
                 network: true,
-            });
+            }));
         }
     }
-    let rps = rpath.to_string_lossy().to_string();
-    let (rc, out) = tokio::task::spawn_blocking(move || {
-        run_cmd_sync(&["git", "-C", &rps, "fetch", "origin"], 600)
-    })
-    .await
-    .unwrap_or((127, "spawn error".to_owned()));
+    let (rc, out) = fetch_held(permit, &[]).await;
     if rc != 0 {
-        return Err(SyncFailure {
+        return Ok(Err(SyncFailure {
             key: FETCH_FAILED,
             detail: format!("git fetch origin failed: {}", crate::util::tail(&out, 300)),
             network: true,
-        });
+        }));
     }
-    Ok(())
+    Ok(Ok(()))
+}
+
+/// [`crate::workspace::fetch`] of `refs` on a blocking thread that holds
+/// `permit` until the fetch ends. The only way the
+/// daemon fetches into a clone.
+async fn fetch_held(permit: &ClonePermit<'_>, refs: &[&str]) -> (i32, String) {
+    let refs: Vec<String> = refs.iter().map(|&r| r.to_owned()).collect();
+    permit
+        .blocking(move |hold| {
+            let refs: Vec<&str> = refs.iter().map(String::as_str).collect();
+            crate::workspace::fetch(hold, &refs, 600)
+        })
+        .await
+        .unwrap_or((127, "spawn error".to_owned()))
 }
 
 /// Sync `repo`'s clone ([`sync_repo`]) and resolve the tip of its default
 /// branch: everything every kind of the repo needs before it can start.
 /// Success ends the `sync` work item's streak.
-async fn sync_to_tip(store: &Store, repo: &Repo) -> Result<String, SyncFailure> {
-    let rpath = PathBuf::from(&repo.path);
-    sync_repo(&repo.url, &rpath).await?;
+async fn sync_to_tip(
+    store: &Store,
+    permit: &ClonePermit<'_>,
+    repo: &Repo,
+) -> sqlx::Result<Result<String, SyncFailure>> {
+    if let Err(failure) = sync_repo(store, permit).await? {
+        return Ok(Err(failure));
+    }
     let rev = format!("origin/{}", repo.default_branch);
-    let tip = tokio::task::spawn_blocking(move || crate::workspace::resolve(&rpath, &rev))
+    let tip = permit
+        .blocking(move |hold| crate::workspace::resolve(hold.clone_dir(), &rev))
         .await
         .ok()
         .flatten();
     let Some(tip) = tip else {
-        return Err(SyncFailure {
+        return Ok(Err(SyncFailure {
             key: BRANCH_NOT_FOUND,
             detail: format!("origin/{} does not resolve", repo.default_branch),
             network: false,
-        });
+        }));
     };
     log_write_failure(
         store.repo_work_succeeded(repo.id, RepoWorkKind::Sync).await,
         format_args!("repo {}: ending the sync streak", repo.id),
     );
-    Ok(tip)
+    Ok(Ok(tip))
 }
 
 /// A repo's `kind` work that could not start because the repo could not be
@@ -1835,6 +1849,12 @@ async fn budget_gate(
 /// because a superseded fix chain holds the same branch checked out, and
 /// git refuses one branch in two worktrees.
 ///
+/// Takes the clone's permit by value: whatever the runner did to the clone
+/// before (a fetch) and the tree made here are one hold, and the runner
+/// cannot keep the clone locked while its worker runs. The workspace comes
+/// back leased ([`OpenWorkspace`]), from before its tree exists, so
+/// nothing releases the tree until the runner closes it.
+///
 /// `Ok(Err(summary))`: the tree could not be made. The job is recorded
 /// `failed` with the reason, and [`crate::workspace::create`] has already
 /// removed whatever it made. `Ok(Ok(..))` hands the job back for its
@@ -1842,29 +1862,37 @@ async fn budget_gate(
 async fn open_workspace(
     store: &Store,
     cfg: &Config,
-    repo: &Repo,
+    (permit, repo): (ClonePermit<'_>, &Repo),
     created: CreatedJob,
     resume: Option<&ResumePlan>,
     spec: TreeSpec,
     kind: JobKind,
     log_prefix: &str,
     finding_id: Option<i64>,
-) -> anyhow::Result<Result<(Workspace, String, RunningJob), CycleSummary>> {
+) -> anyhow::Result<Result<(OpenWorkspace, String, RunningJob), CycleSummary>> {
+    anyhow::ensure!(
+        permit.repo_id() == repo.id,
+        "{log_prefix}: a permit for repo {} opening a workspace of repo {}",
+        permit.repo_id(),
+        repo.id
+    );
     let CreatedJob { job, superseded } = created;
     if let Some(plan) = resume {
-        return Ok(Ok((plan.workspace.clone(), plan.pinned_sha.clone(), job)));
+        let chain = chain_of(store, plan.workspace.origin_id).await?;
+        let ws = OpenWorkspace::lease(&permit, &cfg.work_root, &chain)?;
+        return Ok(Ok((ws, plan.pinned_sha.clone(), job)));
     }
     let id = job.id();
-    let clone = Path::new(&repo.path);
     for &old in &superseded {
-        let origin = store.resume_origin_job(old).await?;
-        let stale = Workspace::for_chain(&cfg.work_root, clone, origin);
-        crate::workspace::release_if_idle(store, &stale).await?;
+        let origin = chain_of(store, store.resume_origin_job(old).await?).await?;
+        crate::workspace::release_if_idle(store, &permit, &cfg.work_root, &origin).await?;
     }
-    let ws = Workspace::for_chain(&cfg.work_root, clone, id);
+    let ws = OpenWorkspace::lease(&permit, &cfg.work_root, &chain_of(store, id).await?)?;
     let made = {
-        let ws = ws.clone();
-        tokio::task::spawn_blocking(move || crate::workspace::create(&ws, &spec)).await?
+        let work_root = cfg.work_root.clone();
+        permit
+            .blocking(move |hold| crate::workspace::create(hold, &work_root, id, &spec))
+            .await?
     };
     match made {
         Ok(sha) => {
@@ -1895,15 +1923,27 @@ async fn open_workspace(
     }
 }
 
+/// Chain `origin_id` as the store names it, for leasing or releasing its
+/// tree. Every caller names a job it read a moment ago, so a missing row
+/// is a fault.
+async fn chain_of(store: &Store, origin_id: i64) -> anyhow::Result<crate::store::ChainRef> {
+    store
+        .chain_ref(origin_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("chain {origin_id}: no job has that id"))
+}
+
 /// Release a chain's tree once its job has ended, unless the job table
 /// says the chain is still `running` or `suspended` — a suspension is a
-/// pause, and its tree is the state the resume continues.
+/// pause, and its tree is the state the resume continues — or another
+/// runner holds it (an engage whose harvest it handed the tree to).
 ///
 /// Best effort: a tree that could not be released is picked up by the
 /// sweep before the next cycle.
-async fn close_workspace(store: &Store, ws: &Workspace) {
-    if let Err(e) = crate::workspace::release_if_idle(store, ws).await {
-        tracing::warn!("releasing {}: {e}", ws.tree.display());
+async fn close_workspace(lane: &mut Lane, ws: OpenWorkspace) {
+    let tree = ws.tree.clone();
+    if let Err(e) = ws.close(lane).await {
+        tracing::warn!("releasing {}: {e}", tree.display());
     }
 }
 
@@ -2198,6 +2238,7 @@ async fn prior_findings(
 )]
 pub async fn run_hunt(
     scope: &CycleScope,
+    lane: &mut Lane,
     cfg: &Config,
     repo: &Repo,
     backend: &dyn Backend,
@@ -2211,6 +2252,9 @@ pub async fn run_hunt(
     let rid = repo.id;
     let rname = &repo.name;
     let rpath = PathBuf::from(&repo.path);
+    // The clone is this hunt's from its fetch to its tree being made
+    // (`open_workspace` takes the permit).
+    let permit = lane.lock_clone(repo.id).await?;
     // The full re-hunt request this hunt answers, if one was pending when
     // the repo row was read; a request landing after that is another hunt's.
     let request = repo.full_hunt_requested_at;
@@ -2226,9 +2270,12 @@ pub async fn run_hunt(
     let head = if let Some(plan) = resume {
         plan.pinned_sha.clone()
     } else {
-        match sync_to_tip(store, repo).await {
+        match sync_to_tip(store, &permit, repo).await? {
             Ok(tip) => tip,
             Err(failure) => {
+                // Let go before `repo_sync_failed` probes the network: a
+                // URL update, the sweep or a delete need not wait it out.
+                drop(permit);
                 // The attempt is over before it had a job. It still answers
                 // the request's place in the queue, or a fetch that keeps
                 // failing would put this hunt first in every cycle.
@@ -2347,18 +2394,11 @@ pub async fn run_hunt(
         let rps = rp_str.clone();
         let h = head.clone();
         let (_rc, base) = tokio::task::spawn_blocking(move || {
-            run_cmd_sync(
-                &[
-                    "git",
-                    "-C",
-                    &rps,
-                    "rev-list",
-                    "-1",
-                    "--before=3 weeks ago",
-                    &h,
-                ],
-                30,
-            )
+            Unheld::LastBefore {
+                rev: &h,
+                before: "3 weeks ago",
+            }
+            .run(Path::new(&rps), 30)
         })
         .await
         .unwrap_or((127, String::new()));
@@ -2366,26 +2406,25 @@ pub async fn run_hunt(
         if base.is_empty() || base == head {
             let rps = rp_str.clone();
             let h = head.clone();
-            let (rc2, base2) = tokio::task::spawn_blocking(move || {
-                run_cmd_sync(&["git", "-C", &rps, "rev-parse", &format!("{h}~30")], 30)
+            let base2 = tokio::task::spawn_blocking(move || {
+                crate::workspace::resolve(Path::new(&rps), &format!("{h}~30"))
             })
             .await
-            .unwrap_or((127, String::new()));
-            let base2 = base2.trim().to_owned();
-            if rc2 != 0 || base2.is_empty() {
+            .ok()
+            .flatten();
+            match base2 {
                 // Very small repo — scan from root
-                (
+                None => (
                     format!("{EMPTY_TREE}..{head}"),
                     "First hunt for this repo: the full history (small repo).".to_owned(),
-                )
-            } else {
-                (
+                ),
+                Some(base2) => (
                     format!("{base2}..{head}"),
                     format!(
                         "First hunt for this repo: the last 30 commits (base {}).",
                         &base2[..12.min(base2.len())]
                     ),
-                )
+                ),
             }
         } else {
             (
@@ -2466,7 +2505,7 @@ pub async fn run_hunt(
     let (ws, pinned, running) = match open_workspace(
         store,
         cfg,
-        repo,
+        (permit, repo),
         created,
         resume,
         TreeSpec::Detached { at: head.clone() },
@@ -2525,7 +2564,7 @@ pub async fn run_hunt(
         Err(e) => {
             let ran = (WorkOf::Repo(RepoJobKind::Hunt, repo), running);
             let denied = runner_failed(store, (cfg, backend, &repo.url), ran, &e).await;
-            close_workspace(store, &ws).await;
+            close_workspace(lane, ws).await;
             return denied.ok_or(e);
         }
     };
@@ -2533,7 +2572,7 @@ pub async fn run_hunt(
     let running = match unmetered_offline(store, cfg, backend, &repo.url, ran, &rr).await {
         ControlFlow::Continue(running) => running,
         ControlFlow::Break(denied) => {
-            close_workspace(store, &ws).await;
+            close_workspace(lane, ws).await;
             return Ok(denied);
         }
     };
@@ -2640,7 +2679,7 @@ pub async fn run_hunt(
         &pinned,
     )
     .await;
-    close_workspace(store, &ws).await;
+    close_workspace(lane, ws).await;
     Ok(summary)
 }
 
@@ -2728,6 +2767,7 @@ async fn handle_recheck_failure(
 )]
 pub async fn run_recheck(
     scope: &CycleScope,
+    lane: &mut Lane,
     cfg: &Config,
     finding: &Finding,
     backend: &dyn Backend,
@@ -2798,11 +2838,11 @@ pub async fn run_recheck(
             .await;
         anyhow::bail!("repo missing");
     };
-    let rpath = PathBuf::from(&repo.path);
+    let permit = lane.lock_clone(repo.id).await?;
     // Never on a resume: a resumed chain continues in its own tree, and
     // nothing is fetched for it.
     if resume.is_none()
-        && let Err(failure) = sync_repo(&repo.url, &rpath).await
+        && let Err(failure) = sync_repo(store, &permit).await?
     {
         let _ = store
             .log_event(
@@ -2854,7 +2894,7 @@ pub async fn run_recheck(
     let (ws, pinned, running) = match open_workspace(
         store,
         cfg,
-        &repo,
+        (permit, &repo),
         created,
         resume,
         TreeSpec::Detached {
@@ -2926,7 +2966,7 @@ pub async fn run_recheck(
         Err(e) => {
             let ran = (WorkOf::Finding(FindingJobKind::Recheck, fid), running);
             let denied = runner_failed(store, (cfg, backend, &repo.url), ran, &e).await;
-            close_workspace(store, &ws).await;
+            close_workspace(lane, ws).await;
             return denied.ok_or(e);
         }
     };
@@ -2934,7 +2974,7 @@ pub async fn run_recheck(
     let running = match unmetered_offline(store, cfg, backend, &repo.url, ran, &rr).await {
         ControlFlow::Continue(running) => running,
         ControlFlow::Break(denied) => {
-            close_workspace(store, &ws).await;
+            close_workspace(lane, ws).await;
             return Ok(denied);
         }
     };
@@ -2965,7 +3005,7 @@ pub async fn run_recheck(
             .is_some_and(|v| !matches!(v, RecheckOutcome::Unknown(_)));
     if !final_verdict && let Some(report) = blocked_report(&ws.tree)? {
         let held = hold_on_report(store, FindingJobKind::Recheck, fid, job, &ws, &report).await;
-        close_workspace(store, &ws).await;
+        close_workspace(lane, ws).await;
         if !held? {
             anyhow::bail!("recheck #{fid}: BLOCKED.md, but it is no longer rechecking");
         }
@@ -2997,7 +3037,7 @@ pub async fn run_recheck(
                 format_args!("#{fid}: clearing one-shot budget override"),
             );
         }
-        close_workspace(store, &ws).await;
+        close_workspace(lane, ws).await;
         return Ok(summary);
     }
 
@@ -3036,7 +3076,7 @@ pub async fn run_recheck(
         .await;
         // Released only once the failure is counted: a hold makes this
         // attempt the checkpoint, and its tree is what `continue` resumes.
-        close_workspace(store, &ws).await;
+        close_workspace(lane, ws).await;
         return Ok(summary);
     };
     let Some(ref outcome) = verdict_obj.verdict else {
@@ -3051,7 +3091,7 @@ pub async fn run_recheck(
             override_mode,
         )
         .await;
-        close_workspace(store, &ws).await;
+        close_workspace(lane, ws).await;
         return Ok(summary);
     };
 
@@ -3138,7 +3178,7 @@ pub async fn run_recheck(
                 override_mode,
             )
             .await;
-            close_workspace(store, &ws).await;
+            close_workspace(lane, ws).await;
             return Ok(summary);
         }
     };
@@ -3159,7 +3199,7 @@ pub async fn run_recheck(
         summary.reason = Some(reason.to_owned());
     }
     // A verdict ends the recheck: its tree is no checkpoint.
-    close_workspace(store, &ws).await;
+    close_workspace(lane, ws).await;
     if override_mode == Some(BudgetOverride::Once) {
         log_write_failure(
             store.set_budget_override(fid, None).await,
@@ -3266,6 +3306,7 @@ const STANDARDS_SPEC: AnalysisSpec = AnalysisSpec {
 )]
 async fn run_analysis_job(
     scope: &CycleScope,
+    lane: &mut Lane,
     cfg: &Config,
     repo: &Repo,
     spec: &AnalysisSpec,
@@ -3286,11 +3327,14 @@ async fn run_analysis_job(
         };
         return repo_sync_failed(store, (cfg, backend), repo, kind, failure).await;
     }
+    let permit = lane.lock_clone(repo.id).await?;
     // Never on a resume: a resumed chain continues in its own tree, and
     // nothing is fetched for it.
     if resume.is_none()
-        && let Err(failure) = sync_to_tip(store, repo).await
+        && let Err(failure) = sync_to_tip(store, &permit, repo).await?
     {
+        // Let go before the probe (see `run_hunt`).
+        drop(permit);
         return repo_sync_failed(store, (cfg, backend), repo, kind, failure).await;
     }
 
@@ -3336,7 +3380,7 @@ async fn run_analysis_job(
     let (ws, pinned, running) = match open_workspace(
         store,
         cfg,
-        repo,
+        (permit, repo),
         created,
         resume,
         TreeSpec::Detached {
@@ -3392,7 +3436,7 @@ async fn run_analysis_job(
         Err(e) => {
             let ran = (WorkOf::Repo(kind, repo), running);
             let denied = runner_failed(store, (cfg, backend, &repo.url), ran, &e).await;
-            close_workspace(store, &ws).await;
+            close_workspace(lane, ws).await;
             return denied.ok_or(e);
         }
     };
@@ -3400,7 +3444,7 @@ async fn run_analysis_job(
     let running = match unmetered_offline(store, cfg, backend, &repo.url, ran, &rr).await {
         ControlFlow::Continue(running) => running,
         ControlFlow::Break(denied) => {
-            close_workspace(store, &ws).await;
+            close_workspace(lane, ws).await;
             return Ok(denied);
         }
     };
@@ -3467,49 +3511,39 @@ async fn run_analysis_job(
     }
     summary.ingest = counts;
     crate::suppression::apply_reconfirmations(store, repo, &types, &out_path, &pinned).await;
-    close_workspace(store, &ws).await;
+    close_workspace(lane, ws).await;
     Ok(summary)
 }
 
 pub async fn run_test_gap(
     scope: &CycleScope,
+    lane: &mut Lane,
     cfg: &Config,
     repo: &Repo,
     backend: &dyn Backend,
     resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
-    run_analysis_job(scope, cfg, repo, &TEST_GAP_SPEC, backend, resume).await
+    run_analysis_job(scope, lane, cfg, repo, &TEST_GAP_SPEC, backend, resume).await
 }
-/// The zero-token Renovate scan of the repo at its fetched tip, with the
-/// GitHub token the repo's forge qualifies for. `None` means Renovate has
-/// no answer (see `scan_repo`).
+/// The zero-token Renovate scan of `tree`, the repo's scan tree at its
+/// fetched tip, with the GitHub token the repo's forge qualifies for.
+/// `None` means Renovate has no answer (see `scan_repo`). Runs holding no
+/// clone: the tree's scan lease is what keeps it.
 async fn renovate_scan(
     cfg: &Config,
     repo: &Repo,
-    rpath: &std::path::Path,
+    tree: &crate::workspace::ScanTree,
 ) -> Option<crate::dep_scan::DepScan> {
-    let work_root = cfg.work_root.clone();
-    let rp = rpath.to_owned();
+    let path = tree.path().to_owned();
     let rn = repo.name.clone();
-    let rid = repo.id;
-    let tip = format!("origin/{}", repo.default_branch);
     let forge = repo.forge;
     let configured = cfg.renovate_github_token.clone();
     tokio::task::spawn_blocking(move || {
-        // Renovate reads manifests, and the fetch-only clone's own files
-        // are never updated, so it scans a throwaway tree at the fetched tip.
-        let scan = match crate::workspace::ScanTree::create(&work_root, &rp, rid, &tip) {
-            Ok(scan) => scan,
-            Err(e) => {
-                tracing::warn!("dep_update {rn}: {e}");
-                return None;
-            }
-        };
         let token = crate::dep_scan::github_token(
             forge,
             configured.as_ref().map(crate::config::Secret::expose),
         );
-        crate::dep_scan::scan_repo(scan.path(), &rn, token.as_deref(), 120)
+        crate::dep_scan::scan_repo(&path, &rn, token.as_deref(), 120)
     })
     .await
     .ok()
@@ -3568,6 +3602,7 @@ async fn settle_dep_updates(
 /// otherwise an AI worker does.
 pub async fn run_dep_update(
     scope: &CycleScope,
+    lane: &mut Lane,
     cfg: &Config,
     repo: &Repo,
     backend: &dyn Backend,
@@ -3581,7 +3616,7 @@ pub async fn run_dep_update(
     // clone check and the sync, so nothing is skipped by going straight
     // there.
     if resume.is_some() {
-        return run_analysis_job(scope, cfg, repo, &DEP_UPDATE_SPEC, backend, resume).await;
+        return run_analysis_job(scope, lane, cfg, repo, &DEP_UPDATE_SPEC, backend, resume).await;
     }
     let rpath = std::path::PathBuf::from(&repo.path);
     if !rpath.exists() {
@@ -3593,19 +3628,37 @@ pub async fn run_dep_update(
         let kind = RepoJobKind::DepUpdate;
         return repo_sync_failed(store, (cfg, backend), repo, kind, failure).await;
     }
-    if let Err(failure) = sync_to_tip(store, repo).await {
+    let permit = lane.lock_clone(repo.id).await?;
+    if let Err(failure) = sync_to_tip(store, &permit, repo).await? {
         let kind = RepoJobKind::DepUpdate;
+        // Let go before the probe (see `run_hunt`).
+        drop(permit);
         return repo_sync_failed(store, (cfg, backend), repo, kind, failure).await;
     }
 
     // Try Renovate (zero tokens). Its answer is authoritative even when it
-    // is "nothing to update"; only an unavailable scan falls back to AI.
-    let Some(scan) = renovate_scan(cfg, repo, &rpath).await else {
+    // is "nothing to update"; only an unavailable scan falls back to AI,
+    // which takes the clone again. The scan tree is made at the fetched
+    // tip in the fetch's hold, which ends there: Renovate runs holding
+    // only the tree's lease.
+    let tip = format!("origin/{}", repo.default_branch);
+    let scan = match crate::workspace::ScanTree::create(&cfg.work_root, permit, &tip).await {
+        Ok(tree) => {
+            let scan = renovate_scan(cfg, repo, &tree).await;
+            tree.discard(lane).await;
+            scan
+        }
+        Err(e) => {
+            tracing::warn!("dep_update {}: {e}", repo.name);
+            None
+        }
+    };
+    let Some(scan) = scan else {
         tracing::info!(
             "dep_update {}: renovate unavailable, falling back to AI",
             repo.name
         );
-        return run_analysis_job(scope, cfg, repo, &DEP_UPDATE_SPEC, backend, resume).await;
+        return run_analysis_job(scope, lane, cfg, repo, &DEP_UPDATE_SPEC, backend, resume).await;
     };
 
     // Write candidates to JSON and ingest via the standard path
@@ -3704,30 +3757,33 @@ async fn renovate_outcome(store: &Store, repo: &Repo, counts: IngestResult) -> C
 }
 pub async fn run_refactor(
     scope: &CycleScope,
+    lane: &mut Lane,
     cfg: &Config,
     repo: &Repo,
     backend: &dyn Backend,
     resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
-    run_analysis_job(scope, cfg, repo, &REFACTOR_SPEC, backend, resume).await
+    run_analysis_job(scope, lane, cfg, repo, &REFACTOR_SPEC, backend, resume).await
 }
 pub async fn run_modernize(
     scope: &CycleScope,
+    lane: &mut Lane,
     cfg: &Config,
     repo: &Repo,
     backend: &dyn Backend,
     resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
-    run_analysis_job(scope, cfg, repo, &MODERNIZATION_SPEC, backend, resume).await
+    run_analysis_job(scope, lane, cfg, repo, &MODERNIZATION_SPEC, backend, resume).await
 }
 pub async fn run_standards(
     scope: &CycleScope,
+    lane: &mut Lane,
     cfg: &Config,
     repo: &Repo,
     backend: &dyn Backend,
     resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
-    run_analysis_job(scope, cfg, repo, &STANDARDS_SPEC, backend, resume).await
+    run_analysis_job(scope, lane, cfg, repo, &STANDARDS_SPEC, backend, resume).await
 }
 
 fn extract_pr_url(text: &str) -> Option<String> {
@@ -3788,7 +3844,7 @@ fn fix_branch(finding: &Finding) -> String {
 struct FixStart {
     repo: Repo,
     job: i64,
-    ws: Workspace,
+    ws: OpenWorkspace,
     /// The commit the chain's tree was created at (`jobs.pinned_sha`).
     pinned: String,
     branch: String,
@@ -3826,6 +3882,7 @@ fn fix_skipped(why: String) -> CycleSummary {
 )]
 async fn start_fix(
     scope: &CycleScope,
+    lane: &mut Lane,
     cfg: &Config,
     finding: &Finding,
     backend: &dyn Backend,
@@ -3901,10 +3958,11 @@ async fn start_fix(
     // The branch is per finding, so a superseded fix chain of this finding
     // holds it checked out; `open_workspace` releases that chain's tree
     // before adding this one.
+    let permit = lane.lock_clone(repo.id).await?;
     let opened = open_workspace(
         store,
         cfg,
-        &repo,
+        (permit, &repo),
         created,
         resume,
         TreeSpec::Branch {
@@ -4551,32 +4609,13 @@ async fn ship_pr(
     state: JobState,
 ) -> Result<(String, bool), ShipFailure> {
     let db = repo.default_branch.clone();
-    let wts = worktree.to_string_lossy().to_string();
+    let wt = worktree.to_owned();
     let db2 = db.clone();
     let (rc, commits) = tokio::task::spawn_blocking(move || {
-        let (rc, out) = run_cmd_sync(
-            &[
-                "git",
-                "-C",
-                &wts,
-                "log",
-                &format!("origin/{db2}..HEAD"),
-                "--oneline",
-            ],
-            30,
-        );
+        let commits = |range: &str| Unheld::Commits { range }.run(&wt, 30);
+        let (rc, out) = commits(&format!("origin/{db2}..HEAD"));
         if rc != 0 {
-            run_cmd_sync(
-                &[
-                    "git",
-                    "-C",
-                    &wts,
-                    "log",
-                    &format!("{db2}..HEAD"),
-                    "--oneline",
-                ],
-                30,
-            )
+            commits(&format!("{db2}..HEAD"))
         } else {
             (rc, out)
         }
@@ -4599,12 +4638,14 @@ async fn ship_pr(
 
     let f = forge::forge_for(repo.forge);
     let push_url = f.ssh_url(&repo.url);
-    let wts = worktree.to_string_lossy().to_string();
+    let wt = worktree.to_owned();
     let (prc, pout) = tokio::task::spawn_blocking(move || {
-        run_cmd_sync(
-            &["git", "-C", &wts, "push", "--force", &push_url, "HEAD"],
-            600,
-        )
+        Unheld::Push {
+            force: Force::Always,
+            url: &push_url,
+            refspec: "HEAD",
+        }
+        .run(&wt, 600)
     })
     .await
     .unwrap_or((127, "spawn error".to_owned()));
@@ -4619,12 +4660,10 @@ async fn ship_pr(
         )));
     }
     let body = std::fs::read_to_string(&pr_desc).unwrap_or_default();
-    let wts = worktree.to_string_lossy().to_string();
-    let (_trc, title) = tokio::task::spawn_blocking(move || {
-        run_cmd_sync(&["git", "-C", &wts, "log", "-1", "--format=%s"], 30)
-    })
-    .await
-    .unwrap_or((127, branch.to_owned()));
+    let wt = worktree.to_owned();
+    let (_trc, title) = tokio::task::spawn_blocking(move || Unheld::HeadSubject.run(&wt, 30))
+        .await
+        .unwrap_or((127, branch.to_owned()));
     let title = title.trim();
     let title = if title.is_empty() { branch } else { title };
     match f.create_pr(Path::new(&repo.path), branch, &db, title, &body) {
@@ -4861,6 +4900,7 @@ async fn record_fix_outcome(
 /// ([`record_fix_outcome`]) what the attempt amounts to.
 pub async fn run_fix(
     scope: &CycleScope,
+    lane: &mut Lane,
     cfg: &Config,
     finding: &Finding,
     backend: &dyn Backend,
@@ -4868,10 +4908,11 @@ pub async fn run_fix(
 ) -> anyhow::Result<CycleSummary> {
     let store = scope.store();
     let fid = finding.id;
-    let (start, running, claim) = match start_fix(scope, cfg, finding, backend, resume).await? {
-        Ok(start) => start,
-        Err(ended) => return Ok(ended),
-    };
+    let (start, running, claim) =
+        match start_fix(scope, lane, cfg, finding, backend, resume).await? {
+            Ok(start) => start,
+            Err(ended) => return Ok(ended),
+        };
     // Any early return from here on drops `running`: the cycle's settle
     // records the abandoned job.
     let prompt = match fix_prompt(cfg, finding, &start, resume) {
@@ -4900,7 +4941,7 @@ pub async fn run_fix(
             let ran = (WorkOf::Finding(FindingJobKind::Fix, fid), running);
             let denied = runner_failed(store, (cfg, backend, &start.repo.url), ran, &e).await;
             release_claim(claim).await;
-            close_workspace(store, &start.ws).await;
+            close_workspace(lane, start.ws).await;
             return denied.ok_or(e);
         }
     };
@@ -4909,7 +4950,7 @@ pub async fn run_fix(
         ControlFlow::Continue(running) => running,
         ControlFlow::Break(denied) => {
             release_claim(claim).await;
-            close_workspace(store, &start.ws).await;
+            close_workspace(lane, start.ws).await;
             return Ok(denied);
         }
     };
@@ -4945,7 +4986,7 @@ pub async fn run_fix(
         &mut summary,
     )
     .await?;
-    close_workspace(store, &start.ws).await;
+    close_workspace(lane, start.ws).await;
     Ok(summary)
 }
 
@@ -5262,12 +5303,12 @@ pub async fn sync_prs(pass: &PrSyncPass, cfg: &Config) -> SyncResult {
 }
 
 /// The repo and PR an engage works on: its `pr_state` row, branch, and the
-/// PR itself, with the PR head fetched into the clone for a cold attempt.
-/// Every way to lack one is logged and an error: sync records them first.
+/// PR itself. Every way to lack one is logged and an error: sync records
+/// them first. Reads only; the clone is changed later, by
+/// [`fetch_pr_head`].
 async fn engage_target(
     store: &Store,
     finding: &Finding,
-    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<(Repo, crate::store::RecordedPrState, String, PrRef)> {
     let fid = finding.id;
     let Ok(Some(repo)) = store.get_repo_by_id(finding.repo_id).await else {
@@ -5319,17 +5360,28 @@ async fn engage_target(
             .await;
         anyhow::bail!("head_ref equals default branch");
     }
-    // Fetch the PR head into the clone for a cold attempt; the tree is
-    // added from it once the job exists. Never on a resume: the chain
-    // continues in its own tree, at the head it was created at.
+    Ok((repo, ps, head_ref, pr))
+}
+
+/// Take the clone's permit, held from here until the tree is made, and
+/// fetch the PR head into the clone for a cold attempt; the tree is added
+/// from it once the job exists. Never on a resume: the chain continues in
+/// its own tree, at the head it was created at.
+///
+/// Taken after every forge read of the engage, never before: the permit
+/// keeps the repo's other changes (a sync, the sweep, a URL update) waiting
+/// while it is held, and a PR view is several network round trips.
+async fn fetch_pr_head<'l>(
+    lane: &'l mut Lane,
+    repo: &Repo,
+    fid: i64,
+    head_ref: &str,
+    resume: Option<&ResumePlan>,
+) -> anyhow::Result<ClonePermit<'l>> {
+    let store = lane.store().clone();
+    let permit = lane.lock_clone(repo.id).await?;
     if resume.is_none() {
-        let rps = repo.path.clone();
-        let hr = head_ref.clone();
-        let (rc, out) = tokio::task::spawn_blocking(move || {
-            run_cmd_sync(&["git", "-C", &rps, "fetch", "origin", &hr], 600)
-        })
-        .await
-        .unwrap_or((127, "spawn error".to_owned()));
+        let (rc, out) = fetch_held(&permit, &[head_ref]).await;
         if rc != 0 {
             let tail = crate::util::tail(&out, 300);
             let _ = store
@@ -5343,7 +5395,7 @@ async fn engage_target(
             anyhow::bail!("fetch failed: {tail}");
         }
     }
-    Ok((repo, ps, head_ref, pr))
+    Ok(permit)
 }
 
 /// Refuse an engage whose `pr_state` row `ps` is of another PR than `pr`,
@@ -5432,7 +5484,7 @@ struct EngageStart {
     /// which sends no playbook and so does not ask the forge.
     pr: Option<PrView>,
     job: i64,
-    ws: Workspace,
+    ws: OpenWorkspace,
     pinned: String,
     cap: Option<i64>,
     /// The newest feedback the chain's worker was shown: read from the PR
@@ -5482,27 +5534,41 @@ async fn engage_view(
     }
 }
 
-/// Everything before the worker runs: target, fetch, budget gate, PR view,
+/// A step before the worker, `step`'s outcome, with a failure handed to
+/// [`engage_prefetch_failed`]: the network's ends the cycle denied
+/// (`Ok(Err(summary))`), anything else stays the error it was.
+async fn engage_prefetch<T>(
+    store: &Store,
+    net: (&Config, &dyn Backend),
+    finding: &Finding,
+    step: anyhow::Result<T>,
+) -> anyhow::Result<Result<T, CycleSummary>> {
+    match step {
+        Ok(value) => Ok(Ok(value)),
+        Err(e) => match engage_prefetch_failed(store, net, finding, &e.to_string()).await {
+            Some(denied) => Ok(Err(denied)),
+            None => Err(e),
+        },
+    }
+}
+
+/// Everything before the worker runs: target, budget gate, PR view, fetch,
 /// job row, tree. `Ok(Err(summary))` is a cycle that ends here.
 async fn start_engage(
     scope: &CycleScope,
+    lane: &mut Lane,
     cfg: &Config,
     finding: &Finding,
     backend: &dyn Backend,
     resume: Option<&ResumePlan>,
 ) -> anyhow::Result<Result<(EngageStart, RunningJob), CycleSummary>> {
     let (store, fid) = (scope.store(), finding.id);
-    let (repo, ps, head_ref, pr_ref) = match engage_target(store, finding, resume).await {
-        Ok(target) => target,
-        Err(e) => {
-            if let Some(denied) =
-                engage_prefetch_failed(store, (cfg, backend), finding, &e.to_string()).await
-            {
-                return Ok(Err(denied));
-            }
-            return Err(e);
-        }
-    };
+    let target = engage_target(store, finding).await;
+    let (repo, ps, head_ref, pr_ref) =
+        match engage_prefetch(store, (cfg, backend), finding, target).await? {
+            Ok(target) => target,
+            Err(denied) => return Ok(Err(denied)),
+        };
 
     let (cap, anticipated) = match budget_gate(
         backend,
@@ -5526,6 +5592,11 @@ async fn start_engage(
         Ok(pr) => pr,
         Err(denied) => return Ok(Err(denied)),
     };
+    let fetched = fetch_pr_head(lane, &repo, fid, &head_ref, resume).await;
+    let permit = match engage_prefetch(store, (cfg, backend), finding, fetched).await? {
+        Ok(permit) => permit,
+        Err(denied) => return Ok(Err(denied)),
+    };
 
     let created = match scope
         .create_job(
@@ -5547,7 +5618,7 @@ async fn start_engage(
     let (ws, pinned, running) = match open_workspace(
         store,
         cfg,
-        &repo,
+        (permit, &repo),
         created,
         resume,
         TreeSpec::PrHead {
@@ -5769,27 +5840,16 @@ async fn push_then_reply(
     }
     let (repo, worktree, head_ref) = (&start.repo, &start.ws.tree, &start.head_ref);
     let fg = forge::forge_for(repo.forge);
-    let wts = worktree.to_string_lossy().to_string();
-    let hr = head_ref.clone();
-    let (rc, commits) = tokio::task::spawn_blocking(move || {
-        run_cmd_sync(
-            &[
-                "git",
-                "-C",
-                &wts,
-                "log",
-                &format!("origin/{hr}..HEAD"),
-                "--oneline",
-            ],
-            30,
-        )
-    })
-    .await
-    .unwrap_or((127, String::new()));
+    let wt = worktree.clone();
+    let range = format!("origin/{head_ref}..HEAD");
+    let (rc, commits) =
+        tokio::task::spawn_blocking(move || Unheld::Commits { range: &range }.run(&wt, 30))
+            .await
+            .unwrap_or((127, String::new()));
     if rc == 0 && !commits.trim().is_empty() {
         let push_url = fg.ssh_url(&repo.url);
-        let wts = worktree.to_string_lossy().to_string();
-        let hr = head_ref.clone();
+        let wt = worktree.clone();
+        let refspec = format!("HEAD:{head_ref}");
         // Leased to the PR head the chain's tree was created at, with the
         // expected commit spelled out: the worker may rewrite that history,
         // but a commit pushed to the branch since -- while this attempt ran,
@@ -5800,20 +5860,14 @@ async fn push_then_reply(
         // is. The explicit `<ref>:<sha>` form reads no remote-tracking ref,
         // so it works against the raw URL; `--force` must not be added, as
         // it overrides the lease.
-        let lease = format!("--force-with-lease={hr}:{}", start.pinned);
+        let lease = format!("{head_ref}:{}", start.pinned);
         let (prc, pout) = tokio::task::spawn_blocking(move || {
-            run_cmd_sync(
-                &[
-                    "git",
-                    "-C",
-                    &wts,
-                    "push",
-                    &lease,
-                    &push_url,
-                    &format!("HEAD:{hr}"),
-                ],
-                600,
-            )
+            Unheld::Push {
+                force: Force::Lease(&lease),
+                url: &push_url,
+                refspec: &refspec,
+            }
+            .run(&wt, 600)
         })
         .await
         .unwrap_or((127, "spawn error".to_owned()));
@@ -6173,6 +6227,7 @@ fn engage_prompt(
 /// work ([`push_and_reply`]) and record that ([`record_engage`]).
 pub async fn run_engage(
     scope: &CycleScope,
+    lane: &mut Lane,
     cfg: &Config,
     finding: &Finding,
     backend: &dyn Backend,
@@ -6181,7 +6236,7 @@ pub async fn run_engage(
     let store = scope.store();
     let fid = finding.id;
     remove_stale_report(resume)?;
-    let (start, running) = match start_engage(scope, cfg, finding, backend, resume).await? {
+    let (start, running) = match start_engage(scope, lane, cfg, finding, backend, resume).await? {
         Ok(started) => started,
         Err(ended) => return Ok(ended),
     };
@@ -6202,7 +6257,7 @@ pub async fn run_engage(
         Err(e) => {
             let ran = (WorkOf::Finding(FindingJobKind::Engage, fid), running);
             let denied = runner_failed(store, (cfg, backend, &start.repo.url), ran, &e).await;
-            close_workspace(store, &start.ws).await;
+            close_workspace(lane, start.ws).await;
             return denied.ok_or(e);
         }
     };
@@ -6210,7 +6265,7 @@ pub async fn run_engage(
     let running = match unmetered_offline(store, cfg, backend, &start.repo.url, ran, &rr).await {
         ControlFlow::Continue(running) => running,
         ControlFlow::Break(denied) => {
-            close_workspace(store, &start.ws).await;
+            close_workspace(lane, start.ws).await;
             return Ok(denied);
         }
     };
@@ -6250,7 +6305,10 @@ pub async fn run_engage(
         }
         withdraw_pr(store, (cfg, backend), fid, &start, &reason, &mut summary).await
     } else if let Some(report) = blocked_report(&start.ws.tree)? {
-        engage_blocked(store, fid, &start, &report, &mut summary).await?;
+        if let Err(e) = engage_blocked(lane.store(), fid, &start, &report, &mut summary).await {
+            close_workspace(lane, start.ws).await;
+            return Err(e);
+        }
         false
     } else {
         let published = push_and_reply(&start, state).await;
@@ -6269,6 +6327,7 @@ pub async fn run_engage(
     if closed_on_forge {
         continue_into_harvest(
             scope,
+            lane,
             cfg,
             backend,
             &start.repo,
@@ -6280,7 +6339,7 @@ pub async fn run_engage(
         )
         .await;
     }
-    close_workspace(store, &start.ws).await;
+    close_workspace(lane, start.ws).await;
     Ok(summary)
 }
 
@@ -6305,7 +6364,6 @@ async fn engage_blocked(
     )
     .await;
     if !held? {
-        close_workspace(store, &start.ws).await;
         anyhow::bail!("engage #{fid}: BLOCKED.md, but the PR is no longer open");
     }
     summary.outcome = Some("held".into());
@@ -6331,6 +6389,7 @@ async fn engage_blocked(
 /// tree afterwards, as it always does.
 async fn continue_into_harvest(
     scope: &CycleScope,
+    lane: &mut Lane,
     cfg: &Config,
     backend: &dyn Backend,
     repo: &Repo,
@@ -6405,7 +6464,7 @@ async fn continue_into_harvest(
             Some(fid),
         )
         .await;
-    if let Err(e) = run_harvest(scope, cfg, &finding, backend, Some(&plan)).await {
+    if let Err(e) = run_harvest(scope, lane, cfg, &finding, backend, Some(&plan)).await {
         let _ = store
             .log_event(
                 "error",
@@ -6550,15 +6609,16 @@ async fn record_harvest_failure(
 /// budget override is kept for the `continue`, as for every kind: the hold
 /// concluded nothing.
 async fn harvest_blocked(
-    store: &Store,
+    lane: &mut Lane,
     fid: i64,
     (job, state): (i64, JobState),
     pr_number: i64,
-    ws: &Workspace,
+    ws: OpenWorkspace,
     report: &str,
 ) -> anyhow::Result<CycleSummary> {
-    let held = hold_on_report(store, FindingJobKind::Harvest, fid, job, ws, report).await;
-    close_workspace(store, ws).await;
+    let store = lane.store();
+    let held = hold_on_report(store, FindingJobKind::Harvest, fid, job, &ws, report).await;
+    close_workspace(lane, ws).await;
     if !held? {
         anyhow::bail!("harvest #{fid}: BLOCKED.md, but the PR is no longer awaiting harvest");
     }
@@ -6588,6 +6648,7 @@ async fn harvest_blocked(
 )]
 pub async fn run_harvest(
     scope: &CycleScope,
+    lane: &mut Lane,
     cfg: &Config,
     finding: &Finding,
     backend: &dyn Backend,
@@ -6647,38 +6708,11 @@ pub async fn run_harvest(
     };
 
     remove_stale_report(resume)?;
-    let rpath = PathBuf::from(&repo.path);
     // A handoff starts a new job, so it gets what a cold one gets from
     // here on: a fresh default branch to compare against, the diff and
     // the full playbook. Only its tree and transcript are inherited.
     let fresh = resume.is_none_or(|p| p.handoff);
     let handoff = resume.is_some_and(|p| p.handoff);
-    // Fetch the default branch into the clone for a fresh attempt; a cold
-    // tree is added at it once the job exists, and a handoff's worker
-    // reads it as `origin/<default>`. Never on a resume: the chain
-    // continues in its own tree.
-    if fresh {
-        let db = repo.default_branch.clone();
-        let rps = rpath.to_string_lossy().to_string();
-        let (rc, out) = tokio::task::spawn_blocking(move || {
-            run_cmd_sync(&["git", "-C", &rps, "fetch", "origin", &db], 600)
-        })
-        .await
-        .unwrap_or((127, "spawn error".to_owned()));
-        if rc != 0 {
-            let tail = crate::util::tail(&out, 300);
-            let what = format!("fetch {}", repo.default_branch);
-            let net = (cfg, backend, repo.url.as_str());
-            if let Some(denied) =
-                harvest_prefetch_failed(store, net, fid, handoff, "fetch failed", &what, &tail)
-                    .await
-            {
-                return Ok(denied);
-            }
-            anyhow::bail!("fetch failed: {tail}");
-        }
-    }
-
     let override_mode = finding.budget_override;
     let (cap, anticipated) = match budget_gate(
         backend,
@@ -6754,6 +6788,33 @@ pub async fn run_harvest(
         String::new()
     };
 
+    // The clone's permit only now, after every forge read: it keeps the
+    // repo's other changes (a sync, the sweep, a URL update) waiting while
+    // it is held, and a PR view and diff are several network round trips.
+    let permit = lane.lock_clone(repo.id).await?;
+    // Fetch the default branch into the clone for a fresh attempt; a cold
+    // tree is added at it once the job exists, and a handoff's worker
+    // reads it as `origin/<default>`. Never on a resume: the chain
+    // continues in its own tree.
+    if fresh {
+        let db = repo.default_branch.as_str();
+        let (rc, out) = fetch_held(&permit, &[db]).await;
+        if rc != 0 {
+            let tail = crate::util::tail(&out, 300);
+            let what = format!("fetch {}", repo.default_branch);
+            // Let go before the probe (see `run_hunt`).
+            drop(permit);
+            let net = (cfg, backend, repo.url.as_str());
+            if let Some(denied) =
+                harvest_prefetch_failed(store, net, fid, handoff, "fetch failed", &what, &tail)
+                    .await
+            {
+                return Ok(denied);
+            }
+            anyhow::bail!("fetch failed: {tail}");
+        }
+    }
+
     let created = match scope
         .create_job(
             resume.map_or(
@@ -6774,7 +6835,7 @@ pub async fn run_harvest(
     let (ws, pinned, running) = match open_workspace(
         store,
         cfg,
-        &repo,
+        (permit, &repo),
         created,
         resume,
         TreeSpec::Detached {
@@ -6870,7 +6931,7 @@ pub async fn run_harvest(
                 let ran = (WorkOf::Finding(FindingJobKind::Harvest, fid), running);
                 runner_failed(store, (cfg, backend, &repo.url), ran, &e).await
             };
-            close_workspace(store, &ws).await;
+            close_workspace(lane, ws).await;
             return denied.ok_or(e);
         }
     };
@@ -6878,7 +6939,7 @@ pub async fn run_harvest(
     let running = match unmetered_offline(store, cfg, backend, &repo.url, ran, &rr).await {
         ControlFlow::Continue(running) => running,
         ControlFlow::Break(denied) => {
-            close_workspace(store, &ws).await;
+            close_workspace(lane, ws).await;
             return Ok(denied);
         }
     };
@@ -6891,7 +6952,7 @@ pub async fn run_harvest(
     .unwrap_or(JobState::Failed);
 
     if let Some(report) = blocked_report(&worktree)? {
-        return harvest_blocked(store, fid, (job, state), pr_number, &ws, &report).await;
+        return harvest_blocked(lane, fid, (job, state), pr_number, ws, &report).await;
     }
     // A closed PR's review must say why it closed. Without that the
     // finding would sit `closed` for good, so a missing or unusable
@@ -6959,7 +7020,7 @@ pub async fn run_harvest(
     } else {
         ingest_followups(store, repo.id, &worktree, fid, job, "harvest").await
     };
-    close_workspace(store, &ws).await;
+    close_workspace(lane, ws).await;
 
     let mut summary = CycleSummary {
         kind: Some(FindingJobKind::Harvest.into()),
@@ -7416,9 +7477,31 @@ pub async fn run_cycle(
             ..Default::default()
         };
     }
-    let scope = CycleScope::open(recovered);
+    // The cycle is one lane: its runners take clone permits in it, and
+    // none can outlive it.
+    let ran = store
+        .lane(async |lane| {
+            run_scoped_cycle(CycleScope::open(recovered), lane, cfg, backend, force_repo).await
+        })
+        .await;
+    ran.unwrap_or_else(|e| CycleSummary {
+        error: Some(e.to_string()),
+        ..Default::default()
+    })
+}
+
+/// [`run_cycle`] inside its lane: run the picked work, then settle what
+/// the runner dropped.
+async fn run_scoped_cycle(
+    scope: CycleScope,
+    lane: &mut Lane,
+    cfg: &Config,
+    backend: &dyn Backend,
+    force_repo: Option<&str>,
+) -> CycleSummary {
+    let store = scope.store().clone();
     // Catch-all
-    let mut summary = match run_cycle_inner(&scope, cfg, backend, force_repo).await {
+    let mut summary = match run_cycle_inner(&scope, lane, cfg, backend, force_repo).await {
         Ok(result) => result,
         Err(e) => {
             let _ = store
@@ -7431,7 +7514,7 @@ pub async fn run_cycle(
         }
     };
     if let Err(e) = scope.settle(&cfg.work_root).await {
-        let msg = settle_failed(store, "the cycle's", &e).await;
+        let msg = settle_failed(&store, "the cycle's", &e).await;
         summary.error = Some(match summary.error.take() {
             Some(runner) => format!("{msg}; {runner}"),
             None => msg,
@@ -7457,6 +7540,7 @@ async fn settle_failed(store: &Store, whose: &str, e: &anyhow::Error) -> String 
 /// Exhaustive dispatch on Candidate variant and sub-kind.
 async fn dispatch(
     scope: &CycleScope,
+    lane: &mut Lane,
     cfg: &Config,
     backend: &dyn Backend,
     candidate: &Candidate,
@@ -7465,9 +7549,9 @@ async fn dispatch(
     match candidate {
         Candidate::Finding {
             kind, finding_id, ..
-        } => run_finding_job(scope, cfg, backend, *kind, *finding_id, None).await,
+        } => run_finding_job(scope, lane, cfg, backend, *kind, *finding_id, None).await,
         Candidate::Repo { kind, repo_id, .. } => {
-            run_repo_job(scope, cfg, backend, *kind, *repo_id, None).await
+            run_repo_job(scope, lane, cfg, backend, *kind, *repo_id, None).await
         }
         // A resume runs through the executor of the kind that was
         // suspended — so ingest, watermarks and PR handling are that
@@ -7496,7 +7580,7 @@ async fn dispatch(
             let resume = Some(plan.as_ref());
             match plan.kind {
                 JobKind::Repo(kind) => {
-                    run_repo_job(scope, cfg, backend, kind, plan.repo_id, resume).await
+                    run_repo_job(scope, lane, cfg, backend, kind, plan.repo_id, resume).await
                 }
                 JobKind::Finding(kind) => {
                     // A finding-kind job always recorded its target, so a
@@ -7504,7 +7588,7 @@ async fn dispatch(
                     let fid = plan
                         .finding_id
                         .ok_or_else(|| anyhow::anyhow!("resume of a {kind} job with no finding"))?;
-                    run_finding_job(scope, cfg, backend, kind, fid, resume).await
+                    run_finding_job(scope, lane, cfg, backend, kind, fid, resume).await
                 }
             }
         }
@@ -7513,6 +7597,7 @@ async fn dispatch(
 
 async fn run_repo_job(
     scope: &CycleScope,
+    lane: &mut Lane,
     cfg: &Config,
     backend: &dyn Backend,
     kind: RepoJobKind,
@@ -7525,17 +7610,18 @@ async fn run_repo_job(
         .await?
         .ok_or_else(|| anyhow::anyhow!("repo {repo_id} not found"))?;
     match kind {
-        RepoJobKind::Hunt => run_hunt(scope, cfg, &repo, backend, resume).await,
-        RepoJobKind::TestGap => run_test_gap(scope, cfg, &repo, backend, resume).await,
-        RepoJobKind::DepUpdate => run_dep_update(scope, cfg, &repo, backend, resume).await,
-        RepoJobKind::Refactor => run_refactor(scope, cfg, &repo, backend, resume).await,
-        RepoJobKind::Modernization => run_modernize(scope, cfg, &repo, backend, resume).await,
-        RepoJobKind::Standards => run_standards(scope, cfg, &repo, backend, resume).await,
+        RepoJobKind::Hunt => run_hunt(scope, lane, cfg, &repo, backend, resume).await,
+        RepoJobKind::TestGap => run_test_gap(scope, lane, cfg, &repo, backend, resume).await,
+        RepoJobKind::DepUpdate => run_dep_update(scope, lane, cfg, &repo, backend, resume).await,
+        RepoJobKind::Refactor => run_refactor(scope, lane, cfg, &repo, backend, resume).await,
+        RepoJobKind::Modernization => run_modernize(scope, lane, cfg, &repo, backend, resume).await,
+        RepoJobKind::Standards => run_standards(scope, lane, cfg, &repo, backend, resume).await,
     }
 }
 
 async fn run_finding_job(
     scope: &CycleScope,
+    lane: &mut Lane,
     cfg: &Config,
     backend: &dyn Backend,
     kind: FindingJobKind,
@@ -7548,10 +7634,10 @@ async fn run_finding_job(
         .await?
         .ok_or_else(|| anyhow::anyhow!("finding {finding_id} not found"))?;
     match kind {
-        FindingJobKind::Engage => run_engage(scope, cfg, &finding, backend, resume).await,
-        FindingJobKind::Harvest => run_harvest(scope, cfg, &finding, backend, resume).await,
-        FindingJobKind::Recheck => run_recheck(scope, cfg, &finding, backend, resume).await,
-        FindingJobKind::Fix => run_fix(scope, cfg, &finding, backend, resume).await,
+        FindingJobKind::Engage => run_engage(scope, lane, cfg, &finding, backend, resume).await,
+        FindingJobKind::Harvest => run_harvest(scope, lane, cfg, &finding, backend, resume).await,
+        FindingJobKind::Recheck => run_recheck(scope, lane, cfg, &finding, backend, resume).await,
+        FindingJobKind::Fix => run_fix(scope, lane, cfg, &finding, backend, resume).await,
     }
 }
 
@@ -7563,6 +7649,7 @@ async fn run_finding_job(
 )]
 async fn run_cycle_inner(
     scope: &CycleScope,
+    lane: &mut Lane,
     cfg: &Config,
     backend: &dyn Backend,
     force_repo: Option<&str>,
@@ -7638,7 +7725,7 @@ async fn run_cycle_inner(
     // alone, so the work is retried as soon as the rotation reaches it and
     // is held after three identical failures (WORK-MODEL.md §17), where it
     // used to be bumped here and wait out its interval each time.
-    let mut result = dispatch(scope, cfg, backend, &candidate).await?;
+    let mut result = dispatch(scope, lane, cfg, backend, &candidate).await?;
 
     if sync.is_some() {
         result.sync = sync;
