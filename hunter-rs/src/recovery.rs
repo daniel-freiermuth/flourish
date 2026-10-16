@@ -55,8 +55,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use crate::domain::{ClosureClass, FindingStatus, JobKind, JobState};
-use crate::store::{JobOutcome, PrSyncPass, Store, StoreWriteError, VerdictAnchor};
+use crate::domain::{ClosureClass, FindingStatus, JobState};
+use crate::store::{JobInsertError, JobOutcome, JobStart, PrSyncPass, Store, VerdictAnchor};
 use crate::transition::Moved;
 use crate::types::Job;
 use crate::workspace::{Workspace, tree_in_use};
@@ -389,30 +389,21 @@ impl CycleScope {
     }
 
     /// Create a job, owned by the [`RunningJob`] returned. The INSERT and
-    /// its rules (deleted repos refused, checkpoints superseded, resumed
-    /// attempts inheriting their chain's pins) are `Store::insert_job`'s.
-    /// A job is always created `running`, and leaves that state only
-    /// through its [`RunningJob`] or, once that is dropped, a settle.
+    /// its rules (deleted repos refused, one `running` job per finding and
+    /// per repo-level (repo, kind), checkpoints superseded, a resume or
+    /// handoff running on its predecessor's place and inheriting its
+    /// chain's pins) are `Store::insert_job`'s. A job is always created
+    /// `running`, and leaves that state only through its [`RunningJob`]
+    /// or, once that is dropped, a settle.
     pub async fn create_job(
         &self,
-        kind: JobKind,
-        repo_id: i64,
-        finding_id: Option<i64>,
+        start: JobStart,
         cap_tokens: Option<i64>,
         estimated_tokens: Option<i64>,
-        resumed_from: Option<i64>,
-    ) -> Result<CreatedJob, StoreWriteError> {
+    ) -> Result<CreatedJob, JobInsertError> {
         let inserted = self
             .store
-            .insert_job(
-                &Owner(()),
-                kind,
-                repo_id,
-                finding_id,
-                cap_tokens,
-                estimated_tokens,
-                resumed_from,
-            )
+            .insert_job(&Owner(()), start, cap_tokens, estimated_tokens)
             .await?;
         Ok(CreatedJob {
             job: RunningJob {
@@ -882,7 +873,7 @@ mod tests {
         // unended, and a hunt is created and dropped unended ...
         drop(scope.claim_fix(2).await.unwrap().unwrap());
         let hunt = scope
-            .create_job(RepoJobKind::Hunt.into(), 1, None, None, None, None)
+            .create_job(JobStart::fresh_repo(RepoJobKind::Hunt, 1), None, None)
             .await
             .unwrap()
             .job;
@@ -921,7 +912,8 @@ mod tests {
         let store = recovered.store();
         let work_root = dir.join("work_root");
         let scope = CycleScope::open(&recovered);
-        let create = |kind: RepoJobKind| scope.create_job(kind.into(), 1, None, None, None, None);
+        let create =
+            |kind: RepoJobKind| scope.create_job(JobStart::fresh_repo(kind, 1), None, None);
         let with_work = create(RepoJobKind::Hunt).await.unwrap().job;
         let without = create(RepoJobKind::TestGap).await.unwrap().job;
         let session = Workspace::for_chain(&work_root, Path::new(""), with_work.id()).session;

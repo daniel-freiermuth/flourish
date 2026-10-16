@@ -5,7 +5,7 @@
 //! endpoint and the loop cannot disagree about what runs next. The
 //! `run_*` executors below are the other half.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::ops::ControlFlow;
 use std::path::Path;
 
@@ -17,7 +17,10 @@ use crate::domain::{
     BudgetOverride, ClosureClass, FindingJobKind, FindingStatus, FindingType, FinishedState,
     HoldReason, JobKind, JobState, RepoJobKind, RepoWorkKind, Severity,
 };
-use crate::store::{FindingFilter, JobOutcome, PrSyncPass, SeenActivity, Store, StoreWriteError};
+use crate::store::{
+    FindingFilter, JobInsertError, JobOutcome, JobPlace, JobStart, PrSyncPass, SeenActivity, Store,
+    StoreWriteError,
+};
 use crate::transition::{Moved, PrEnded, PrEnding, PrRef, Transition, Unclaimed};
 use crate::types::{Finding, Job, Repo};
 use crate::util::now_ms;
@@ -77,6 +80,23 @@ pub struct ResumePlan {
     /// is the first attempt since: its reason and detail. The resume prompt
     /// is chosen from the reason (WORK-MODEL.md §9.1).
     pub after_hold: Option<(HoldReason, String)>,
+}
+
+impl ResumePlan {
+    /// The job this plan starts: a handoff of its engage, or a resume of
+    /// its checkpoint. Either runs on the predecessor's place, which the
+    /// insert reads from that row.
+    pub const fn start(&self) -> JobStart {
+        if self.handoff {
+            JobStart::Handoff {
+                engage: self.predecessor_id,
+            }
+        } else {
+            JobStart::Resume {
+                checkpoint: self.predecessor_id,
+            }
+        }
+    }
 }
 
 /// What `run_cycle` would act on right now, if invoked (scheduler.py
@@ -330,6 +350,20 @@ async fn select(
     attention.retain(not_held(FindingJobKind::Engage));
     pending_harvest.retain(not_held(FindingJobKind::Harvest));
     queued.retain(not_held(FindingJobKind::Fix));
+    // A place a job is running on takes no second attempt: the insert
+    // would be refused (migration 031). It is skipped like held work, so a
+    // job left `running` by a stray worker keeps only its own place, not
+    // the whole selection, from being picked.
+    let running = store.running_places().await?;
+    let busy = |place: JobPlace| running.contains(&place);
+    for tier in [
+        &mut rechecking,
+        &mut attention,
+        &mut pending_harvest,
+        &mut queued,
+    ] {
+        tier.retain(|f| !busy(JobPlace::Finding(f.id)));
+    }
 
     // list_findings is id DESC: oldest first, as the engage and harvest
     // lists already are.
@@ -381,7 +415,7 @@ async fn select(
     // re-cache ratio 1.00 across 112 production events) where restarting
     // costs a flat ~37,000-token session floor plus every token already
     // spent, and advances no watermark to show for it.
-    match pick_resume(store, cfg, force_id, &held, mode).await? {
+    match pick_resume(store, cfg, force_id, (&held, &running), mode).await? {
         Picked::Work(c) => return Ok(Some(c)),
         // A repo chain given up there was counted as a failure, which may
         // have held its work: select again, from the top.
@@ -394,9 +428,9 @@ async fn select(
     // last_hunt_at first; ties keep list_repos' name order (Python
     // sorted() and Vec::sort_by_key are both stable). Held work is
     // skipped: a held `sync` takes the whole repo out of the rotation, a
-    // held kind only that kind. A request whose hunt is held is not
-    // urgent: it waits for the hunt's release without putting the repo's
-    // other kinds ahead of every other repo.
+    // held kind only that kind. A request whose hunt is held, or still
+    // running, is not urgent: it waits for that hunt without putting the
+    // repo's other kinds ahead of every other repo.
     let mut repos: Vec<Repo> = store
         .list_repos()
         .await?
@@ -409,9 +443,13 @@ async fn select(
             }
         })
         .collect();
+    let hunt_busy = |r: &Repo| {
+        held.repo(r.id, RepoJobKind::Hunt)
+            || busy(JobPlace::of(RepoJobKind::Hunt.into(), r.id, None))
+    };
     repos.sort_by_key(|r| {
         (
-            !full_hunt_urgent(r) || held.repo(r.id, RepoJobKind::Hunt),
+            !full_hunt_urgent(r) || hunt_busy(r),
             r.last_hunt_at.is_some(),
             r.last_hunt_at.unwrap_or(0),
         )
@@ -422,7 +460,10 @@ async fn select(
         if held.repo_sync(target.id) {
             continue;
         }
-        let hunt_held = held.repo(target.id, RepoJobKind::Hunt);
+        let repo_busy = |kind: RepoJobKind| {
+            held.repo(target.id, kind) || busy(JobPlace::of(kind.into(), target.id, None))
+        };
+        let hunt_held = hunt_busy(target);
         if !Path::new(&target.path).exists() {
             // Not cloned yet -> hunt does the clone (`scheduler.pick_next`).
             if hunt_held {
@@ -437,7 +478,7 @@ async fn select(
             return Ok(Some(repo_candidate(RepoJobKind::Hunt, target)));
         }
 
-        if let Some(kind) = rotation_kind(cfg, target, now, |k| held.repo(target.id, k)) {
+        if let Some(kind) = rotation_kind(cfg, target, now, repo_busy) {
             return Ok(Some(repo_candidate(kind, target)));
         }
         // All scan types ran within their intervals for this repo.
@@ -703,7 +744,7 @@ async fn pick_resume(
     store: &Store,
     cfg: &Config,
     force_id: Option<i64>,
-    held: &crate::store::HeldWork,
+    (held, running): (&crate::store::HeldWork, &HashSet<JobPlace>),
     mode: Pick,
 ) -> anyhow::Result<Picked> {
     for job in store.list_resumable_jobs().await? {
@@ -715,7 +756,7 @@ async fn pick_resume(
             (JobKind::Repo(kind), _) => held.repo(job.repo_id, kind),
             (JobKind::Finding(_), None) => false,
         };
-        if is_held {
+        if is_held || running.contains(&JobPlace::of(job.kind, job.repo_id, job.finding_id)) {
             continue;
         }
         let (kind, repo, job_id) = (job.kind, (job.repo_id, job.repo_name.clone()), job.id);
@@ -1265,28 +1306,45 @@ fn job_state(rr: &RunResult) -> FinishedState {
     }
 }
 
-/// Turn a refused `create_job` into a skipped cycle.
+/// Turn a refused `create_job` into a skipped cycle, or the cycle's error.
 ///
-/// The repo was live when this run was picked and soft-deleted before the
-/// job row went in. Losing that race is ordinary operator traffic, not a
-/// fault: reporting it as an error would log "cycle crashed" and hand the
-/// operator a stack trace for having deleted a repo. A genuine DB failure
-/// still propagates.
-fn job_refused(
-    kind: JobKind,
-    repo: Option<&str>,
-    finding_id: Option<i64>,
-    err: StoreWriteError,
-) -> anyhow::Result<CycleSummary> {
+/// A skip is a race this run lost to someone else's write between its
+/// pick and its insert; the next selection reads the state that write
+/// left, so it does not name the same work again:
+/// - The repo was live when this run was picked and soft-deleted before
+///   the job row went in. Only repo-level work can lose it:
+///   `soft_delete_repo` refuses a repo any finding references, and
+///   findings are never removed, so a finding's repo is never deleted.
+/// - The checkpoint a resume continues is not its work item's checkpoint
+///   any more (an operator restarted the work, or another attempt
+///   continued it), or the engage a handoff continues was continued
+///   already. Selection names a checkpoint by the same pointer the insert
+///   reads, so only a write in between parts them.
+///
+/// Reporting either as an error would log "cycle crashed", back every
+/// other piece of work off for minutes and hand the operator a stack
+/// trace for ordinary traffic. The skip names the kind and repo, never a
+/// finding.
+///
+/// A place another `running` job still holds is an error, not a skip.
+/// Selection never picks such a place ([`Store::running_places`]), so the
+/// insert only meets one when a runner starts a second attempt itself
+/// beside one it failed to end -- an engage handing off to its harvest
+/// after the write ending the engage failed. That is a fault to surface.
+/// The next selection skips the place, so the backoff does not repeat.
+/// So is a finding with no row, and a genuine DB failure propagates too.
+fn job_refused(kind: JobKind, repo: &str, err: JobInsertError) -> anyhow::Result<CycleSummary> {
     match err {
-        StoreWriteError::Refused(msg) => Ok(CycleSummary {
-            kind: Some(kind),
-            repo: repo.map(ToOwned::to_owned),
-            finding_id,
-            skipped: Some(msg),
-            ..Default::default()
-        }),
-        StoreWriteError::Db(e) => Err(e.into()),
+        JobInsertError::RepoDeleted { .. } | JobInsertError::NotContinuable { .. } => {
+            Ok(CycleSummary {
+                kind: Some(kind),
+                repo: Some(repo.to_owned()),
+                skipped: Some(err.to_string()),
+                ..Default::default()
+            })
+        }
+        JobInsertError::Occupied { .. } | JobInsertError::UnknownFinding { .. } => Err(err.into()),
+        JobInsertError::Db(e) => Err(e.into()),
     }
 }
 
@@ -2374,17 +2432,17 @@ pub async fn run_hunt(
 
     let created = match scope
         .create_job(
-            RepoJobKind::Hunt.into(),
-            rid,
-            None,
+            resume.map_or(
+                JobStart::fresh_repo(RepoJobKind::Hunt, rid),
+                ResumePlan::start,
+            ),
             cap,
             Some(anticipated),
-            resume.map(|r| r.predecessor_id),
         )
         .await
     {
         Ok(j) => j,
-        Err(e) => return job_refused(RepoJobKind::Hunt.into(), Some(rname), None, e),
+        Err(e) => return job_refused(RepoJobKind::Hunt.into(), rname, e),
     };
     let job = created.job.id();
     if resume.is_none() {
@@ -2778,23 +2836,18 @@ pub async fn run_recheck(
     remove_stale_report(resume)?;
     let created = match scope
         .create_job(
-            FindingJobKind::Recheck.into(),
-            repo.id,
-            Some(fid),
+            resume.map_or(
+                JobStart::fresh_finding(FindingJobKind::Recheck, fid),
+                ResumePlan::start,
+            ),
             cap,
             Some(anticipated),
-            resume.map(|r| r.predecessor_id),
         )
         .await
     {
         Ok(j) => j,
         Err(e) => {
-            return job_refused(
-                FindingJobKind::Recheck.into(),
-                Some(&repo.name),
-                Some(fid),
-                e,
-            );
+            return job_refused(FindingJobKind::Recheck.into(), &repo.name, e);
         }
     };
     let job = created.job.id();
@@ -3270,17 +3323,14 @@ async fn run_analysis_job(
     };
     let created = match scope
         .create_job(
-            kind.into(),
-            rid,
-            None,
+            resume.map_or(JobStart::fresh_repo(kind, rid), ResumePlan::start),
             cap,
             Some(anticipated),
-            resume.map(|r| r.predecessor_id),
         )
         .await
     {
         Ok(j) => j,
-        Err(e) => return job_refused(kind.into(), Some(rname), None, e),
+        Err(e) => return job_refused(kind.into(), rname, e),
     };
     let job = created.job.id();
     let (ws, pinned, running) = match open_workspace(
@@ -3832,20 +3882,19 @@ async fn start_fix(
     }
     let created = match scope
         .create_job(
-            FindingJobKind::Fix.into(),
-            repo.id,
-            Some(fid),
+            resume.map_or(
+                JobStart::fresh_finding(FindingJobKind::Fix, fid),
+                ResumePlan::start,
+            ),
             cap,
             Some(anticipated),
-            resume.map(|r| r.predecessor_id),
         )
         .await
     {
         Ok(j) => j,
         Err(e) => {
             release_claim(claim).await;
-            return job_refused(FindingJobKind::Fix.into(), Some(&repo.name), Some(fid), e)
-                .map(Err);
+            return job_refused(FindingJobKind::Fix.into(), &repo.name, e).map(Err);
         }
     };
     let job = created.job.id();
@@ -5480,24 +5529,18 @@ async fn start_engage(
 
     let created = match scope
         .create_job(
-            FindingJobKind::Engage.into(),
-            repo.id,
-            Some(fid),
+            resume.map_or(
+                JobStart::fresh_finding(FindingJobKind::Engage, fid),
+                ResumePlan::start,
+            ),
             cap,
             Some(anticipated),
-            resume.map(|r| r.predecessor_id),
         )
         .await
     {
         Ok(j) => j,
         Err(e) => {
-            return job_refused(
-                FindingJobKind::Engage.into(),
-                Some(&repo.name),
-                Some(fid),
-                e,
-            )
-            .map(Err);
+            return job_refused(FindingJobKind::Engage.into(), &repo.name, e).map(Err);
         }
     };
     let job = created.job.id();
@@ -6713,23 +6756,18 @@ pub async fn run_harvest(
 
     let created = match scope
         .create_job(
-            FindingJobKind::Harvest.into(),
-            repo.id,
-            Some(fid),
+            resume.map_or(
+                JobStart::fresh_finding(FindingJobKind::Harvest, fid),
+                ResumePlan::start,
+            ),
             cap,
             Some(anticipated),
-            resume.map(|r| r.predecessor_id),
         )
         .await
     {
         Ok(j) => j,
         Err(e) => {
-            return job_refused(
-                FindingJobKind::Harvest.into(),
-                Some(&repo.name),
-                Some(fid),
-                e,
-            );
+            return job_refused(FindingJobKind::Harvest.into(), &repo.name, e);
         }
     };
     let job = created.job.id();

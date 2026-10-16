@@ -15,11 +15,14 @@ use std::path::{Path, PathBuf};
 
 use hunter::backend::SpendLedger;
 use hunter::domain::{
-    BudgetOverride, ClosureClass, FindingJobKind, FindingStatus, ForgeName, HoldReason,
-    ReleaseAction, RepoJobKind,
+    BudgetOverride, ClosureClass, FindingJobKind, FindingStatus, FinishedState, ForgeName,
+    HoldReason, JobKind, ReleaseAction, RepoJobKind,
 };
 use hunter::store::SeenActivity;
-use hunter::store::{RepoUpdate, ResumeChainStats, Store, StoreWriteError};
+use hunter::store::{
+    JobInsertError, JobOutcome, JobPlace, JobStart, RepoUpdate, ResumeChainStats, Store,
+    StoreWriteError,
+};
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnectOptions;
 use support::{TempDir, pr_ref, pr_sync};
@@ -229,23 +232,18 @@ async fn create_job_refuses_a_soft_deleted_repo_and_leaves_it_reapable() {
 
     let Err(err) = support::scope(&store)
         .create_job(
-            RepoJobKind::Hunt.into(),
-            picked.id,
-            None,
+            JobStart::fresh_repo(RepoJobKind::Hunt, picked.id),
             Some(100_000),
-            None,
             None,
         )
         .await
     else {
         panic!("a job was created on a deleted repo");
     };
-    match err {
-        StoreWriteError::Refused(msg) => {
-            assert_eq!(msg, "repo 2 is deleted -- cannot start a hunt job");
-        }
-        StoreWriteError::Db(e) => panic!("expected Refused, got Db({e:?})"),
-    }
+    assert!(
+        matches!(err, JobInsertError::RepoDeleted { repo_id: 2, .. }),
+        "expected RepoDeleted, got {err:?}"
+    );
     assert!(
         store.list_jobs(10).await.unwrap().is_empty(),
         "a refused insert must write no job row"
@@ -254,7 +252,11 @@ async fn create_job_refuses_a_soft_deleted_repo_and_leaves_it_reapable() {
     // The guard is keyed on deleted_at, not on the repo being absent: a
     // live repo still gets its job.
     let job = support::scope(&store)
-        .create_job(RepoJobKind::Hunt.into(), 1, None, Some(100_000), None, None)
+        .create_job(
+            JobStart::fresh_repo(RepoJobKind::Hunt, 1),
+            Some(100_000),
+            None,
+        )
         .await
         .unwrap()
         .job
@@ -271,6 +273,255 @@ async fn create_job_refuses_a_soft_deleted_repo_and_leaves_it_reapable() {
         .await
         .unwrap();
     assert_eq!(still_there, 0, "the reaped row must be gone for good");
+}
+
+/// One `running` job per finding, whatever its kind, and one per repo and
+/// kind for repo-level work (migration 031). A second is refused before
+/// anything is written, naming the job that holds the place; the place
+/// is free again once that job has ended.
+#[tokio::test]
+async fn create_job_refuses_a_second_running_job_on_one_place() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo_and_findings(&pool).await;
+    let store = rw_store(&path).await;
+    let scope = support::scope(&store);
+    let create = |start: JobStart| scope.create_job(start, Some(100_000), None);
+
+    let fix = create(JobStart::fresh_finding(FindingJobKind::Fix, 2))
+        .await
+        .unwrap()
+        .job;
+    let hunt = create(JobStart::fresh_repo(RepoJobKind::Hunt, 1))
+        .await
+        .unwrap()
+        .job;
+    let jobs_before = store.list_jobs(10).await.unwrap().len();
+
+    for kind in [FindingJobKind::Fix, FindingJobKind::Engage] {
+        let Err(err) = create(JobStart::fresh_finding(kind, 2)).await else {
+            panic!("a {kind} job started beside a running fix of #2");
+        };
+        assert!(
+            matches!(
+                err,
+                JobInsertError::Occupied { place: JobPlace::Finding(2), holder, .. }
+                    if holder == fix.id()
+            ),
+            "got {err:?}"
+        );
+    }
+    let Err(err) = create(JobStart::fresh_repo(RepoJobKind::Hunt, 1)).await else {
+        panic!("a second hunt of repo 1 started");
+    };
+    assert!(
+        matches!(
+            err,
+            JobInsertError::Occupied {
+                place: JobPlace::RepoWork { repo_id: 1, kind: JobKind::Repo(RepoJobKind::Hunt) },
+                holder,
+                ..
+            } if holder == hunt.id()
+        ),
+        "got {err:?}"
+    );
+    assert_eq!(
+        store.list_jobs(10).await.unwrap().len(),
+        jobs_before,
+        "a refused insert writes no row"
+    );
+
+    // Other places are free: another finding, another repo-level kind.
+    create(JobStart::fresh_finding(FindingJobKind::Engage, 3))
+        .await
+        .unwrap()
+        .job
+        .disown();
+    create(JobStart::fresh_repo(RepoJobKind::TestGap, 1))
+        .await
+        .unwrap()
+        .job
+        .disown();
+
+    // And this one is free once its job has ended.
+    fix.complete(&JobOutcome {
+        state: FinishedState::Failed,
+        tokens_new: 0,
+        calls: 0,
+        exit_code: Some(1),
+        killed_reason: None,
+        session_file: None,
+        notes: None,
+        model: None,
+        usage_delta: None,
+        finished_at: 2000,
+    })
+    .await
+    .unwrap();
+    create(JobStart::fresh_finding(FindingJobKind::Engage, 2))
+        .await
+        .unwrap()
+        .job
+        .disown();
+    hunt.disown();
+}
+
+/// Fresh finding work runs in its finding's own repo, read from the
+/// finding's row, so the job and the clone it works in can never belong
+/// to different repos. A finding with no row starts nothing.
+#[tokio::test]
+async fn fresh_finding_work_runs_in_its_findings_repo() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo_and_findings(&pool).await;
+    sqlx::raw_sql(
+        r"
+        INSERT INTO repos (id, name, url, path, forge, default_branch, enabled, added_at)
+        VALUES (2, 'beta', 'https://example.com/beta.git', '/tmp/beta', 'github', 'main', 1, 1000);
+        UPDATE findings SET repo_id = 2 WHERE id = 3;
+        ",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let store = rw_store(&path).await;
+    let scope = support::scope(&store);
+
+    let job = scope
+        .create_job(
+            JobStart::fresh_finding(FindingJobKind::Engage, 3),
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .job;
+    assert_eq!(
+        job_place(&pool, job.id()).await,
+        ("engage".to_owned(), 2, Some(3), None)
+    );
+    job.disown();
+
+    let Err(err) = scope
+        .create_job(JobStart::fresh_finding(FindingJobKind::Fix, 99), None, None)
+        .await
+    else {
+        panic!("a fix of a finding with no row started");
+    };
+    assert!(
+        matches!(err, JobInsertError::UnknownFinding { finding_id: 99, .. }),
+        "got {err:?}"
+    );
+    assert_eq!(
+        store.list_jobs(10).await.unwrap().len(),
+        1,
+        "no row for #99"
+    );
+}
+
+/// How a fixture job ended: with a transcript, so a paused one is a
+/// checkpoint.
+fn ended(state: FinishedState) -> JobOutcome<'static> {
+    JobOutcome {
+        state,
+        tokens_new: 10,
+        calls: 1,
+        exit_code: None,
+        killed_reason: None,
+        session_file: Some("/s/session.jsonl"),
+        notes: None,
+        model: None,
+        usage_delta: None,
+        finished_at: 2000,
+    }
+}
+
+/// Job `id`'s (kind, repo, finding, `resumed_from`).
+async fn job_place(pool: &SqlitePool, id: i64) -> (String, i64, Option<i64>, Option<i64>) {
+    sqlx::query_as("SELECT kind, repo_id, finding_id, resumed_from FROM jobs WHERE id = ?1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// A fresh `kind` job on `finding`, ended as `state`.
+async fn ended_job(
+    scope: &hunter::recovery::CycleScope,
+    kind: FindingJobKind,
+    finding: i64,
+    state: FinishedState,
+) -> i64 {
+    let start = JobStart::fresh_finding(kind, finding);
+    let job = scope.create_job(start, None, None).await.unwrap().job;
+    let id = job.id();
+    job.complete(&ended(state)).await.unwrap();
+    id
+}
+
+/// A resume names only its checkpoint, and runs where that job's work is,
+/// only while that job is still the checkpoint. With migration 031's
+/// indexes that leaves a checkpoint at most one live successor, and none
+/// on another finding or repo.
+#[tokio::test]
+async fn a_resume_runs_on_its_checkpoints_place_while_it_is_the_checkpoint() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo_and_findings(&pool).await;
+    let store = rw_store(&path).await;
+    let scope = support::scope(&store);
+    let paused = ended_job(&scope, FindingJobKind::Fix, 2, FinishedState::Suspended).await;
+    let resume = JobStart::Resume { checkpoint: paused };
+
+    let resumed = scope.create_job(resume, None, None).await.unwrap().job;
+    assert_eq!(
+        job_place(&pool, resumed.id()).await,
+        ("fix".to_owned(), 1, Some(2), Some(paused))
+    );
+    resumed.fail_unstarted("no backend").await.unwrap();
+
+    // Fresh work supersedes the checkpoint: no resume continues it now.
+    ended_job(&scope, FindingJobKind::Fix, 2, FinishedState::Failed).await;
+    let Err(err) = scope.create_job(resume, None, None).await else {
+        panic!("a superseded checkpoint was resumed");
+    };
+    assert!(
+        matches!(err, JobInsertError::NotContinuable { start } if start == resume),
+        "got {err:?}"
+    );
+}
+
+/// A handoff names only its engage, and is that engage's finding's
+/// harvest, once. Nothing but an engage hands over.
+#[tokio::test]
+async fn an_engage_hands_over_to_its_findings_harvest_once() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo_and_findings(&pool).await;
+    let store = rw_store(&path).await;
+    let scope = support::scope(&store);
+    let engage = ended_job(&scope, FindingJobKind::Engage, 3, FinishedState::Done).await;
+    let fix = ended_job(&scope, FindingJobKind::Fix, 2, FinishedState::Done).await;
+
+    let harvest = scope
+        .create_job(JobStart::Handoff { engage }, None, None)
+        .await
+        .unwrap()
+        .job;
+    assert_eq!(
+        job_place(&pool, harvest.id()).await,
+        ("harvest".to_owned(), 1, Some(3), Some(engage))
+    );
+    harvest.fail_unstarted("no backend").await.unwrap();
+
+    for start in [
+        JobStart::Handoff { engage },
+        JobStart::Handoff { engage: fix },
+    ] {
+        let Err(err) = scope.create_job(start, None, None).await else {
+            panic!("{start} went through");
+        };
+        assert!(
+            matches!(err, JobInsertError::NotContinuable { start: s } if s == start),
+            "got {err:?}"
+        );
+    }
 }
 
 // -- 4. add_repo / update_repo --------------------------------------------
@@ -381,20 +632,28 @@ async fn insert_job(
 async fn running_estimate_counts_running_jobs_only() {
     let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
-    insert_job(&pool, "running", Some(100_000), None, None).await;
-    insert_job(&pool, "running", Some(50_000), None, None).await;
-    insert_job(&pool, "running", None, None, None).await; // NULL cap: no contribution
+    insert_running_job(&pool, "hunt", Some(100_000), None).await;
+    insert_running_job(&pool, "test_gap", Some(50_000), None).await;
+    insert_running_job(&pool, "refactor", None, None).await; // NULL cap: no contribution
     insert_job(&pool, "done", Some(999_999), Some(1_000), Some(2_000)).await;
     let store = rw_store(&path).await;
 
     assert_eq!(store.running_estimate().await.unwrap(), 150_000);
 }
 
-async fn insert_running_job(pool: &SqlitePool, cap_tokens: Option<i64>, estimate: Option<i64>) {
+/// A running repo-level job of `kind`: one repo runs one job per kind at
+/// a time (migration 031), so concurrent fixture rows differ in kind.
+async fn insert_running_job(
+    pool: &SqlitePool,
+    kind: &str,
+    cap_tokens: Option<i64>,
+    estimate: Option<i64>,
+) {
     sqlx::query(
         "INSERT INTO jobs (kind, repo_id, state, cap_tokens, estimated_tokens, started_at) \
-         VALUES ('hunt', 1, 'running', ?1, ?2, 1)",
+         VALUES (?1, 1, 'running', ?2, ?3, 1)",
     )
+    .bind(kind)
     .bind(cap_tokens)
     .bind(estimate)
     .execute(pool)
@@ -410,7 +669,7 @@ async fn insert_running_job(pool: &SqlitePool, cap_tokens: Option<i64>, estimate
 async fn running_estimate_counts_a_running_job_by_its_estimate_not_its_cap() {
     let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
-    insert_running_job(&pool, Some(20_000), Some(204_000)).await;
+    insert_running_job(&pool, "hunt", Some(20_000), Some(204_000)).await;
     let store = rw_store(&path).await;
 
     assert_eq!(store.running_estimate().await.unwrap(), 204_000);
@@ -424,8 +683,8 @@ async fn running_estimate_counts_a_running_job_by_its_estimate_not_its_cap() {
 async fn running_estimate_falls_back_to_cap_for_rows_without_an_estimate() {
     let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
-    insert_running_job(&pool, Some(50_000), None).await; // pre-migration row
-    insert_running_job(&pool, Some(20_000), Some(204_000)).await;
+    insert_running_job(&pool, "hunt", Some(50_000), None).await; // pre-migration row
+    insert_running_job(&pool, "test_gap", Some(20_000), Some(204_000)).await;
     let store = rw_store(&path).await;
 
     assert_eq!(store.running_estimate().await.unwrap(), 254_000);
@@ -2124,14 +2383,7 @@ async fn resumable_jobs_skip_a_suspension_that_already_has_a_successor() {
     insert_suspended_job(&pool, 11, (1, "test_gap"), Some("/s/11/session.jsonl")).await;
     let store = rw_store(&path).await;
     support::scope(&store)
-        .create_job(
-            RepoJobKind::TestGap.into(),
-            1,
-            None,
-            None,
-            Some(250_000),
-            Some(11),
-        )
+        .create_job(JobStart::Resume { checkpoint: 11 }, None, Some(250_000))
         .await
         .unwrap();
 
@@ -2160,14 +2412,7 @@ async fn a_resume_that_never_ran_keeps_the_repo_checkpoint() {
     insert_suspended_job(&pool, 10, (1, "hunt"), Some("/s/10/session.jsonl")).await;
     let store = rw_store(&path).await;
     let resumed = support::scope(&store)
-        .create_job(
-            RepoJobKind::Hunt.into(),
-            1,
-            None,
-            None,
-            Some(250_000),
-            Some(10),
-        )
+        .create_job(JobStart::Resume { checkpoint: 10 }, None, Some(250_000))
         .await
         .unwrap();
     assert!(resumed.superseded.is_empty(), "{:?}", resumed.superseded);
@@ -2239,13 +2484,20 @@ async fn resume_chain_stats_measure_every_attempt_from_any_link() {
     let mut previous = None;
     for tokens in [120_000, 90_000, 30_000] {
         let id = support::scope(&store)
-            .create_job(RepoJobKind::Hunt.into(), 1, None, None, None, previous)
+            .create_job(
+                previous.map_or(JobStart::fresh_repo(RepoJobKind::Hunt, 1), |checkpoint| {
+                    JobStart::Resume { checkpoint }
+                }),
+                None,
+                None,
+            )
             .await
             .unwrap()
             .job
             .disown();
         set_tokens(&pool, id, tokens).await;
         set_state(&pool, id, "suspended").await;
+        support::point_repo_checkpoint(&pool, 1, "hunt", Some(id)).await;
         chain.push(id);
         previous = Some(id);
     }
@@ -2264,7 +2516,7 @@ async fn resume_chain_stats_measure_every_attempt_from_any_link() {
 
     // Unrelated work is not swept in: the walk follows the link, not the repo.
     let loner = support::scope(&store)
-        .create_job(RepoJobKind::Hunt.into(), 1, None, None, None, None)
+        .create_job(JobStart::fresh_repo(RepoJobKind::Hunt, 1), None, None)
         .await
         .unwrap()
         .job
@@ -2306,13 +2558,20 @@ async fn resume_chain_stats_terminate_on_a_cyclic_link() {
     let mut previous = None;
     for tokens in [120_000, 90_000, 30_000] {
         let id = support::scope(&store)
-            .create_job(RepoJobKind::Hunt.into(), 1, None, None, None, previous)
+            .create_job(
+                previous.map_or(JobStart::fresh_repo(RepoJobKind::Hunt, 1), |checkpoint| {
+                    JobStart::Resume { checkpoint }
+                }),
+                None,
+                None,
+            )
             .await
             .unwrap()
             .job
             .disown();
         set_tokens(&pool, id, tokens).await;
         set_state(&pool, id, "suspended").await;
+        support::point_repo_checkpoint(&pool, 1, "hunt", Some(id)).await;
         chain.push(id);
         previous = Some(id);
     }

@@ -22,7 +22,7 @@ use hunter::scheduler::{
     run_recheck,
 };
 use hunter::server::{AppState, SchedulerHandle, router};
-use hunter::store::{FindingInsert, Store};
+use hunter::store::{FindingInsert, JobStart, Store};
 use hunter::types::RunResult;
 use hunter::workspace::Workspace;
 use sqlx::SqlitePool;
@@ -965,12 +965,9 @@ async fn fresh_work_on_a_finding_supersedes_its_suspended_attempt() {
 
     let created = support::scope(&store)
         .create_job(
-            FindingJobKind::Engage.into(),
-            1,
-            Some(5),
+            JobStart::fresh_finding(FindingJobKind::Engage, 5),
             None,
             Some(40_000),
-            None,
         )
         .await
         .unwrap();
@@ -1035,7 +1032,11 @@ async fn fresh_work_on_a_repo_supersedes_its_suspended_attempt() {
     let store = rw_store(&path).await;
 
     let fresh = support::scope(&store)
-        .create_job(RepoJobKind::Hunt.into(), 1, None, None, Some(40_000), None)
+        .create_job(
+            JobStart::fresh_repo(RepoJobKind::Hunt, 1),
+            None,
+            Some(40_000),
+        )
         .await
         .unwrap()
         .job
@@ -1156,14 +1157,7 @@ async fn resume_unavailable_fails_the_attempt_and_gives_up_the_checkpoint() {
     let store = rw_store(&path).await;
 
     let attempt = support::scope(&store)
-        .create_job(
-            RepoJobKind::Hunt.into(),
-            1,
-            None,
-            None,
-            Some(260_000),
-            Some(10),
-        )
+        .create_job(JobStart::Resume { checkpoint: 10 }, None, Some(260_000))
         .await
         .unwrap()
         .job;
@@ -1489,6 +1483,46 @@ async fn a_resumed_hunt_does_not_sync_the_clone() {
         .await
         .expect("a resume must not touch the remote at all");
     assert_eq!(summary.state, Some(JobState::Done));
+}
+
+/// A resume whose checkpoint moved on between the pick and the insert
+/// (an operator restarted the work, another attempt continued it) skips
+/// the cycle instead of failing it: the next selection reads where the
+/// work is now, so a failure would only back all other work off.
+#[tokio::test]
+async fn a_resume_whose_checkpoint_moved_on_skips_the_cycle() {
+    let (dir, path, pool) = fresh_db().await;
+    executable_repo(&dir, &pool, 10).await;
+    let store = rw_store(&path).await;
+    let cfg = test_config(dir.path());
+    let plan = match pick_next(&store, &cfg, None).await.unwrap() {
+        Some(Candidate::Resume { plan, .. }) => *plan,
+        other => panic!("expected a resume candidate, got {other:?}"),
+    };
+    sqlx::query("UPDATE repo_work SET checkpoint_job_id = NULL WHERE checkpoint_job_id = 10")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let row = store.get_repo_by_id(1).await.unwrap().unwrap();
+    let backend = RecordingBackend::new(
+        cfg.work_root.join("out").join("job10.findings.json"),
+        one_finding(),
+    );
+    let jobs_before = store.list_jobs(10).await.unwrap().len();
+
+    let summary = run_hunt(&support::scope(&store), &cfg, &row, &backend, Some(&plan))
+        .await
+        .expect("a checkpoint that moved on is a skip, not the cycle's error");
+
+    assert!(
+        summary.skipped.is_some(),
+        "the cycle must report a skip: {summary:?}"
+    );
+    assert_eq!(
+        store.list_jobs(10).await.unwrap().len(),
+        jobs_before,
+        "no successor row"
+    );
 }
 
 /// A whole cycle picks the suspension up and runs it as the kind that

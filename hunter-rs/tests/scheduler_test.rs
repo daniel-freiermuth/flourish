@@ -279,6 +279,35 @@ async fn pick_next_queued_finding_beats_huntable_repo() {
     assert_eq!(c.label(), Some("queued bug"));
 }
 
+/// A place a job is still `running` on is skipped, not picked: its second
+/// attempt would be refused at insert (migration 031), and picking it
+/// again every cycle would stall everything behind it. A stray fix still
+/// runs on queued #5 and a stray hunt on repo 1, so the pick passes both
+/// and lands on repo 2's hunt.
+#[tokio::test]
+async fn pick_next_skips_the_places_running_jobs_hold() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo(&pool, 1, "alpha", 1, "/nonexistent/alpha").await;
+    seed_repo(&pool, 2, "beta", 1, "/nonexistent/beta").await;
+    seed_finding(&pool, 5, 1, "queued", "queued bug").await;
+    sqlx::query(
+        "INSERT INTO jobs (id, kind, repo_id, finding_id, state, started_at) VALUES \
+         (20, 'fix', 1, 5, 'running', 1000), (21, 'hunt', 1, NULL, 'running', 1000)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let store = open_store(pool, &path).await;
+    let cfg = test_config(3600.0);
+
+    let c = pick_next(&store, &cfg, None).await.unwrap().unwrap();
+    assert_eq!(
+        (c.job_kind(), c.repo_id()),
+        (RepoJobKind::Hunt.into(), 2),
+        "#5 and repo 1's hunt each have a running job: {c:?}"
+    );
+}
+
 #[tokio::test]
 async fn pick_next_attention_beats_queued_fix_and_orders_by_attention_since() {
     let (_dir, path, pool) = fresh_db().await;

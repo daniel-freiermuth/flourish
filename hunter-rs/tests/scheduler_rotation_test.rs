@@ -939,6 +939,34 @@ async fn a_held_hunt_takes_its_full_rehunt_request_out_of_the_queue() {
     assert_eq!(alpha.full_hunt_request_attempted, None);
 }
 
+/// Running is no different from held: while the requested hunt still
+/// has a `running` row, the request does not put the repo's other kinds
+/// ahead of every other repo.
+#[tokio::test]
+async fn a_running_hunt_takes_its_full_rehunt_request_out_of_the_queue() {
+    let (dir, store, cfg) = two_repos_for_selection("rotation-urgent-running", true).await;
+    assert!(store.request_full_hunt(1).await.unwrap());
+    let pool = sqlx::SqlitePool::connect_with(
+        sqlx::sqlite::SqliteConnectOptions::new().filename(dir.join("rotation-select.db")),
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO jobs (id, kind, repo_id, finding_id, state, started_at) \
+         VALUES (30, 'hunt', 1, NULL, 'running', 1000)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let picked = pick_next(&store, &cfg, None).await.unwrap();
+    assert!(
+        is_repo_pick(picked.as_ref(), 2, RepoJobKind::Hunt),
+        "beta's staler hunt goes first, not alpha's test_gap, got {picked:?}"
+    );
+}
+
 /// A held `sync` holds every kind of its repo, its paused chains included:
 /// the resume tier skips a checkpoint whose own kind is not held, and the
 /// checkpoint stays for the release.

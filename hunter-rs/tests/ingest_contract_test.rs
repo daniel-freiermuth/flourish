@@ -10,8 +10,10 @@
 
 use std::path::Path;
 
-use hunter::domain::{FindingJobKind, FindingType, ForgeName, RepoJobKind, Severity};
-use hunter::store::{FindingFilter, Store};
+use hunter::domain::{
+    FindingJobKind, FindingType, FinishedState, ForgeName, RepoJobKind, Severity,
+};
+use hunter::store::{FindingFilter, JobOutcome, JobStart, Store};
 
 mod support;
 use support::TempDir;
@@ -221,11 +223,8 @@ async fn findings_are_attributed_to_the_hunt_that_produced_them() {
     let (dir, store, repo_id) = provenance_fixture().await;
     let job = support::scope(&store)
         .create_job(
-            RepoJobKind::Hunt.into(),
-            repo_id,
-            None,
+            JobStart::fresh_repo(RepoJobKind::Hunt, repo_id),
             Some(1000),
-            None,
             None,
         )
         .await
@@ -252,27 +251,37 @@ async fn a_rediscovery_does_not_steal_attribution() {
     let (dir, store, repo_id) = provenance_fixture().await;
     let first = support::scope(&store)
         .create_job(
-            RepoJobKind::Hunt.into(),
-            repo_id,
-            None,
+            JobStart::fresh_repo(RepoJobKind::Hunt, repo_id),
             Some(1000),
-            None,
             None,
         )
         .await
         .unwrap()
-        .job
-        .disown();
-    assert_eq!(hunt_producing_two(&dir, &store, repo_id, first).await, 2);
-    let original = produced_by(&store, first).await;
+        .job;
+    let first_id = first.id();
+    assert_eq!(hunt_producing_two(&dir, &store, repo_id, first_id).await, 2);
+    let original = produced_by(&store, first_id).await;
+    // The repo's next hunt starts once this one has ended.
+    first
+        .complete(&JobOutcome {
+            state: FinishedState::Done,
+            tokens_new: 1,
+            calls: 1,
+            exit_code: Some(0),
+            killed_reason: None,
+            session_file: None,
+            notes: None,
+            model: None,
+            usage_delta: None,
+            finished_at: 2000,
+        })
+        .await
+        .unwrap();
 
     let second = support::scope(&store)
         .create_job(
-            RepoJobKind::Hunt.into(),
-            repo_id,
-            None,
+            JobStart::fresh_repo(RepoJobKind::Hunt, repo_id),
             Some(1000),
-            None,
             None,
         )
         .await
@@ -286,7 +295,7 @@ async fn a_rediscovery_does_not_steal_attribution() {
     );
 
     assert_eq!(
-        produced_by(&store, first).await,
+        produced_by(&store, first_id).await,
         original,
         "the original finder keeps its findings"
     );
@@ -303,11 +312,8 @@ async fn a_job_given_a_finding_produces_nothing() {
     let (dir, store, repo_id) = provenance_fixture().await;
     let hunt = support::scope(&store)
         .create_job(
-            RepoJobKind::Hunt.into(),
-            repo_id,
-            None,
+            JobStart::fresh_repo(RepoJobKind::Hunt, repo_id),
             Some(1000),
-            None,
             None,
         )
         .await
@@ -319,11 +325,8 @@ async fn a_job_given_a_finding_produces_nothing() {
 
     let fix = support::scope(&store)
         .create_job(
-            FindingJobKind::Fix.into(),
-            repo_id,
-            Some(found[0]),
+            JobStart::fresh_finding(FindingJobKind::Fix, found[0]),
             Some(1000),
-            None,
             None,
         )
         .await
@@ -352,11 +355,8 @@ async fn follow_ups_link_to_the_finding_their_job_worked_on() {
     let (dir, store, repo_id) = provenance_fixture().await;
     let hunt = support::scope(&store)
         .create_job(
-            RepoJobKind::Hunt.into(),
-            repo_id,
-            None,
+            JobStart::fresh_repo(RepoJobKind::Hunt, repo_id),
             Some(1000),
-            None,
             None,
         )
         .await
@@ -369,11 +369,8 @@ async fn follow_ups_link_to_the_finding_their_job_worked_on() {
 
     let engage = support::scope(&store)
         .create_job(
-            FindingJobKind::Engage.into(),
-            repo_id,
-            Some(source),
+            JobStart::fresh_finding(FindingJobKind::Engage, source),
             Some(1000),
-            None,
             None,
         )
         .await
