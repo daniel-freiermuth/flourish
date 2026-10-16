@@ -144,3 +144,13 @@ export class Filter {
 export function needsSelector(options: readonly string[], filter: Filter): boolean {
   return options.length > 1 || !filter.allSelected(options);
 }
+
+/**
+ * The Filter a selector shows for the selection its URL now holds.
+ *
+ * `previous` is the instance shown before this URL change.
+ */
+export function restoreFilter(previous: Filter | undefined, values: readonly string[] | null): Filter {
+  void previous;
+  return new Filter(values);
+}
