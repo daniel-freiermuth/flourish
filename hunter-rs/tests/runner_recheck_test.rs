@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use hunter::config::Config;
 use hunter::domain::{BudgetOverride, FindingJobKind, FindingStatus};
-use hunter::scheduler::{CycleSummary, run_recheck};
+use hunter::scheduler::{Attempt, CycleSummary, Resumed, run_recheck};
 use hunter::store::{FindingInsert, Store, WorkStreak};
 use hunter::types::{Finding, RunResult};
 use sqlx::SqlitePool;
@@ -56,9 +56,8 @@ impl Fixture {
             &support::scope(&self.store),
             self.store.test_lane(),
             &self.cfg,
-            &finding,
+            Attempt::Cold(&finding),
             backend,
-            None,
         )
         .await
         .unwrap()
@@ -620,8 +619,8 @@ async fn a_stuck_recheck_keeps_its_tree_for_the_continue() {
     let Some(hunter::scheduler::Candidate::Resume { plan, .. }) = picked else {
         panic!("continue resumes the held attempt, got {picked:?}");
     };
-    assert_eq!(Some(plan.predecessor_id), hold.checkpoint_job_id);
-    assert!(plan.workspace.tree.is_dir());
+    assert_eq!(Some(plan.predecessor_id()), hold.checkpoint_job_id);
+    assert!(plan.workspace().tree.is_dir());
 }
 
 /// A recheck worker that fails without doing any metered work while its
@@ -678,9 +677,8 @@ async fn a_recheck_whose_backend_keeps_failing_is_held() {
             &support::scope(&f.store),
             f.store.test_lane(),
             &f.cfg,
-            &finding,
+            Attempt::Cold(&finding),
             &failing,
-            None,
         )
         .await
         .unwrap_err();
@@ -781,14 +779,12 @@ async fn a_continued_recheck_hold_resumes_with_its_reason() {
     };
     let resumed = replying(f.out(), &serde_json::json!({ "verdict": "confirmed" }));
 
-    let finding = f.finding().await;
     run_recheck(
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
-        &finding,
+        Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
         &resumed,
-        Some(&plan),
     )
     .await
     .unwrap();
