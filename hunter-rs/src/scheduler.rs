@@ -1321,8 +1321,11 @@ fn job_state(rr: &RunResult) -> FinishedState {
 ///   continued it), or the engage a handoff continues was continued
 ///   already. Selection names a checkpoint by the same pointer the insert
 ///   reads, so only a write in between parts them.
+/// - A harvest whose finding's PR no longer awaits one: another attempt
+///   or an operator got there first, and the harvest queue no longer
+///   lists the finding.
 ///
-/// Reporting either as an error would log "cycle crashed", back every
+/// Reporting any of them as an error would log "cycle crashed", back every
 /// other piece of work off for minutes and hand the operator a stack
 /// trace for ordinary traffic. The skip names the kind and repo, never a
 /// finding.
@@ -1336,14 +1339,14 @@ fn job_state(rr: &RunResult) -> FinishedState {
 /// So is a finding with no row, and a genuine DB failure propagates too.
 fn job_refused(kind: JobKind, repo: &str, err: JobInsertError) -> anyhow::Result<CycleSummary> {
     match err {
-        JobInsertError::RepoDeleted { .. } | JobInsertError::NotContinuable { .. } => {
-            Ok(CycleSummary {
-                kind: Some(kind),
-                repo: Some(repo.to_owned()),
-                skipped: Some(err.to_string()),
-                ..Default::default()
-            })
-        }
+        JobInsertError::RepoDeleted { .. }
+        | JobInsertError::NotContinuable { .. }
+        | JobInsertError::NoHarvestDue { .. } => Ok(CycleSummary {
+            kind: Some(kind),
+            repo: Some(repo.to_owned()),
+            skipped: Some(err.to_string()),
+            ..Default::default()
+        }),
         JobInsertError::Occupied { .. } | JobInsertError::UnknownFinding { .. } => Err(err.into()),
         JobInsertError::Db(e) => Err(e.into()),
     }
