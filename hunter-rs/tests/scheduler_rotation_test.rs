@@ -1046,6 +1046,7 @@ async fn a_hunt_with_no_new_commits_ends_its_streak() {
 
     let summary = hunter::scheduler::run_hunt(
         &support::scope(&store),
+        store.test_lane(),
         &cfg,
         &repo,
         &ScriptedBackend::noop(),

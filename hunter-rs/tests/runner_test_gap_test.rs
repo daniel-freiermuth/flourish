@@ -136,10 +136,16 @@ async fn a_test_gap_scan_sees_the_repos_bugs_and_may_file_one() {
         }
     });
 
-    let summary =
-        hunter::scheduler::run_test_gap(&support::scope(&store), &cfg, &repo, &backend, None)
-            .await
-            .unwrap();
+    let summary = hunter::scheduler::run_test_gap(
+        &support::scope(&store),
+        store.test_lane(),
+        &cfg,
+        &repo,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
 
     let prompt = &backend.runs()[0].prompt;
     let (suppressions, known) = prompt

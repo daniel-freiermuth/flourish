@@ -20,6 +20,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::clones::Unheld;
 use crate::domain::FindingStatus;
 use crate::playbooks::{Changed, Suppression};
 use crate::store::{FindingInsert, Store, VerdictAnchor};
@@ -134,25 +135,12 @@ fn changed_since(clone: &Path, anchor: &VerdictAnchor, at: &str) -> Option<Chang
     if anchor.files.is_empty() {
         return None;
     }
-    let clone = clone.to_string_lossy();
-    // `--no-renames`: rename detection is the one thing that warns on
-    // stderr while succeeding, and `run_cmd` merges the two streams. A
-    // watched file that was renamed away still shows, as its old path.
-    let mut argv = vec![
-        "git",
-        "-C",
-        &clone,
-        "-c",
-        "core.quotepath=off",
-        "diff",
-        "--name-only",
-        "--no-renames",
-        &anchor.sha,
-        at,
-        "--",
-    ];
-    argv.extend(anchor.files.iter().map(String::as_str));
-    let (rc, out) = crate::util::run_cmd(&argv, GIT_DIFF_TIMEOUT_S);
+    let (rc, out) = Unheld::ChangedPaths {
+        from: &anchor.sha,
+        to: at,
+        paths: &anchor.files,
+    }
+    .run(clone, GIT_DIFF_TIMEOUT_S);
     let since: String = anchor.sha.chars().take(12).collect();
     if rc != 0 {
         return Some(Changed::Unknown { since });

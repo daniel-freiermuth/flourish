@@ -156,6 +156,7 @@ impl Fixture {
     async fn hunt_with(&self, worker: &ScriptedBackend) -> (String, i64) {
         let summary = run_hunt(
             &support::scope(&self.store),
+            self.store.test_lane(),
             &self.cfg,
             &self.repo().await,
             worker,
@@ -214,9 +215,16 @@ async fn decline_phantom(f: &Fixture, fid: i64) -> String {
          Evidence: the row never reaches the output.",
     );
     let finding = f.store.get_finding(fid).await.unwrap().unwrap();
-    run_fix(&support::scope(&f.store), &f.cfg, &finding, &decline, None)
-        .await
-        .unwrap();
+    run_fix(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        &finding,
+        &decline,
+        None,
+    )
+    .await
+    .unwrap();
     judged_at
 }
 

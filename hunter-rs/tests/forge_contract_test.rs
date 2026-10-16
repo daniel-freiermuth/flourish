@@ -580,11 +580,14 @@ fn push_forces_to_a_raw_ssh_url_for_both_forges() {
         .unwrap();
 
     let calls = bins.calls_to("git");
+    let d = dir.path().to_string_lossy().into_owned();
     assert_eq!(
         calls,
         vec![
             vec![
                 "git",
+                "-C",
+                d.as_str(),
                 "push",
                 "--force",
                 "git@github.com:acme/widget.git",
@@ -592,6 +595,8 @@ fn push_forces_to_a_raw_ssh_url_for_both_forges() {
             ],
             vec![
                 "git",
+                "-C",
+                d.as_str(),
                 "push",
                 "--force",
                 "git@gitlab.com:group/widget.git",
@@ -599,6 +604,8 @@ fn push_forces_to_a_raw_ssh_url_for_both_forges() {
             ],
             vec![
                 "git",
+                "-C",
+                d.as_str(),
                 "push",
                 "--force",
                 "git@github.com:acme/widget.git",
@@ -606,6 +613,8 @@ fn push_forces_to_a_raw_ssh_url_for_both_forges() {
             ],
             vec![
                 "git",
+                "-C",
+                d.as_str(),
                 "push",
                 "--force",
                 "git@gitlab.com:group/widget.git",
