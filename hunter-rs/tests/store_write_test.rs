@@ -488,12 +488,24 @@ async fn a_resume_runs_on_its_checkpoints_place_while_it_is_the_checkpoint() {
     );
 }
 
+/// Finding 3's PR, closed without merging and awaiting its harvest.
+async fn close_pr_of_finding_3(pool: &SqlitePool) {
+    sqlx::raw_sql(
+        "UPDATE findings SET status = 'closed' WHERE id = 3;
+         INSERT INTO pr_state (finding_id, pr_number, state, synced_at) VALUES (3, 7, 'CLOSED', 1);",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 /// A handoff names only its engage, and is that engage's finding's
 /// harvest, once. Nothing but an engage hands over.
 #[tokio::test]
 async fn an_engage_hands_over_to_its_findings_harvest_once() {
     let (_dir, path, pool) = fresh_db().await;
     seed_repo_and_findings(&pool).await;
+    close_pr_of_finding_3(&pool).await;
     let store = rw_store(&path).await;
     let scope = support::scope(&store);
     let engage = ended_job(&scope, FindingJobKind::Engage, 3, FinishedState::Done).await;
@@ -522,6 +534,43 @@ async fn an_engage_hands_over_to_its_findings_harvest_once() {
             "got {err:?}"
         );
     }
+}
+
+/// A harvest goes in only while its PR still awaits one, however it
+/// starts. A cold harvest that finished while an engage was withdrawing
+/// stamped the PR harvested; the engage's handoff, arriving after, would
+/// harvest it a second time, and so would another fresh harvest.
+#[tokio::test]
+async fn a_harvest_starts_only_while_its_pr_awaits_one() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo_and_findings(&pool).await;
+    close_pr_of_finding_3(&pool).await;
+    let store = rw_store(&path).await;
+    let scope = support::scope(&store);
+    let engage = ended_job(&scope, FindingJobKind::Engage, 3, FinishedState::Done).await;
+    sqlx::query("UPDATE pr_state SET harvested_at = 3000 WHERE finding_id = 3")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let jobs_before = store.list_jobs(10).await.unwrap().len();
+
+    for start in [
+        JobStart::Handoff { engage },
+        JobStart::fresh_finding(FindingJobKind::Harvest, 3),
+    ] {
+        let Err(err) = scope.create_job(start, None, None).await else {
+            panic!("{start} harvested a PR already harvested");
+        };
+        assert!(
+            matches!(err, JobInsertError::NoHarvestDue { finding_id: 3 }),
+            "got {err:?}"
+        );
+    }
+    assert_eq!(
+        store.list_jobs(10).await.unwrap().len(),
+        jobs_before,
+        "a refused harvest writes no row"
+    );
 }
 
 // -- 4. add_repo / update_repo --------------------------------------------
