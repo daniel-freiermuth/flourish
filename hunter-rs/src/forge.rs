@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
+use crate::clones::{Force, Unheld};
 use crate::domain::ForgeName;
 use crate::util::{run_cmd, run_cmd_in};
 
@@ -1367,7 +1368,12 @@ impl Forge for GitHubForge {
     fn push(&self, repo_path: &Path, url: &str, branch: &str) -> anyhow::Result<()> {
         let ssh = self.ssh_url(url);
         let refspec = format!("HEAD:{branch}");
-        let (rc, out) = run_cmd_cwd(&["git", "push", "--force", &ssh, &refspec], repo_path, 120);
+        let (rc, out) = Unheld::Push {
+            force: Force::Always,
+            url: &ssh,
+            refspec: &refspec,
+        }
+        .run(repo_path, 120);
         if rc != 0 {
             anyhow::bail!("git push failed (rc={rc}): {out}");
         }
@@ -1612,7 +1618,12 @@ impl Forge for GitLabForge {
     fn push(&self, repo_path: &Path, url: &str, branch: &str) -> anyhow::Result<()> {
         let ssh = self.ssh_url(url);
         let refspec = format!("HEAD:{branch}");
-        let (rc, out) = run_cmd_cwd(&["git", "push", "--force", &ssh, &refspec], repo_path, 120);
+        let (rc, out) = Unheld::Push {
+            force: Force::Always,
+            url: &ssh,
+            refspec: &refspec,
+        }
+        .run(repo_path, 120);
         if rc != 0 {
             anyhow::bail!("git push failed (rc={rc}): {out}");
         }

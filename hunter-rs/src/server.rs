@@ -27,6 +27,7 @@ use serde_json::{Map, Value, json};
 use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::auth::{self, CurrentUser};
+use crate::clones::{ClonePermit, Lane, Unheld};
 use crate::config::{Config, HostAllowList};
 use crate::domain::{
     BudgetOverride, ClosureClass, FindingJobKind, FindingStatus, FindingType, ForgeName,
@@ -1329,11 +1330,30 @@ async fn update_repo(
         // "bitbucket"} yields this, not a forge-specific error).
         return Err(ApiError::BadRequest("no valid fields to update".to_owned()));
     }
-    state.store.update_repo(rid, &fields).await?;
-    if let Some(new_url) = fields.url.as_deref()
-        && new_url != repo.url
-    {
-        repoint_clone_origin(rid, Path::new(&repo.path), &repo.url, new_url).await;
+    // The clone's permit before the new URL is written, held until the
+    // clone is repointed: a runner that takes it reads either the old URL
+    // with the old origin or the new URL with the new one. Taken after the
+    // write, a runner could sync against the new URL while the clone still
+    // points at the old origin, which `sync_repo` refuses as somebody
+    // else's checkout and counts against the repo.
+    //
+    // Both URLs of the repoint are read under the permit: decided from the
+    // row read before the lock, two overlapping updates both took the
+    // first's old URL, and the second found the clone already moved, left
+    // it, and wrote its own URL beside the first's origin. A URL the row
+    // already has is not written at all, so it needs no permit and waits
+    // for no runner; were it written unlocked, an update landing between
+    // that read and this write would be overwritten beside its own origin.
+    if fields.url.as_deref() == Some(repo.url.as_str()) {
+        fields.url = None;
+    }
+    match fields.url.clone() {
+        Some(new_url) => state
+            .store
+            .lane(async |lane| write_url(lane, rid, &fields, &new_url).await)
+            .await
+            .map_err(anyhow::Error::from)??,
+        None => state.store.update_repo(rid, &fields).await?,
     }
     state
         .store
@@ -1346,6 +1366,24 @@ async fn update_repo(
         .await?;
     let refreshed = fetch_repo(&state.store, rid).await?;
     Ok(Json(json!({ "ok": true, "repo": refreshed })).into_response())
+}
+
+/// Write `fields`, whose URL is `new_url`, under the clone's permit, and
+/// repoint the clone from the URL the row had under that permit.
+async fn write_url(
+    lane: &mut Lane,
+    rid: i64,
+    fields: &RepoUpdate,
+    new_url: &str,
+) -> Result<(), ApiError> {
+    let store = lane.store().clone();
+    let permit = lane.lock_clone(rid).await.map_err(anyhow::Error::from)?;
+    let old_url = store.origin_url(&permit).await?;
+    store.update_repo(rid, fields).await?;
+    if old_url != new_url {
+        repoint_clone_origin(&permit, &old_url, new_url).await;
+    }
+    Ok(())
 }
 
 /// Point an existing clone at the repo's new URL.
@@ -1365,32 +1403,27 @@ async fn update_repo(
 /// missing or unreadable clone is not an error — the next cycle clones
 /// it fresh. Failure is logged for the operator rather than surfaced to
 /// the caller, whose write did succeed.
-async fn repoint_clone_origin(rid: i64, dir: &Path, old_url: &str, new_url: &str) {
-    // `repo.path`, not a path derived from the id. They agree for every
-    // row migration 007 rewrote, but 007 deliberately left alone any
-    // path that did not end in the repo's name — an operator-edited one
-    // — and the scheduler syncs whatever `repo.path` says. Deriving the
-    // directory here would repoint nothing for those rows and leave the
-    // old origin exactly where `sync_repo` looks, which is the permanent
-    // refusal this function exists to prevent.
+///
+/// The clone is the permit's: `repo.path`, not a path derived from the
+/// id. They agree for every row migration 007 rewrote, but 007
+/// deliberately left alone any path that did not end in the repo's name
+/// — an operator-edited one — and the scheduler syncs whatever
+/// `repo.path` says. Deriving the directory here would repoint nothing
+/// for those rows and leave the old origin exactly where `sync_repo`
+/// looks, which is the permanent refusal this function exists to prevent.
+async fn repoint_clone_origin(permit: &ClonePermit<'_>, old_url: &str, new_url: &str) {
+    let (rid, dir) = (permit.repo_id(), permit.clone_dir());
     if !dir.join(".git").exists() {
         return;
     }
-    let dir_s = dir.to_string_lossy().into_owned();
+    let dir_s = dir.display().to_string();
     // The configured URL, as `sync_repo` reads it: `remote get-url` is
     // rewritten through `url.<base>.insteadOf` and would never match the
     // raw `old_url` under such a rule.
-    let (rc, out) = {
-        let d = dir_s.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::util::run_cmd(
-                &["git", "-C", &d, "config", "--get", "remote.origin.url"],
-                30,
-            )
-        })
+    let (rc, out) = permit
+        .blocking(|hold| hold.git(&["config", "--get", "remote.origin.url"], 30))
         .await
-        .unwrap_or((127, "spawn error".to_owned()))
-    };
+        .unwrap_or((127, "spawn error".to_owned()));
     if rc != 0 {
         return;
     }
@@ -1403,14 +1436,12 @@ async fn repoint_clone_origin(rid: i64, dir: &Path, old_url: &str, new_url: &str
         return;
     }
     let new = new_url.to_owned();
-    let (rc, out) = tokio::task::spawn_blocking(move || {
-        crate::util::run_cmd(
-            &["git", "-C", &dir_s, "remote", "set-url", "origin", &new],
-            30,
-        )
-    })
-    .await
-    .unwrap_or((127, "spawn error".to_owned()));
+    // On a thread that holds the clone: a command outliving a dropped
+    // request still holds it until it ends.
+    let (rc, out) = permit
+        .blocking(move |hold| hold.git(&["remote", "set-url", "origin", &new], 30))
+        .await
+        .unwrap_or((127, "spawn error".to_owned()));
     if rc != 0 {
         tracing::warn!("repo {rid} url changed but its clone origin could not be updated: {out}");
     }
@@ -1614,6 +1645,20 @@ pub async fn reap_repo(
     rid: i64,
     notes_lock: &tokio::sync::Mutex<()>,
 ) -> std::io::Result<()> {
+    store
+        .lane(async |lane| reap_in(lane, repos_dir, rid, notes_lock).await)
+        .await
+        .map_err(std::io::Error::other)?
+}
+
+/// [`reap_repo`] in its lane.
+async fn reap_in(
+    lane: &mut Lane,
+    repos_dir: &Path,
+    rid: i64,
+    notes_lock: &tokio::sync::Mutex<()>,
+) -> std::io::Result<()> {
+    let store = lane.store().clone();
     // Taken here rather than by the callers, because there are two of
     // them and only one used to hold it: the delete handler did, but the
     // reaper pass that runs at startup and before every cycle did not.
@@ -1622,18 +1667,31 @@ pub async fn reap_repo(
     // moment later — leaving a file for a repo that no longer exists and
     // nothing that will ever retry it. Python takes the lock inside its
     // reaper for the same reason.
+    // The clone's permit first: a runner may be fetching into it, and the
+    // notes lock is not held while waiting for that.
+    let permit = lane.lock_clone(rid).await.map_err(std::io::Error::other)?;
     let _guard = notes_lock.lock().await;
+    // On a thread that holds the clone, not `tokio::fs`: removing a clone
+    // is explicitly not instant -- that slowness is the whole reason
+    // deletion is two-phase -- and a delete request whose client hung up
+    // is dropped mid-removal. The clone stays held until the removal ends,
+    // so neither the reaper's next pass nor a fetch starts on a half-removed
+    // directory.
+    //
+    // What is removed is `repos/repo-<id>`, the directory this daemon made
+    // for the id, not whatever path the row names: a row an operator
+    // pointed elsewhere (migration 007 kept such paths) names their own
+    // checkout, which deleting the repo must not destroy. The permit is
+    // keyed by the id either way, so it covers this directory too.
     let dir = Store::repo_dir(repos_dir, rid);
-    // `tokio::fs`, not `std::fs`: removing a clone is explicitly not
-    // instant — that slowness is the whole reason deletion is two-phase —
-    // and the synchronous call blocks a tokio worker for its duration,
-    // here while holding the notes mutex, so every append would queue
-    // behind a multi-gigabyte rmtree.
-    match tokio::fs::remove_dir_all(&dir).await {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
+    let removed = permit
+        .blocking(move |_| match std::fs::remove_dir_all(&dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        })
+        .await
+        .map_err(std::io::Error::other)?;
+    removed?;
     // Notes live outside the clone, so removing the clone does not take
     // them with it. Left behind they would be read by whatever repo next
     // holds this id -- which AUTOINCREMENT makes unlikely, but the file
@@ -1690,11 +1748,7 @@ pub fn migrate_repo_notes(work_root: &Path) -> usize {
         }
         // `--error-unmatch` exits 0 when tracked, 1 when not; anything
         // else (128: not a repository) means git could not tell.
-        let (rc, _) = crate::util::run_cmd_in(
-            &["git", "ls-files", "--error-unmatch", "--", "NOTES.md"],
-            Some(&entry.path()),
-            30,
-        );
+        let (rc, _) = Unheld::IsTracked { path: "NOTES.md" }.run(&entry.path(), 30);
         if rc != 1 {
             if rc == 0 {
                 tracing::info!(

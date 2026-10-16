@@ -32,6 +32,7 @@ lint:
     cargo clippy --all-targets -- -D warnings
     cargo clippy --lib --bins -- -D warnings
     ./check-sql.sh
+    ./check-git.sh
 
 check:
     cargo check --all-targets

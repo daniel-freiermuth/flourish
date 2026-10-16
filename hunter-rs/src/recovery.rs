@@ -366,7 +366,9 @@ pub struct Owner(());
 /// cycle. [`CycleScope::open`] takes a [`Recovered`], so nothing is created
 /// before the startup reconcile. What it creates is owned by the values
 /// it returns, not by the scope: [`CycleScope::settle`] settles what was
-/// dropped unended.
+/// dropped unended. Its runners take clone permits in the cycle's
+/// [`Lane`](crate::clones::Lane), which they are lent beside it: a permit borrows the lane, not
+/// the scope, so a runner holding one can still create its job.
 pub struct CycleScope {
     store: Store,
 }

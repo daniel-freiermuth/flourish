@@ -28,6 +28,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 
 use crate::attention::{AnswerRecorded, EngageAnswer, ObservedOpenPr, OpenPrRecorded};
 use crate::auth::CurrentUser;
+use crate::clones::{ClonePermit, Clones};
 use crate::domain::{
     BudgetOverride, BugClass, ClosureClass, FindingJobKind, FindingStatus, FindingType,
     FinishedState, ForgeName, HoldReason, JobKind, JobState, ReleaseAction, RepoJobKind,
@@ -460,6 +461,63 @@ pub(crate) struct InsertedJob {
     pub(crate) superseded: Vec<i64>,
 }
 
+/// Which clone: a repo's id and its directory, as one repo row names them.
+///
+/// The lock is keyed by the id and the git commands run in the directory,
+/// so the two must come from the same row. Only this module makes one,
+/// from a row it read ([`Lane::lock_clone`](crate::clones::Lane::lock_clone), [`ChainStatus::clone`]):
+/// neither a caller's id and path nor a [`Repo`] put together elsewhere
+/// can name a clone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloneRef {
+    repo_id: i64,
+    dir: PathBuf,
+}
+
+impl CloneRef {
+    pub const fn repo_id(&self) -> i64 {
+        self.repo_id
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+}
+
+/// Which chain, and which repo's clone its tree was added from: the
+/// repo of the chain's origin job row, as [`Store::chain_ref`] read it.
+///
+/// A chain's tree is leased under its clone's permit
+/// ([`ClonePermit::lease`](crate::clones::ClonePermit::lease)), and that
+/// is the clone the sweep locks to look for the lease
+/// ([`ChainStatus::clone`], from the same row). Only this module makes
+/// one, so a caller cannot pair a chain with another repo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainRef {
+    origin_id: i64,
+    repo_id: i64,
+}
+
+impl ChainRef {
+    pub const fn origin_id(&self) -> i64 {
+        self.origin_id
+    }
+
+    pub const fn repo_id(&self) -> i64 {
+        self.repo_id
+    }
+}
+
+/// Why [`Lane::lock_clone`](crate::clones::Lane::lock_clone) gave no permit.
+#[derive(Debug, thiserror::Error)]
+pub enum CloneLockError {
+    /// No row, live or flagged deleted, has this id.
+    #[error("no repo {0} -- it has no clone to lock")]
+    NoRepo(i64),
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
+}
+
 /// Whether a chain's working tree is still needed; see
 /// [`Store::chain_status`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -473,7 +531,31 @@ pub struct ChainStatus {
     /// When the chain's latest attempt finished, if any has.
     pub last_finished_at: Option<i64>,
     /// The clone the chain's tree was added from, if its repo still exists.
-    pub clone: Option<String>,
+    pub clone: Option<CloneRef>,
+}
+
+/// [`ChainStatus`] as the query reads it: the clone's two halves come
+/// from one repo row, and only become a [`CloneRef`] together.
+struct ChainRow {
+    attempts: i64,
+    live: i64,
+    last_finished_at: Option<i64>,
+    repo_id: Option<i64>,
+    clone: Option<String>,
+}
+
+impl From<ChainRow> for ChainStatus {
+    fn from(row: ChainRow) -> Self {
+        Self {
+            attempts: row.attempts,
+            live: row.live,
+            last_finished_at: row.last_finished_at,
+            clone: row.repo_id.zip(row.clone).map(|(repo_id, dir)| CloneRef {
+                repo_id,
+                dir: PathBuf::from(dir),
+            }),
+        }
+    }
 }
 
 /// A running or suspended job, as the workspace sweep needs to see it.
@@ -635,6 +717,10 @@ pub struct Store {
     /// `begin`, cleared by its drop. Shared by clones, which are the same
     /// handle.
     pr_sync: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Who may change each repo clone, and which chain trees runners
+    /// hold (`crate::clones`). Shared by clones of the handle, so the HTTP
+    /// handlers and the scheduler wait for each other.
+    clones: Clones,
 }
 
 /// INSERT one event row on `ex` — the pool, or an open transaction when
@@ -1046,7 +1132,54 @@ impl Store {
             pool,
             recovery,
             pr_sync: std::sync::Arc::default(),
+            clones: Clones::default(),
         }
+    }
+
+    /// This handle's clone locks and tree leases.
+    pub(crate) const fn clones(&self) -> &Clones {
+        &self.clones
+    }
+
+    /// Which clone repo `repo_id`'s row names, for
+    /// [`Lane::lock_clone`](crate::clones::Lane::lock_clone). A row flagged deleted still names one: it
+    /// stays until its clone is removed.
+    pub(crate) async fn clone_ref(&self, repo_id: i64) -> Result<CloneRef, CloneLockError> {
+        let path = sqlx::query_scalar!("SELECT path FROM repos WHERE id = ?1", repo_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(CloneLockError::NoRepo(repo_id))?;
+        Ok(CloneRef {
+            repo_id,
+            dir: PathBuf::from(path),
+        })
+    }
+
+    /// Every repo row's id, deleted or not, in id order: the clones on
+    /// disk. A row flagged deleted keeps its clone until it is reaped, so
+    /// whatever changes every clone (the sweep) must hold its permit too.
+    pub(crate) async fn clone_ids(&self) -> sqlx::Result<Vec<i64>> {
+        sqlx::query_scalar!(r#"SELECT id AS "id!" FROM repos ORDER BY id"#)
+            .fetch_all(&self.pool)
+            .await
+    }
+
+    /// The URL `permit`'s repo row names now. Read under the permit, it is
+    /// the clone's origin too: a URL update holds the permit across its
+    /// write and the clone's repoint (`server::update_repo`).
+    pub async fn origin_url(&self, permit: &ClonePermit<'_>) -> sqlx::Result<String> {
+        sqlx::query_scalar!("SELECT url FROM repos WHERE id = ?1", permit.repo_id())
+            .fetch_one(&self.pool)
+            .await
+    }
+
+    /// Chain `origin_id` and the repo its tree belongs to, read from its
+    /// origin job row. `None` when no job has that id.
+    pub async fn chain_ref(&self, origin_id: i64) -> sqlx::Result<Option<ChainRef>> {
+        let repo_id = sqlx::query_scalar!("SELECT repo_id FROM jobs WHERE id = ?1", origin_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(repo_id.map(|repo_id| ChainRef { origin_id, repo_id }))
     }
 
     /// This handle's recovery state, for `crate::recovery` alone: every
@@ -3326,7 +3459,7 @@ impl Store {
     pub async fn chain_status(&self, origin_id: i64) -> sqlx::Result<ChainStatus> {
         let running = JobState::Running;
         sqlx::query_as!(
-            ChainStatus,
+            ChainRow,
             r#"
             WITH RECURSIVE chain(id, depth) AS (
                 SELECT id, 0 FROM jobs WHERE id = ?1
@@ -3343,6 +3476,8 @@ impl Store {
                                   WHERE w.checkpoint_job_id = jobs.id)), 0)
                        AS "live!: i64",
                    MAX(finished_at) AS "last_finished_at?: i64",
+                   (SELECT r.id FROM jobs o JOIN repos r ON r.id = o.repo_id
+                    WHERE o.id = ?1) AS "repo_id?: i64",
                    (SELECT r.path FROM jobs o JOIN repos r ON r.id = o.repo_id
                     WHERE o.id = ?1) AS "clone?: String"
             FROM jobs WHERE id IN (SELECT id FROM chain)
@@ -3353,6 +3488,7 @@ impl Store {
         )
         .fetch_one(&self.pool)
         .await
+        .map(ChainStatus::from)
     }
 
     /// Every running job and every checkpoint (see [`Self::chain_status`]),

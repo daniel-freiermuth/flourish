@@ -368,10 +368,16 @@ async fn a_fetch_that_fails_while_offline_is_not_counted() {
     let repo = store.get_repo_by_id(1).await.unwrap().unwrap();
     let backend = ScriptedBackend::new(|_| panic!("no worker may start offline")).offline(&[FORGE]);
 
-    let summary =
-        hunter::scheduler::run_test_gap(&support::scope(&store), &cfg, &repo, &backend, None)
-            .await
-            .unwrap();
+    let summary = hunter::scheduler::run_test_gap(
+        &support::scope(&store),
+        store.test_lane(),
+        &cfg,
+        &repo,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         summary.denied.as_deref(),
@@ -382,8 +388,15 @@ async fn a_fetch_that_fails_while_offline_is_not_counted() {
 
     // The same failure with the forge reachable is the repo's own.
     let up = ScriptedBackend::new(|_| panic!("no worker may start without a fetch"));
-    let failed =
-        hunter::scheduler::run_test_gap(&support::scope(&store), &cfg, &repo, &up, None).await;
+    let failed = hunter::scheduler::run_test_gap(
+        &support::scope(&store),
+        store.test_lane(),
+        &cfg,
+        &repo,
+        &up,
+        None,
+    )
+    .await;
     assert!(failed.is_err(), "{failed:?}");
     assert_eq!(repo_streaks(&store).await, (1, 0));
 }
@@ -396,10 +409,16 @@ async fn a_runner_error_while_offline_is_not_counted() {
     let repo = store.get_repo_by_id(1).await.unwrap().unwrap();
     let backend = ScriptedBackend::failing().offline(&[FORGE]);
 
-    let summary =
-        hunter::scheduler::run_test_gap(&support::scope(&store), &cfg, &repo, &backend, None)
-            .await
-            .unwrap();
+    let summary = hunter::scheduler::run_test_gap(
+        &support::scope(&store),
+        store.test_lane(),
+        &cfg,
+        &repo,
+        &backend,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         summary.denied.as_deref(),
