@@ -1,3 +1,4 @@
+import { untrack } from "svelte";
 import { SvelteSet } from "svelte/reactivity";
 
 /**
@@ -148,9 +149,23 @@ export function needsSelector(options: readonly string[], filter: Filter): boole
 /**
  * The Filter a selector shows for the selection its URL now holds.
  *
- * `previous` is the instance shown before this URL change.
+ * `previous` is the instance shown before this URL change. When the URL
+ * holds exactly its selection, the change is that instance's own write
+ * echoing back, so it is kept: a fresh instance would treat a narrowing
+ * the user just made from All as a restored explicit list, and putting
+ * the unchecked option back would no longer return the dimension to all.
+ * Any other selection (a link, Back/Forward) is restored as explicit.
  */
 export function restoreFilter(previous: Filter | undefined, values: readonly string[] | null): Filter {
-  void previous;
+  // Read without subscribing: called from a $derived, which must follow
+  // the URL, not the toggles that precede each URL write.
+  const current = untrack(() => previous?.selection);
+  if (previous && sameSelection(current ?? null, values)) return previous;
   return new Filter(values);
+}
+
+function sameSelection(a: readonly string[] | null, b: readonly string[] | null): boolean {
+  if (a === null || b === null) return a === b;
+  const sorted = [...b].sort();
+  return a.length === sorted.length && a.every((value, i) => value === sorted[i]);
 }
