@@ -59,6 +59,7 @@ use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use tokio::sync::OwnedMutexGuard;
 
@@ -76,6 +77,9 @@ struct Registry {
     /// Live leases, by what they keep: a chain's tree, or a repo's scan
     /// tree.
     leases: Mutex<HashMap<Leased, usize>>,
+    /// When each clone's last full fetch (`git fetch origin`) ended, as
+    /// recorded under its permit ([`ClonePermit::record_fetch`]).
+    fetched: Mutex<HashMap<i64, Instant>>,
 }
 
 /// What a [`TreeLease`] keeps.
@@ -391,6 +395,20 @@ impl ClonePermit<'_> {
             return Err(ScanRunning(repo_id));
         }
         Ok(self.clones.take(Leased::Scan(repo_id)))
+    }
+
+    /// Record that a full fetch of this clone ended just now. Under the
+    /// permit, so no other fetch of the clone ran between it and this.
+    pub(crate) fn record_fetch(&self) {
+        lock(&self.clones.0.fetched).insert(self.repo_id(), Instant::now());
+    }
+
+    /// Whether this clone's last full fetch in this process ended less
+    /// than `age` ago, whoever made it. `false` after a restart.
+    pub fn fetched_within(&self, age: Duration) -> bool {
+        lock(&self.clones.0.fetched)
+            .get(&self.repo_id())
+            .is_some_and(|at| at.elapsed() < age)
     }
 }
 

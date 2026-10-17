@@ -1684,9 +1684,14 @@ async fn renovate_scans_a_tree_at_the_fetched_tip() {
     );
     let row = f.store.get_repo_by_id(1).await.unwrap().unwrap();
 
-    hunter::scheduler::scan_dependencies(f.store.test_lane(), &f.store, &f.cfg, &row)
-        .await
-        .unwrap();
+    hunter::scheduler::scan_dependencies(
+        f.store.test_lane(),
+        &support::admin(&f.store),
+        &f.cfg,
+        &row,
+    )
+    .await
+    .unwrap();
 
     let scan = f.cfg.work_root.join("scan").join("repo-1");
     let cwd = std::fs::read_to_string(&seen_cwd).expect("renovate ran");
@@ -1726,7 +1731,8 @@ async fn renovate_runs_holding_no_clone_and_the_sweep_keeps_its_tree() {
     let row = f.store.get_repo_by_id(1).await.unwrap().unwrap();
     let scan = f.cfg.work_root.join("scan").join("repo-1");
 
-    let runner = hunter::scheduler::scan_dependencies(f.store.test_lane(), &f.store, &f.cfg, &row);
+    let admin = support::admin(&f.store);
+    let runner = hunter::scheduler::scan_dependencies(f.store.test_lane(), &admin, &f.cfg, &row);
     let meanwhile = async {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while !started.exists() {

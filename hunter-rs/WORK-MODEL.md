@@ -182,7 +182,7 @@ stateDiagram-v2
 ```mermaid
 flowchart TD
   ship["fix ships a PR"] --> open["pr_open"]
-  open --> sync{"sync_prs, every admin-lane pass"}
+  open --> sync{"sync_prs, the admin lane's PR sync duty"}
   sync -->|"merged"| merged["merged"]
   sync -->|"closed"| closed["closed"]
   sync -->|"new comments, changes requested, conflict, failing checks"| flagged["attention flag set"]
@@ -236,7 +236,7 @@ Walking every path turned up these. Each needs a decision before or during imple
 
 | # | Gap | Today | Proposed |
 |---|---|---|---|
-| G1 | The engage tier is keyed on a flag that `sync_prs` recomputes on every admin-lane pass | A paused engage is resumable while the finding is `pr_open`, whatever the flag (`list_resumable_jobs`), so today's resume gate already ignores the flag | Engage is active while `pr_open`; the flag only decides whether to start fresh (§6.1). |
+| G1 | The engage tier is keyed on a flag that `sync_prs` recomputes on every run of the admin lane's PR sync duty | A paused engage is resumable while the finding is `pr_open`, whatever the flag (`list_resumable_jobs`), so today's resume gate already ignores the flag | Engage is active while `pr_open`; the flag only decides whether to start fresh (§6.1). |
 | G2 | Dep-update handover and refresh vs. a fix that has a checkpoint or a hold | `hand_over_queued_dep_updates` supersedes `queued` sources and `refresh_dep_update` rewrites `new`/`queued` ones. Held fixes are safe only because they are `blocked`. A **paused** fix is `queued`, so its finding can be superseded, or its target rewritten under the checkpoint. Reproduced by `a_paused_fix_keeps_its_queued_update_from_being_handed_over` and `…_refreshed`. | Both skip a finding whose fix work item has a checkpoint or an active hold. Add a test for today's paused case first. |
 | G3 | The engage → harvest handoff crosses kinds | The first harvest job is created with `resumed_from` = the engage job | A work item's checkpoint may point to another kind's job for the first attempt only. The handoff stays a special case in the plan, not a general cross-kind chain. |
 | G4 | Operator actions on held work aren't verdicts on inbox statuses | `/api/verdict` only accepts `new`, `blocked`, `note`, `closed` | Release actions go through `POST /api/hold/release` (§12). `/api/verdict` keeps the inbox statuses and `closed`, and no longer accepts `blocked`. |
@@ -590,7 +590,7 @@ Fixed strings; git's or the worker's words go into the detail.
 
 **The network's failures count nothing (#95, layer 2).** Before a clone or fetch failure, a runner error, or a worker that failed without metered work is counted, the repo's hosts are probed again (`Backend::first_unreachable(&work_hosts(..))`). If one is unreachable, nothing is counted, the checkpoint stays, and the cycle ends as `offline_denial`. `origin mismatch`, `branch not found` and `repo not cloned` are local and always count.
 
-**Renovate (`dep_update` without a job).** The zero-token Renovate scan runs on the admin lane (`scheduler::dependency_scans`), for every enabled, cloned repo whose `dep_update` is due and is not held, running or checkpointed. A scan with invalid entries is the failure `invalid entries` and has no checkpoint. Renovate having no answer is not a failure: it records a request for the AI scan (`dep_scan_fallbacks`, migration 032), and the job lane's rotation offers the repo's `dep_update` only while that request is newer than its `last_dep_update_at`, so the two lanes never scan one repo's dependencies at once. The AI job is counted like any other, and its success answers the request. A store error while settling the scan is logged as an `error` event, and the next admin pass retries the scan. A clone that cannot be synced is skipped and counted nowhere: the job lane's own fetches keep the `sync` streak.
+**Renovate (`dep_update` without a job).** The zero-token Renovate scan runs on the admin lane (`scheduler::dependency_scans`), for every enabled, cloned repo whose `dep_update` is due and is not held, running or checkpointed. A scan with invalid entries is the failure `invalid entries` and has no checkpoint. Renovate having no answer is not a failure: it records a request for the AI scan (`dep_scan_fallbacks`, migration 032), and the job lane's rotation offers the repo's `dep_update` only while that request is newer than its `last_dep_update_at`, so the two lanes never scan one repo's dependencies at once. The AI job is counted like any other, and its success answers the request. A store error while settling the scan is logged as an `error` event, and the duty's next run retries the scan. A clone that cannot be synced is skipped and counted nowhere: the job lane's own fetches keep the `sync` streak.
 
 ### 17.4 Holds and releases
 

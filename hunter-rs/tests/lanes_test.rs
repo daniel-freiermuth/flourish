@@ -1,22 +1,25 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-//! The daemon's two lanes: the admin lane's work does not wait for a job.
+//! The daemon's two lanes: the admin lane's work does not wait for a job,
+//! and its duties do not wait for each other.
 //!
 //! PR sync, reaping and the workspace sweep used to run inside the cycle,
 //! before its pick, so a 45-minute fix held every merged PR, every review
 //! comment and every finished tree until it ended. They are the admin
-//! lane's now (`daemon::admin_pass`), and run while the job lane's worker
-//! does.
+//! lane's duties now (`daemon::spawn_admin_lane`), each its own task, and
+//! run while the job lane's worker does.
 
 mod support;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use hunter::activity::AdminStatus;
 use hunter::config::Config;
+use hunter::daemon::{ADMIN_DUTIES, DutyRun, DutyTimer};
 use hunter::domain::{FindingStatus, JobState};
 use hunter::store::{FindingInsert, Store};
+use hunter::types::AdminTask;
 use support::{FakeBins, GitRepo, ScriptedBackend, TempDir};
 
 /// How long a step may take before the test fails instead of hanging.
@@ -27,18 +30,29 @@ const BOUND: Duration = Duration::from_secs(20);
 /// and disabled, so the rotation passes it by; one of its findings has an
 /// open PR, which only sync reads (a clone is never needed for that).
 async fn fixture(label: &str) -> (TempDir, Store, Config, i64) {
+    fixture_with(label, false).await
+}
+
+/// [`fixture`], with `alpha`'s dependency scan due when `deps_due`; then
+/// `alpha` is GitLab's, so that scan asks `gh` for no token.
+async fn fixture_with(label: &str, deps_due: bool) -> (TempDir, Store, Config, i64) {
     let dir = TempDir::new(label);
     let (path, pool) = support::fresh_pool(&dir, "lanes").await;
     let repo = GitRepo::with_branch(&dir, "feature");
     let clone = dir.path().join("repo-1");
     std::fs::rename(&repo.work, &clone).unwrap();
     let future = hunter::util::now_ms() + 999_999;
+    let (alpha_deps, alpha_forge) = if deps_due {
+        (0, "gitlab")
+    } else {
+        (future, "github")
+    };
     sqlx::query(
         "INSERT INTO repos \
          (id, name, url, path, forge, default_branch, enabled, added_at, \
           last_hunt_at, last_test_gap_at, last_dep_update_at, last_refactor_at, \
           last_modernization_at, last_standards_at) \
-         VALUES (1, 'alpha', ?1, ?2, 'github', 'main', 1, 1000, ?3, 1000, ?3, ?3, ?3, ?3), \
+         VALUES (1, 'alpha', ?1, ?2, ?6, 'main', 1, 1000, ?3, 1000, ?5, ?3, ?3, ?3), \
                 (2, 'widget', 'https://github.com/acme/widget', ?4, 'github', 'main', 0, 1000, \
                  ?3, ?3, ?3, ?3, ?3, ?3)",
     )
@@ -46,6 +60,8 @@ async fn fixture(label: &str) -> (TempDir, Store, Config, i64) {
     .bind(clone.to_string_lossy().to_string())
     .bind(future)
     .bind(dir.path().join("repo-2").to_string_lossy().to_string())
+    .bind(alpha_deps)
+    .bind(alpha_forge)
     .execute(&pool)
     .await
     .unwrap();
@@ -81,11 +97,32 @@ async fn fixture(label: &str) -> (TempDir, Store, Config, i64) {
     (dir, store, cfg, fid)
 }
 
-/// While the job lane's worker runs, an admin pass syncs the open PR to
-/// its merge, sweeps, and returns; the job is still running when it does,
+/// Run every admin duty once, one after another, as the daemon's tasks
+/// would each run it, and return the PR sync's counts.
+async fn every_duty_once(
+    store: &Store,
+    cfg: &Config,
+    status: &AdminStatus,
+) -> Option<hunter::scheduler::SyncResult> {
+    let admin = support::admin(store);
+    let notes_lock = tokio::sync::Mutex::new(());
+    let (_keep, running_on) = tokio::sync::watch::channel(false);
+    let mut sync = None;
+    for task in ADMIN_DUTIES {
+        let run =
+            hunter::daemon::admin_duty(&admin, cfg, &notes_lock, status, task, &running_on).await;
+        if let DutyRun::Synced(s) = run {
+            sync = s;
+        }
+    }
+    sync
+}
+
+/// While the job lane's worker runs, the admin duties sync the open PR to
+/// its merge, sweep, and return; the job is still running when they do,
 /// and finishes once its worker does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_admin_pass_runs_while_a_job_runs() {
+async fn the_admin_duties_run_while_a_job_runs() {
     let bins = FakeBins::acquire("lanes");
     bins.ok(
         "gh",
@@ -132,36 +169,21 @@ async fn an_admin_pass_runs_while_a_job_runs() {
         .expect("a job is running");
 
     let status = AdminStatus::default();
-    let notes_lock = tokio::sync::Mutex::new(());
-    let (_keep, running_on) = tokio::sync::watch::channel(false);
-    let pass = tokio::time::timeout(
-        BOUND,
-        hunter::daemon::admin_pass(
-            &support::admin(&store),
-            &cfg,
-            &notes_lock,
-            &status,
-            &running_on,
-        ),
-    )
-    .await
-    .expect("the admin pass waited for the running job");
+    let sync = tokio::time::timeout(BOUND, every_duty_once(&store, &cfg, &status))
+        .await
+        .expect("an admin duty waited for the running job")
+        .expect("the open PR was synced");
 
-    let sync = pass.sync.expect("the open PR was synced");
     assert_eq!((sync.merged, sync.errors), (1, 0), "{sync:?}");
     assert!(sync.made_work(), "a merge is work for the job lane");
     let finding = store.get_finding(fid).await.unwrap().unwrap();
     assert_eq!(finding.status, FindingStatus::Merged);
-    assert_eq!(
-        status.current(),
-        None,
-        "no task shows once the pass is over"
-    );
+    assert_eq!(status.current(), [], "no duty shows once its run is over");
     assert_eq!(prsync_events(&store).await, 1, "the merge is in the log");
     assert_eq!(
         store.current_job().await.unwrap().map(|j| j.id),
         Some(running.id),
-        "the job was still running when the pass returned"
+        "the job was still running when the duties returned"
     );
 
     release.store(true, Ordering::SeqCst);
@@ -185,10 +207,10 @@ async fn prsync_events(store: &Store) -> usize {
         .count()
 }
 
-/// A pass that only re-reads an open PR nobody touched makes no work for
+/// A sync that only re-reads an open PR nobody touched makes no work for
 /// the job lane and leaves the log alone: it runs every five minutes.
 #[tokio::test]
-async fn a_pass_that_changes_nothing_makes_no_work_and_logs_nothing() {
+async fn a_sync_that_changes_nothing_makes_no_work_and_logs_nothing() {
     let bins = FakeBins::acquire("lanes-quiet");
     bins.ok(
         "gh",
@@ -196,22 +218,146 @@ async fn a_pass_that_changes_nothing_makes_no_work_and_logs_nothing() {
     );
     let (_dir, store, cfg, fid) = fixture("lanes-quiet").await;
 
-    let (_keep, running_on) = tokio::sync::watch::channel(false);
-    let pass = hunter::daemon::admin_pass(
-        &support::admin(&store),
-        &cfg,
-        &tokio::sync::Mutex::new(()),
-        &AdminStatus::default(),
-        &running_on,
-    )
-    .await;
+    let sync = every_duty_once(&store, &cfg, &AdminStatus::default())
+        .await
+        .expect("the open PR was synced");
 
-    let sync = pass.sync.expect("the open PR was synced");
     assert_eq!((sync.synced, sync.errors), (1, 0), "{sync:?}");
     assert!(!sync.made_work(), "{sync:?}");
     assert_eq!(prsync_events(&store).await, 0);
     let finding = store.get_finding(fid).await.unwrap().unwrap();
     assert_eq!(finding.status, FindingStatus::PrOpen);
+}
+
+/// A PR sync asked for while a Renovate scan runs reads the PR at once:
+/// each admin duty is its own task, so the scan -- up to two minutes per
+/// repo -- holds up no merge. Run as one pass, the sync would wait for
+/// the scan to end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pr_sync_does_not_wait_for_a_dependency_scan() {
+    let bins = FakeBins::acquire("lanes-apart");
+    let open = r#"{"state":"OPEN","mergeable":"MERGEABLE","reviewDecision":"","comments":[],"reviews":[],"statusCheckRollup":[],"updatedAt":"2026-01-02T03:04:05Z","headRefName":"fix/some-bug","headRefOid":"deadbeef"}"#;
+    let merged = r#"{"state":"MERGED","mergedAt":"2026-01-02T03:04:05Z","mergeable":"UNKNOWN","reviewDecision":"","comments":[],"reviews":[],"statusCheckRollup":[],"updatedAt":"2026-01-02T03:04:05Z","headRefName":"fix/some-bug","headRefOid":"deadbeef"}"#;
+    bins.ok("gh", open);
+    let (dir, store, cfg, fid) = fixture_with("lanes-apart", true).await;
+    let scanning = dir.path().join("renovate-started");
+    let release = dir.path().join("renovate-release");
+    bins.script(
+        "renovate",
+        &format!(
+            // Bounded, so a failing assertion below cannot leave it waiting.
+            "touch '{}'\ni=0\nwhile [ ! -e '{}' ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done\nexit 1",
+            scanning.display(),
+            release.display()
+        ),
+    );
+
+    let scheduler = hunter::server::SchedulerHandle::default();
+    let (stop, stopping) = tokio::sync::watch::channel(false);
+    let duties = hunter::daemon::spawn_admin_lane(
+        hunter::daemon::AdminLane {
+            admin: support::admin(&store),
+            cfg: cfg.clone(),
+            notes_lock: Arc::default(),
+            status: scheduler.admin.clone(),
+            pr_sync_wake: scheduler.pr_sync_wake.clone(),
+            job_wake: scheduler.wake.clone(),
+        },
+        &stopping,
+    );
+    tokio::time::timeout(BOUND, async {
+        while !scanning.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the dependency scan never started");
+
+    // The PR merges while Renovate runs, and the operator asks for a sync.
+    bins.ok("gh", merged);
+    scheduler.pr_sync_wake.notify_one();
+    let synced = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let f = store.get_finding(fid).await.unwrap().unwrap();
+            if f.status == FindingStatus::Merged {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    let scan_still_running = scheduler
+        .admin
+        .current()
+        .iter()
+        .any(|a| a.task == AdminTask::DependencyScan);
+
+    std::fs::write(&release, "").unwrap();
+    stop.send_replace(true);
+    for duty in duties {
+        tokio::time::timeout(BOUND, duty)
+            .await
+            .expect("an admin duty did not stop")
+            .unwrap();
+    }
+    assert!(synced.is_ok(), "the PR sync waited for the dependency scan");
+    assert!(
+        scan_still_running,
+        "fixture: the scan ended before the sync, so it proves nothing"
+    );
+}
+
+/// A duty whose run panics runs again at its next tick, and the panic is
+/// in the log: one bad run cannot end PR sync, or any duty, for the rest
+/// of the daemon's life while the job lane goes on.
+#[tokio::test]
+async fn a_duty_whose_run_panics_runs_again_and_the_panic_is_logged() {
+    let dir = TempDir::new("lanes-panic");
+    let (_db, store) = support::fresh_store(&dir, "lanes-panic").await;
+    let runs = Arc::new(AtomicUsize::new(0));
+    let run = {
+        let runs = Arc::clone(&runs);
+        move || {
+            let runs = Arc::clone(&runs);
+            async move {
+                assert_ne!(runs.fetch_add(1, Ordering::SeqCst), 0, "a bad first run");
+                DutyRun::Swept
+            }
+        }
+    };
+    let (stop, stopping) = tokio::sync::watch::channel(false);
+    let duty = tokio::spawn(hunter::daemon::supervise_duty(
+        store.clone(),
+        AdminTask::Sweep,
+        DutyTimer {
+            interval: Duration::from_millis(20),
+            wake: None,
+        },
+        Arc::new(tokio::sync::Notify::new()),
+        stopping,
+        run,
+    ));
+
+    let ran_again = tokio::time::timeout(BOUND, async {
+        while runs.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    stop.send_replace(true);
+    let ended = tokio::time::timeout(BOUND, duty)
+        .await
+        .expect("the duty did not stop");
+
+    assert!(ended.is_ok(), "the duty's own task died with its run");
+    assert!(ran_again.is_ok(), "the duty never ran again");
+    let logged = store.recent_events(50).await.unwrap();
+    assert!(
+        logged
+            .iter()
+            .any(|e| e.kind == "error" && e.message.contains("admin duty Sweep failed")),
+        "{logged:?}"
+    );
 }
 
 /// Each change a sync can make is work for the job lane on its own; what
@@ -260,18 +406,111 @@ fn a_sync_made_work_when_it_ended_flagged_or_requeued_something() {
     }
 }
 
-/// The status page's admin row names a task only while it runs: from
-/// `begin` until its guard is dropped, however the task returned.
+/// A duty's run is work for the job lane when its sync made some, or its
+/// dependency scan handed a repo to the AI scan; reaping, fetching and
+/// sweeping never are.
 #[test]
-fn an_admin_task_shows_only_while_its_guard_lives() {
-    use hunter::types::AdminTask;
+fn a_duty_made_work_only_through_a_sync_or_a_scan_fallback() {
+    use hunter::scheduler::{DepScans, FetchAhead, SyncResult};
+    let merged = SyncResult {
+        merged: 1,
+        ..SyncResult::default()
+    };
+    for (run, made) in [
+        (DutyRun::Synced(None), false),
+        (DutyRun::Synced(Some(SyncResult::default())), false),
+        (DutyRun::Synced(Some(merged)), true),
+        (
+            DutyRun::Scanned(DepScans {
+                scanned: 3,
+                failed: 1,
+                ..DepScans::default()
+            }),
+            false,
+        ),
+        (
+            DutyRun::Scanned(DepScans {
+                fallbacks: 1,
+                ..DepScans::default()
+            }),
+            true,
+        ),
+        (DutyRun::Reaped(2), false),
+        (
+            DutyRun::Fetched(FetchAhead {
+                fetched: 4,
+                ..FetchAhead::default()
+            }),
+            false,
+        ),
+        (DutyRun::Swept, false),
+    ] {
+        assert_eq!(run.made_work(), made, "{run:?}");
+    }
+}
+
+/// A run that made work wakes the job lane; one that made none leaves it
+/// asleep.
+#[tokio::test]
+async fn a_duty_wakes_the_job_lane_only_after_a_run_that_made_work() {
+    let dir = TempDir::new("lanes-wake");
+    let (_db, store) = support::fresh_store(&dir, "lanes-wake").await;
+    let job_wake = Arc::new(tokio::sync::Notify::new());
+    let supervise = |made: bool| {
+        let (stop, stopping) = tokio::sync::watch::channel(false);
+        let run = move || async move {
+            DutyRun::Scanned(hunter::scheduler::DepScans {
+                fallbacks: usize::from(made),
+                ..Default::default()
+            })
+        };
+        let duty = tokio::spawn(hunter::daemon::supervise_duty(
+            store.clone(),
+            AdminTask::DependencyScan,
+            DutyTimer {
+                interval: BOUND,
+                wake: None,
+            },
+            Arc::clone(&job_wake),
+            stopping,
+            run,
+        ));
+        (stop, duty)
+    };
+    let short = Duration::from_millis(300);
+
+    let (stop, duty) = supervise(false);
+    let woken = tokio::time::timeout(short, job_wake.notified()).await;
+    stop.send_replace(true);
+    duty.await.unwrap();
+    assert!(woken.is_err(), "a run that made no work woke the job lane");
+
+    let (stop, duty) = supervise(true);
+    let woken = tokio::time::timeout(BOUND, job_wake.notified()).await;
+    stop.send_replace(true);
+    duty.await.unwrap();
+    assert!(
+        woken.is_ok(),
+        "a run that made work left the job lane asleep"
+    );
+}
+
+/// The status page's admin row names each duty only while it runs, from
+/// `begin` until its guard is dropped, however the duty returned -- also
+/// while others run beside it and end first.
+#[test]
+fn an_admin_duty_shows_only_while_its_guard_lives() {
     let status = AdminStatus::default();
     let reader = status.clone();
-    assert_eq!(reader.current(), None);
-    let guard = status.begin(AdminTask::Sweep);
-    assert_eq!(reader.current().map(|a| a.task), Some(AdminTask::Sweep));
-    drop(guard);
-    assert_eq!(reader.current(), None);
+    let tasks = || reader.current().iter().map(|a| a.task).collect::<Vec<_>>();
+    assert_eq!(tasks(), []);
+    let sweep = status.begin(AdminTask::Sweep);
+    let sync = status.begin(AdminTask::PrSync);
+    assert_eq!(tasks(), [AdminTask::PrSync, AdminTask::Sweep]);
+    drop(sweep);
+    assert_eq!(tasks(), [AdminTask::PrSync], "the sync still runs");
+    drop(sync);
+    assert_eq!(tasks(), []);
 }
 
 /// The admin lane fetches every enabled clone ahead of its jobs: a commit
@@ -312,12 +551,15 @@ async fn fetch_ahead_brings_every_enabled_clone_up_to_its_origin() {
     );
 
     let (_keep, running_on) = tokio::sync::watch::channel(false);
-    let done = hunter::scheduler::fetch_ahead(&store, &running_on).await;
+    let admin = support::admin(&store);
+    let hour = Duration::from_hours(1);
+    let done = hunter::scheduler::fetch_ahead(&admin, hour, &running_on).await;
 
     assert_eq!(
         done,
         hunter::scheduler::FetchAhead {
             fetched: 1,
+            fresh: 0,
             failed: 0
         }
     );
@@ -326,4 +568,45 @@ async fn fetch_ahead_brings_every_enabled_clone_up_to_its_origin() {
         !std::path::Path::new(&widget.path).exists(),
         "fetch-ahead cloned a repo"
     );
+}
+
+/// Fetch-ahead leaves a clone fetched in full less than its `min_age` ago
+/// alone, and fetches it again once that has passed: a fetch holds the
+/// clone, which a job starting on the repo waits for, so fetching every
+/// clone on every run would cost the job lane for nothing.
+#[tokio::test]
+async fn fetch_ahead_leaves_a_recently_fetched_clone_alone() {
+    let (dir, store, _cfg, _fid) = fixture("lanes-fetch-fresh").await;
+    let alpha = store.get_repo_by_id(1).await.unwrap().unwrap();
+    let clone = std::path::Path::new(&alpha.path);
+    let (_keep, running_on) = tokio::sync::watch::channel(false);
+    let admin = support::admin(&store);
+    let fetch = |min_age| hunter::scheduler::fetch_ahead(&admin, min_age, &running_on);
+    let hour = Duration::from_hours(1);
+    assert_eq!(
+        fetch(hour).await.fetched,
+        1,
+        "never fetched in this process"
+    );
+
+    let pusher = dir.path().join("pusher");
+    support::git(
+        dir.path(),
+        &["clone", "-q", &alpha.url, &pusher.to_string_lossy()],
+    );
+    support::git(&pusher, &["commit", "--allow-empty", "-qm", "moved again"]);
+    support::git(&pusher, &["push", "-q", "origin", "HEAD:main"]);
+    let upstream = support::git(&pusher, &["rev-parse", "HEAD"]);
+
+    let again = fetch(hour).await;
+    assert_eq!((again.fetched, again.fresh), (0, 1), "{again:?}");
+    assert_ne!(
+        support::git(clone, &["rev-parse", "origin/main"]),
+        upstream,
+        "a fresh clone was fetched"
+    );
+
+    let stale = fetch(Duration::ZERO).await;
+    assert_eq!((stale.fetched, stale.fresh), (1, 0), "{stale:?}");
+    assert_eq!(support::git(clone, &["rev-parse", "origin/main"]), upstream);
 }

@@ -93,6 +93,13 @@ export function isSummary(v: unknown): v is Summary {
     typeof v.scheduler_paused !== "boolean"
     || typeof v.scheduler_overdrive !== "boolean"
   ) return false;
+  // `StatusPage` renders `{#each admin_activity as aa (aa.task)}`: a
+  // repeated or missing `task` throws each_key_duplicate inside the
+  // component. Absent renders nothing, so an older daemon passes.
+  if (
+    v.admin_activity !== undefined && v.admin_activity !== null
+    && !isKeyedList(v.admin_activity, "task", "string")
+  ) return false;
   // Keyed, not merely records: `ReposPage` renders
   // `{#each repos as repo (repo.id)}`. It also reads `r.url` and
   // `r.added_at` off every entry to build a repo's identity, and three
