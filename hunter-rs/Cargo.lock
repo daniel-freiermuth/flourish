@@ -690,6 +690,7 @@ dependencies = [
  "async-trait",
  "axum",
  "chrono",
+ "futures-util",
  "getrandom 0.4.3",
  "hunter",
  "insta",
