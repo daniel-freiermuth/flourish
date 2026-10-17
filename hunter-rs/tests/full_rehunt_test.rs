@@ -442,7 +442,7 @@ async fn a_failed_requested_hunt_waits_for_the_next_hunt_turn() {
         exit_code: Some(1),
         ..done()
     });
-    let summary = run_cycle(&support::recovered(&f.store), &f.cfg, &failing, None).await;
+    let summary = run_cycle(&mut support::jobs(&f.store), &f.cfg, &failing, None).await;
     assert_eq!(summary.state, Some(JobState::Failed), "{summary:?}");
 
     assert!(
@@ -661,7 +661,7 @@ async fn a_requested_hunt_whose_fetch_fails_waits_for_the_next_hunt_turn() {
     std::fs::remove_dir_all(&f.origin).unwrap();
 
     let summary = run_cycle(
-        &support::recovered(&f.store),
+        &mut support::jobs(&f.store),
         &f.cfg,
         &ScriptedBackend::noop(),
         None,

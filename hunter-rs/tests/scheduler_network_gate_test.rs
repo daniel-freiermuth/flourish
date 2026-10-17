@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use hunter::backend::{NullBackend, OverdriveBackend};
-use support::{FakeBins, GitRepo, ScriptedBackend, TempDir};
+use support::{GitRepo, ScriptedBackend, TempDir};
 
 /// The forge the fixture's repo is on, as the probe sees it.
 const FORGE: &str = "forge.example";
@@ -127,7 +127,7 @@ async fn an_unreachable_forge_denies_a_scan() {
         .offline(&[FORGE]);
 
     let before = hunter::util::now_ms();
-    let summary = run_cycle(&support::recovered(&store), &cfg, &backend, None).await;
+    let summary = run_cycle(&mut support::jobs(&store), &cfg, &backend, None).await;
 
     assert_denied_for(&store, &summary, &down, before).await;
     assert_eq!(summary.unreachable.as_deref(), Some(down.as_str()));
@@ -155,7 +155,7 @@ async fn an_unreachable_provider_denies_a_scan() {
         .offline(&[PROVIDER]);
 
     let before = hunter::util::now_ms();
-    let summary = run_cycle(&support::recovered(&store), &cfg, &backend, None).await;
+    let summary = run_cycle(&mut support::jobs(&store), &cfg, &backend, None).await;
 
     assert_denied_for(&store, &summary, &down, before).await;
 }
@@ -169,7 +169,7 @@ async fn an_unreachable_forge_denies_the_cloning_hunt() {
     let backend = ScriptedBackend::new(|_| panic!("no worker may start offline")).offline(&[FORGE]);
 
     let before = hunter::util::now_ms();
-    let summary = run_cycle(&support::recovered(&store), &cfg, &backend, None).await;
+    let summary = run_cycle(&mut support::jobs(&store), &cfg, &backend, None).await;
 
     assert_eq!(
         summary.kind.map(hunter::domain::JobKind::as_str),
@@ -210,7 +210,7 @@ async fn a_denied_fix_leaves_its_finding_queued() {
     let backend = ScriptedBackend::new(|_| panic!("no worker may start offline")).offline(&[FORGE]);
 
     let before = hunter::util::now_ms();
-    let summary = run_cycle(&support::recovered(&store), &cfg, &backend, None).await;
+    let summary = run_cycle(&mut support::jobs(&store), &cfg, &backend, None).await;
 
     assert_eq!(
         summary.kind.map(hunter::domain::JobKind::as_str),
@@ -240,7 +240,7 @@ async fn the_overdrive_wrapper_reports_the_providers_hosts() {
     let backend = OverdriveBackend::new(Arc::new(provider), Arc::new(AtomicBool::new(false)));
 
     let before = hunter::util::now_ms();
-    let summary = run_cycle(&support::recovered(&store), &cfg, &backend, None).await;
+    let summary = run_cycle(&mut support::jobs(&store), &cfg, &backend, None).await;
 
     assert_denied_for(&store, &summary, &down, before).await;
 }
@@ -252,57 +252,12 @@ async fn the_overdrive_wrapper_reports_the_providers_hosts() {
 async fn a_backend_without_hosts_adds_nothing_to_probe() {
     let (_dir, store, cfg) = fixture("net-null", "/srv/git/widget", true).await;
 
-    let summary = run_cycle(&support::recovered(&store), &cfg, &NullBackend, None).await;
+    let summary = run_cycle(&mut support::jobs(&store), &cfg, &NullBackend, None).await;
 
     assert_eq!(
         summary.denied.as_deref(),
         Some("no window data -- deny until fresh"),
         "{summary:?}"
-    );
-}
-
-/// An offline cycle still reports the PR sync it ran before picking, as a
-/// disk denial does: the summary says what the cycle did.
-#[tokio::test]
-async fn an_offline_cycle_still_reports_its_pr_sync() {
-    let bins = FakeBins::acquire("net-sync");
-    bins.fail("gh", 1, "offline");
-    let down = FORGE.to_owned();
-    let (_dir, store, cfg) = fixture("net-sync", &forge_url(&down), true).await;
-    let (fid, _) = store
-        .upsert_finding(
-            1,
-            &FindingInsert {
-                fingerprint: "fp-open-pr".to_owned(),
-                file: "src/lib.rs".to_owned(),
-                severity: Severity::Medium,
-                confidence: 0.9,
-                summary: "a bug with a PR".to_owned(),
-                ..Default::default()
-            },
-            "bug",
-            None,
-        )
-        .await
-        .unwrap();
-    store
-        .set_finding_pr_open(fid, &format!("{}/pull/7", forge_url(&down)))
-        .await
-        .unwrap();
-    let backend = ScriptedBackend::new(|_| panic!("no worker may start offline")).offline(&[FORGE]);
-
-    let summary = run_cycle(&support::recovered(&store), &cfg, &backend, None).await;
-
-    assert_eq!(
-        summary.denied,
-        Some(format!("offline: {down} unreachable")),
-        "{summary:?}"
-    );
-    let sync = summary.sync.as_ref().expect("the sync is reported");
-    assert_eq!(
-        sync.synced + sync.errors,
-        1,
-        "the one open PR was looked at: {summary:?}"
     );
 }
 
@@ -312,7 +267,7 @@ async fn reachable_hosts_let_the_candidate_run() {
     let (_dir, store, cfg) = fixture("net-up", &forge_url(FORGE), true).await;
     let backend = ScriptedBackend::noop().needing(&[PROVIDER]);
 
-    let summary = run_cycle(&support::recovered(&store), &cfg, &backend, None).await;
+    let summary = run_cycle(&mut support::jobs(&store), &cfg, &backend, None).await;
 
     assert_eq!(summary.denied, None, "{summary:?}");
     assert_eq!(
@@ -334,7 +289,7 @@ async fn the_gate_switched_off_probes_nothing() {
         .needing(&[PROVIDER])
         .offline(&[FORGE, PROVIDER]);
 
-    let summary = run_cycle(&support::recovered(&store), &cfg, &backend, None).await;
+    let summary = run_cycle(&mut support::jobs(&store), &cfg, &backend, None).await;
 
     assert_eq!(summary.denied, None, "{summary:?}");
     assert_eq!(backend.runs().len(), 1, "the worker ran");

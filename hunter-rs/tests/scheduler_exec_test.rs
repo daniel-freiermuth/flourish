@@ -471,9 +471,9 @@ async fn a_settle_takes_only_what_was_dropped_unended() {
     let abandoned_fix = job(FindingJobKind::Fix, 2).await.unwrap().job;
     let abandoned_fix_id = abandoned_fix.id();
     // Another fix of #3 (seeded `fixing`) holds its claim and has not
-    // created its job yet; the cycle abandons an engage on #3.
-    let abandoned_engage = job(FindingJobKind::Engage, 3).await.unwrap().job;
-    let abandoned_engage_id = abandoned_engage.id();
+    // created its job yet; the cycle abandons a recheck on #3.
+    let abandoned_recheck = job(FindingJobKind::Recheck, 3).await.unwrap().job;
+    let abandoned_recheck_id = abandoned_recheck.id();
     // Another owner claims #4 and runs its fix, holding both.
     let live_claim = scope.claim_fix(4).await.unwrap().unwrap();
     let live = job(FindingJobKind::Fix, 4).await.unwrap().job;
@@ -481,7 +481,12 @@ async fn a_settle_takes_only_what_was_dropped_unended() {
     // The cycle's fix of #5 returned with its claim unreleased (the
     // release write failed after its job was recorded).
     let unreleased = scope.claim_fix(5).await.unwrap().unwrap();
-    drop((abandoned_claim, abandoned_fix, abandoned_engage, unreleased));
+    drop((
+        abandoned_claim,
+        abandoned_fix,
+        abandoned_recheck,
+        unreleased,
+    ));
 
     let settled = scope.settle(&dir.subdir("work_root")).await.unwrap();
 
@@ -502,7 +507,7 @@ async fn a_settle_takes_only_what_was_dropped_unended() {
     assert_eq!(
         (
             state(abandoned_fix_id),
-            state(abandoned_engage_id),
+            state(abandoned_recheck_id),
             state(live_id)
         ),
         (Killed, Killed, Running)
@@ -568,14 +573,14 @@ async fn a_settled_claim_is_not_released_again_under_a_later_claim() {
     seed_repo(&pool).await;
     seed_findings(&pool).await;
     let store = rw_store(&path).await;
-    let recovered = support::recovered(&store);
+    let jobs = support::jobs(&store);
     let work_root = dir.subdir("work_root");
     drop(support::scope(&store).claim_fix(2).await.unwrap().unwrap());
-    let released = recovered.settle_unsettled(&work_root).await.unwrap();
+    let released = jobs.settle_unsettled(&work_root).await.unwrap();
     assert_eq!(released.requeued, 1);
     let later = support::scope(&store).claim_fix(2).await.unwrap().unwrap();
 
-    let settled = recovered.settle_unsettled(&work_root).await.unwrap();
+    let settled = jobs.settle_unsettled(&work_root).await.unwrap();
 
     assert_eq!(settled, Settled::default());
     let status = store.get_finding(2).await.unwrap().unwrap().status;
@@ -724,10 +729,10 @@ async fn a_settled_claim_spares_a_finding_a_running_job_works_on() {
         .await
         .unwrap()
         .job;
-    let recovered = support::recovered(&store);
+    let jobs = support::jobs(&store);
     let work_root = dir.subdir("work_root");
 
-    let spared = recovered.settle_unsettled(&work_root).await.unwrap();
+    let spared = jobs.settle_unsettled(&work_root).await.unwrap();
 
     assert_eq!(
         spared,
@@ -754,7 +759,7 @@ async fn a_settled_claim_spares_a_finding_a_running_job_works_on() {
         })
         .await
         .unwrap();
-    let released = recovered.settle_unsettled(&work_root).await.unwrap();
+    let released = jobs.settle_unsettled(&work_root).await.unwrap();
 
     assert_eq!(
         released,
@@ -800,17 +805,17 @@ async fn a_job_dropped_while_its_tree_is_in_use_stays_owed() {
         .spawn()
         .unwrap();
     drop(job);
-    let recovered = support::recovered(&store);
+    let jobs = support::jobs(&store);
     let state = |store: Store| async move {
         let jobs = store.list_jobs(10).await.unwrap();
         jobs.into_iter().find(|j| j.job.id == id).unwrap().job.state
     };
 
-    let while_working = recovered.settle_unsettled(&work_root).await;
+    let while_working = jobs.settle_unsettled(&work_root).await;
     let state_while_working = state(store.clone()).await;
     worker.kill().unwrap();
     worker.wait().unwrap();
-    let after = recovered.settle_unsettled(&work_root).await.unwrap();
+    let after = jobs.settle_unsettled(&work_root).await.unwrap();
 
     assert_eq!(
         while_working.unwrap(),
@@ -851,7 +856,7 @@ async fn a_job_dropped_unended_is_owed_to_the_next_settle() {
     let id = job.id();
     drop(job);
 
-    let settled = support::recovered(&store)
+    let settled = support::jobs(&store)
         .settle_unsettled(&dir.subdir("work_root"))
         .await
         .unwrap();
@@ -1104,50 +1109,33 @@ async fn work_failure_streak_tracking() {
     seed_repo(&pool).await;
     seed_findings(&pool).await;
     let store = rw_store(&path).await;
+    // #2 is `queued`: in the fix tier, out of every other kind's.
     let streak = |kind| {
         let store = store.clone();
-        async move { store.work_streak(1, kind).await.unwrap() }
+        async move { store.work_streak(2, kind).await.unwrap() }
+    };
+    let fail = |kind, key: &'static str| {
+        let store = store.clone();
+        async move { store.record_work_failure(2, kind, key).await.unwrap() }
     };
 
     // Same failure twice
-    assert_eq!(
-        store
-            .record_work_failure(1, Fix, "push failed")
-            .await
-            .unwrap(),
-        1
-    );
+    assert_eq!(fail(Fix, "push failed").await, Some(1));
     assert_eq!(
         streak(Fix).await.last_failure.as_deref(),
         Some("push failed")
     );
-    assert_eq!(
-        store
-            .record_work_failure(1, Fix, "push failed")
-            .await
-            .unwrap(),
-        2
-    );
+    assert_eq!(fail(Fix, "push failed").await, Some(2));
     assert_eq!(streak(Fix).await.streak, 2);
 
-    // Each kind keeps its own streak
-    assert_eq!(
-        store
-            .record_work_failure(1, Harvest, "push failed")
-            .await
-            .unwrap(),
-        1
-    );
+    // Each kind keeps its own streak, and only the tier's kind counts: a
+    // harvest of a `queued` finding has no work to fail.
+    assert_eq!(fail(Harvest, "push failed").await, None);
+    assert_eq!(streak(Harvest).await.streak, 0);
     assert_eq!(streak(Fix).await.streak, 2);
 
     // Different failure resets streak
-    assert_eq!(
-        store
-            .record_work_failure(1, Fix, "PR create failed")
-            .await
-            .unwrap(),
-        1
-    );
+    assert_eq!(fail(Fix, "PR create failed").await, Some(1));
     assert_eq!(
         streak(Fix).await.last_failure.as_deref(),
         Some("PR create failed")

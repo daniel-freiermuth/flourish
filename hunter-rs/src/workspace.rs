@@ -93,8 +93,8 @@ impl Workspace {
     /// tree-local `target/` would mean a full cold compile inside the job's
     /// wall-clock limit and up to a gigabyte per live chain; the clone's
     /// own `target/` is already gitignored and warm from before trees were
-    /// per-chain. Sharing it is safe because the scheduler runs one job at
-    /// a time and cargo locks the directory anyway.
+    /// per-chain. Sharing it is safe because the job lane runs one job at
+    /// a time (`recovery::JobAuthority`) and cargo locks the directory anyway.
     pub fn build_cache(&self) -> PathBuf {
         self.clone.join("target")
     }
@@ -640,7 +640,8 @@ pub struct SweepReport {
 }
 
 /// Reclaim what finished chains, and the layouts before this one, left on
-/// disk. Runs at daemon startup and before every cycle.
+/// disk. Runs at daemon startup and on every admin-lane pass
+/// (`daemon::admin_pass`), beside whatever job is running.
 ///
 /// Nothing is removed without first reading from the database that no
 /// `running` job or checkpoint needs it, and no tree a runner leases. A

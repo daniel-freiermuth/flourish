@@ -159,7 +159,7 @@ async fn run_while(
         .is_some_and(|c| wanted(&c))
     {
         assert!(cycles < 20, "the work was never held");
-        run_cycle(&support::recovered(store), cfg, backend, None).await;
+        run_cycle(&mut support::jobs(store), cfg, backend, None).await;
         cycles += 1;
     }
     cycles
@@ -175,7 +175,7 @@ async fn three_failures_hold_test_gap(store: &Store, cfg: &Config, backend: &Scr
             is_repo_pick(picked.as_ref(), 1, RepoJobKind::TestGap),
             "attempt {attempt}: a failing scan is retried at once, got {picked:?}"
         );
-        let summary = run_cycle(&support::recovered(store), cfg, backend, None).await;
+        let summary = run_cycle(&mut support::jobs(store), cfg, backend, None).await;
         assert_eq!(
             summary.kind.map(|k| k.to_string()),
             Some("test_gap".to_owned()),
@@ -215,7 +215,7 @@ async fn a_killed_analysis_attempt_is_retried_then_held() {
     // is the plain killed outcome.
     let backend = stopped_worker("unmetered", true);
 
-    let summary = run_cycle(&support::recovered(&store), &cfg, &backend, None).await;
+    let summary = run_cycle(&mut support::jobs(&store), &cfg, &backend, None).await;
     assert_eq!(summary.state, Some(JobState::Killed), "{summary:?}");
     assert_eq!(
         streak(&store, 1, RepoWorkKind::TestGap).await,
@@ -225,7 +225,7 @@ async fn a_killed_analysis_attempt_is_retried_then_held() {
     // Two more: the held work's checkpoint is the last attempt, which left
     // a transcript, so the operator may continue it.
     for _ in 0..2 {
-        run_cycle(&support::recovered(&store), &cfg, &backend, None).await;
+        run_cycle(&mut support::jobs(&store), &cfg, &backend, None).await;
     }
     let held = hold_of(&store, 1, RepoWorkKind::TestGap).await.unwrap();
     assert_eq!(
@@ -274,7 +274,7 @@ async fn a_suspended_analysis_attempt_is_a_pause() {
     // the window ran out of headroom mid-run.
     let backend = stopped_worker("cap", true);
 
-    let summary = run_cycle(&support::recovered(&store), &cfg, &backend, None).await;
+    let summary = run_cycle(&mut support::jobs(&store), &cfg, &backend, None).await;
 
     assert_eq!(summary.state, Some(JobState::Suspended), "{summary:?}");
     assert_eq!(last_test_gap_at(&store).await, STALE_TEST_GAP);
@@ -318,7 +318,7 @@ async fn an_attempt_that_died_after_doing_work_is_suspended_for_resume() {
     let store = Store::connect(&path).await.unwrap();
 
     let summary = run_cycle(
-        &support::recovered(&store),
+        &mut support::jobs(&store),
         &cfg,
         &died_worker(105_327, true),
         None,
@@ -361,7 +361,7 @@ async fn a_scan_that_writes_nothing_is_counted() {
     let store = Store::connect(&path).await.unwrap();
 
     let summary = run_cycle(
-        &support::recovered(&store),
+        &mut support::jobs(&store),
         &cfg,
         &ScriptedBackend::noop(),
         None,
@@ -489,9 +489,9 @@ async fn a_killed_resume_of_an_analysis_chain_is_counted() {
         }
     });
 
-    let started = run_cycle(&support::recovered(&store), &cfg, &backend, None).await;
+    let started = run_cycle(&mut support::jobs(&store), &cfg, &backend, None).await;
     assert_eq!(started.state, Some(JobState::Suspended), "{started:?}");
-    let resumed = run_cycle(&support::recovered(&store), &cfg, &backend, None).await;
+    let resumed = run_cycle(&mut support::jobs(&store), &cfg, &backend, None).await;
     assert_eq!(resumed.state, Some(JobState::Killed), "{resumed:?}");
     let runs = backend.runs();
     assert_eq!(runs.len(), 2);
@@ -555,7 +555,7 @@ async fn a_partly_invalid_analysis_attempt_files_its_valid_entries_and_is_counte
         serde_json::json!([one_test_gap(), { "type": "test_gap" }]),
     );
 
-    let summary = run_cycle(&support::recovered(&store), &cfg, &backend, None).await;
+    let summary = run_cycle(&mut support::jobs(&store), &cfg, &backend, None).await;
 
     assert_eq!(summary.state, Some(JobState::Done), "{summary:?}");
     let ingest = summary.ingest.as_ref().expect("the output was ingested");
@@ -575,7 +575,7 @@ async fn a_clean_scan_moves_its_timestamp_and_ends_the_streak() {
     let (_dir, path, cfg) = fixture("rotation-success").await;
     let store = Store::connect(&path).await.unwrap();
     run_cycle(
-        &support::recovered(&store),
+        &mut support::jobs(&store),
         &cfg,
         &ScriptedBackend::noop(),
         None,
@@ -584,7 +584,7 @@ async fn a_clean_scan_moves_its_timestamp_and_ends_the_streak() {
     assert_eq!(streak(&store, 1, RepoWorkKind::TestGap).await.0, 1);
 
     let backend = test_gap_output(&cfg, serde_json::json!([one_test_gap()]));
-    let summary = run_cycle(&support::recovered(&store), &cfg, &backend, None).await;
+    let summary = run_cycle(&mut support::jobs(&store), &cfg, &backend, None).await;
 
     assert_eq!(summary.state, Some(JobState::Done), "{summary:?}");
     assert_eq!(summary.outcome, None, "{summary:?}");
@@ -600,7 +600,7 @@ async fn a_runner_error_closes_the_job_and_is_counted() {
     let store = Store::connect(&path).await.unwrap();
 
     let summary = run_cycle(
-        &support::recovered(&store),
+        &mut support::jobs(&store),
         &cfg,
         &ScriptedBackend::failing(),
         None,
@@ -755,7 +755,7 @@ async fn a_repo_whose_fetch_fails_is_held_once_for_every_kind() {
     std::fs::remove_dir_all(dir.join("origin.git")).unwrap();
 
     let summary = run_cycle(
-        &support::recovered(&store),
+        &mut support::jobs(&store),
         &cfg,
         &ScriptedBackend::noop(),
         None,
@@ -827,7 +827,7 @@ async fn a_repo_whose_clone_keeps_failing_is_left_alone_once_held() {
 
     for _ in 0..3 {
         let summary = run_cycle(
-            &support::recovered(&store),
+            &mut support::jobs(&store),
             &cfg,
             &ScriptedBackend::noop(),
             None,

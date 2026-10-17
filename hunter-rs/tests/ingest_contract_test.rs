@@ -367,6 +367,11 @@ async fn follow_ups_link_to_the_finding_their_job_worked_on() {
     let found = produced_by(&store, hunt).await;
     let (source, bystander) = (found[0], found[1]);
 
+    // The source shipped a PR, which its engage answers.
+    store
+        .set_finding_pr_open(source, "https://github.com/acme/widget/pull/1")
+        .await
+        .unwrap();
     let engage = support::scope(&store)
         .create_job(
             JobStart::fresh_finding(FindingJobKind::Engage, source),

@@ -642,10 +642,8 @@ async fn summary_over_queued_fix(overdrive: bool, last_cycle: Option<(&str, &str
         )),
         repo_notes: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         scheduler: hunter::server::SchedulerHandle {
-            running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            paused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             overdrive,
-            wake: std::sync::Arc::new(tokio::sync::Notify::new()),
+            ..hunter::server::SchedulerHandle::default()
         },
     };
 
