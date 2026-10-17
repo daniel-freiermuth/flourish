@@ -297,7 +297,7 @@ async fn create_job_refuses_a_second_running_job_on_one_place() {
         .job;
     let jobs_before = store.list_jobs(10).await.unwrap().len();
 
-    for kind in [FindingJobKind::Fix, FindingJobKind::Engage] {
+    for kind in [FindingJobKind::Fix, FindingJobKind::Recheck] {
         let Err(err) = create(JobStart::fresh_finding(kind, 2)).await else {
             panic!("a {kind} job started beside a running fix of #2");
         };
@@ -331,7 +331,7 @@ async fn create_job_refuses_a_second_running_job_on_one_place() {
     );
 
     // Other places are free: another finding, another repo-level kind.
-    create(JobStart::fresh_finding(FindingJobKind::Engage, 3))
+    create(JobStart::fresh_finding(FindingJobKind::Recheck, 3))
         .await
         .unwrap()
         .job
@@ -357,7 +357,7 @@ async fn create_job_refuses_a_second_running_job_on_one_place() {
     })
     .await
     .unwrap();
-    create(JobStart::fresh_finding(FindingJobKind::Engage, 2))
+    create(JobStart::fresh_finding(FindingJobKind::Recheck, 2))
         .await
         .unwrap()
         .job
@@ -387,7 +387,7 @@ async fn fresh_finding_work_runs_in_its_findings_repo() {
 
     let job = scope
         .create_job(
-            JobStart::fresh_finding(FindingJobKind::Engage, 3),
+            JobStart::fresh_finding(FindingJobKind::Recheck, 3),
             None,
             None,
         )
@@ -396,7 +396,7 @@ async fn fresh_finding_work_runs_in_its_findings_repo() {
         .job;
     assert_eq!(
         job_place(&pool, job.id()).await,
-        ("engage".to_owned(), 2, Some(3), None)
+        ("recheck".to_owned(), 2, Some(3), None)
     );
     job.disown();
 
@@ -499,16 +499,78 @@ async fn close_pr_of_finding_3(pool: &SqlitePool) {
     .unwrap();
 }
 
+/// An engage of finding 3 that ran, `done`, while its PR was open, after
+/// which the PR closed: the engage a handoff continues. An engage starts
+/// only on a `pr_open` finding (`JobInsertError::NoEngageDue`).
+async fn engaged_then_closed(pool: &SqlitePool, scope: &hunter::recovery::CycleScope<'_>) -> i64 {
+    sqlx::query("UPDATE findings SET status = 'pr_open', pr_url = ?1 WHERE id = 3")
+        .bind("https://example.com/alpha/pull/7")
+        .execute(pool)
+        .await
+        .unwrap();
+    let engage = ended_job(scope, FindingJobKind::Engage, 3, FinishedState::Done).await;
+    close_pr_of_finding_3(pool).await;
+    engage
+}
+
+/// An engage goes in only while its finding is `pr_open`. PR sync runs on
+/// the admin lane, beside the job lane, and can record the PR's end after
+/// the engage was picked; the insert reads the status under its write lock.
+#[tokio::test]
+async fn an_engage_starts_only_while_its_finding_is_pr_open() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo_and_findings(&pool).await;
+    let store = rw_store(&path).await;
+    let scope = support::scope(&store);
+
+    for status in ["new", "merged", "closed"] {
+        sqlx::query("UPDATE findings SET status = ?1 WHERE id = 3")
+            .bind(status)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let Err(err) = scope
+            .create_job(
+                JobStart::fresh_finding(FindingJobKind::Engage, 3),
+                None,
+                None,
+            )
+            .await
+        else {
+            panic!("an engage of a {status} finding started");
+        };
+        assert!(
+            matches!(err, JobInsertError::NoEngageDue { finding_id: 3 }),
+            "{status}: got {err:?}"
+        );
+    }
+    assert!(store.list_jobs(10).await.unwrap().is_empty());
+
+    sqlx::query("UPDATE findings SET status = 'pr_open' WHERE id = 3")
+        .execute(&pool)
+        .await
+        .unwrap();
+    scope
+        .create_job(
+            JobStart::fresh_finding(FindingJobKind::Engage, 3),
+            None,
+            None,
+        )
+        .await
+        .expect("a pr_open finding's engage starts")
+        .job
+        .disown();
+}
+
 /// A handoff names only its engage, and is that engage's finding's
 /// harvest, once. Nothing but an engage hands over.
 #[tokio::test]
 async fn an_engage_hands_over_to_its_findings_harvest_once() {
     let (_dir, path, pool) = fresh_db().await;
     seed_repo_and_findings(&pool).await;
-    close_pr_of_finding_3(&pool).await;
     let store = rw_store(&path).await;
     let scope = support::scope(&store);
-    let engage = ended_job(&scope, FindingJobKind::Engage, 3, FinishedState::Done).await;
+    let engage = engaged_then_closed(&pool, &scope).await;
     let fix = ended_job(&scope, FindingJobKind::Fix, 2, FinishedState::Done).await;
 
     let harvest = scope
@@ -544,10 +606,9 @@ async fn an_engage_hands_over_to_its_findings_harvest_once() {
 async fn a_harvest_starts_only_while_its_pr_awaits_one() {
     let (_dir, path, pool) = fresh_db().await;
     seed_repo_and_findings(&pool).await;
-    close_pr_of_finding_3(&pool).await;
     let store = rw_store(&path).await;
     let scope = support::scope(&store);
-    let engage = ended_job(&scope, FindingJobKind::Engage, 3, FinishedState::Done).await;
+    let engage = engaged_then_closed(&pool, &scope).await;
     sqlx::query("UPDATE pr_state SET harvested_at = 3000 WHERE finding_id = 3")
         .execute(&pool)
         .await

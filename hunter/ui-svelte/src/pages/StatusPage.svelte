@@ -46,9 +46,11 @@
   async function runCycle() {
     btnDisabled = true;
     try {
-      const r = await post<unknown>("/api/cycle", {});
+      const r = await post<{ error?: string }>("/api/cycle", {});
       if (r.status === 409) {
-        btnText = "busy";
+        // "busy" still woke the admin lane: while a cycle runs, the button
+        // syncs open PRs.
+        btnText = r.body?.error === "busy" ? "syncing PRs\u2026" : "busy";
       } else {
         btnText = r.status === 202 ? "started\u2026" : "error";
       }
@@ -130,10 +132,11 @@
         <button
           class="cycle-btn"
           class:ready={activityKind === "ready" && !btnDisabled && !store.summary.cycle_running}
-          disabled={btnDisabled || store.summary.cycle_running || store.summary.scheduler_paused}
+          disabled={btnDisabled || store.summary.scheduler_paused}
           onclick={runCycle}
+          title={store.summary.cycle_running ? "A cycle is running; this syncs open PRs now." : undefined}
         >
-          {store.summary.cycle_running ? "cycle running…" : btnText}
+          {btnDisabled ? btnText : store.summary.cycle_running ? "Sync PRs now" : btnText}
         </button>
         {#if store.summary.last_cycle}
           <div class="last-cycle">

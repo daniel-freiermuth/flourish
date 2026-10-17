@@ -1385,6 +1385,8 @@ fn job_state(rr: &RunResult) -> FinishedState {
 /// - A harvest whose finding's PR no longer awaits one: another attempt
 ///   or an operator got there first, and the harvest queue no longer
 ///   lists the finding.
+/// - An engage whose finding is no longer `pr_open`: the admin lane's PR
+///   sync recorded the PR's end after the pick.
 ///
 /// Reporting any of them as an error would log "cycle crashed", back every
 /// other piece of work off for minutes and hand the operator a stack
@@ -1402,7 +1404,8 @@ fn job_refused(kind: JobKind, repo: &str, err: JobInsertError) -> anyhow::Result
     match err {
         JobInsertError::RepoDeleted { .. }
         | JobInsertError::NotContinuable { .. }
-        | JobInsertError::NoHarvestDue { .. } => Ok(CycleSummary {
+        | JobInsertError::NoHarvestDue { .. }
+        | JobInsertError::NoEngageDue { .. } => Ok(CycleSummary {
             kind: Some(kind),
             repo: Some(repo.to_owned()),
             skipped: Some(err.to_string()),
@@ -6438,6 +6441,12 @@ pub async fn run_engage(
 /// wrote `BLOCKED.md`: it is held on the report ([`hold_on_report`]), and
 /// nothing is pushed or posted. The attention stays unaddressed, for the
 /// continue to take up.
+///
+/// If the finding left `pr_open` while the worker ran -- the admin lane's
+/// PR sync recorded the PR's merge or close -- there is nothing to hold:
+/// the PR's end is the harvest's now. That is ordinary traffic, not a
+/// fault, so it is an outcome and an event rather than the cycle's error,
+/// which would back all other work off for minutes.
 async fn engage_blocked(
     store: &Store,
     fid: i64,
@@ -6455,11 +6464,24 @@ async fn engage_blocked(
     )
     .await;
     if !held? {
-        anyhow::bail!("engage #{fid}: BLOCKED.md, but the PR is no longer open");
+        let _ = store
+            .log_event(
+                FindingJobKind::Engage.as_str(),
+                &format!("#{fid} wrote BLOCKED.md, but its PR is no longer open; nothing held"),
+                Some(start.job),
+                Some(fid),
+            )
+            .await;
+        summary.outcome = Some(NOT_HELD_PR_ENDED.into());
+        return Ok(());
     }
     summary.outcome = Some("held".into());
     Ok(())
 }
+
+/// The outcome of an engage or harvest that wrote `BLOCKED.md` for a
+/// finding that had left the kind's tier by the time it finished.
+const NOT_HELD_PR_ENDED: &str = "not held: finding left the tier";
 
 /// Carry a withdrawing engage straight on into its closed PR's harvest:
 /// the next attempt of the engage's chain, in the engage's tree and
@@ -6698,7 +6720,9 @@ async fn record_harvest_failure(
 /// ([`hold_on_report`]), the PR stays unharvested, and its follow-ups wait
 /// for the attempt that concludes, as a failed harvest's do. A one-shot
 /// budget override is kept for the `continue`, as for every kind: the hold
-/// concluded nothing.
+/// concluded nothing. A finding that left the harvest tier meanwhile (an
+/// operator's verdict) has nothing to hold, which is an outcome, not the
+/// cycle's error ([`engage_blocked`]).
 async fn harvest_blocked(
     lane: &mut Lane,
     fid: i64,
@@ -6707,19 +6731,32 @@ async fn harvest_blocked(
     ws: OpenWorkspace,
     report: &str,
 ) -> anyhow::Result<CycleSummary> {
-    let store = lane.store();
-    let held = hold_on_report(store, FindingJobKind::Harvest, fid, job, &ws, report).await;
+    let store = lane.store().clone();
+    let held = hold_on_report(&store, FindingJobKind::Harvest, fid, job, &ws, report).await;
     close_workspace(lane, ws).await;
-    if !held? {
-        anyhow::bail!("harvest #{fid}: BLOCKED.md, but the PR is no longer awaiting harvest");
-    }
+    let outcome = if held? {
+        "held"
+    } else {
+        let _ = store
+            .log_event(
+                FindingJobKind::Harvest.as_str(),
+                &format!(
+                    "#{fid} wrote BLOCKED.md, but its PR is no longer awaiting harvest; \
+                     nothing held"
+                ),
+                Some(job),
+                Some(fid),
+            )
+            .await;
+        NOT_HELD_PR_ENDED
+    };
     Ok(CycleSummary {
         kind: Some(FindingJobKind::Harvest.into()),
         finding_id: Some(fid),
         job_id: Some(job),
         state: Some(state),
         pr_number: Some(pr_number),
-        outcome: Some("held".into()),
+        outcome: Some(outcome.into()),
         ..Default::default()
     })
 }

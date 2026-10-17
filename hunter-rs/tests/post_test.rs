@@ -775,14 +775,20 @@ async fn cycle_wakes_both_scheduler_lanes() {
         .expect("POST /api/cycle must wake the admin lane");
 }
 
-/// Contract §2: a cycle already under way is refused, not queued twice.
+/// Contract §2: a cycle already under way is refused, not queued twice --
+/// but the admin lane is still woken: a manual PR sync is most useful
+/// exactly while a long job runs, and the admin lane does not wait for it.
 #[tokio::test]
-async fn cycle_while_running_is_409_busy() {
+async fn cycle_while_running_is_409_busy_and_still_wakes_the_admin_lane() {
     let state = test_state().await;
+    let admin_wake = Arc::clone(&state.scheduler.admin_wake);
     state.scheduler.running.store(true, Ordering::SeqCst);
     let (status, body) = post(&state, "/api/cycle", json!({})).await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["error"], "busy");
+    tokio::time::timeout(std::time::Duration::from_secs(1), admin_wake.notified())
+        .await
+        .expect("a busy trigger must still wake the admin lane");
 }
 
 /// Deleting a repo must remove its notes file.

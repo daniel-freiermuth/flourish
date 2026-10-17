@@ -1137,9 +1137,11 @@ async fn release_repo_hold(
 
 // -- POST /api/cycle (contract §2) --------------------------------------------
 
-/// Trigger both lanes now (contract §2): 409 if a cycle is already
-/// running, otherwise 202; the admin lane syncs and the job lane starts
-/// its next cycle.
+/// Trigger both lanes now (contract §2): the admin lane syncs PRs at
+/// once, and the job lane starts its next cycle. 409 while paused (neither
+/// lane runs); 409 `busy` while a cycle is already running, which still
+/// wakes the admin lane: that is exactly when a manual sync is worth
+/// having, since the admin lane does not wait for the job.
 ///
 /// The busy check is advisory, as Python's non-blocking lock acquire was:
 /// a trigger that races the loop into its next cycle is held as a notify
@@ -1149,10 +1151,11 @@ async fn cycle(State(state): State<AppState>, headers: HeaderMap) -> Result<Resp
     if state.scheduler.paused.load(Ordering::SeqCst) {
         return Ok(error_body(StatusCode::CONFLICT, "paused"));
     }
+    state.scheduler.admin_wake.notify_one();
     if state.scheduler.running.load(Ordering::SeqCst) {
         return Ok(error_body(StatusCode::CONFLICT, "busy"));
     }
-    state.scheduler.wake_both();
+    state.scheduler.wake.notify_one();
     Ok((StatusCode::ACCEPTED, Json(json!({ "started": true }))).into_response())
 }
 

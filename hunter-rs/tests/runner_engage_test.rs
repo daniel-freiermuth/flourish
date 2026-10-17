@@ -3430,6 +3430,129 @@ async fn an_engage_that_needs_a_maintainer_is_held_on_its_report() {
     assert_eq!(f.addressed_fp().await, None, "attention left unaddressed");
 }
 
+/// Move the fixture's finding to `merged` straight in the database: what
+/// the admin lane's PR sync writes when it sees the merge, done here
+/// without a sync pass so the test can place it exactly.
+async fn merge_finding(db: &Path, fid: i64) {
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(db))
+            .await
+            .unwrap();
+    sqlx::query("UPDATE findings SET status = 'merged' WHERE id = ?1")
+        .bind(fid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+}
+
+/// PR sync runs on the admin lane, beside the job lane, so it can record a
+/// merge after an engage was picked and before its job goes in -- the
+/// window holds the budget gate, a PR view and a fetch. The insert refuses
+/// it under its write lock: the cycle is skipped, no job row is written,
+/// and no worker runs against the PR that has ended.
+#[tokio::test]
+async fn an_engage_whose_pr_ended_after_the_pick_never_starts() {
+    let f = fixture("engage-ended-before-insert").await;
+    let bins = FakeBins::acquire("engage-ended-before-insert");
+    bins.ok("gh", PR_VIEW_JSON);
+    push_to(&f, None).await;
+    let (db, fid) = (f.db.clone(), f.fid);
+    let backend =
+        ScriptedBackend::new(|_| panic!("no worker may run on an ended PR")).on_decide(move || {
+            let db = db.clone();
+            async move { merge_finding(&db, fid).await }
+        });
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Cold(&finding),
+        &backend,
+    )
+    .await
+    .expect("a PR that ended after the pick is a skip, not the cycle's error");
+
+    assert!(
+        summary
+            .skipped
+            .as_deref()
+            .is_some_and(|s| s.contains("no open PR")),
+        "{summary:?}"
+    );
+    assert!(backend.runs().is_empty());
+    assert!(
+        f.store.jobs_by_finding(f.fid).await.unwrap().is_empty(),
+        "a refused engage writes no job row"
+    );
+}
+
+/// A merge recorded while the engage's worker runs leaves its `BLOCKED.md`
+/// nothing to hold: the finding has left the engage tier. That is the
+/// attempt's outcome, logged, not the cycle's error, which would back
+/// every other piece of work off for five minutes.
+#[tokio::test]
+async fn a_blocked_engage_whose_pr_ended_meanwhile_is_an_outcome() {
+    let f = fixture("engage-blocked-ended").await;
+    let bins = FakeBins::acquire("engage-blocked-ended");
+    bins.ok("gh", PR_VIEW_JSON);
+    let origin = push_to(&f, None).await;
+    let before = git(&origin, &["rev-parse", BRANCH]);
+    let (db, fid) = (f.db.clone(), f.fid);
+    let backend = ScriptedBackend::new(move |tree| {
+        std::fs::write(tree.join("BLOCKED.md"), "two reviewers want opposite APIs").unwrap();
+        // The worker runs inside the runner's future, so the admin lane's
+        // write comes from a thread with a runtime of its own.
+        let db = db.clone();
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(merge_finding(&db, fid));
+        })
+        .join()
+        .unwrap();
+        support::done_with_transcript(tree)
+    });
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Cold(&finding),
+        &backend,
+    )
+    .await
+    .expect("BLOCKED.md on an ended PR is an outcome, not the cycle's error");
+
+    assert_eq!(
+        summary.outcome.as_deref(),
+        Some("not held: finding left the tier")
+    );
+    assert!(
+        support::hold_of(&f.store, f.fid, hunter::domain::FindingJobKind::Engage)
+            .await
+            .is_none(),
+        "nothing is held for a finding out of the tier"
+    );
+    assert_eq!(
+        git(&origin, &["rev-parse", BRANCH]),
+        before,
+        "nothing pushed"
+    );
+    let events = f.store.recent_events(20).await.unwrap();
+    assert!(
+        events.iter().any(|e| e
+            .message
+            .contains("BLOCKED.md, but its PR is no longer open")),
+        "{events:?}"
+    );
+}
+
 /// A `BLOCKED.md` holds the engage whatever state its attempt ended in: a
 /// worker that asked for a maintainer and then lost its connection (a
 /// suspension) asked all the same. It used to be read only from a worker

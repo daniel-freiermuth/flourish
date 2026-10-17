@@ -207,6 +207,12 @@ pub enum JobInsertError {
     /// that race is a skip.
     #[error("finding {finding_id} awaits no harvest -- cannot start one")]
     NoHarvestDue { finding_id: i64 },
+    /// An engage of a finding that is no longer `pr_open`: the admin lane's
+    /// PR sync recorded the PR's merge or close between the pick and the
+    /// insert, which spans forge calls and a fetch. The engage queue no
+    /// longer lists the finding, so losing that race is a skip.
+    #[error("finding {finding_id} has no open PR -- cannot start an engage")]
+    NoEngageDue { finding_id: i64 },
     #[error(transparent)]
     Db(#[from] sqlx::Error),
 }
@@ -3118,7 +3124,8 @@ impl Store {
     /// that holds the place.
     ///
     /// A harvest, however it starts, goes in only while its finding's PR
-    /// still awaits one ([`JobInsertError::NoHarvestDue`]).
+    /// still awaits one ([`JobInsertError::NoHarvestDue`]), and an engage
+    /// only while its finding is `pr_open` ([`JobInsertError::NoEngageDue`]).
     ///
     /// Takes an [`Owner`], which only `crate::recovery` makes, inside
     /// [`CycleScope::create_job`](crate::recovery::CycleScope::create_job): every job is recorded in the scope that
@@ -3135,8 +3142,14 @@ impl Store {
         // predecessor is read under the lock that inserts its successor.
         let mut tx = ImmediateTx::begin(&self.pool).await?;
         let (kind, repo_id, finding_id, resumed_from) = Self::start_place(&mut tx, start).await?;
-        if let (JobKind::Finding(FindingJobKind::Harvest), Some(fid)) = (kind, finding_id) {
-            Self::ensure_harvest_due(&mut tx, fid).await?;
+        match (kind, finding_id) {
+            (JobKind::Finding(FindingJobKind::Harvest), Some(fid)) => {
+                Self::ensure_harvest_due(&mut tx, fid).await?;
+            }
+            (JobKind::Finding(FindingJobKind::Engage), Some(fid)) => {
+                Self::ensure_engage_due(&mut tx, fid).await?;
+            }
+            _ => {}
         }
         let id = Self::insert_running_row(
             &mut tx,
@@ -3322,6 +3335,30 @@ impl Store {
         .await?;
         due.map(|_| ())
             .ok_or(JobInsertError::NoHarvestDue { finding_id })
+    }
+
+    /// Refuse an engage of `finding_id` unless the finding is `pr_open`,
+    /// read under the insert's write lock. PR sync runs on the admin lane,
+    /// beside the job lane, and an engage is picked some forge calls and a
+    /// fetch before its row goes in: without this, a sync that recorded the
+    /// PR's merge or close in between would leave a worker answering a PR
+    /// that has ended. A resume is already refused once the finding leaves
+    /// `pr_open` (its checkpoint is cleared), so this matters for fresh
+    /// engages; it is checked for every start all the same.
+    async fn ensure_engage_due(
+        tx: &mut ImmediateTx,
+        finding_id: i64,
+    ) -> Result<(), JobInsertError> {
+        let pr_open = FindingStatus::PrOpen;
+        let due = sqlx::query_scalar!(
+            r#"SELECT 1 AS "due!: i64" FROM findings WHERE id = ?1 AND status = ?2"#,
+            finding_id,
+            pr_open
+        )
+        .fetch_optional(&mut **tx)
+        .await?;
+        due.map(|_| ())
+            .ok_or(JobInsertError::NoEngageDue { finding_id })
     }
 
     /// [`Self::insert_job`]'s INSERT: the `running` row, its chain's pins

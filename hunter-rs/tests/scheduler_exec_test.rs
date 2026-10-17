@@ -471,9 +471,9 @@ async fn a_settle_takes_only_what_was_dropped_unended() {
     let abandoned_fix = job(FindingJobKind::Fix, 2).await.unwrap().job;
     let abandoned_fix_id = abandoned_fix.id();
     // Another fix of #3 (seeded `fixing`) holds its claim and has not
-    // created its job yet; the cycle abandons an engage on #3.
-    let abandoned_engage = job(FindingJobKind::Engage, 3).await.unwrap().job;
-    let abandoned_engage_id = abandoned_engage.id();
+    // created its job yet; the cycle abandons a recheck on #3.
+    let abandoned_recheck = job(FindingJobKind::Recheck, 3).await.unwrap().job;
+    let abandoned_recheck_id = abandoned_recheck.id();
     // Another owner claims #4 and runs its fix, holding both.
     let live_claim = scope.claim_fix(4).await.unwrap().unwrap();
     let live = job(FindingJobKind::Fix, 4).await.unwrap().job;
@@ -481,7 +481,12 @@ async fn a_settle_takes_only_what_was_dropped_unended() {
     // The cycle's fix of #5 returned with its claim unreleased (the
     // release write failed after its job was recorded).
     let unreleased = scope.claim_fix(5).await.unwrap().unwrap();
-    drop((abandoned_claim, abandoned_fix, abandoned_engage, unreleased));
+    drop((
+        abandoned_claim,
+        abandoned_fix,
+        abandoned_recheck,
+        unreleased,
+    ));
 
     let settled = scope.settle(&dir.subdir("work_root")).await.unwrap();
 
@@ -502,7 +507,7 @@ async fn a_settle_takes_only_what_was_dropped_unended() {
     assert_eq!(
         (
             state(abandoned_fix_id),
-            state(abandoned_engage_id),
+            state(abandoned_recheck_id),
             state(live_id)
         ),
         (Killed, Killed, Running)
