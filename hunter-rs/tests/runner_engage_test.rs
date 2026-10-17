@@ -2172,6 +2172,24 @@ async fn feedback_a_resumed_worker_was_shown_is_answered_by_its_reply() {
     assert_eq!(f.attention().await, None);
 }
 
+/// A resume inherits the problems its chain started from, so the reply it
+/// finally posts without a push declines them while the row still records
+/// them.
+#[tokio::test]
+async fn problems_a_resumed_worker_was_shown_are_declined_by_its_reply() {
+    let f = fixture("engage-problems-shown-resumed").await;
+    let bins = FakeBins::acquire("engage-problems-shown-resumed");
+    bins.ok("gh", PR_VIEW_JSON);
+    push_to(&f, None).await;
+
+    let summary = suspend_and_resume(&f, suspend_then_reply(), || {}).await;
+    assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
+
+    let row = f.pr_row().await;
+    assert_eq!(row.addressed_fingerprint.as_deref(), Some(FP));
+    assert_eq!(row.addressed_head_sha.as_deref(), Some("deadbeef"));
+}
+
 /// A resumed worker is only told to carry on, in the tree its chain was
 /// created in, so problems a sync recorded while the chain was suspended
 /// never reached it. A reply without a push must not decline them.
