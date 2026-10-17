@@ -126,12 +126,7 @@ async fn test_state() -> TestState {
             backend: Arc::new(hunter::backend::NullBackend),
             // Read-only GET tests; no cycle is triggered from here.
             repo_notes: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-            scheduler: hunter::server::SchedulerHandle {
-                running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                paused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                overdrive: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                wake: std::sync::Arc::new(tokio::sync::Notify::new()),
-            },
+            scheduler: hunter::server::SchedulerHandle::default(),
         },
         _dir: dir,
     }

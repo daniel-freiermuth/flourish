@@ -11,12 +11,11 @@ mod support;
 
 use hunter::config::Config;
 use hunter::scheduler::{disk_denial, pick_next, run_cycle};
-use hunter::store::{FindingInsert, Store};
-use support::{FakeBins, GitRepo, ScriptedBackend, TempDir};
+use hunter::store::Store;
+use support::{GitRepo, ScriptedBackend, TempDir};
 
 /// An enabled repo with a real clone, whose `test_gap` is due: a cycle
-/// with room would run it. The URL is GitHub's so `sync_prs` can resolve
-/// the repo; nothing here ever fetches from it.
+/// with room would run it.
 async fn fixture(label: &str) -> (TempDir, Store, Config) {
     let dir = TempDir::new(label);
     let (path, pool) = support::fresh_pool(&dir, "disk").await;
@@ -49,42 +48,18 @@ async fn fixture(label: &str) -> (TempDir, Store, Config) {
     (dir, store, cfg)
 }
 
-/// `sync_prs`'s view of a PR nobody has touched.
-const PR_OPEN_JSON: &str = r#"{"state":"OPEN","mergeable":"MERGEABLE","reviewDecision":"","comments":[],"reviews":[],"statusCheckRollup":[],"updatedAt":"2026-01-02T03:04:05Z","headRefName":"fix/some-bug","headRefOid":"deadbeef"}"#;
-
-/// A short disk stops jobs, not PR polling: the sync is free reads, and
-/// review feedback must not wait for someone to clear the disk.
+/// A short disk denies the cycle before its pick: no job row, no worker,
+/// and the work still waiting. (PR sync is the admin lane's, which the
+/// disk gate does not stop: review feedback need not wait for space.)
 #[tokio::test]
 async fn a_cycle_short_of_disk_is_denied_before_any_job_starts() {
-    let bins = FakeBins::acquire("disk-gate");
-    bins.ok("gh", PR_OPEN_JSON);
     let (_dir, store, mut cfg) = fixture("disk-gate").await;
-    let (fid, _) = store
-        .upsert_finding(
-            1,
-            &FindingInsert {
-                fingerprint: "fp-open-pr".to_owned(),
-                file: "src/lib.rs".to_owned(),
-                severity: hunter::domain::Severity::Medium,
-                confidence: 0.9,
-                summary: "a bug with a PR".to_owned(),
-                ..Default::default()
-            },
-            "bug",
-            None,
-        )
-        .await
-        .unwrap();
-    store
-        .set_finding_pr_open(fid, "https://github.com/acme/widget/pull/7")
-        .await
-        .unwrap();
     // More than any filesystem has free.
     cfg.min_free_disk_bytes = u64::MAX;
     let backend = ScriptedBackend::new(|_| panic!("no worker may start on a full disk"));
 
     let before = hunter::util::now_ms();
-    let summary = run_cycle(&support::recovered(&store), &cfg, &backend, None).await;
+    let summary = run_cycle(&mut support::jobs(&store), &cfg, &backend, None).await;
     let after = hunter::util::now_ms();
 
     let denied = summary.denied.as_deref().unwrap_or_default();
@@ -97,17 +72,15 @@ async fn a_cycle_short_of_disk_is_denied_before_any_job_starts() {
             .is_some_and(|t| (before + five_min..=after + five_min).contains(&t)),
         "a disk denial is looked at again in five minutes: {summary:?}"
     );
-    assert_eq!(
-        summary.sync.as_ref().map(|s| s.synced),
-        Some(1),
-        "the open PR was still synced: {summary:?}"
-    );
     assert!(
         store.list_jobs(100).await.unwrap().is_empty(),
         "no job row is created"
     );
     assert!(
-        pick_next(&store, &cfg, None).await.unwrap().is_some(),
+        pick_next(&support::scope(&store), &cfg, None)
+            .await
+            .unwrap()
+            .is_some(),
         "the work is still waiting"
     );
 }

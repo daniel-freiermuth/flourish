@@ -208,7 +208,7 @@ async fn a_cycle_runs_the_queued_fix() {
         ScriptedBackend::writing("NOT-A-BUG.md", "Classification: wrong\nmisread the code");
 
     let summary =
-        hunter::scheduler::run_cycle(&support::recovered(&f.store), &f.cfg, &backend, None).await;
+        hunter::scheduler::run_cycle(&mut support::jobs(&f.store), &f.cfg, &backend, None).await;
 
     assert_eq!(summary.finding_id, Some(f.fid), "{summary:?}");
     assert_eq!(summary.outcome.as_deref(), Some("rejected"), "{summary:?}");
@@ -481,7 +481,7 @@ async fn verdict_after_selection_stops_the_fix_before_its_job() {
     .unwrap();
     assert_eq!(summary.outcome.as_deref(), Some("suspended"));
     let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
-        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
             .await
             .unwrap()
     else {
@@ -524,7 +524,7 @@ async fn verdict_after_selection_stops_the_fix_before_its_job() {
         .set_finding_status(f.fid, hunter::domain::FindingStatus::Queued)
         .await
         .unwrap();
-    let picked = hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+    let picked = hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
         .await
         .unwrap();
     assert!(
@@ -629,7 +629,7 @@ async fn a_blocked_report_holds_the_fix_and_keeps_its_checkpoint() {
     assert!(!tree.join("BLOCKED.md").exists());
     assert!(tree.join("PR-DESCRIPTION.md").is_file());
     assert!(f.store.suppressions(1, "bug").await.unwrap().is_empty());
-    let picked = hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+    let picked = hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
         .await
         .unwrap();
     assert!(
@@ -643,7 +643,7 @@ async fn a_blocked_report_holds_the_fix_and_keeps_its_checkpoint() {
         "held work is skipped: {picked:?}"
     );
     hunter::workspace::sweep(
-        f.store.test_lane(),
+        &support::admin(&f.store),
         &f.cfg.work_root,
         hunter::util::now_ms(),
     )
@@ -669,7 +669,7 @@ async fn a_continued_fix_resumes_its_checkpoint_and_is_ordinary_again() {
     )
     .await;
     let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
-        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
             .await
             .unwrap()
     else {
@@ -752,7 +752,7 @@ async fn an_interrupted_continue_resumes_as_an_ordinary_resume() {
     )
     .await;
     let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
-        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
             .await
             .unwrap()
     else {
@@ -791,7 +791,7 @@ async fn an_interrupted_continue_resumes_as_an_ordinary_resume() {
         .await
         .unwrap();
     let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
-        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
             .await
             .unwrap()
     else {
@@ -862,7 +862,7 @@ async fn a_continued_fix_that_concludes_ends_ordinarily() {
         )
         .await;
         let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
-            hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+            hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
                 .await
                 .unwrap()
         else {
@@ -950,7 +950,7 @@ async fn resumed_hold_prompt(f: &Fixture) -> String {
     )
     .await;
     let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
-        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
             .await
             .unwrap()
     else {
@@ -1058,7 +1058,7 @@ async fn fix_resume_without_a_blocker_runs_the_plain_continuation() {
     .unwrap();
     assert_eq!(summary.outcome.as_deref(), Some("suspended"));
     let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
-        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
             .await
             .unwrap()
     else {
@@ -1098,7 +1098,7 @@ async fn an_unremovable_stale_report_stops_the_resume_before_its_job() {
     )
     .await;
     let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
-        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
             .await
             .unwrap()
     else {
@@ -1130,7 +1130,7 @@ async fn an_unremovable_stale_report_stops_the_resume_before_its_job() {
 
     std::fs::remove_dir(tree.join("BLOCKED.md")).unwrap();
     let Some(hunter::scheduler::Candidate::Resume { plan: again, .. }) =
-        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
             .await
             .unwrap()
     else {
@@ -1150,7 +1150,7 @@ async fn rejecting_a_held_fix_lets_the_sweep_release_its_checkpoint() {
     let job = summary.job_id.unwrap();
 
     hunter::workspace::sweep(
-        f.store.test_lane(),
+        &support::admin(&f.store),
         &f.cfg.work_root,
         hunter::util::now_ms(),
     )
@@ -1178,7 +1178,7 @@ async fn rejecting_a_held_fix_lets_the_sweep_release_its_checkpoint() {
         ("rejected", Some("not worth it"))
     );
     hunter::workspace::sweep(
-        f.store.test_lane(),
+        &support::admin(&f.store),
         &f.cfg.work_root,
         hunter::util::now_ms(),
     )
@@ -1212,7 +1212,7 @@ async fn a_fix_whose_backend_keeps_failing_is_held() {
     .await;
     let failing = ScriptedBackend::failing();
     for attempt in 1..=3 {
-        let plan = match hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        let plan = match hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
             .await
             .unwrap()
         {
@@ -1427,7 +1427,7 @@ async fn a_verdict_after_selection_wins_over_a_stale_report() {
     )
     .await;
     let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
-        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
             .await
             .unwrap()
     else {
@@ -1703,7 +1703,8 @@ async fn a_shipped_fix_reaches_origin_and_opens_its_pr_from_the_branch() {
     bins.ok("gh", "https://github.com/acme/widget/pull/42");
     let f = fixture("fix-ship-argv").await;
     route_push(&f, None);
-    f.store
+    support::scope(&f.store)
+        .store()
         .record_work_failure(f.fid, FindingJobKind::Fix, "no commits")
         .await
         .unwrap();
@@ -1831,7 +1832,8 @@ async fn unshippable_work_is_requeued_with_the_reason() {
 async fn a_different_failure_restarts_the_streak() {
     let f = fixture("fix-streak-reset").await;
     for _ in 0..2 {
-        f.store
+        support::scope(&f.store)
+            .store()
             .record_work_failure(f.fid, FindingJobKind::Fix, "no commits")
             .await
             .unwrap();
@@ -1946,7 +1948,7 @@ async fn a_failed_push_counts_only_while_the_forge_is_reachable() {
         assert!(summary.retry_at.is_some(), "{summary:?}");
         assert_eq!(fix_streak(&f).await.streak, 0);
         let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
-            hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+            hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
                 .await
                 .unwrap()
         else {
@@ -1989,7 +1991,7 @@ async fn a_runner_error_while_the_provider_is_unreachable_counts_nothing() {
         .unwrap();
     f.cfg.network_gate = true;
     let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
-        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
             .await
             .unwrap()
     else {
@@ -2062,4 +2064,66 @@ async fn a_blocked_fix_keeps_its_one_shot_override() {
         finding.budget_override,
         Some(hunter::domain::BudgetOverride::Once)
     );
+}
+
+/// The admin lane's Renovate pass can rewrite a `queued` dep update's
+/// target after the job lane picked it and before the fix claims it --
+/// the window holds the budget gate. The worker is asked for the target
+/// the claimed row names, not the one the pick read: built from the
+/// pick, the fix would ship the old upgrade under a finding that names
+/// the new one, and the next scan would find the dependency still behind.
+#[tokio::test]
+async fn a_fix_works_from_the_row_it_claimed_not_the_row_it_picked() {
+    let f = fixture("fix-claimed-row").await;
+    let dep = |latest: &str| FindingInsert {
+        fingerprint: "fp-dep-serde".to_owned(),
+        file: "Cargo.toml".to_owned(),
+        severity: hunter::domain::Severity::Low,
+        confidence: 0.9,
+        summary: format!("serde 1.0.0 -> {latest}"),
+        ecosystem: Some("cargo".to_owned()),
+        package: Some("serde".to_owned()),
+        current_version: Some("1.0.0".to_owned()),
+        latest_version: Some(latest.to_owned()),
+        update_type: Some("minor".to_owned()),
+        ..Default::default()
+    };
+    let repo_id = f.store.get_finding(f.fid).await.unwrap().unwrap().repo_id;
+    let (fid, _) = f
+        .store
+        .upsert_finding(repo_id, &dep("1.5.0"), "dep_update", None)
+        .await
+        .unwrap();
+    f.store
+        .set_finding_status(fid, hunter::domain::FindingStatus::Queued)
+        .await
+        .unwrap();
+    std::fs::write(
+        f.cfg.root.join("playbooks").join("apply_improvement.md"),
+        "apply {{FINDING_JSON}}\n",
+    )
+    .unwrap();
+    let picked = f.store.get_finding(fid).await.unwrap().unwrap();
+    let store = f.store.clone();
+    let worker = ScriptedBackend::noop().on_decide(move || {
+        let store = store.clone();
+        async move {
+            assert!(store.refresh_dep_update(fid, &dep("2.0.0")).await.unwrap());
+        }
+    });
+
+    hunter::scheduler::run_fix(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Cold(&picked),
+        &worker,
+    )
+    .await
+    .unwrap();
+
+    let runs = worker.runs();
+    assert_eq!(runs.len(), 1);
+    assert!(runs[0].prompt.contains("2.0.0"), "{}", runs[0].prompt);
+    assert!(!runs[0].prompt.contains("1.5.0"), "{}", runs[0].prompt);
 }

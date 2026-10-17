@@ -237,6 +237,84 @@ fn now_ms() -> i64 {
     .unwrap()
 }
 
+/// A pass reads its open PRs side by side, but never more than
+/// `PR_SYNC_CONCURRENCY` at once: each `gh pr view` is a forge round trip,
+/// and a serial pass cost their sum. Every PR is still synced once.
+///
+/// The fake `gh` marks itself live in `live/` for half a second and
+/// records how many reads were live when it started. Serial reads would
+/// each see only themselves.
+#[tokio::test]
+async fn a_pass_reads_its_open_prs_side_by_side_within_the_bound() {
+    const PRS: i64 = 7;
+    let f = fixture("sync-parallel").await;
+    let bins = FakeBins::acquire("sync-parallel");
+    let rid = f.store.get_finding(f.fid).await.unwrap().unwrap().repo_id;
+    for n in 2..=PRS {
+        let (fid, _) = f
+            .store
+            .upsert_finding(
+                rid,
+                &FindingInsert {
+                    fingerprint: format!("fp-sync-{n}"),
+                    file: "src/lib.rs".to_owned(),
+                    summary: "a fix".to_owned(),
+                    ..Default::default()
+                },
+                "bug",
+                None,
+            )
+            .await
+            .unwrap();
+        f.store
+            .set_finding_pr_open(fid, &format!("{REPO_URL}/pull/{}", 100 + n))
+            .await
+            .unwrap();
+    }
+    let live = f.cfg.work_root.join("live");
+    let seen = f.cfg.work_root.join("seen");
+    std::fs::create_dir_all(&live).unwrap();
+    std::fs::create_dir_all(&seen).unwrap();
+    bins.script(
+        "gh",
+        &format!(
+            "touch '{live}/'$$\n\
+             ls '{live}' | wc -l > '{seen}/'$$\n\
+             sleep 0.5\n\
+             rm -f '{live}/'$$\n\
+             cat <<'__PR_EOF__'\n{view}\n__PR_EOF__\nexit 0",
+            live = live.display(),
+            seen = seen.display(),
+            view = pr(&json!({})),
+        ),
+    );
+
+    let result = f.sync().await;
+
+    assert_eq!((result.synced, result.errors), (PRS, 0), "{result:?}");
+    let overlaps: Vec<usize> = std::fs::read_dir(&seen)
+        .unwrap()
+        .map(|e| {
+            std::fs::read_to_string(e.unwrap().path())
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(
+        overlaps.len(),
+        usize::try_from(PRS).unwrap(),
+        "one read per PR"
+    );
+    let most = overlaps.iter().copied().max().unwrap();
+    assert!(most >= 2, "the reads ran one at a time: {overlaps:?}");
+    assert!(
+        most <= hunter::scheduler::PR_SYNC_CONCURRENCY,
+        "more than the bound at once: {overlaps:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Leaving pr_open, and the paths that must not
 // ---------------------------------------------------------------------------
@@ -375,6 +453,25 @@ async fn a_pr_already_read_in_the_pass_is_an_error_and_not_read_again() {
     );
 }
 
+/// A pass asked to stop reads no further PR: a daemon shutting down waits
+/// for its PR sync's run, and each PR is a forge round trip. The finding is
+/// left as it was, for the next daemon's first sync.
+#[tokio::test]
+async fn a_pass_told_to_stop_reads_no_more_prs() {
+    let f = fixture("sync-stop").await;
+    let bins = FakeBins::acquire("sync-stop");
+    serve_pr(&bins, &pr(&json!({"state": "MERGED"})));
+    let (stop, stopping) = tokio::sync::watch::channel(false);
+    let pass = pr_sync(&f.store).until(stopping);
+    stop.send_replace(true);
+
+    let result = hunter::scheduler::sync_prs(&pass, &f.cfg).await;
+
+    assert_eq!((result.synced, result.merged, result.errors), (0, 0, 0));
+    assert!(bins.calls_to("gh").is_empty(), "{:?}", bins.calls());
+    assert_eq!(f.status().await, FindingStatus::PrOpen);
+}
+
 /// A read whose push count cannot be taken is never begun: an error, the
 /// forge not asked, the finding left `pr_open` for the next sync.
 #[tokio::test]
@@ -459,7 +556,15 @@ async fn a_pr_open_finding_without_a_url_is_requeued() {
 
     let result = f.sync().await;
 
-    assert_eq!((result.errors, result.synced), (0, 0), "{result:?}");
+    assert_eq!(
+        (result.errors, result.synced, result.requeued),
+        (0, 0, 1),
+        "{result:?}"
+    );
+    assert!(
+        result.made_work(),
+        "a requeued fix is work for the job lane"
+    );
     assert_eq!(f.status().await, FindingStatus::Queued);
     assert!(bins.calls_to("gh").is_empty(), "{:?}", bins.calls());
 }
@@ -844,6 +949,8 @@ async fn a_changed_reason_lifts_suppression() {
 
 /// `list_attention` orders by `attention_since`: restamping it on every
 /// sync would send a long-waiting PR to the back of the queue each cycle.
+/// A sync counts as raised only the attention it changed, which is what
+/// wakes the job lane; a PR still flagged for the same reasons is not.
 #[tokio::test]
 async fn attention_since_moves_only_when_the_reason_changes() {
     let f = fixture("sync-attention-since").await;
@@ -854,15 +961,18 @@ async fn attention_since_moves_only_when_the_reason_changes() {
         &bins,
         &pr(&json!({ "reviewDecision": "CHANGES_REQUESTED" })),
     );
-    f.sync().await;
+    let same = f.sync().await;
     assert_eq!(f.pr_state().await.attention_since, Some(42), "unchanged");
+    assert_eq!((same.attention, same.raised), (1, 0), "{same:?}");
+    assert!(!same.made_work(), "{same:?}");
 
     serve_pr(
         &bins,
         &pr(&json!({ "reviewDecision": "CHANGES_REQUESTED", "mergeable": "CONFLICTING" })),
     );
     let before = now_ms();
-    f.sync().await;
+    let changed = f.sync().await;
+    assert_eq!((changed.attention, changed.raised), (1, 1), "{changed:?}");
     let ps = f.pr_state().await;
     assert_eq!(
         ps.needs_attention.as_deref(),
@@ -871,7 +981,8 @@ async fn attention_since_moves_only_when_the_reason_changes() {
     assert!(ps.attention_since.unwrap() >= before, "restamped: {ps:?}");
 
     serve_pr(&bins, &pr(&json!({})));
-    f.sync().await;
+    let cleared = f.sync().await;
+    assert_eq!((cleared.attention, cleared.raised), (0, 0), "{cleared:?}");
     let ps = f.pr_state().await;
     assert_eq!(ps.needs_attention, None);
     assert_eq!(ps.attention_since, None, "cleared");

@@ -44,6 +44,7 @@
       case "unqueue": return "kind-stale";
       // Routine daemon and operator activity.
       case "cycle":
+      case "prsync":
       case "fix":
       case "engage":
       case "harvest":

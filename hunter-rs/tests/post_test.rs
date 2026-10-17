@@ -155,12 +155,7 @@ async fn test_state() -> TestState {
             config: Arc::new(config),
             backend: Arc::new(hunter::backend::NullBackend),
             repo_notes: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-            scheduler: hunter::server::SchedulerHandle {
-                running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                overdrive: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                wake: Arc::new(tokio::sync::Notify::new()),
-            },
+            scheduler: hunter::server::SchedulerHandle::default(),
         },
         dir,
     }
@@ -198,6 +193,24 @@ async fn post_raw(
 
 async fn post(state: &AppState, path: &str, body: Value) -> (StatusCode, Value) {
     post_raw(state, path, Some("application/json"), &body.to_string()).await
+}
+
+/// What a delete leaves to the admin lane: it wakes the reaper duty (the
+/// permit is held, so `notified()` resolves at once), whose run this
+/// stands in for. The number of repos it reaped.
+async fn run_woken_reaper(state: &AppState) -> usize {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        state.scheduler.reap_wake.notified(),
+    )
+    .await
+    .expect("a delete must wake the admin lane's reaper");
+    hunter::server::reap_deleted_repos(
+        &support::admin(&state.store),
+        &state.config.work_root,
+        &state.repo_notes,
+    )
+    .await
 }
 
 /// Captures `tracing` output for the duration of one request.
@@ -699,7 +712,12 @@ async fn repo_delete_refused_with_history_then_success_when_clean() {
             .any(|e| e.kind == "repo" && e.message == "deleted clean (#2)")
     );
 
-    // Gone: a second delete is a 404.
+    // Flagged, files still on disk: a second delete is the same `ok`,
+    // until the woken reaper has removed them and dropped the row.
+    let (status, body) = post(&state, "/api/repo/delete", json!({ "id": 2 })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({ "ok": true }));
+    assert_eq!(run_woken_reaper(&state).await, 1);
     let (status, body) = post(&state, "/api/repo/delete", json!({ "id": 2 })).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["error"], "no repo 2");
@@ -761,28 +779,39 @@ async fn cycle_starts_returns_202() {
     assert_eq!(body["started"], true);
 }
 
-/// Contract §2: the 202 is not cosmetic -- it must actually reach the loop.
-/// The handler notifies before responding, so the permit is already held
-/// and `notified()` resolves immediately.
+/// Contract §2: the 202 is not cosmetic -- it must actually reach both
+/// lanes: the job lane's next cycle, and the admin lane's PR sync duty. The
+/// handler notifies before responding, so each permit is already held and
+/// `notified()` resolves immediately.
 #[tokio::test]
-async fn cycle_wakes_the_scheduler_loop() {
+async fn cycle_wakes_both_scheduler_lanes() {
     let state = test_state().await;
     let wake = Arc::clone(&state.scheduler.wake);
+    let pr_sync_wake = Arc::clone(&state.scheduler.pr_sync_wake);
     let (status, _) = post(&state, "/api/cycle", json!({})).await;
     assert_eq!(status, StatusCode::ACCEPTED);
     tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified())
         .await
-        .expect("POST /api/cycle must wake the scheduler loop");
+        .expect("POST /api/cycle must wake the job lane");
+    tokio::time::timeout(std::time::Duration::from_secs(1), pr_sync_wake.notified())
+        .await
+        .expect("POST /api/cycle must wake the PR sync");
 }
 
-/// Contract §2: a cycle already under way is refused, not queued twice.
+/// Contract §2: a cycle already under way is refused, not queued twice --
+/// but the PR sync is still woken: a manual PR sync is most useful
+/// exactly while a long job runs, and the admin lane does not wait for it.
 #[tokio::test]
-async fn cycle_while_running_is_409_busy() {
+async fn cycle_while_running_is_409_busy_and_still_wakes_the_admin_lane() {
     let state = test_state().await;
+    let pr_sync_wake = Arc::clone(&state.scheduler.pr_sync_wake);
     state.scheduler.running.store(true, Ordering::SeqCst);
     let (status, body) = post(&state, "/api/cycle", json!({})).await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["error"], "busy");
+    tokio::time::timeout(std::time::Duration::from_secs(1), pr_sync_wake.notified())
+        .await
+        .expect("a busy trigger must still wake the PR sync");
 }
 
 /// Deleting a repo must remove its notes file.
@@ -824,6 +853,7 @@ async fn deleting_a_repo_removes_its_notes() {
 
     let (status, body) = post(&state, "/api/repo/delete", json!({ "id": rid })).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(run_woken_reaper(&state).await, 1);
     assert!(
         !notes_path.exists(),
         "notes survived the delete: the deleted repo's private notes are still on disk"
@@ -842,9 +872,9 @@ async fn deleting_a_repo_removes_its_notes() {
 /// The obstruction is `repos/` made read-only: unlinking `repo-{id}`
 /// needs write permission on the parent, not on the directory itself.
 ///
-/// The envelope stays generic — `ApiError::Internal` deliberately never
-/// leaks internals to a client — so the id and the remediation reach the
-/// operator through the log, and that is where they are asserted.
+/// The reaper runs on the admin lane, after the response, so the id and
+/// the remediation reach the operator through the log, and that is where
+/// they are asserted.
 #[tokio::test]
 async fn a_repo_whose_files_survive_keeps_its_id_reserved_until_reaped() {
     require_enforced_permissions();
@@ -860,7 +890,7 @@ async fn a_repo_whose_files_survive_keeps_its_id_reserved_until_reaped() {
     let rid = body["repo"]["id"].as_i64().expect("new repo id");
 
     // Make the repo's directory impossible to remove by taking write
-    // permission off its parent, which is what the handler needs in order
+    // permission off its parent, which is what the reaper needs in order
     // to unlink the entry.
     let repos_root = state.config.work_root.join("repos");
     let repo_dir = repos_root.join(format!("repo-{rid}"));
@@ -869,6 +899,7 @@ async fn a_repo_whose_files_survive_keeps_its_id_reserved_until_reaped() {
     let mut perms = std::fs::metadata(&repos_root).unwrap().permissions();
     perms.set_readonly(true);
     std::fs::set_permissions(&repos_root, perms).unwrap();
+    let (status, body) = post(&state, "/api/repo/delete", json!({ "id": rid })).await;
     let sink = LogSink::default();
     let capture = tracing::subscriber::set_default(
         tracing_subscriber::fmt()
@@ -876,7 +907,7 @@ async fn a_repo_whose_files_survive_keeps_its_id_reserved_until_reaped() {
             .with_writer(sink.clone())
             .finish(),
     );
-    let (status, body) = post(&state, "/api/repo/delete", json!({ "id": rid })).await;
+    let reaped = run_woken_reaper(&state).await;
     drop(capture);
     // Before any assertion can panic: a directory left unwritable defeats
     // the scratch dir's cleanup and leaks it into /tmp for good.
@@ -887,16 +918,13 @@ async fn a_repo_whose_files_survive_keeps_its_id_reserved_until_reaped() {
     // The repo *is* deleted — only reclaiming its files failed, and that
     // is not the caller's problem to retry.
     assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(reaped, 0);
     let logged = sink.text();
     assert!(
-        logged.contains(&format!("repo {rid} deleted, but reclaiming "))
-            && logged.contains("its files stay until the reaper retries"),
+        logged.contains(&format!("repo {rid} is flagged deleted but "))
+            && logged.contains("its row stays until the reaper retries"),
         "a failed reclamation must say the id is still held: {logged}"
     );
-
-    // No retry here on purpose: a second delete re-attempts reclamation,
-    // which would succeed now that permissions are restored and release
-    // the very id this test is about. Retry behaviour has its own test.
 
     // ...but the row is still holding the id, which is the whole point:
     // handing it to the next INSERT while those files remain is what put
@@ -909,7 +937,7 @@ async fn a_repo_whose_files_survive_keeps_its_id_reserved_until_reaped() {
 
     // The reaper finishes the job once the obstruction is gone.
     let reaped = hunter::server::reap_deleted_repos(
-        &state.store,
+        &support::admin(&state.store),
         &state.config.work_root,
         &state.repo_notes,
     )
@@ -961,6 +989,8 @@ async fn notes_that_cannot_be_removed_keep_the_id_reserved_too() {
         "fixture: the clone must be absent, or it fails first"
     );
 
+    let (status, body) = post(&state, "/api/repo/delete", json!({ "id": rid })).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
     let sink = LogSink::default();
     let capture = tracing::subscriber::set_default(
         tracing_subscriber::fmt()
@@ -968,9 +998,9 @@ async fn notes_that_cannot_be_removed_keep_the_id_reserved_too() {
             .with_writer(sink.clone())
             .finish(),
     );
-    let (status, body) = post(&state, "/api/repo/delete", json!({ "id": rid })).await;
+    let reaped = run_woken_reaper(&state).await;
     drop(capture);
-    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(reaped, 0);
     assert_eq!(
         state.store.deleted_repo_ids().await.unwrap(),
         vec![rid],
@@ -978,7 +1008,7 @@ async fn notes_that_cannot_be_removed_keep_the_id_reserved_too() {
     );
     let logged = sink.text();
     assert!(
-        logged.contains(&format!("repo {rid} deleted, but reclaiming ")),
+        logged.contains(&format!("repo {rid} is flagged deleted but ")),
         "a failed reclamation must be logged: {logged}"
     );
 
@@ -986,7 +1016,7 @@ async fn notes_that_cannot_be_removed_keep_the_id_reserved_too() {
     // makes the retained row a retry rather than a wedge.
     std::fs::remove_dir_all(&notes_path).unwrap();
     let reaped = hunter::server::reap_deleted_repos(
-        &state.store,
+        &support::admin(&state.store),
         &state.config.work_root,
         &state.repo_notes,
     )
@@ -1092,6 +1122,7 @@ async fn deleting_a_repo_removes_its_directory() {
 
     let (status, body) = post(&state, "/api/repo/delete", json!({ "id": rid })).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(run_woken_reaper(&state).await, 1);
     assert!(
         !repo_dir.exists(),
         "{} survived the delete, so repo {rid}'s row cannot be released and its clone is still on disk",
@@ -1246,8 +1277,12 @@ async fn a_retried_delete_is_a_success_while_reclamation_is_pending() {
     assert_eq!(retry, StatusCode::OK, "a retry must not 404: {retry_body}");
 
     // Once reclaimed, the id is ordinary again and answers 404.
-    hunter::server::reap_deleted_repos(&state.store, &state.config.work_root, &state.repo_notes)
-        .await;
+    hunter::server::reap_deleted_repos(
+        &support::admin(&state.store),
+        &state.config.work_root,
+        &state.repo_notes,
+    )
+    .await;
     let (after, _) = post(&state, "/api/repo/delete", json!({ "id": rid })).await;
     assert_eq!(after, StatusCode::NOT_FOUND);
 
@@ -1286,8 +1321,12 @@ async fn a_reclaimed_id_is_never_reissued() {
     // the state in which a rowid alias would be reissued.
     let (status, _) = post(&state, "/api/repo/delete", json!({ "id": first })).await;
     assert_eq!(status, StatusCode::OK);
-    hunter::server::reap_deleted_repos(&state.store, &state.config.work_root, &state.repo_notes)
-        .await;
+    hunter::server::reap_deleted_repos(
+        &support::admin(&state.store),
+        &state.config.work_root,
+        &state.repo_notes,
+    )
+    .await;
     assert_eq!(
         state.store.deleted_repo_ids().await.unwrap(),
         [] as [i64; 0]
@@ -1815,6 +1854,7 @@ async fn summary_paused(state: &AppState) -> bool {
 /// Pausing is a round trip the dashboard can see: the flag the daemon
 /// loop reads, the summary field the button renders from, and the refusal
 /// of a manual cycle while paused -- then all three undone by resuming.
+/// A pause stops only jobs: the refused trigger still wakes the admin lane.
 #[tokio::test]
 async fn pausing_and_resuming_the_scheduler_round_trips() {
     let state = test_state().await;
@@ -1837,10 +1877,19 @@ async fn pausing_and_resuming_the_scheduler_round_trips() {
         summary_paused(&state).await,
         "the dashboard must see the pause"
     );
+    // The pause rang both lanes; take that permit, so the next one is the
+    // trigger's.
+    let pr_sync_wake = Arc::clone(&state.scheduler.pr_sync_wake);
+    tokio::time::timeout(std::time::Duration::from_secs(1), pr_sync_wake.notified())
+        .await
+        .expect("the pause wakes the PR sync");
 
     let (status, body) = post(&state, "/api/cycle", json!({})).await;
     assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
     assert_eq!(body, json!({ "error": "paused" }));
+    tokio::time::timeout(std::time::Duration::from_secs(1), pr_sync_wake.notified())
+        .await
+        .expect("a trigger while paused still wakes the PR sync");
 
     let (status, body) = post(&state, "/api/scheduler", json!({ "paused": false })).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
@@ -2375,8 +2424,8 @@ async fn held_fix_state() -> (TestState, i64, String) {
         "x".repeat(800)
     );
     assert!(
-        state
-            .store
+        support::scope(&state.store)
+            .store()
             .hold_work(
                 1,
                 FindingJobKind::Fix,
@@ -2491,8 +2540,8 @@ async fn rejecting_a_held_fix_through_the_hold_endpoint() {
         .await
         .unwrap();
     assert!(
-        state
-            .store
+        support::scope(&state.store)
+            .store()
             .hold_work(
                 1,
                 FindingJobKind::Fix,

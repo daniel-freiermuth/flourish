@@ -21,7 +21,7 @@
 
 use crate::domain::{ClosureClass, FindingStatus};
 use crate::forge::Forge;
-use crate::store::{FindingAnalysisUpdate, FindingInsert, VerdictAnchor};
+use crate::store::{FindingAnalysisUpdate, FindingInsert, ScanEdge, VerdictAnchor};
 
 /// A finding status no fix claim holds: every [`FindingStatus`] but
 /// `fixing`, which only a [`crate::recovery::FixClaim`]'s holder moves a
@@ -182,17 +182,21 @@ pub enum Transition<'a> {
     /// scan's analysis, the verdict and its anchor gone.
     Reopened { scan: &'a FindingInsert },
     /// A Renovate scan proposes again a `dep_update` an earlier scan retired
-    /// as unproposed: it never landed, so it is triage's again.
-    Reproposed,
-    /// A Renovate scan no longer proposes a `new` `dep_update`.
-    Unproposed { reason: &'a str },
+    /// as unproposed: it never landed, so it is triage's again. Made only
+    /// inside the store's dependency-scan writes ([`ScanEdge`]).
+    Reproposed(ScanEdge),
+    /// A Renovate scan no longer proposes a `new` `dep_update`. Made only
+    /// inside the admin lane's Renovate writes ([`ScanEdge`]).
+    Unproposed { reason: &'a str, scan: ScanEdge },
     /// A queued `dep_update` gives its place in the queue to the scan's
-    /// finding for the same move.
-    HandedOver { reason: &'a str },
+    /// finding for the same move. Made only inside the admin lane's
+    /// Renovate writes ([`ScanEdge`]).
+    HandedOver { reason: &'a str, scan: ScanEdge },
     /// The scan's finding that takes a handed-over place in the queue, with
     /// the stronger of its own budget override and `from_id`'s. From
     /// `queued` as well: several queued findings can hand over to one group.
-    TakesOver { from_id: i64 },
+    /// Made only beside [`Self::HandedOver`].
+    TakesOver { from_id: i64, scan: ScanEdge },
     /// A `pr_open` row without a PR URL (a fix that failed before its PR,
     /// from before fix claims): retried.
     PrMissing,
@@ -259,6 +263,13 @@ pub enum PrEnding<'a> {
     /// engage. The harvest classifies it.
     Closed { reason: &'a str },
 }
+
+/// The verdict reason the PR sync records for a PR it saw closed without
+/// merging: a closure nobody has classified yet. An engage that withdrew
+/// the same PR takes such a closure over ([`Store::adopt_closure`]).
+///
+/// [`Store::adopt_closure`]: crate::store::Store::adopt_closure
+pub const PR_CLOSED_AWAITING_HARVEST: &str = "PR closed without merge; awaiting harvest";
 
 impl<'a> PrEnding<'a> {
     /// The status an end applies from: only a `pr_open` finding has a PR
@@ -367,7 +378,7 @@ impl<'a> Transition<'a> {
             | Self::RecheckStale { .. }
             | Self::RecheckInvalid { .. } => One(S::Rechecking),
             Self::Reopened { .. } => Either(S::Rejected, S::Wontfix),
-            Self::Reproposed => One(S::Superseded),
+            Self::Reproposed(_) => One(S::Superseded),
             Self::TakesOver { .. } => Either(S::New, S::Queued),
             Self::PrMissing => One(S::PrOpen),
             Self::Classified { .. } => One(S::Closed),
@@ -382,7 +393,7 @@ impl<'a> Transition<'a> {
             Self::Unqueued
             | Self::RecheckConfirmed { .. }
             | Self::Reopened { .. }
-            | Self::Reproposed => S::New,
+            | Self::Reproposed(_) => S::New,
             Self::Verdict(v) => v.to,
             Self::HoldReleased { verdict, .. } => match verdict {
                 ReleaseVerdict::Rejected => S::Rejected,
@@ -403,7 +414,7 @@ impl<'a> Transition<'a> {
             Self::RecheckRequested | Self::Unqueued | Self::PrMissing => Record::StatusOnly,
             Self::RecheckConfirmed { analysis } => Record::Analysis(analysis),
             Self::Reopened { scan } => Record::Rescan(scan),
-            Self::TakesOver { from_id } => Record::InheritOverride { from_id },
+            Self::TakesOver { from_id, .. } => Record::InheritOverride { from_id },
             // An operator's verdict has no tree to anchor to, and one given
             // without a reason clears the reason an earlier verdict left.
             Self::Verdict(v) => Record::Verdict {
@@ -411,14 +422,14 @@ impl<'a> Transition<'a> {
                 anchor: None,
             },
             // The retirement's reason no longer applies.
-            Self::Reproposed => Record::Verdict {
+            Self::Reproposed(_) => Record::Verdict {
                 reason: None,
                 anchor: None,
             },
             Self::HoldReleased { reason, .. }
             | Self::RecheckStale { reason }
-            | Self::Unproposed { reason }
-            | Self::HandedOver { reason } => Record::Verdict {
+            | Self::Unproposed { reason, .. }
+            | Self::HandedOver { reason, .. } => Record::Verdict {
                 reason: Some(reason),
                 anchor: None,
             },

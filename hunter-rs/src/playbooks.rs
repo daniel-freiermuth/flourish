@@ -602,6 +602,10 @@ fn capped_diff(diff: &str) -> String {
     }
 }
 
+/// `base` is the default-branch commit the harvest judges against,
+/// resolved right after its fetch (`jobs.base_sha`). The worker is named
+/// it by its sha, not `origin/<default>`: that ref belongs to the shared
+/// clone, which the admin lane fetches while the worker runs.
 pub fn build_harvest_closed_prompt(
     root: &Path,
     finding: &Finding,
@@ -611,17 +615,18 @@ pub fn build_harvest_closed_prompt(
     pr_number: i64,
     pr_diff: &str,
     tree: ClosedTree,
+    base: &str,
     repo_notes: &str,
 ) -> Result<String> {
     let notes = notes_or_default(repo_notes, "(No notes yet)");
     let db = &repo.default_branch;
     let state = match tree {
         ClosedTree::DefaultBranch => format!(
-            "checked out at {db}'s HEAD, which does NOT contain this PR's changes; \
+            "checked out at {db}'s HEAD ({base}), which does NOT contain this PR's changes; \
              the PR's diff is below"
         ),
         ClosedTree::PrHead => format!(
-            "checked out at the PR's head branch; {db} is origin/{db}; the PR's diff is below"
+            "checked out at the PR's head branch; {db} is commit {base}; the PR's diff is below"
         ),
     };
     let template = read_template(root, "harvest-closed.md")?;
@@ -630,6 +635,7 @@ pub fn build_harvest_closed_prompt(
     slots.insert("WORKTREE_STATE", state);
     slots.insert("REPO_NAME", repo.name.clone());
     slots.insert("DEFAULT_BRANCH", db.clone());
+    slots.insert("BASE", base.to_owned());
     slots.insert("FINDING_JSON", finding_json(finding));
     slots.insert("PR_NUMBER", pr_number.to_string());
     slots.insert("PR_TITLE", pr.title.clone());

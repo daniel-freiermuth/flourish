@@ -5,10 +5,12 @@
 // Generated types say what the daemon sends, not what arrives: `api<T>()`
 // casts without looking, so the runtime guard is still `validate.ts`.
 
+export type { AdminTask } from "./generated/AdminTask";
 export type { Event } from "./generated/Event";
 export type { FindingDetail } from "./generated/FindingDetail";
 export type { FindingOut } from "./generated/FindingOut";
 export type { JobListEntry } from "./generated/JobListEntry";
+export type { JobPhase } from "./generated/JobPhase";
 export type { NextCandidate } from "./generated/NextCandidate";
 export type { RepoBrief } from "./generated/RepoBrief";
 export type { RepoNotesResponse } from "./generated/RepoNotesResponse";

@@ -37,6 +37,7 @@ use std::time::SystemTime;
 
 use crate::clones::{CloneHold, ClonePermit, ForeignChain, Lane, TreeLease, Unheld};
 use crate::domain::{FindingJobKind, JobKind, JobState};
+use crate::recovery::AdminAuthority;
 use crate::store::{ChainRef, ChainStatus, CloneLockError, CloneRef, Store};
 
 /// How long a finished chain's transcript is kept.
@@ -93,8 +94,8 @@ impl Workspace {
     /// tree-local `target/` would mean a full cold compile inside the job's
     /// wall-clock limit and up to a gigabyte per live chain; the clone's
     /// own `target/` is already gitignored and warm from before trees were
-    /// per-chain. Sharing it is safe because the scheduler runs one job at
-    /// a time and cargo locks the directory anyway.
+    /// per-chain. Sharing it is safe because the job lane runs one job at
+    /// a time (`recovery::JobAuthority`) and cargo locks the directory anyway.
     pub fn build_cache(&self) -> PathBuf {
         self.clone.join("target")
     }
@@ -640,7 +641,8 @@ pub struct SweepReport {
 }
 
 /// Reclaim what finished chains, and the layouts before this one, left on
-/// disk. Runs at daemon startup and before every cycle.
+/// disk. Runs at daemon startup and as the admin lane's sweep duty
+/// (`daemon::admin_duty`), beside whatever job is running.
 ///
 /// Nothing is removed without first reading from the database that no
 /// `running` job or checkpoint needs it, and no tree a runner leases. A
@@ -677,7 +679,22 @@ pub struct SweepReport {
 /// per-repo cargo build cache every worker compiles into (see
 /// [`Workspace::build_cache`]); `<work_root>/out/`; and a chain's
 /// `session/` while its workspace is inside retention.
-pub async fn sweep(lane: &mut Lane, work_root: &Path, now_ms: i64) -> anyhow::Result<SweepReport> {
+///
+/// The admin lane's alone: it takes the [`AdminAuthority`], and runs in a
+/// lane of its own.
+pub async fn sweep(
+    admin: &AdminAuthority,
+    work_root: &Path,
+    now_ms: i64,
+) -> anyhow::Result<SweepReport> {
+    admin
+        .store()
+        .lane(async |lane| sweep_in(lane, work_root, now_ms).await)
+        .await?
+}
+
+/// [`sweep`] in its lane.
+async fn sweep_in(lane: &mut Lane, work_root: &Path, now_ms: i64) -> anyhow::Result<SweepReport> {
     let mut report = SweepReport::default();
     sweep_chains(lane, work_root, now_ms, &mut report).await?;
     sweep_legacy_trees(lane, work_root, &mut report).await?;

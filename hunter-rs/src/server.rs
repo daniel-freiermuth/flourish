@@ -26,6 +26,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 use tower_http::set_header::SetResponseHeaderLayer;
 
+use crate::activity::{AdminStatus, JobStatus};
 use crate::auth::{self, CurrentUser};
 use crate::clones::{ClonePermit, Lane, Unheld};
 use crate::config::{Config, HostAllowList};
@@ -40,22 +41,45 @@ use crate::types::{
     Repo, RepoBrief, RepoHoldOut, RepoOut, RepoStreakOut, RepoWorkOut, Stats, Summary,
 };
 
-/// Handle to this process's scheduler loop.
-#[derive(Clone)]
+/// Handle to this process's two scheduler lanes: the job lane, which runs
+/// cycles, and the admin lane beside it (`crate::daemon`).
+#[derive(Clone, Default)]
 pub struct SchedulerHandle {
-    /// Set by the loop for the duration of a cycle. Drives `cycle_running`,
-    /// the "working" activity status, and the busy check on manual triggers.
+    /// Set by the job lane for the duration of a cycle. Drives
+    /// `cycle_running`, the "working" activity status, and the busy check
+    /// on manual triggers.
     pub running: Arc<AtomicBool>,
-    /// Prevents new scheduler cycles; an already-running worker is allowed
-    /// to finish and remains visible as running.
+    /// Prevents new job-lane cycles; an already-running worker is allowed
+    /// to finish and remains visible as running. The admin lane, which
+    /// spends no tokens, runs on regardless.
     pub paused: Arc<AtomicBool>,
     /// Promotes every budget decision to the backend's prioritized path.
     /// Pacing limits are bypassed, but provider hard stops remain enforced.
     pub overdrive: Arc<AtomicBool>,
-    /// Interrupts the loop's sleep so the next cycle starts immediately.
-    /// A notify delivered mid-cycle is held as a permit, so a trigger is
-    /// never lost -- it just lands on the following iteration.
+    /// Interrupts the job lane's sleep so the next cycle starts
+    /// immediately. A notify delivered mid-cycle is held as a permit, so a
+    /// trigger is never lost -- it just lands on the following iteration.
     pub wake: Arc<tokio::sync::Notify>,
+    /// Interrupts the sleep of the admin lane's PR sync duty, so open PRs
+    /// are read now. Held as a permit while a sync runs, like `wake`.
+    pub pr_sync_wake: Arc<tokio::sync::Notify>,
+    /// Interrupts the sleep of the admin lane's reaper duty, so a repo
+    /// just deleted has its files removed now. Held as a permit, like
+    /// `wake`.
+    pub reap_wake: Arc<tokio::sync::Notify>,
+    /// The admin lane's duties running now.
+    pub admin: AdminStatus,
+    /// The job lane's current phase outside its worker.
+    pub job: JobStatus,
+}
+
+impl SchedulerHandle {
+    /// Wake the PR sync and the job lane: open PRs are read, the job lane
+    /// picks.
+    pub fn wake_both(&self) {
+        self.pr_sync_wake.notify_one();
+        self.wake.notify_one();
+    }
 }
 
 #[derive(Clone)]
@@ -365,10 +389,12 @@ async fn summary(State(state): State<AppState>) -> Result<Json<Summary>, ApiErro
     let scheduler_state = store.scheduler_state().await?;
 
     let backend_status_html = state.backend.status_html().await?;
-    // True only while the loop is inside a cycle.
+    // True only while the job lane is inside a cycle.
     let cycle_running = state.scheduler.running.load(Ordering::SeqCst);
     let scheduler_paused = state.scheduler.paused.load(Ordering::SeqCst);
     let scheduler_overdrive = state.scheduler.overdrive.load(Ordering::SeqCst);
+    let admin_activity = state.scheduler.admin.current();
+    let job_activity = state.scheduler.job.current();
 
     // "What's next" preview (`server.Handler._summary`): only when nothing is
     // running, from the SAME selection the scheduler itself makes, minus its
@@ -420,7 +446,8 @@ async fn summary(State(state): State<AppState>) -> Result<Json<Summary>, ApiErro
             job: Box::new(job.clone()),
         }
     } else if cycle_running {
-        // Priority 2: a cycle is under way but has not created a job row yet.
+        // Priority 2: the job lane is in a cycle with no job row: picking,
+        // or preparing or finishing a job.
         ActivityStatus::Working
     } else if let Some(s) = scheduler_state.as_ref().filter(|s| s.state == "error") {
         ActivityStatus::Error {
@@ -461,6 +488,8 @@ async fn summary(State(state): State<AppState>) -> Result<Json<Summary>, ApiErro
         next_candidate,
         scheduler_state,
         activity_status,
+        admin_activity,
+        job_activity,
     }))
 }
 
@@ -1079,14 +1108,18 @@ async fn release_repo_hold(
 
 // -- POST /api/cycle (contract §2) --------------------------------------------
 
-/// Trigger a scheduler cycle now (contract §2): 409 if one is already
-/// running, otherwise 202 and the loop starts immediately.
+/// Trigger both lanes now (contract §2): the admin lane syncs PRs at
+/// once, and the job lane starts its next cycle. The admin lane is woken
+/// whatever the job lane is doing: a pause stops only jobs, and a manual
+/// sync is most useful exactly while a long job runs. Then 409 `paused`
+/// while paused, 409 `busy` while a cycle is already running, else 202.
 ///
 /// The busy check is advisory, as Python's non-blocking lock acquire was:
 /// a trigger that races the loop into its next cycle is held as a notify
 /// permit and runs on the following iteration rather than being dropped.
 async fn cycle(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
     post_gate(&headers)?;
+    state.scheduler.pr_sync_wake.notify_one();
     if state.scheduler.paused.load(Ordering::SeqCst) {
         return Ok(error_body(StatusCode::CONFLICT, "paused"));
     }
@@ -1109,7 +1142,7 @@ async fn set_scheduler_paused(
         .and_then(Value::as_bool)
         .ok_or_else(|| ApiError::BadRequest("paused must be a boolean".to_owned()))?;
     state.scheduler.paused.store(paused, Ordering::SeqCst);
-    state.scheduler.wake.notify_one();
+    state.scheduler.wake_both();
     Ok(Json(json!({ "paused": paused })).into_response())
 }
 
@@ -1639,7 +1672,10 @@ async fn add_repo(
 /// row accounts for and no pass will ever revisit. Leaving it flagged is
 /// always safe — the repo is already invisible, and the next pass tries
 /// again.
-pub async fn reap_repo(
+///
+/// Only [`reap_deleted_repos`], the admin lane's, removes a clone: a
+/// handler wakes that duty instead.
+async fn reap_repo(
     store: &Store,
     repos_dir: &Path,
     rid: i64,
@@ -1661,8 +1697,8 @@ async fn reap_in(
     let store = lane.store().clone();
     // Taken here rather than by the callers, because there are two of
     // them and only one used to hold it: the delete handler did, but the
-    // reaper pass that runs at startup and before every cycle did not.
-    // An append interleaving with that pass recreates the notes file
+    // reaper that runs at startup and as an admin-lane duty did not.
+    // An append interleaving with the reaper recreates the notes file
     // after the reaper has walked past it, and the row is dropped a
     // moment later — leaving a file for a repo that no longer exists and
     // nothing that will ever retry it. Python takes the lock inside its
@@ -1837,12 +1873,15 @@ pub fn migrate_repo_notes(work_root: &Path) -> usize {
     moved
 }
 
-/// Finish any deletion left flagged by a crash or a failed reclamation.
+/// Remove the clone of every repo flagged deleted, then drop its row
+/// ([`reap_repo`]): the admin lane's reaper duty, woken by the delete
+/// handler (`SchedulerHandle::reap_wake`), and once at daemon startup.
 pub async fn reap_deleted_repos(
-    store: &Store,
+    admin: &crate::recovery::AdminAuthority,
     work_root: &Path,
     notes_lock: &tokio::sync::Mutex<()>,
 ) -> usize {
+    let store = admin.store();
     let repos_dir = work_root.join("repos");
     let ids = store.deleted_repo_ids().await.unwrap_or_default();
     let mut reaped = 0;
@@ -1868,10 +1907,7 @@ async fn delete_repo(
     post_gate(&headers)?;
     let body = parse_object(&raw)?;
     let rid = require_int(&body, "id", "id must be an integer")?;
-    // Not `_guard`: this one is released explicitly below, before
-    // reclamation takes the same lock itself.
     let guard = state.repo_notes.lock().await;
-    let repos_dir = state.config.work_root.join("repos");
     let Some(repo) = state.store.get_repo_by_id(rid).await? else {
         // Deleting something already deleted is not an error. A client
         // that lost the first response and retried must not be told the
@@ -1883,7 +1919,7 @@ async fn delete_repo(
         // from one that was never used.
         if state.store.repo_is_deleted(rid).await? {
             drop(guard);
-            let _ = reap_repo(&state.store, &repos_dir, rid, &state.repo_notes).await;
+            state.scheduler.reap_wake.notify_one();
             return Ok(Json(json!({ "ok": true })).into_response());
         }
         return Err(ApiError::NotFound(format!("no repo {rid}")));
@@ -1902,24 +1938,15 @@ async fn delete_repo(
             None,
         )
         .await?;
-    // Phase two, attempted inline so the common case finishes before the
-    // response: reclaim the directory, then drop the row. The row is what
-    // records that `repos/repo-<id>` is still on disk, so it goes only once
-    // the files have -- the id itself is never reissued (`repos.id` is
-    // AUTOINCREMENT, migration 009). A failure here is not an error for the
-    // caller — the repo *is* deleted — it just leaves the files on disk
-    // until the reaper retries on the next cycle.
-    // The guard goes before reclamation, which now takes the lock
-    // itself: holding it here as well would deadlock, and the row is
-    // already flagged, so an append can no longer resolve this repo.
+    // Phase two is the admin lane's reaper, woken here: it removes the
+    // directory, then drops the row. The row is what records that
+    // `repos/repo-<id>` is still on disk, so it goes only once the files
+    // have -- the id itself is never reissued (`repos.id` is
+    // AUTOINCREMENT, migration 009). The caller is told the truth by the
+    // 200 all the same: the repo *is* deleted, and only its files wait for
+    // the reaper, which retries a removal that fails on every later run.
     drop(guard);
-    if let Err(e) = reap_repo(&state.store, &repos_dir, rid, &state.repo_notes).await {
-        tracing::warn!(
-            "repo {rid} deleted, but reclaiming {} failed ({e}); \
-             its files stay until the reaper retries",
-            Store::repo_dir(&repos_dir, rid).display()
-        );
-    }
+    state.scheduler.reap_wake.notify_one();
     Ok(Json(json!({ "ok": true })).into_response())
 }
 

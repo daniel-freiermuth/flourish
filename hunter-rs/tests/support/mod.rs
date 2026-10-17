@@ -155,11 +155,23 @@ pub fn recovered(store: &Store) -> hunter::recovery::Recovered {
     })
 }
 
+/// `store`'s job lane authority ([`hunter::recovery::JobAuthority`]), for
+/// a test that runs cycles. A fresh one each call: the one-per-daemon rule
+/// is the daemon's, not a fixture's.
+pub fn jobs(store: &Store) -> hunter::recovery::JobAuthority {
+    recovered(store).into_lanes().0
+}
+
+/// `store`'s admin lane authority ([`hunter::recovery::AdminAuthority`]).
+pub fn admin(store: &Store) -> hunter::recovery::AdminAuthority {
+    recovered(store).into_lanes().1
+}
+
 /// `store`'s PR sync pass ([`hunter::store::PrSyncPass`]), for a test that
 /// syncs or records an observation. Only one is live at a time: a test
 /// drops it before the next sync begins its own.
 pub fn pr_sync(store: &Store) -> hunter::store::PrSyncPass {
-    recovered(store)
+    admin(store)
         .begin_pr_sync()
         .expect("another PR sync pass of this store is still live")
 }
@@ -177,8 +189,8 @@ pub fn pr_ref(url: &str) -> hunter::transition::PrRef {
 /// what the runner itself left. A fixture job that stands for one a live
 /// owner still runs is kept out of the ledger with
 /// [`hunter::recovery::RunningJob::disown`] ([`live_job`]).
-pub fn scope(store: &Store) -> hunter::recovery::CycleScope {
-    hunter::recovery::CycleScope::open(&recovered(store))
+pub fn scope(store: &Store) -> hunter::recovery::CycleScope<'static> {
+    jobs(store).into_test_scope()
 }
 
 /// The id of a fixture job left `running` for a live owner: created, and

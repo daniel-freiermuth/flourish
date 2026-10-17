@@ -35,7 +35,8 @@ use crate::domain::{
     RepoWorkKind, Severity,
 };
 use crate::recovery::{
-    DaemonLock, Owner, RecordedJob, Recovery, StrandedClaim, StrandedJob, Unreconciled,
+    DaemonLock, JobAuthority, Owner, RecordedJob, Recovered, Recovery, StrandedClaim, StrandedJob,
+    Unreconciled,
 };
 use crate::transition::{
     Moved, PrEnded, PrEnding, PrRef, Record, ReleaseVerdict, Sources, Transition, Unclaimed,
@@ -165,6 +166,36 @@ pub enum StoreWriteError {
     Db(#[from] sqlx::Error),
 }
 
+/// The repos whose `dep_update` is the job lane's: Renovate had no answer
+/// for them since their last `dep_update` run, so the AI scan is due
+/// ([`Store::dep_update_fallbacks`]). Every other repo's `dep_update` is
+/// the admin lane's Renovate scan (`scheduler::dependency_scans`).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DepScanFallbacks(HashSet<i64>);
+
+impl DepScanFallbacks {
+    /// Whether `repo_id`'s AI `dep_update` scan is due.
+    pub fn pending(&self, repo_id: i64) -> bool {
+        self.0.contains(&repo_id)
+    }
+}
+
+/// Why [`Store::upsert_finding`] wrote no finding.
+#[derive(Debug, thiserror::Error)]
+pub enum FindingInsertError {
+    /// The repo was soft-deleted while the work that found this ran. Only
+    /// work with no job row can get here -- a repo with a job or a finding
+    /// cannot be deleted at all -- which today is the zero-token Renovate
+    /// scan. A finding inserted anyway would be invisible (every read
+    /// skips a deleted repo) and would hold the repo's row in place
+    /// (`findings.repo_id` has no cascade), so the reaper's delete of it
+    /// would fail on every pass.
+    #[error("repo {repo_id} is deleted -- no finding can be filed in it")]
+    RepoDeleted { repo_id: i64 },
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
+}
+
 /// Why [`CycleScope::create_job`](crate::recovery::CycleScope::create_job)
 /// wrote no job row.
 #[derive(Debug, thiserror::Error)]
@@ -207,6 +238,12 @@ pub enum JobInsertError {
     /// that race is a skip.
     #[error("finding {finding_id} awaits no harvest -- cannot start one")]
     NoHarvestDue { finding_id: i64 },
+    /// An engage of a finding that is no longer `pr_open`: the admin lane's
+    /// PR sync recorded the PR's merge or close between the pick and the
+    /// insert, which spans forge calls and a fetch. The engage queue no
+    /// longer lists the finding, so losing that race is a skip.
+    #[error("finding {finding_id} has no open PR -- cannot start an engage")]
+    NoEngageDue { finding_id: i64 },
     #[error(transparent)]
     Db(#[from] sqlx::Error),
 }
@@ -1219,6 +1256,15 @@ impl Store {
     /// SELECT all 39 columns FROM findings WHERE id = ? (embedded row in
     /// verdict/recheck/unqueue/override success bodies).
     pub async fn get_finding(&self, id: i64) -> sqlx::Result<Option<Finding>> {
+        Self::read_finding(&self.pool, id).await
+    }
+
+    /// [`Self::get_finding`], on `executor`: the pool, or a transaction
+    /// that reads the row it has just written.
+    async fn read_finding<'e>(
+        executor: impl sqlx::Executor<'e, Database = sqlx::Sqlite>,
+        id: i64,
+    ) -> sqlx::Result<Option<Finding>> {
         sqlx::query_as!(
             Finding,
             r#"
@@ -1236,7 +1282,7 @@ impl Store {
             "#,
             id
         )
-        .fetch_optional(&self.pool)
+        .fetch_optional(executor)
         .await
     }
 
@@ -1353,6 +1399,22 @@ impl Store {
         let ended = pr_state::end(&mut tx, finding_id, pr, ending).await?;
         tx.commit().await?;
         Ok(ended)
+    }
+
+    /// Take over the PR sync's record of the closure an engage's
+    /// withdrawal made, the sync having recorded it first: the worker's
+    /// `reason` replaces the sync's. `true` when it was that closure
+    /// (`pr_state::adopt_closure`).
+    pub async fn adopt_closure(
+        &self,
+        finding_id: i64,
+        pr: &PrRef,
+        reason: &str,
+    ) -> sqlx::Result<bool> {
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
+        let adopted = pr_state::adopt_closure(&mut tx, finding_id, pr, reason).await?;
+        tx.commit().await?;
+        Ok(adopted)
     }
 
     /// Move `finding_id` from one of `from` to `to`, writing `record` with
@@ -2749,7 +2811,8 @@ impl Store {
     /// Give up `finding_id`'s `kind` checkpoint at `job_id`, logging `msg`
     /// as a `resume` event in the same transaction. The job row is left as
     /// it ended. A pointer that has moved on since is left alone: `false`.
-    pub async fn drop_checkpoint(
+    /// The job lane's alone, through [`JobStore`].
+    async fn drop_checkpoint(
         &self,
         finding_id: i64,
         kind: FindingJobKind,
@@ -2820,8 +2883,9 @@ impl Store {
 
     /// Give up `repo_id`'s `kind` checkpoint at `job_id`, logging `msg` as a
     /// `resume` event in the same transaction, as [`Self::drop_checkpoint`]
-    /// does for a finding's work. The job row is left as it ended.
-    pub async fn drop_repo_checkpoint(
+    /// does for a finding's work. The job row is left as it ended. The job
+    /// lane's alone, through [`JobStore`].
+    async fn drop_repo_checkpoint(
         &self,
         repo_id: i64,
         kind: RepoJobKind,
@@ -3107,10 +3171,12 @@ impl Store {
     /// holds its branch checked out, and git refuses to check one branch
     /// out in two worktrees.
     ///
-    /// A resumed attempt copies `pinned_sha` and `seen_activity_at` from the
-    /// attempt it continues, here in the INSERT, so every link of a chain
-    /// names the commit its shared tree was created at and the newest PR
-    /// feedback an engage chain's worker was shown.
+    /// A resumed attempt copies `pinned_sha`, `base_sha` and
+    /// `seen_activity_at` from the attempt it continues, here in the
+    /// INSERT, so every link of a chain names the commit its shared tree
+    /// was created at, the default-branch commit a harvest chain judges
+    /// against, and the newest PR feedback an engage chain's worker was
+    /// shown.
     ///
     /// At most one job is `running` per finding, and per (repo, kind) for
     /// repo-level work (migration 031's indexes). An insert that would be
@@ -3118,7 +3184,8 @@ impl Store {
     /// that holds the place.
     ///
     /// A harvest, however it starts, goes in only while its finding's PR
-    /// still awaits one ([`JobInsertError::NoHarvestDue`]).
+    /// still awaits one ([`JobInsertError::NoHarvestDue`]), and an engage
+    /// only while its finding is `pr_open` ([`JobInsertError::NoEngageDue`]).
     ///
     /// Takes an [`Owner`], which only `crate::recovery` makes, inside
     /// [`CycleScope::create_job`](crate::recovery::CycleScope::create_job): every job is recorded in the scope that
@@ -3135,8 +3202,14 @@ impl Store {
         // predecessor is read under the lock that inserts its successor.
         let mut tx = ImmediateTx::begin(&self.pool).await?;
         let (kind, repo_id, finding_id, resumed_from) = Self::start_place(&mut tx, start).await?;
-        if let (JobKind::Finding(FindingJobKind::Harvest), Some(fid)) = (kind, finding_id) {
-            Self::ensure_harvest_due(&mut tx, fid).await?;
+        match (kind, finding_id) {
+            (JobKind::Finding(FindingJobKind::Harvest), Some(fid)) => {
+                Self::ensure_harvest_due(&mut tx, fid).await?;
+            }
+            (JobKind::Finding(FindingJobKind::Engage), Some(fid)) => {
+                Self::ensure_engage_due(&mut tx, fid).await?;
+            }
+            _ => {}
         }
         let id = Self::insert_running_row(
             &mut tx,
@@ -3324,6 +3397,30 @@ impl Store {
             .ok_or(JobInsertError::NoHarvestDue { finding_id })
     }
 
+    /// Refuse an engage of `finding_id` unless the finding is `pr_open`,
+    /// read under the insert's write lock. PR sync runs on the admin lane,
+    /// beside the job lane, and an engage is picked some forge calls and a
+    /// fetch before its row goes in: without this, a sync that recorded the
+    /// PR's merge or close in between would leave a worker answering a PR
+    /// that has ended. A resume is already refused once the finding leaves
+    /// `pr_open` (its checkpoint is cleared), so this matters for fresh
+    /// engages; it is checked for every start all the same.
+    async fn ensure_engage_due(
+        tx: &mut ImmediateTx,
+        finding_id: i64,
+    ) -> Result<(), JobInsertError> {
+        let pr_open = FindingStatus::PrOpen;
+        let due = sqlx::query_scalar!(
+            r#"SELECT 1 AS "due!: i64" FROM findings WHERE id = ?1 AND status = ?2"#,
+            finding_id,
+            pr_open
+        )
+        .fetch_optional(&mut **tx)
+        .await?;
+        due.map(|_| ())
+            .ok_or(JobInsertError::NoEngageDue { finding_id })
+    }
+
     /// [`Self::insert_job`]'s INSERT: the `running` row, its chain's pins
     /// copied from `resumed_from`. Refused for a deleted repo, and for a
     /// place another `running` job holds.
@@ -3337,9 +3434,11 @@ impl Store {
         let result = sqlx::query!(
             "INSERT INTO jobs \
              (kind, repo_id, finding_id, cap_tokens, state, started_at, estimated_tokens, \
-              resumed_from, pinned_sha, seen_activity_at, full_history, full_hunt_request) \
+              resumed_from, pinned_sha, base_sha, seen_activity_at, full_history, \
+              full_hunt_request) \
              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, \
                     (SELECT p.pinned_sha FROM jobs p WHERE p.id = ?8), \
+                    (SELECT p.base_sha FROM jobs p WHERE p.id = ?8), \
                     (SELECT p.seen_activity_at FROM jobs p WHERE p.id = ?8), \
                     COALESCE((SELECT p.full_history FROM jobs p WHERE p.id = ?8), 0), \
                     (SELECT p.full_hunt_request FROM jobs p WHERE p.id = ?8) \
@@ -3454,6 +3553,27 @@ impl Store {
     pub async fn pinned_sha(&self, job_id: i64) -> sqlx::Result<Option<String>> {
         Ok(
             sqlx::query_scalar!("SELECT pinned_sha FROM jobs WHERE id = ?1", job_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .flatten(),
+        )
+    }
+
+    /// Record the default-branch commit a harvest judges against
+    /// (migration 033), resolved right after its own fetch. A resumed
+    /// attempt inherits it ([`CycleScope::create_job`](crate::recovery::CycleScope::create_job)).
+    pub async fn set_base_sha(&self, job_id: i64, sha: &str) -> sqlx::Result<()> {
+        sqlx::query!("UPDATE jobs SET base_sha = ?1 WHERE id = ?2", sha, job_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// The default-branch commit `job_id`'s harvest chain judges against,
+    /// if one was recorded ([`Self::set_base_sha`]).
+    pub async fn base_sha(&self, job_id: i64) -> sqlx::Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar!("SELECT base_sha FROM jobs WHERE id = ?1", job_id)
                 .fetch_optional(&self.pool)
                 .await?
                 .flatten(),
@@ -4046,23 +4166,26 @@ impl Store {
     /// Insert a finding unless one with the same (type, fingerprint) already
     /// exists. Returns (id, `was_inserted`).
     ///
-    /// Deliberately *not* `INSERT OR IGNORE`: the lookup and the INSERT are
-    /// separate statements, so two callers racing on the same fingerprint
-    /// would have the second fail the UNIQUE constraint rather than be
-    /// ignored. Only the single scheduler loop ingests, so no second caller
-    /// exists to open that window.
-    /// Insert a finding, or report the existing one with this fingerprint.
+    /// Both lanes file findings -- the job lane its workers', the admin lane
+    /// Renovate's -- so two writers can race on one fingerprint. The INSERT
+    /// yields to the UNIQUE index (`ON CONFLICT DO NOTHING`) and the row
+    /// that won is read back, so the loser reports a duplicate rather than
+    /// failing the constraint.
     ///
     /// `found_by_job` is stored only on a genuine insert: a duplicate
     /// belongs to the job that first turned it up, not the latest one to
     /// rediscover it.
+    ///
+    /// Refused for a soft-deleted repo ([`FindingInsertError::RepoDeleted`]),
+    /// read by the INSERT itself, as `insert_job` refuses one: the delete
+    /// checks that the repo has no findings, and this keeps that true.
     pub async fn upsert_finding(
         &self,
         repo_id: i64,
         row: &FindingInsert,
         finding_type: &str,
         found_by_job: Option<i64>,
-    ) -> sqlx::Result<(i64, bool)> {
+    ) -> Result<(i64, bool), FindingInsertError> {
         // Check if already exists
         let fingerprint = &row.fingerprint;
         let existing = sqlx::query_scalar!(
@@ -4108,7 +4231,9 @@ impl Store {
              missing_tests, test_file, smell_type, suggested_refactor, \
              modernization_class, current_approach, proposed_approach, standard_section, \
              status, created_at, updated_at, found_by_job) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27, ?28, ?29, ?30, ?31)",
+             SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27, ?28, ?29, ?30, ?31 \
+             WHERE EXISTS (SELECT 1 FROM repos WHERE id = ?2 AND deleted_at IS NULL) \
+             ON CONFLICT (type, fingerprint) DO NOTHING",
             finding_type, repo_id, fingerprint, file, symbol, line, bug_class,
             severity, confidence, summary, detail, evidence_plan, introduced_by,
             ecosystem, package, current_version, latest_version, update_type, security_advisory,
@@ -4118,6 +4243,21 @@ impl Store {
         )
         .execute(&self.pool)
         .await?;
+        if result.rows_affected() == 0 {
+            // Another writer filed it since the lookup above, or the repo
+            // is deleted.
+            let raced = sqlx::query_scalar!(
+                r#"SELECT id AS "id!: i64" FROM findings WHERE type = ?1 AND fingerprint = ?2"#,
+                finding_type,
+                fingerprint
+            )
+            .fetch_optional(&self.pool)
+            .await?;
+            return match raced {
+                Some(id) => Ok((id, false)),
+                None => Err(FindingInsertError::RepoDeleted { repo_id }),
+            };
+        }
         Ok((result.last_insert_rowid(), true))
     }
 
@@ -4157,13 +4297,14 @@ impl Store {
         };
         let revived = open.status == FindingStatus::Superseded
             && open.verdict_reason.as_deref() == Some(DEP_UNPROPOSED_REASON);
+        let revive = Transition::Reproposed(ScanEdge(()));
         if revived
             && let Moved::Conflict { now } =
-                Self::apply_transition(&mut tx, finding_id, &Transition::Reproposed).await?
+                Self::apply_transition(&mut tx, finding_id, &revive).await?
         {
             return Err(StoreWriteError::Refused(format!(
                 "#{finding_id} moved from {} to {now:?} inside its refresh",
-                Transition::Reproposed.from()
+                revive.from()
             )));
         }
         let now = now_ms();
@@ -4226,7 +4367,10 @@ impl Store {
     /// Returns how many were retired. Each edge's status is read in this
     /// transaction, so a conflict is a store fault: refused, and nothing is
     /// retired.
-    pub async fn supersede_unproposed_dep_updates(
+    ///
+    /// Only the admin lane's Renovate scan decides what Renovate no longer
+    /// proposes, so only [`AdminStore`] exposes this.
+    async fn supersede_unproposed_dep_updates(
         &self,
         repo_id: i64,
         proposed: &[String],
@@ -4250,6 +4394,7 @@ impl Store {
         .await?;
         let retire = Transition::Unproposed {
             reason: DEP_UNPROPOSED_REASON,
+            scan: ScanEdge(()),
         };
         for &id in &unproposed {
             if let Moved::Conflict { now } = Self::apply_transition(&mut tx, id, &retire).await? {
@@ -4285,8 +4430,9 @@ impl Store {
     /// is held: handing it over would drop the work a paused fix has done for a
     /// fresh fix of the scan's finding (WORK-MODEL.md G2). `moves` is every
     /// move of every finding the scan produced. Returns how many were
-    /// handed over.
-    pub async fn hand_over_queued_dep_updates(
+    /// handed over. Only the admin lane's Renovate scan proposes moves, so
+    /// only [`AdminStore`] exposes this.
+    async fn hand_over_queued_dep_updates(
         &self,
         repo_id: i64,
         moves: &[ProposedMove],
@@ -4331,9 +4477,13 @@ impl Store {
             // would leave a queue place given up with nobody taking it:
             // the whole handover is refused, rolled back with `tx`.
             let reason = format!("replaced by #{} from the dependency scan", pair.to_id);
-            let gives = Transition::HandedOver { reason: &reason };
+            let gives = Transition::HandedOver {
+                reason: &reason,
+                scan: ScanEdge(()),
+            };
             let takes = Transition::TakesOver {
                 from_id: pair.from_id,
+                scan: ScanEdge(()),
             };
             for (id, edge) in [(pair.from_id, &gives), (pair.to_id, &takes)] {
                 if let Moved::Conflict { now } = Self::apply_transition(&mut tx, id, edge).await? {
@@ -4571,20 +4721,35 @@ impl Store {
     /// failure had the same key, else 1. One statement, so two writers
     /// cannot both read the old streak and lose a count.
     ///
+    /// `None`, and nothing counted, when the finding is no longer in the
+    /// kind's tier, or a harvest's PR is harvested already: that work is
+    /// over, and leaving the tier ended its streak (migration 024). PR sync
+    /// runs beside the job lane and can end an engage's PR while its worker
+    /// runs; counted, that failure would start the streak of the next PR's
+    /// engage, which `hold_work` refuses for the same reason.
+    ///
     /// The checkpoint is left alone (WORK-MODEL.md §6.3): an attempt that
     /// ran has moved it in `complete_job` already, and a failure without a
     /// new attempt (a fetch, a PR view, a runner that would not start) did
     /// no work that could replace the paused one, so throwing it away would
     /// lose that work to what is most often a network that is not back yet.
-    pub async fn record_work_failure(
+    ///
+    /// The job lane's alone, through [`JobStore`].
+    async fn record_work_failure(
         &self,
         finding_id: i64,
         kind: FindingJobKind,
         key: &str,
-    ) -> sqlx::Result<i64> {
+    ) -> sqlx::Result<Option<i64>> {
+        let harvest = FindingJobKind::Harvest;
         sqlx::query_scalar!(
             r#"INSERT INTO finding_work (finding_id, kind, streak, last_failure)
-               VALUES (?1, ?2, 1, ?3)
+               SELECT ?1, ?2, 1, ?3
+               WHERE EXISTS (SELECT 1 FROM findings f
+                             JOIN work_tiers t ON t.status = f.status AND t.kind = ?2
+                             WHERE f.id = ?1)
+                 AND (?2 <> ?4 OR NOT EXISTS (SELECT 1 FROM pr_state p
+                      WHERE p.finding_id = ?1 AND p.harvested_at IS NOT NULL))
                ON CONFLICT(finding_id, kind) DO UPDATE SET
                  streak = CASE WHEN finding_work.last_failure IS excluded.last_failure
                      THEN finding_work.streak + 1 ELSE 1 END,
@@ -4592,9 +4757,10 @@ impl Store {
                RETURNING streak AS "streak!: i64""#,
             finding_id,
             kind,
-            key
+            key,
+            harvest
         )
-        .fetch_one(&self.pool)
+        .fetch_optional(&self.pool)
         .await
     }
 
@@ -4701,8 +4867,8 @@ impl Store {
     /// Only while the finding is in that kind's tier (invariant 2): work
     /// that has left it is over, and `false` says nothing was held. `false`
     /// too when the work item is already held, which the partial unique
-    /// index enforces.
-    pub async fn hold_work(
+    /// index enforces. The job lane's alone, through [`JobStore`].
+    async fn hold_work(
         &self,
         finding_id: i64,
         kind: FindingJobKind,
@@ -4958,6 +5124,38 @@ impl Store {
         Ok(())
     }
 
+    /// Record that Renovate had no answer for `repo_id` just now, so its
+    /// AI `dep_update` scan is due on the job lane (migration 032). Only
+    /// the admin lane's Renovate scan decides that, so only [`AdminStore`]
+    /// exposes this: the job lane cannot request its own AI scan.
+    async fn request_dep_update_fallback(&self, repo_id: i64) -> sqlx::Result<()> {
+        let now = now_ms();
+        sqlx::query!(
+            "INSERT INTO dep_scan_fallbacks (repo_id, requested_at) VALUES (?1, ?2) \
+             ON CONFLICT (repo_id) DO UPDATE SET requested_at = excluded.requested_at",
+            repo_id,
+            now
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The repos whose AI `dep_update` scan is due: Renovate had no answer
+    /// for them after their last `dep_update` run ([`DepScanFallbacks`]).
+    pub async fn dep_update_fallbacks(&self) -> sqlx::Result<DepScanFallbacks> {
+        let rows = sqlx::query!(
+            r#"SELECT f.repo_id AS "repo_id!: i64"
+               FROM dep_scan_fallbacks f JOIN repos r ON r.id = f.repo_id
+               WHERE f.requested_at > COALESCE(r.last_dep_update_at, 0)"#
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(DepScanFallbacks(
+            rows.into_iter().map(|r| r.repo_id).collect(),
+        ))
+    }
+
     /// Every live repo's work item that is failing and not yet held: its
     /// streak and the key it fails with, by repo then kind.
     pub async fn repo_streaks(&self) -> sqlx::Result<Vec<RepoStreak>> {
@@ -5175,9 +5373,8 @@ impl Store {
         Ok(())
     }
 
-    /// The guarded UPDATE behind a fix claim's take and release
-    /// ([`CycleScope::claim_fix`](crate::recovery::CycleScope::claim_fix),
-    /// [`FixClaim::release`](crate::recovery::FixClaim::release)).
+    /// The guarded UPDATE behind a fix claim's release
+    /// ([`FixClaim::release`](crate::recovery::FixClaim::release)).
     async fn move_if_at(
         &self,
         finding_id: i64,
@@ -5197,13 +5394,41 @@ impl Store {
         Ok(claimed.rows_affected() > 0)
     }
 
-    /// Claim `finding_id` for a fix (`queued` → `fixing`); `false` when it
-    /// is no longer `queued`. Takes an [`Owner`], which only
-    /// `crate::recovery` makes, inside [`CycleScope::claim_fix`](crate::recovery::CycleScope::claim_fix):
+    /// Claim `finding_id` for a fix (`queued` → `fixing`) and read the row
+    /// as the claim took it, in one transaction; `None` when it is no
+    /// longer `queued`. Takes an [`Owner`], which only `crate::recovery`
+    /// makes, inside [`CycleScope::claim_fix`](crate::recovery::CycleScope::claim_fix):
     /// every claim is a [`FixClaim`](crate::recovery::FixClaim) that releases it.
-    pub(crate) async fn claim_fixing(&self, _owner: &Owner, finding_id: i64) -> sqlx::Result<bool> {
-        self.move_if_at(finding_id, FindingStatus::Queued, FindingStatus::Fixing)
-            .await
+    ///
+    /// The row is read here, not at the pick, because a `queued` row can
+    /// still change between the two: the admin lane's Renovate pass
+    /// rewrites a `queued` dep update's target ([`Self::refresh_dep_update`]).
+    /// Once `fixing`, nothing rewrites it, so the fix works from this row
+    /// throughout.
+    pub(crate) async fn claim_fixing(
+        &self,
+        _owner: &Owner,
+        finding_id: i64,
+    ) -> sqlx::Result<Option<Finding>> {
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
+        let (queued, fixing, now) = (FindingStatus::Queued, FindingStatus::Fixing, now_ms());
+        let claimed = sqlx::query!(
+            "UPDATE findings SET status = ?1, updated_at = ?2 WHERE id = ?3 AND status = ?4",
+            fixing,
+            now,
+            finding_id,
+            queued
+        )
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+        if !claimed {
+            return Ok(None);
+        }
+        let row = Self::read_finding(&mut *tx, finding_id).await?;
+        tx.commit().await?;
+        Ok(row)
     }
 
     /// Release a fix claim (`fixing` → `queued`) if the finding is still
@@ -5283,6 +5508,147 @@ impl Store {
         )
         .fetch_all(&self.pool)
         .await
+    }
+}
+
+/// What only the store's dependency-scan writes can make: the finding
+/// transitions that carry one ([`Transition::Unproposed`],
+/// [`Transition::HandedOver`], [`Transition::TakesOver`] and
+/// [`Transition::Reproposed`]) cannot be built anywhere else, so
+/// [`Store::transition`] cannot be handed one. The first three are made
+/// only through [`AdminStore`], Renovate's; the last by the guarded
+/// `dep_update` refresh both lanes' ingest runs.
+#[derive(Debug, Clone, Copy)]
+pub struct ScanEdge(());
+
+/// The store as the job lane writes it: everything a [`Store`] does,
+/// through `Deref`, and the writes only the job lane makes. Those end a
+/// chain's checkpoint and count or hold a finding's work, which only the
+/// lane's own selection and runners may decide.
+///
+/// Made only from the [`JobAuthority`] (by its
+/// [`CycleScope`](crate::recovery::CycleScope)), so an admin duty or a
+/// handler, holding a plain [`Store`], has none of these writes to call.
+pub struct JobStore(Store);
+
+impl JobStore {
+    pub(crate) fn of(_jobs: &JobAuthority, store: Store) -> Self {
+        Self(store)
+    }
+
+    /// Give up `finding_id`'s `kind` checkpoint at `job_id`, with its
+    /// `resume` event; `false` when the pointer has moved on since.
+    pub async fn drop_checkpoint(
+        &self,
+        finding_id: i64,
+        kind: FindingJobKind,
+        job_id: i64,
+        msg: &str,
+    ) -> sqlx::Result<bool> {
+        self.0.drop_checkpoint(finding_id, kind, job_id, msg).await
+    }
+
+    /// Give up `repo_id`'s `kind` checkpoint at `job_id`, as
+    /// [`Self::drop_checkpoint`] does for a finding's work.
+    pub async fn drop_repo_checkpoint(
+        &self,
+        repo_id: i64,
+        kind: RepoJobKind,
+        job_id: i64,
+        msg: &str,
+    ) -> sqlx::Result<bool> {
+        self.0
+            .drop_repo_checkpoint(repo_id, kind, job_id, msg)
+            .await
+    }
+
+    /// Count a failure of `finding_id`'s `kind` work under `key`: the
+    /// streak it makes, or `None` when the finding has left the kind's
+    /// tier and nothing was counted (WORK-MODEL.md §7).
+    pub async fn record_work_failure(
+        &self,
+        finding_id: i64,
+        kind: FindingJobKind,
+        key: &str,
+    ) -> sqlx::Result<Option<i64>> {
+        self.0.record_work_failure(finding_id, kind, key).await
+    }
+
+    /// Hold `finding_id`'s `kind` work for the operator (WORK-MODEL.md
+    /// §9); `false` when the finding has left the kind's tier or the work
+    /// is already held.
+    pub async fn hold_work(
+        &self,
+        finding_id: i64,
+        kind: FindingJobKind,
+        reason: HoldReason,
+        detail: &str,
+        job: Option<i64>,
+    ) -> sqlx::Result<bool> {
+        self.0
+            .hold_work(finding_id, kind, reason, detail, job)
+            .await
+    }
+}
+
+impl std::ops::Deref for JobStore {
+    type Target = Store;
+
+    fn deref(&self) -> &Store {
+        &self.0
+    }
+}
+
+/// The store as the admin lane writes it: everything a [`Store`] does,
+/// through `Deref`, and the writes only the admin lane's Renovate scan
+/// makes. Only that scan decides what Renovate proposes, retires or hands
+/// over, and when the job lane's AI scan is wanted instead.
+///
+/// Made only with the startup proof ([`Recovered`]), by
+/// [`Recovered::into_lanes`] for the [`AdminAuthority`], which only the
+/// admin lane holds.
+pub struct AdminStore(Store);
+
+impl AdminStore {
+    pub(crate) fn of(_recovered: &Recovered, store: Store) -> Self {
+        Self(store)
+    }
+
+    /// Retire the repo's `new` `dep_update` findings Renovate no longer
+    /// proposes; see the private `Store` method of the same name.
+    pub async fn supersede_unproposed_dep_updates(
+        &self,
+        repo_id: i64,
+        proposed: &[String],
+        unchecked: &[String],
+    ) -> Result<u64, StoreWriteError> {
+        self.0
+            .supersede_unproposed_dep_updates(repo_id, proposed, unchecked)
+            .await
+    }
+
+    /// Hand each queued `dep_update` in `moves` over to the scan's finding
+    /// for the same move; see the private `Store` method of the same name.
+    pub async fn hand_over_queued_dep_updates(
+        &self,
+        repo_id: i64,
+        moves: &[ProposedMove],
+    ) -> Result<u64, StoreWriteError> {
+        self.0.hand_over_queued_dep_updates(repo_id, moves).await
+    }
+
+    /// Ask for the job lane's AI dependency scan of `repo_id`: Renovate had
+    /// no answer (migration 032).
+    pub async fn request_dep_update_fallback(&self, repo_id: i64) -> sqlx::Result<()> {
+        self.0.request_dep_update_fallback(repo_id).await
+    }
+}
+
+impl std::ops::Deref for AdminStore {
+    type Target = Store;
+
+    fn deref(&self) -> &Store {
+        &self.0
     }
 }
 

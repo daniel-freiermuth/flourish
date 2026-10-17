@@ -42,7 +42,7 @@ async fn fixture(label: &str) -> (TempDir, Store, Config) {
 async fn a_cycle_with_no_work_is_idle_and_logs_it() {
     let (_dir, store, cfg) = fixture("cycle-idle").await;
 
-    let summary = run_cycle(&support::recovered(&store), &cfg, &NullBackend, None).await;
+    let summary = run_cycle(&mut support::jobs(&store), &cfg, &NullBackend, None).await;
 
     assert_eq!(summary.kind, None);
     assert_eq!(summary.job_id, None);
@@ -66,7 +66,7 @@ async fn a_crashing_cycle_returns_the_error_and_logs_it() {
     let (_dir, store, cfg) = fixture("cycle-crash").await;
 
     let summary = run_cycle(
-        &support::recovered(&store),
+        &mut support::jobs(&store),
         &cfg,
         &NullBackend,
         Some("nosuch"),
@@ -99,10 +99,10 @@ async fn a_crashing_cycle_returns_the_error_and_logs_it() {
 #[tokio::test]
 async fn a_cycle_started_inside_a_lane_returns_the_refusal() {
     let (_dir, store, cfg) = fixture("cycle-nested").await;
-    let recovered = support::recovered(&store);
+    let mut jobs = support::jobs(&store);
 
     let summary = store
-        .lane(async |_| run_cycle(&recovered, &cfg, &NullBackend, None).await)
+        .lane(async |_| run_cycle(&mut jobs, &cfg, &NullBackend, None).await)
         .await
         .unwrap();
 
@@ -165,7 +165,7 @@ async fn a_cycle_settles_the_jobs_its_runner_abandoned_and_no_others() {
     .await;
 
     let summary = run_cycle(
-        &support::recovered(&store),
+        &mut support::jobs(&store),
         &cfg,
         &ScriptedBackend::noop(),
         None,
@@ -209,11 +209,10 @@ async fn a_failed_settle_is_the_cycles_error_and_is_retried_before_the_next() {
          WHEN NEW.killed_reason = 'orphaned' BEGIN SELECT RAISE(ABORT, 'settle refused'); END;",
     )
     .await;
-    let recovered = support::recovered(&store);
+    let mut authority = support::jobs(&store);
     let backend = ScriptedBackend::noop();
-    let cycle = || run_cycle(&recovered, &cfg, &backend, None);
 
-    let failed = cycle().await;
+    let failed = run_cycle(&mut authority, &cfg, &backend, None).await;
 
     let error = failed.error.as_deref().unwrap_or_default();
     assert!(
@@ -237,7 +236,7 @@ async fn a_failed_settle_is_the_cycles_error_and_is_retried_before_the_next() {
         .expect("still running")
         .id;
 
-    let still_failing = cycle().await;
+    let still_failing = run_cycle(&mut authority, &cfg, &backend, None).await;
 
     let error = still_failing.error.as_deref().unwrap_or_default();
     assert!(
@@ -256,7 +255,7 @@ async fn a_failed_settle_is_the_cycles_error_and_is_retried_before_the_next() {
         .await
         .unwrap();
     pool.close().await;
-    cycle().await;
+    run_cycle(&mut authority, &cfg, &backend, None).await;
 
     let jobs = store.list_jobs(10).await.unwrap();
     let first = &jobs.iter().find(|j| j.job.id == abandoned).unwrap().job;

@@ -639,7 +639,7 @@ async fn a_failed_withdrawal_counts_toward_the_engage_streak() {
         .expect("held at the limit");
     assert_eq!(hold.reason, hunter::domain::HoldReason::Stuck);
     assert!(hold.detail.starts_with("PR close failed"), "{hold:?}");
-    let picked = hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+    let picked = hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
         .await
         .unwrap();
     assert!(
@@ -703,7 +703,7 @@ async fn a_withdrawal_spends_only_a_once_override() {
             let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
             assert_eq!(after.budget_override, left, "{outcome}, {mode} override");
             if !close_fails {
-                let next = hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+                let next = hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
                     .await
                     .unwrap()
                     .expect("the closed PR's harvest is pending");
@@ -1469,7 +1469,7 @@ async fn assert_left_for_the_cold_harvest(f: &Fixture, tree: &std::path::Path) {
         "a failed handoff is not a harvest failure"
     );
     assert!(!tree.exists(), "the chain's tree must be released");
-    match hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+    match hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
         .await
         .unwrap()
     {
@@ -1520,10 +1520,20 @@ async fn a_withdrawal_continues_into_its_harvest_in_the_same_session() {
         .join("session")
         .join("engage.jsonl");
     assert_eq!(runs[1].resume_from.as_deref(), Some(transcript.as_path()));
+    // Nothing moves `origin/main` in this test, so the clone's tip is the
+    // commit the harvest resolved after its fetch.
+    let repo = f
+        .store
+        .get_repo_by_id(finding.repo_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let base = git(Path::new(&repo.path), &["rev-parse", "origin/main"]);
+    let base = base.trim();
     assert!(
-        runs[1]
-            .prompt
-            .contains("checked out at the PR's head branch; main is origin/main"),
+        runs[1].prompt.contains(&format!(
+            "checked out at the PR's head branch; main is commit {base}"
+        )),
         "{}",
         runs[1].prompt
     );
@@ -1564,6 +1574,90 @@ async fn a_withdrawal_continues_into_its_harvest_in_the_same_session() {
     assert!(!runs[0].tree.exists(), "the chain's tree must be released");
 }
 
+/// The admin lane fetches clones while a job's worker runs, so
+/// `origin/main` can move under a harvest continuing a withdrawal. The
+/// verdict must still be anchored at the commit the harvest resolved right
+/// after its own fetch and named to the worker, never at whatever the ref
+/// says when the worker is done: commits in between were never judged, and
+/// anchoring past them hides their changes from suppression for good.
+#[tokio::test]
+async fn a_handoff_verdict_is_anchored_at_the_commit_its_worker_was_shown() {
+    let f = fixture("handoff-base-moves").await;
+    let bins = FakeBins::acquire("handoff-base-moves");
+    gh_for_handoff(&bins);
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    // What `origin/main` named when the harvest's worker started, read by
+    // the worker itself; the backend then moves the ref as a fetch would.
+    let shown: Arc<OnceLock<String>> = Arc::default();
+    let backend = ScriptedBackend::staged({
+        let shown = shown.clone();
+        move |tree, resume_from| {
+            let session = tree.parent().unwrap().join("session").join("engage.jsonl");
+            if let Some(file) = resume_from {
+                let tip = git(tree, &["rev-parse", "origin/main"]).trim().to_owned();
+                shown.set(tip).unwrap();
+                // A fetch landing while the worker runs: `origin/main` now
+                // names the PR's head, a commit the worker never judged.
+                let head = git(tree, &["rev-parse", "HEAD"]).trim().to_owned();
+                git(tree, &["update-ref", "refs/remotes/origin/main", &head]);
+                std::fs::write(
+                    tree.join("CLOSE-REASON.json"),
+                    serde_json::json!({
+                        "classification": "wrong",
+                        "reason": "the guard rejects it",
+                        "evidence": "abc1234",
+                        "holds_while": "the guard at src/lib.rs:1 rejects it",
+                        "depends_on": ["src/lib.rs:1"],
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+                return RunResult {
+                    session_file: Some(file.to_string_lossy().into_owned()),
+                    ..done()
+                };
+            }
+            std::fs::write(tree.join("WITHDRAW.md"), "the guard rejects it").unwrap();
+            std::fs::write(&session, format!("{USAGE}\n")).unwrap();
+            RunResult {
+                session_file: Some(session.to_string_lossy().into_owned()),
+                ..done()
+            }
+        }
+    });
+
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Cold(&finding),
+        &backend,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("withdrawn"));
+    let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(after.status, FindingStatus::Rejected);
+    let shown = shown.get().expect("the harvest's worker ran").clone();
+    let runs = backend.runs();
+    assert!(
+        runs[1].prompt.contains(&shown),
+        "the worker is named the commit by its sha: {}",
+        runs[1].prompt
+    );
+    let anchors = f
+        .store
+        .suppression_anchors(finding.repo_id, finding.kind.as_str())
+        .await
+        .unwrap();
+    let anchor = anchors.get(&f.fid).expect("a rejected verdict is anchored");
+    assert_eq!(
+        anchor.sha, shown,
+        "anchored at the commit the worker was shown, not the ref's later tip"
+    );
+}
+
 /// A sweep while the handoff stands at the harvest's budget gate keeps
 /// the engage's tree. At that moment the engage is recorded `done` and
 /// the harvest has no row yet, so the job table says no attempt of the
@@ -1583,7 +1677,7 @@ async fn a_sweep_during_the_handoff_keeps_the_tree_for_the_harvest() {
         move || {
             let (store, root, sweeps) = (store.clone(), root.clone(), sweeps.clone());
             async move {
-                hunter::workspace::sweep(store.test_lane(), &root, hunter::util::now_ms())
+                hunter::workspace::sweep(&support::admin(&store), &root, hunter::util::now_ms())
                     .await
                     .unwrap();
                 sweeps.fetch_add(1, Ordering::SeqCst);
@@ -1851,29 +1945,30 @@ async fn an_unrecorded_closed_verdict_starts_no_harvest_and_waits_for_the_sync()
 }
 
 /// The finding left `pr_open` between the engage's read and its `closed`
-/// verdict: here the PR sync recorded the closure first. That decision
-/// owns the finding, so the engage neither overwrites its verdict nor
-/// starts the harvest it would hand to, and no second harvest of the one
-/// closure can start.
+/// verdict, closed by a decision other than the PR sync's record of this
+/// closure (here an operator's). That decision owns the finding, so the
+/// engage neither overwrites its verdict nor starts the harvest it would
+/// hand to.
 ///
 /// The race is staged with a trigger: the engage's UPDATE first moves the
-/// row the way the sync would and is then skipped, exactly as if the
-/// sync's write had landed in between.
+/// row the way that decision would and is then skipped, exactly as if its
+/// write had landed in between.
 #[tokio::test]
-async fn a_withdrawal_the_sync_recorded_first_keeps_the_syncs_verdict() {
-    let f = fixture("handoff-sync-first").await;
-    let bins = FakeBins::acquire("handoff-sync-first");
+async fn a_withdrawal_whose_finding_another_decision_closed_keeps_that_verdict() {
+    let f = fixture("handoff-other-first").await;
+    let bins = FakeBins::acquire("handoff-other-first");
     gh_for_handoff(&bins);
     let pool =
         sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
             .await
             .unwrap();
     sqlx::query(
-        "CREATE TRIGGER sync_first BEFORE UPDATE OF status ON findings \
-         WHEN NEW.status = 'closed' AND NEW.verdict_reason IS NOT 'sync: closed' \
+        "CREATE TRIGGER other_first BEFORE UPDATE OF status ON findings \
+         WHEN NEW.status = 'closed' AND NEW.verdict_reason IS NOT 'operator: closed' \
          BEGIN \
-           UPDATE findings SET status = 'closed', verdict_reason = 'sync: closed' \
+           UPDATE findings SET status = 'closed', verdict_reason = 'operator: closed' \
              WHERE id = OLD.id; \
+           UPDATE pr_state SET state = 'CLOSED' WHERE finding_id = OLD.id; \
            SELECT RAISE(IGNORE); \
          END",
     )
@@ -1893,7 +1988,6 @@ async fn a_withdrawal_the_sync_recorded_first_keeps_the_syncs_verdict() {
     .await
     .unwrap();
 
-    assert_eq!(summary.outcome.as_deref(), Some("withdrawn"));
     let engage_job = summary.job_id.unwrap();
     let runs = backend.runs();
     assert_eq!(runs.len(), 1, "only the engage may run: {runs:?}");
@@ -1904,7 +1998,76 @@ async fn a_withdrawal_the_sync_recorded_first_keeps_the_syncs_verdict() {
     );
     let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
     assert_eq!(after.status, FindingStatus::Closed);
-    assert_eq!(after.verdict_reason.as_deref(), Some("sync: closed"));
+    assert_eq!(after.verdict_reason.as_deref(), Some("operator: closed"));
+}
+
+/// The PR sync runs beside the engage, so it can see the PR the engage
+/// has just closed on the forge and record that closure before the
+/// engage's own write lands. It is the same closure: the engage takes it
+/// over and continues into its harvest in the same session, as if its
+/// write had landed. Left to the sync, the warm handoff would be lost and
+/// a cold harvest would review the closure from scratch.
+///
+/// Staged with a trigger that records the closure exactly as the sync
+/// does -- `closed` with the sync's reason, `pr_state` CLOSED -- in place
+/// of the engage's write.
+#[tokio::test]
+async fn a_withdrawal_the_sync_recorded_first_still_continues_into_its_harvest() {
+    let f = fixture("handoff-sync-first").await;
+    let bins = FakeBins::acquire("handoff-sync-first");
+    gh_for_handoff(&bins);
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    assert_eq!(
+        hunter::transition::PR_CLOSED_AWAITING_HARVEST,
+        "PR closed without merge; awaiting harvest",
+        "the trigger below writes the sync's reason"
+    );
+    sqlx::query(
+        "CREATE TRIGGER sync_first BEFORE UPDATE OF status ON findings \
+         WHEN NEW.status = 'closed' AND OLD.status = 'pr_open' \
+         BEGIN \
+           UPDATE findings SET status = 'closed', \
+             verdict_reason = 'PR closed without merge; awaiting harvest' \
+             WHERE id = OLD.id; \
+           UPDATE pr_state SET state = 'CLOSED' WHERE finding_id = OLD.id; \
+           SELECT RAISE(IGNORE); \
+         END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let backend = withdraw_then_classify(true);
+
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Cold(&finding),
+        &backend,
+    )
+    .await
+    .unwrap();
+
+    let engage_job = summary.job_id.unwrap();
+    let runs = backend.runs();
+    assert_eq!(runs.len(), 2, "the harvest continues the engage: {runs:?}");
+    assert_eq!(runs[1].tree, runs[0].tree);
+    let jobs = f.jobs().await;
+    let harvest = jobs
+        .iter()
+        .find(|j| j.1 == "harvest")
+        .expect("a harvest ran");
+    assert_eq!(harvest.3, Some(engage_job), "resumed from the engage job");
+    let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(
+        after.status,
+        FindingStatus::Superseded,
+        "the harvest's classification landed"
+    );
 }
 
 /// The same for the closed PR's view, which the harvest fetches before
@@ -2528,7 +2691,7 @@ async fn suspend_and_resume(
 
     meanwhile();
 
-    let plan = match hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+    let plan = match hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
         .await
         .unwrap()
     {
@@ -2935,7 +3098,8 @@ async fn an_engage_whose_pr_will_not_load_is_held_at_the_streak_limit() {
 async fn a_held_engage_stays_held_through_new_pr_activity() {
     let f = fixture("engage-held-activity").await;
     assert!(
-        f.store
+        support::scope(&f.store)
+            .store()
             .hold_work(
                 f.fid,
                 hunter::domain::FindingJobKind::Engage,
@@ -2965,7 +3129,7 @@ async fn a_held_engage_stays_held_through_new_pr_activity() {
         .await
         .expect("still held");
     assert!(after.new_activity);
-    let picked = hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+    let picked = hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
         .await
         .unwrap();
     assert!(
@@ -2988,7 +3152,7 @@ async fn a_paused_engage_continues_without_the_forge() {
     assert_eq!(paused.outcome.as_deref(), Some("suspended"));
     bins.script("gh", "echo 'dial tcp: no route to host' >&2\nexit 1");
     let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
-        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
             .await
             .unwrap()
     else {
@@ -3194,7 +3358,7 @@ async fn paused_then_served_at(
             .unwrap();
     }
     f.cfg.network_gate = true;
-    match hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+    match hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
         .await
         .unwrap()
     {
@@ -3250,7 +3414,7 @@ async fn a_failed_reply_counts_only_while_the_forge_is_reachable() {
         assert_eq!(summary.unreachable.as_deref(), Some(host), "{summary:?}");
         assert_eq!(streak, 0, "the network's failure counts nothing");
         let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
-            hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+            hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
                 .await
                 .unwrap()
         else {
@@ -3430,6 +3594,338 @@ async fn an_engage_that_needs_a_maintainer_is_held_on_its_report() {
     assert_eq!(f.addressed_fp().await, None, "attention left unaddressed");
 }
 
+/// Move the fixture's finding to `merged` straight in the database: what
+/// the admin lane's PR sync writes when it sees the merge, done here
+/// without a sync pass so the test can place it exactly.
+async fn merge_finding(db: &Path, fid: i64) {
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(db))
+            .await
+            .unwrap();
+    sqlx::query("UPDATE findings SET status = 'merged' WHERE id = ?1")
+        .bind(fid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+}
+
+/// PR sync runs on the admin lane, beside the job lane, so it can record a
+/// merge after an engage was picked and before its job goes in -- the
+/// window holds the budget gate, a PR view and a fetch. The insert refuses
+/// it under its write lock: the cycle is skipped, no job row is written,
+/// and no worker runs against the PR that has ended.
+#[tokio::test]
+async fn an_engage_whose_pr_ended_after_the_pick_never_starts() {
+    let f = fixture("engage-ended-before-insert").await;
+    let bins = FakeBins::acquire("engage-ended-before-insert");
+    bins.ok("gh", PR_VIEW_JSON);
+    push_to(&f, None).await;
+    let (db, fid) = (f.db.clone(), f.fid);
+    let backend =
+        ScriptedBackend::new(|_| panic!("no worker may run on an ended PR")).on_decide(move || {
+            let db = db.clone();
+            async move { merge_finding(&db, fid).await }
+        });
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Cold(&finding),
+        &backend,
+    )
+    .await
+    .expect("a PR that ended after the pick is a skip, not the cycle's error");
+
+    assert!(summary.skipped.is_some(), "a skip: {summary:?}");
+    assert!(backend.runs().is_empty());
+    assert!(
+        f.store.jobs_by_finding(f.fid).await.unwrap().is_empty(),
+        "a refused engage writes no job row"
+    );
+}
+
+/// An engage picked from a `pr_open` row whose PR the forge already shows
+/// merged -- the PR sync, on its own timer, has not recorded it yet, as
+/// right after a restart -- runs no worker and writes no job. The PR's
+/// end is the sync's to record, so the finding is left as it is, the
+/// cycle asks the job lane to wait for a sync, and nothing counts against
+/// the finding. Run, the worker would spend a session on a merged PR.
+#[tokio::test]
+async fn an_engage_whose_pr_the_forge_shows_merged_never_starts() {
+    let f = fixture("engage-merged-on-forge").await;
+    f.store
+        .set_budget_override(f.fid, Some(BudgetOverride::Once))
+        .await
+        .unwrap();
+    let bins = FakeBins::acquire("engage-merged-on-forge");
+    // As `gh` answers: a PR's state only when the view asks for it.
+    bins.script(
+        "gh",
+        r#"case "$*" in
+  *"--json state"*|*",state"*) echo '{"state":"MERGED","title":"a fix","body":"because","comments":[],"reviews":[],"statusCheckRollup":[],"headRefName":"fix/some-bug","headRefOid":"deadbeef"}' ;;
+  *) echo '{"title":"a fix","body":"because","comments":[],"reviews":[],"statusCheckRollup":[],"headRefName":"fix/some-bug","headRefOid":"deadbeef"}' ;;
+esac"#,
+    );
+    push_to(&f, None).await;
+    let backend = ScriptedBackend::new(|_| panic!("no worker may run on a merged PR"));
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Cold(&finding),
+        &backend,
+    )
+    .await
+    .expect("a PR the forge has ended is a skip, not the cycle's error");
+
+    assert!(summary.awaits_pr_sync, "{summary:?}");
+    assert!(backend.runs().is_empty());
+    assert!(
+        f.store.jobs_by_finding(f.fid).await.unwrap().is_empty(),
+        "no job row"
+    );
+    assert_eq!(
+        f.store
+            .work_streak(f.fid, hunter::domain::FindingJobKind::Engage)
+            .await
+            .unwrap()
+            .streak,
+        0
+    );
+    let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(after.status, FindingStatus::PrOpen, "left for the sync");
+    assert_eq!(
+        after.budget_override, None,
+        "the one-shot override is spent"
+    );
+}
+
+/// `gh` answering every view with the PR merged.
+fn gh_merged(bins: &FakeBins) {
+    bins.ok(
+        "gh",
+        r#"{"state":"MERGED","title":"a fix","body":"because","comments":[],"reviews":[],"statusCheckRollup":[],"headRefName":"fix/some-bug","headRefOid":"deadbeef"}"#,
+    );
+}
+
+/// The engage tier is the top one, and after a cycle that found its PR
+/// ended on the forge the job lane waits for a PR sync pass and picks
+/// again. If that pass cannot record the end (its view or its write keeps
+/// failing for this one PR), the same engage is picked at once, views the
+/// PR, waits for another pass, and so on for good, with no tier below it
+/// ever running. Each such round counts against the engage, so the limit
+/// holds it for the operator and the selection moves on.
+#[tokio::test]
+async fn an_ended_pr_the_sync_cannot_record_holds_its_engage() {
+    let f = fixture("engage-ended-unrecorded").await;
+    let bins = FakeBins::acquire("engage-ended-unrecorded");
+    gh_merged(&bins);
+    let never = ScriptedBackend::new(|_| panic!("no worker may run on a merged PR"));
+
+    for _ in 0..3 {
+        let scope = support::scope(&f.store);
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        let summary = hunter::scheduler::run_engage(
+            &scope,
+            f.store.test_lane(),
+            &f.cfg,
+            Attempt::Cold(&finding),
+            &never,
+        )
+        .await
+        .unwrap();
+        assert!(summary.awaits_pr_sync, "{summary:?}");
+        // The pass the job lane waited for ran, and failed to record it.
+        hunter::scheduler::count_unrecorded_pr_end(&scope, &summary).await;
+    }
+
+    let hold = support::hold_of(&f.store, f.fid, hunter::domain::FindingJobKind::Engage)
+        .await
+        .expect("held at the limit");
+    assert!(
+        hold.detail
+            .starts_with(hunter::scheduler::PR_END_UNRECORDED),
+        "{hold:?}"
+    );
+    let next = hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
+        .await
+        .unwrap();
+    assert!(
+        !matches!(
+            next,
+            Some(hunter::scheduler::Candidate::Finding {
+                kind: hunter::domain::FindingJobKind::Engage,
+                ..
+            })
+        ),
+        "the held engage is picked no more: {next:?}"
+    );
+}
+
+/// A pass that did record the end leaves nothing to count, or to log: the
+/// finding has left `pr_open`, the common case, and the engage is no
+/// failure of its own.
+#[tokio::test]
+async fn an_ended_pr_the_sync_recorded_counts_nothing() {
+    let f = fixture("engage-ended-recorded").await;
+    let bins = FakeBins::acquire("engage-ended-recorded");
+    gh_merged(&bins);
+    let never = ScriptedBackend::new(|_| panic!("no worker may run on a merged PR"));
+    let scope = support::scope(&f.store);
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let summary = hunter::scheduler::run_engage(
+        &scope,
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Cold(&finding),
+        &never,
+    )
+    .await
+    .unwrap();
+    merge_finding(&f.db, f.fid).await;
+
+    hunter::scheduler::count_unrecorded_pr_end(&scope, &summary).await;
+
+    assert_eq!(
+        f.store
+            .work_streak(f.fid, hunter::domain::FindingJobKind::Engage)
+            .await
+            .unwrap()
+            .streak,
+        0
+    );
+    let logged = f.store.recent_events(50).await.unwrap();
+    assert!(
+        !logged
+            .iter()
+            .any(|e| e.message.contains(hunter::scheduler::PR_END_UNRECORDED)),
+        "{logged:?}"
+    );
+}
+
+/// A merge recorded while the engage's worker runs leaves its `BLOCKED.md`
+/// nothing to hold: the finding has left the engage tier. That is the
+/// attempt's outcome, logged, not the cycle's error, which would back
+/// every other piece of work off for five minutes.
+#[tokio::test]
+async fn a_blocked_engage_whose_pr_ended_meanwhile_is_an_outcome() {
+    let f = fixture("engage-blocked-ended").await;
+    let bins = FakeBins::acquire("engage-blocked-ended");
+    bins.ok("gh", PR_VIEW_JSON);
+    let origin = push_to(&f, None).await;
+    let before = git(&origin, &["rev-parse", BRANCH]);
+    let (db, fid) = (f.db.clone(), f.fid);
+    let backend = ScriptedBackend::new(move |tree| {
+        std::fs::write(tree.join("BLOCKED.md"), "two reviewers want opposite APIs").unwrap();
+        merge_finding_from_worker(&db, fid);
+        support::done_with_transcript(tree)
+    });
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+
+    hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Cold(&finding),
+        &backend,
+    )
+    .await
+    .expect("BLOCKED.md on an ended PR is an outcome, not the cycle's error");
+
+    assert!(
+        support::hold_of(&f.store, f.fid, hunter::domain::FindingJobKind::Engage)
+            .await
+            .is_none(),
+        "nothing is held for a finding out of the tier"
+    );
+    assert_eq!(
+        git(&origin, &["rev-parse", BRANCH]),
+        before,
+        "nothing pushed"
+    );
+}
+
+/// [`merge_finding`] from inside a worker: the worker runs inside the
+/// runner's future, so the admin lane's write comes from a thread with a
+/// runtime of its own.
+fn merge_finding_from_worker(db: &Path, fid: i64) {
+    let db = db.to_owned();
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(merge_finding(&db, fid));
+    })
+    .join()
+    .unwrap();
+}
+
+/// A merge recorded while the engage's worker runs leaves it nothing to
+/// publish: its commits are not pushed to the merged PR's branch and its
+/// reply is not posted, and nothing is counted against the next PR's
+/// engage. A one-shot override is spent, so the harvest does not jump the
+/// queue on it.
+#[tokio::test]
+async fn an_engage_whose_pr_ended_while_its_worker_ran_publishes_nothing() {
+    let f = fixture("engage-ended-mid-run").await;
+    f.store
+        .set_budget_override(f.fid, Some(BudgetOverride::Once))
+        .await
+        .unwrap();
+    let bins = FakeBins::acquire("engage-ended-mid-run");
+    bins.ok("gh", PR_VIEW_JSON);
+    let origin = push_to(&f, None).await;
+    let before = git(&origin, &["rev-parse", BRANCH]);
+    let (db, fid) = (f.db.clone(), f.fid);
+    let backend = ScriptedBackend::new(move |tree| {
+        std::fs::write(tree.join("PR-REPLY.md"), "addressed").unwrap();
+        git(tree, &["commit", "--allow-empty", "-qm", "address review"]);
+        merge_finding_from_worker(&db, fid);
+        support::done_with_transcript(tree)
+    });
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+
+    hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Cold(&finding),
+        &backend,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        git(&origin, &["rev-parse", BRANCH]),
+        before,
+        "nothing pushed"
+    );
+    let calls = bins.calls_to("gh");
+    assert!(
+        calls.iter().all(|c| !c.iter().any(|a| a == "comment")),
+        "nothing posted: {calls:?}"
+    );
+    assert_eq!(
+        f.store
+            .work_streak(f.fid, hunter::domain::FindingJobKind::Engage)
+            .await
+            .unwrap()
+            .streak,
+        0
+    );
+    let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(
+        after.budget_override, None,
+        "the one-shot override is spent"
+    );
+}
+
 /// A `BLOCKED.md` holds the engage whatever state its attempt ended in: a
 /// worker that asked for a maintainer and then lost its connection (a
 /// suspension) asked all the same. It used to be read only from a worker
@@ -3497,7 +3993,7 @@ async fn a_continued_stuck_engage_resumes_with_its_reason() {
     )
     .await;
     let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
-        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
             .await
             .unwrap()
     else {
