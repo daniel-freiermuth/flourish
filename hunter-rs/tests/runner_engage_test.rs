@@ -717,6 +717,51 @@ async fn a_withdrawal_spends_only_a_once_override() {
     }
 }
 
+/// An override the operator changes while the engage runs is theirs: the
+/// attempt spends the `once` it was started under, never the `exempt`
+/// that replaced it meanwhile.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_override_raised_while_the_engage_ran_is_kept() {
+    let f = fixture("engage-override-raised").await;
+    let bins = FakeBins::acquire("engage-override-raised");
+    bins.ok("gh", PR_VIEW_JSON);
+    f.store
+        .set_budget_override(f.fid, Some(BudgetOverride::Once))
+        .await
+        .unwrap();
+    let (db, fid) = (f.db.clone(), f.fid);
+    let backend = ScriptedBackend::new(move |tree| {
+        std::fs::write(tree.join("WITHDRAW.md"), "superseded by #9").unwrap();
+        // The operator's upgrade, through the API's own write, mid-run.
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                hunter::store::Store::connect(&db)
+                    .await
+                    .unwrap()
+                    .set_budget_override(fid, Some(BudgetOverride::Exempt))
+                    .await
+                    .unwrap();
+            });
+        });
+        done()
+    });
+
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Cold(&finding),
+        &backend,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("withdrawn"), "{summary:?}");
+    let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(after.budget_override, Some(BudgetOverride::Exempt));
+}
+
 // ---------------------------------------------------------------------------
 // Push and reply
 // ---------------------------------------------------------------------------
