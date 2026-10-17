@@ -24,7 +24,7 @@ Shared conventions (error envelope `{"error": "<msg>"}`, `_send` headers, Row sh
 
 - **Prefix match**: `application/json; charset=utf-8` passes.
 - The gate applies to **every POST route including `/api/cycle`**, which never reads a body.
-- **Every UI POST clears the gate**: the Svelte UI routes all of them through one `post()` helper that sets `Content-Type: application/json` and a JSON body (`ui-svelte/src/lib/api.svelte.ts:104-110`); the bare `api()` wrapper sets no headers (`api.svelte.ts:32-45`) and is never called directly by a read either — every GET goes through `get()` (`:76-87`), which adds the abort deadline. The body-less `/api/cycle` call is `post("/api/cycle", {})` (`ui-svelte/src/pages/StatusPage.svelte:12`), i.e. it sends `{}` and passes. (This supersedes the old vanilla-`app.ts` discrepancy where `runCycle` sent no header and got a 415.)
+- **Every UI POST clears the gate**: the Svelte UI routes all of them through one `post()` helper that sets `Content-Type: application/json` and a JSON body (`ui-svelte/src/lib/api.svelte.ts:104-110`); the bare `api()` wrapper sets no headers (`api.svelte.ts:32-45`) and is never called directly by a read either — every GET goes through `get()` (`:76-87`), which adds the abort deadline. The body-less `/api/cycle` call is `post("/api/cycle", {})` (`ui-svelte/src/pages/StatusPage.svelte:48`), i.e. it sends `{}` and passes. (This supersedes the old vanilla-`app.ts` discrepancy where `runCycle` sent no header and got a 415.)
 
 **Session gate (Rust only).** Every `/api` route except `POST /api/login` — reads and writes, `/api/me` and `/api/logout` included — requires a live session: a `hunter_session` cookie whose token's SHA-256 is in `sessions`, not past `expires_at`, for an account whose `disabled_at` is NULL. Otherwise `401 {"error": "login required"}`, before any handler runs (`server::require_session`, a `route_layer` on the API sub-router). Order: Host gate, then session gate, then the handler (Content-Type gate, body parse). Static files and unknown paths are not gated: the bundle carries no data and has to load to show the login form. Pinned: `every_api_route_needs_a_session` (`hunter-rs/tests/post_test.rs`). Python has no accounts.
 
@@ -132,8 +132,8 @@ Handler `_cycle` (server.py:489-518). **Never reads the body** (only the §0.1 g
 **Success**: `200 {"paused": <value>}`. The process-local flag changes
 immediately and both lanes are notified. Pausing blocks new job-lane cycles;
 a worker already running is allowed to finish. It does not stop the admin
-lane, which spends no tokens: PR sync, the reaper and the workspace sweep
-keep running, so merges, closes and review comments are still recorded
+lane, which spends no tokens: PR sync, the reaper, fetch-ahead, the dependency scans and the
+workspace sweep keep running, so merges, closes and review comments are still recorded
 while jobs are paused. The flag resets to false on restart.
 
 ## 2.2 POST /api/overdrive — global prioritized budget mode

@@ -204,6 +204,25 @@ impl Rig {
         .await
         .unwrap()
     }
+
+    /// Install a Renovate that touches `started`, waits for `release` to
+    /// exist (bounded, so a failed assertion cannot hang the test binary),
+    /// then prints `output` and exits 0.
+    fn hold_renovate(&self, output: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let started = self.cfg.work_root.join("renovate-started");
+        let release = self.cfg.work_root.join("renovate-release");
+        self.bins.script(
+            "renovate",
+            &format!(
+                "touch '{started}'\ni=0\n\
+                 while [ ! -e '{release}' ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done\n\
+                 cat <<'__FAKE_EOF__'\n{output}\n__FAKE_EOF__\nexit 0",
+                started = started.display(),
+                release = release.display(),
+            ),
+        );
+        (started, release)
+    }
 }
 
 /// [`dep_update_cycle`], optionally with a read-only result file an
@@ -301,21 +320,8 @@ async fn updates_are_ingested_and_reported() {
 /// The cycle is skipped, and the reaper finishes the delete.
 #[tokio::test]
 async fn a_repo_deleted_during_its_renovate_scan_files_nothing_and_is_reaped() {
-    let update = r#"{"name":"renovate","level":20,"msg":"packageFiles with updates","config":{"npm":[{"packageFile":"package.json","deps":[{"depName":"left-pad","currentValue":"^1.2.0","datasource":"npm","updates":[{"newVersion":"1.3.0","updateType":"minor"}]}]}]}}"#;
     let rig = Rig::new("depupd-deleted").await;
-    let started = rig.cfg.work_root.join("renovate-started");
-    let release = rig.cfg.work_root.join("renovate-release");
-    // Bounded: a failed assertion below never releases it.
-    rig.bins.script(
-        "renovate",
-        &format!(
-            "touch '{started}'\ni=0\n\
-             while [ ! -e '{release}' ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done\n\
-             cat <<'__FAKE_EOF__'\n{update}\n__FAKE_EOF__\nexit 0",
-            started = started.display(),
-            release = release.display(),
-        ),
-    );
+    let (started, release) = rig.hold_renovate(UPDATE);
 
     let (scope, lane) = (support::scope(&rig.store), rig.store.test_lane());
     let scan = hunter::scheduler::run_dep_update(
@@ -326,14 +332,7 @@ async fn a_repo_deleted_during_its_renovate_scan_files_nothing_and_is_reaped() {
         &rig.backend,
     );
     let delete = async {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while !started.exists() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "renovate never started"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        wait_for(&started).await;
         rig.store
             .soft_delete_repo(rig.repo.id)
             .await
@@ -366,6 +365,60 @@ async fn a_repo_deleted_during_its_renovate_scan_files_nothing_and_is_reaped() {
         [] as [i64; 0],
         "the reaper finished the delete"
     );
+}
+
+/// The job lane says what it is doing outside a worker: while Renovate
+/// runs, the status page's `job_activity` reads `scanning_dependencies`,
+/// and once the cycle is over it reads nothing.
+#[tokio::test]
+async fn a_running_renovate_scan_shows_as_the_job_lanes_phase() {
+    use hunter::types::JobPhase;
+    let rig = Rig::new("depupd-phase").await;
+    let (started, release) = rig.hold_renovate(UPDATE);
+    let status = hunter::activity::JobStatus::default();
+
+    let (scope, lane) = (support::scope(&rig.store), rig.store.test_lane());
+    let scan = hunter::activity::reporting_job_phases(
+        status.clone(),
+        hunter::scheduler::run_dep_update(
+            &scope,
+            lane,
+            &rig.cfg,
+            Attempt::Cold(&rig.repo),
+            &rig.backend,
+        ),
+    );
+    let watch = async {
+        wait_for(&started).await;
+        let seen = status.current().map(|a| a.phase);
+        std::fs::write(&release, "").unwrap();
+        seen
+    };
+    let (summary, seen) = tokio::join!(scan, watch);
+
+    summary.expect("the scan ran");
+    assert_eq!(seen, Some(JobPhase::ScanningDependencies));
+    assert_eq!(
+        status.current(),
+        None,
+        "nothing shows once the cycle is over"
+    );
+}
+
+/// One Renovate update of `left-pad`, as the scan reports it.
+const UPDATE: &str = r#"{"name":"renovate","level":20,"msg":"packageFiles with updates","config":{"npm":[{"packageFile":"package.json","deps":[{"depName":"left-pad","currentValue":"^1.2.0","datasource":"npm","updates":[{"newVersion":"1.3.0","updateType":"minor"}]}]}]}}"#;
+
+/// Poll until `path` exists; bounded.
+async fn wait_for(path: &std::path::Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} never appeared",
+            path.display()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 /// When the result file cannot be written, the cycle fails instead of

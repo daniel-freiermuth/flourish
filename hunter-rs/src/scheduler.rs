@@ -23,7 +23,7 @@ use crate::store::{
     StoreWriteError,
 };
 use crate::transition::{Moved, PrEnded, PrEnding, PrRef, Transition, Unclaimed};
-use crate::types::{Finding, Job, Repo};
+use crate::types::{Finding, Job, JobPhase, Repo};
 use crate::util::now_ms;
 
 mod attempt;
@@ -1681,6 +1681,7 @@ async fn sync_repo(
         if let Some(parent) = rpath.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        let _phase = crate::activity::job_phase(JobPhase::Cloning);
         let url = repo_url.clone();
         let (rc, out) = permit
             .blocking(move |hold| hold.clone_from(&url, 600))
@@ -1709,6 +1710,7 @@ async fn sync_repo(
 /// `permit` until the fetch and its housekeeping end. The only way the
 /// daemon fetches into a clone.
 async fn fetch_held(permit: &ClonePermit<'_>, refs: &[&str]) -> (i32, String) {
+    let _phase = crate::activity::job_phase(JobPhase::Fetching);
     let refs: Vec<String> = refs.iter().map(|&r| r.to_owned()).collect();
     permit
         .blocking(move |hold| {
@@ -1962,6 +1964,7 @@ async fn open_workspace(
         permit.repo_id(),
         repo.id
     );
+    let _phase = crate::activity::job_phase(JobPhase::PreparingTree);
     let CreatedJob { job, superseded } = created;
     if let Some(plan) = resume {
         let chain = chain_of(store, plan.workspace.origin_id).await?;
@@ -3648,6 +3651,7 @@ async fn renovate_scan(
     repo: &Repo,
     tree: &crate::workspace::ScanTree,
 ) -> Option<crate::dep_scan::DepScan> {
+    let _phase = crate::activity::job_phase(JobPhase::ScanningDependencies);
     let path = tree.path().to_owned();
     let rn = repo.name.clone();
     let forge = repo.forge;
@@ -4743,6 +4747,7 @@ async fn ship_pr(
     worktree: &Path,
     state: JobState,
 ) -> Result<(String, bool), ShipFailure> {
+    let _phase = crate::activity::job_phase(JobPhase::Publishing);
     let db = repo.default_branch.clone();
     let wt = worktree.to_owned();
     let db2 = db.clone();
@@ -5857,6 +5862,7 @@ async fn withdraw_pr(
     reason: &str,
     summary: &mut CycleSummary,
 ) -> bool {
+    let _phase = crate::activity::job_phase(JobPhase::Publishing);
     let (repo, job, pr_number) = (&start.repo, start.job, start.pr_ref.number());
     let fg = forge::forge_for(repo.forge);
     let mut forge_closed = false;
@@ -5998,6 +6004,7 @@ struct Published {
 /// Push the worker's commits to the PR branch and post its `PR-REPLY.md`.
 /// A worker that did not finish publishes nothing.
 async fn push_and_reply(start: &EngageStart, state: JobState) -> Published {
+    let _phase = crate::activity::job_phase(JobPhase::Publishing);
     let mut pushed = false;
     let replied = push_then_reply(start, state, &mut pushed).await;
     Published { pushed, replied }
@@ -7766,11 +7773,19 @@ pub async fn run_cycle(
         };
     }
     // The cycle is one lane: its runners take clone permits in it, and
-    // none can outlive it.
+    // none can outlive it. Its helpers report their phases to the lane's
+    // status (`crate::activity::job_phase`).
+    let status = jobs.status();
     let scope = jobs.scope();
-    let ran = store
-        .lane(async |lane| run_scoped_cycle(scope, lane, cfg, backend, force_repo).await)
-        .await;
+    let ran = crate::activity::reporting_job_phases(
+        status,
+        // Boxed: the cycle is the largest future in the daemon, and the
+        // task-local scope would otherwise carry it inline.
+        Box::pin(
+            store.lane(async |lane| run_scoped_cycle(scope, lane, cfg, backend, force_repo).await),
+        ),
+    )
+    .await;
     ran.unwrap_or_else(|e| CycleSummary {
         error: Some(e.to_string()),
         ..Default::default()
