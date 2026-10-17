@@ -4,4 +4,4 @@
  * A phase of a job-lane cycle outside its worker, reported by the
  * helpers that do it (`crate::activity::job_phase`).
  */
-export type JobPhase = "cloning" | "fetching" | "preparing_tree" | "scanning_dependencies" | "publishing" | "ingesting";
+export type JobPhase = "cloning" | "fetching" | "preparing_tree" | "publishing" | "ingesting";

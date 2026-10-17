@@ -504,13 +504,19 @@ async fn select(
         )
     });
 
+    // A repo's `dep_update` is the admin lane's zero-token Renovate scan
+    // (`dependency_scans`); the rotation offers it only once Renovate had
+    // no answer for the repo, and then it is the AI scan.
+    let fallbacks = store.dep_update_fallbacks().await?;
     let now = now_ms();
     for target in &repos {
         if held.repo_sync(target.id) {
             continue;
         }
         let repo_busy = |kind: RepoJobKind| {
-            held.repo(target.id, kind) || busy(JobPlace::of(kind.into(), target.id, None))
+            held.repo(target.id, kind)
+                || busy(JobPlace::of(kind.into(), target.id, None))
+                || (kind == RepoJobKind::DepUpdate && !fallbacks.pending(target.id))
         };
         let hunt_held = hunt_busy(target);
         if !Path::new(&target.path).exists() {
@@ -3723,7 +3729,6 @@ async fn renovate_scan(
     repo: &Repo,
     tree: &crate::workspace::ScanTree,
 ) -> Option<crate::dep_scan::DepScan> {
-    let _phase = crate::activity::job_phase(JobPhase::ScanningDependencies);
     let path = tree.path().to_owned();
     let rn = repo.name.clone();
     let forge = repo.forge;
@@ -3788,8 +3793,10 @@ async fn settle_dep_updates(
     Ok((retired, handed_over))
 }
 
-/// Dependency scan. Renovate answers it for free whenever it can;
-/// otherwise an AI worker does.
+/// The job lane's `dep_update`: the AI scan, offered by the rotation only
+/// once Renovate had no answer for the repo (`Store::dep_update_fallbacks`),
+/// and resumed like every other kind. The zero-token Renovate scan is the
+/// admin lane's ([`dependency_scans`]).
 pub async fn run_dep_update(
     scope: &CycleScope<'_>,
     lane: &mut Lane,
@@ -3797,40 +3804,146 @@ pub async fn run_dep_update(
     attempt: Attempt<'_, kind::DepUpdate>,
     backend: &dyn Backend,
 ) -> anyhow::Result<CycleSummary> {
-    let (repo, resume) = (attempt.subject(), attempt.plan());
-    let store = scope.store();
-    // A resume continues a suspended AI worker, so the Renovate
-    // shortcut below is not an option for it: that path spends no
-    // tokens, creates no job row, and would leave the suspension
-    // uncontinued and still resumable. `run_analysis_job` repeats the
-    // clone check and the sync, so nothing is skipped by going straight
-    // there.
-    if resume.is_some() {
-        return run_analysis_job(scope, lane, cfg, attempt, backend).await;
-    }
-    let rpath = std::path::PathBuf::from(&repo.path);
-    if !rpath.exists() {
-        let failure = SyncFailure {
-            key: REPO_NOT_CLONED,
-            detail: format!("{} is not cloned", rpath.display()),
-            network: false,
-        };
-        let kind = RepoJobKind::DepUpdate;
-        return repo_sync_failed(store, (cfg, backend), repo, kind, failure).await;
-    }
-    let permit = lane.lock_clone(repo.id).await?;
-    if let Err(failure) = sync_to_tip(store, &permit, repo).await? {
-        let kind = RepoJobKind::DepUpdate;
-        // Let go before the probe (see `run_hunt`).
-        drop(permit);
-        return repo_sync_failed(store, (cfg, backend), repo, kind, failure).await;
-    }
+    run_analysis_job(scope, lane, cfg, attempt, backend).await
+}
 
-    // Try Renovate (zero tokens). Its answer is authoritative even when it
-    // is "nothing to update"; only an unavailable scan falls back to AI,
-    // which takes the clone again. The scan tree is made at the fetched
-    // tip in the fetch's hold, which ends there: Renovate runs holding
-    // only the tree's lease.
+/// What one [`scan_dependencies`] came to.
+#[derive(Debug)]
+pub enum DependencyScan {
+    /// Renovate answered: its updates were filed and settled, as the
+    /// summary says.
+    Scanned(Box<CycleSummary>),
+    /// Renovate had no answer; the AI scan is now due on the job lane
+    /// (`Store::request_dep_update_fallback`).
+    Unavailable,
+    /// The clone could not be synced: nothing scanned, nothing counted.
+    /// The job lane's own fetches keep the repo's `sync` streak.
+    NotSynced(String),
+}
+
+/// What one [`dependency_scans`] pass did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DepScans {
+    /// Repos Renovate answered for.
+    pub scanned: usize,
+    /// Repos Renovate had no answer for, now due their AI scan.
+    pub fallbacks: usize,
+    /// Repos whose scan failed or could not run.
+    pub failed: usize,
+}
+
+/// The admin lane's dependency pass (`crate::daemon::admin_pass`): the
+/// zero-token Renovate scan of every enabled, cloned repo whose
+/// `dep_update` is due, beside whatever job runs. It spends no tokens, so
+/// it is not the job lane's: a Renovate run takes up to two minutes, and
+/// the job lane used to sit in it.
+///
+/// A repo is skipped while its `dep_update` is held, running, or holds a
+/// checkpoint (a paused AI scan, which the job lane's resume tier owns),
+/// and while its AI scan is due ([`Store::dep_update_fallbacks`]): that
+/// one is the job lane's, and the rotation offers it only then. So the
+/// two lanes never both scan a repo's dependencies.
+///
+/// Stops at the next repo once `stop` is set.
+pub async fn dependency_scans(
+    store: &Store,
+    cfg: &Config,
+    stop: &tokio::sync::watch::Receiver<bool>,
+) -> DepScans {
+    let due = match dependency_scans_due(store, cfg).await {
+        Ok(due) => due,
+        Err(e) => {
+            tracing::warn!("dependency scans: {e}");
+            return DepScans::default();
+        }
+    };
+    let ran = store
+        .lane(async |lane| {
+            let mut done = DepScans::default();
+            for repo in &due {
+                if *stop.borrow() {
+                    break;
+                }
+                match scan_dependencies(lane, store, cfg, repo).await {
+                    Ok(DependencyScan::Scanned(summary)) => {
+                        if summary.failure.is_some() {
+                            done.failed += 1;
+                        } else {
+                            done.scanned += 1;
+                        }
+                    }
+                    Ok(DependencyScan::Unavailable) => done.fallbacks += 1,
+                    Ok(DependencyScan::NotSynced(why)) => {
+                        tracing::info!("dependency scan {}: not synced: {why}", repo.name);
+                    }
+                    Err(e) => {
+                        done.failed += 1;
+                        let _ = store
+                            .log_event(
+                                "error",
+                                &format!("dep_update {}: renovate scan failed: {e:#}", repo.name),
+                                None,
+                                None,
+                            )
+                            .await;
+                    }
+                }
+            }
+            done
+        })
+        .await;
+    ran.unwrap_or_else(|e| {
+        tracing::warn!("dependency scans: {e}");
+        DepScans::default()
+    })
+}
+
+/// The repos [`dependency_scans`] scans now, by its rules.
+async fn dependency_scans_due(store: &Store, cfg: &Config) -> sqlx::Result<Vec<Repo>> {
+    let held = store.held_work().await?;
+    let running = store.running_places().await?;
+    let fallbacks = store.dep_update_fallbacks().await?;
+    let interval_ms = (cfg.scan_interval_days * 86_400_000.0) as i64;
+    let now = now_ms();
+    let mut due = Vec::new();
+    for repo in store.list_repos().await? {
+        let kind = RepoJobKind::DepUpdate;
+        let skip = repo.enabled == 0
+            || held.repo(repo.id, kind)
+            || running.contains(&JobPlace::of(kind.into(), repo.id, None))
+            || fallbacks.pending(repo.id)
+            || repo
+                .last_dep_update_at
+                .is_some_and(|last| last != 0 && now - last < interval_ms)
+            || !Path::new(&repo.path).exists();
+        if !skip && store.repo_checkpoint_job(repo.id, kind).await?.is_none() {
+            due.push(repo);
+        }
+    }
+    Ok(due)
+}
+
+/// One repo's Renovate scan, as [`dependency_scans`] runs it: sync the
+/// clone, scan a throwaway tree at the fetched tip, file and settle what
+/// Renovate proposes, record the run. Renovate's answer is authoritative
+/// even when it is "nothing to update"; only no answer at all requests the
+/// AI scan. An error is a scan whose outcome could not be recorded (the
+/// result file, the settle): nothing moves, and the next pass retries it.
+pub async fn scan_dependencies(
+    lane: &mut Lane,
+    store: &Store,
+    cfg: &Config,
+    repo: &Repo,
+) -> anyhow::Result<DependencyScan> {
+    let permit = lane.lock_clone(repo.id).await?;
+    if !permit.clone_dir().exists() {
+        return Ok(DependencyScan::NotSynced("not cloned".to_owned()));
+    }
+    if let Err(failure) = sync_to_tip(store, &permit, repo).await? {
+        return Ok(DependencyScan::NotSynced(failure.detail));
+    }
+    // The scan tree is made at the fetched tip in the fetch's hold, which
+    // ends there: Renovate runs holding only the tree's lease.
     let tip = format!("origin/{}", repo.default_branch);
     let scan = match crate::workspace::ScanTree::create(&cfg.work_root, permit, &tip).await {
         Ok(tree) => {
@@ -3844,11 +3957,16 @@ pub async fn run_dep_update(
         }
     };
     let Some(scan) = scan else {
-        tracing::info!(
-            "dep_update {}: renovate unavailable, falling back to AI",
-            repo.name
-        );
-        return run_analysis_job(scope, lane, cfg, attempt, backend).await;
+        store.request_dep_update_fallback(repo.id).await?;
+        let _ = store
+            .log_event(
+                "dep_update",
+                &format!("{}: renovate had no answer; the AI scan is due", repo.name),
+                None,
+                None,
+            )
+            .await;
+        return Ok(DependencyScan::Unavailable);
     };
 
     // Write candidates to JSON and ingest via the standard path
@@ -3891,7 +4009,7 @@ pub async fn run_dep_update(
     )
     .await;
     if counts.repo_deleted {
-        return Ok(deleted_during_scan(repo));
+        return Ok(DependencyScan::Scanned(Box::new(deleted_during_scan(repo))));
     }
     let (retired, handed_over) = if counts.invalid == 0 {
         settle_dep_updates(store, repo, &scan).await?
@@ -3911,7 +4029,9 @@ pub async fn run_dep_update(
         )
         .await;
 
-    Ok(renovate_outcome(store, repo, counts).await)
+    Ok(DependencyScan::Scanned(Box::new(
+        renovate_outcome(store, repo, counts).await,
+    )))
 }
 
 /// A Renovate scan whose repo the operator deleted while it ran: the path
