@@ -613,7 +613,10 @@ impl Backend for ScriptedBackend {
             resume_from: resume_from.map(Path::to_path_buf),
         });
         if self.fails {
-            anyhow::bail!("test: the backend failed before the worker ran");
+            // With a cause under it, so a test can see whether the whole
+            // chain reaches the operator or only the outermost message.
+            return Err(anyhow::anyhow!("test: the blocking task panicked")
+                .context("test: the backend failed before the worker ran"));
         }
         Ok((self.run)(&ws.tree, resume_from))
     }

@@ -585,11 +585,13 @@ Fixed strings; git's or the worker's words go into the detail.
 | Work item | Keys |
 |---|---|
 | `(repo, sync)` | `clone failed`, `fetch failed`, `origin mismatch`, `branch not found`, `repo not cloned` |
-| `(repo, kind)` | `workspace not created`, `runner error`, `worker <state>` (not `Done`, without a pause), `no findings file`, `invalid entries`, `resume chain gave up` |
+| `(repo, kind)` | `workspace not created`, `runner error`, `worker <state>` (not `Done`, without a pause), `no findings file`, `invalid entries`, `resume chain gave up`, `cycle error` |
+
+**`cycle error`** is any error the hunt's or scan's runner returns without counting it itself: a suppression list that cannot be read, a playbook that cannot be rendered (a missing template, an unfilled placeholder, a missing `CODING_STANDARDS.md`), a tree or a scan result that cannot be written down. `run_cycle_inner` counts it on the candidate's `(repo, kind)` with the error as the detail, so the same error every cycle holds the work instead of keeping its repo at the head of the rotation. An error already counted (`repo_sync_failed`, `runner_failed`) is not counted a second time.
 
 **The network's failures count nothing (#95, layer 2).** Before a clone or fetch failure, a runner error, or a worker that failed without metered work is counted, the repo's hosts are probed again (`Backend::first_unreachable(&work_hosts(..))`). If one is unreachable, nothing is counted, the checkpoint stays, and the cycle ends as `offline_denial`. `origin mismatch`, `branch not found` and `repo not cloned` are local and always count.
 
-**Renovate (`dep_update` without a job).** A scan with invalid entries is the failure `invalid entries` and has no checkpoint. Renovate being unavailable is not a failure: the AI job it falls back to is counted like any other. A store error while settling the scan stays a cycle error.
+**Renovate (`dep_update` without a job).** A scan with invalid entries is the failure `invalid entries` and has no checkpoint. Renovate being unavailable is not a failure: the AI job it falls back to is counted like any other. A store error while settling the scan ends the cycle and is counted as `cycle error`.
 
 ### 17.4 Holds and releases
 
