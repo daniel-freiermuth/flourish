@@ -3795,6 +3795,9 @@ pub async fn run_dep_update(
         None,
     )
     .await;
+    if counts.repo_deleted {
+        return Ok(deleted_during_scan(repo));
+    }
     let (retired, handed_over) = if counts.invalid == 0 {
         settle_dep_updates(store, repo, &scan).await?
     } else {
@@ -3814,6 +3817,19 @@ pub async fn run_dep_update(
         .await;
 
     Ok(renovate_outcome(store, repo, counts).await)
+}
+
+/// A Renovate scan whose repo the operator deleted while it ran: the path
+/// has no job row, so the delete was allowed, and ingest filed nothing
+/// (`FindingInsertError::RepoDeleted`). There is no repo left to settle
+/// its updates or record a run on, so the cycle is a skip.
+fn deleted_during_scan(repo: &Repo) -> CycleSummary {
+    CycleSummary {
+        kind: Some(RepoJobKind::DepUpdate.into()),
+        repo: Some(repo.name.clone()),
+        skipped: Some(format!("repo {} was deleted during its scan", repo.id)),
+        ..Default::default()
+    }
 }
 
 /// What a Renovate scan amounts to for the repo's `dep_update` work: one

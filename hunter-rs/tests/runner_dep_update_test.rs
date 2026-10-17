@@ -294,6 +294,80 @@ async fn updates_are_ingested_and_reported() {
     assert!(advanced);
 }
 
+/// The Renovate scan creates no job row, so a repo with no jobs and no
+/// findings can be deleted while its scan runs. The scan's results are not
+/// filed in it: a finding there would be invisible and, with no cascade on
+/// `findings.repo_id`, would keep the reaper from ever dropping the row.
+/// The cycle is skipped, and the reaper finishes the delete.
+#[tokio::test]
+async fn a_repo_deleted_during_its_renovate_scan_files_nothing_and_is_reaped() {
+    let update = r#"{"name":"renovate","level":20,"msg":"packageFiles with updates","config":{"npm":[{"packageFile":"package.json","deps":[{"depName":"left-pad","currentValue":"^1.2.0","datasource":"npm","updates":[{"newVersion":"1.3.0","updateType":"minor"}]}]}]}}"#;
+    let rig = Rig::new("depupd-deleted").await;
+    let started = rig.cfg.work_root.join("renovate-started");
+    let release = rig.cfg.work_root.join("renovate-release");
+    // Bounded: a failed assertion below never releases it.
+    rig.bins.script(
+        "renovate",
+        &format!(
+            "touch '{started}'\ni=0\n\
+             while [ ! -e '{release}' ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done\n\
+             cat <<'__FAKE_EOF__'\n{update}\n__FAKE_EOF__\nexit 0",
+            started = started.display(),
+            release = release.display(),
+        ),
+    );
+
+    let (scope, lane) = (support::scope(&rig.store), rig.store.test_lane());
+    let scan = hunter::scheduler::run_dep_update(
+        &scope,
+        lane,
+        &rig.cfg,
+        Attempt::Cold(&rig.repo),
+        &rig.backend,
+    );
+    let delete = async {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !started.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "renovate never started"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        rig.store
+            .soft_delete_repo(rig.repo.id)
+            .await
+            .expect("a repo with no jobs and no findings can be deleted");
+        std::fs::write(&release, "").unwrap();
+    };
+    let (summary, ()) = tokio::join!(scan, delete);
+
+    let summary = summary.expect("a repo deleted during its scan is a skip, not an error");
+    assert!(
+        summary
+            .skipped
+            .as_deref()
+            .is_some_and(|s| s.contains("deleted during its scan")),
+        "{summary:?}"
+    );
+    assert!(!rig.model_ran.load(Ordering::SeqCst));
+    assert!(
+        rig.findings().await.is_empty(),
+        "nothing filed in a deleted repo"
+    );
+    hunter::server::reap_deleted_repos(
+        &rig.store,
+        &rig.cfg.work_root,
+        &tokio::sync::Mutex::new(()),
+    )
+    .await;
+    assert_eq!(
+        rig.store.deleted_repo_ids().await.unwrap(),
+        [] as [i64; 0],
+        "the reaper finished the delete"
+    );
+}
+
 /// When the result file cannot be written, the cycle fails instead of
 /// ingesting whatever an earlier scan left at that path: here a stale
 /// candidate would be re-filed and the cadence advanced, for a repo whose

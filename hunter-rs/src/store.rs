@@ -165,6 +165,22 @@ pub enum StoreWriteError {
     Db(#[from] sqlx::Error),
 }
 
+/// Why [`Store::upsert_finding`] wrote no finding.
+#[derive(Debug, thiserror::Error)]
+pub enum FindingInsertError {
+    /// The repo was soft-deleted while the work that found this ran. Only
+    /// work with no job row can get here -- a repo with a job or a finding
+    /// cannot be deleted at all -- which today is the zero-token Renovate
+    /// scan. A finding inserted anyway would be invisible (every read
+    /// skips a deleted repo) and would hold the repo's row in place
+    /// (`findings.repo_id` has no cascade), so the reaper's delete of it
+    /// would fail on every pass.
+    #[error("repo {repo_id} is deleted -- no finding can be filed in it")]
+    RepoDeleted { repo_id: i64 },
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
+}
+
 /// Why [`CycleScope::create_job`](crate::recovery::CycleScope::create_job)
 /// wrote no job row.
 #[derive(Debug, thiserror::Error)]
@@ -4086,20 +4102,23 @@ impl Store {
     /// Deliberately *not* `INSERT OR IGNORE`: the lookup and the INSERT are
     /// separate statements, so two callers racing on the same fingerprint
     /// would have the second fail the UNIQUE constraint rather than be
-    /// ignored. Only the single scheduler loop ingests, so no second caller
-    /// exists to open that window.
-    /// Insert a finding, or report the existing one with this fingerprint.
+    /// ignored. Only the job lane ingests, one cycle at a time, so no
+    /// second caller exists to open that window.
     ///
     /// `found_by_job` is stored only on a genuine insert: a duplicate
     /// belongs to the job that first turned it up, not the latest one to
     /// rediscover it.
+    ///
+    /// Refused for a soft-deleted repo ([`FindingInsertError::RepoDeleted`]),
+    /// read by the INSERT itself, as `insert_job` refuses one: the delete
+    /// checks that the repo has no findings, and this keeps that true.
     pub async fn upsert_finding(
         &self,
         repo_id: i64,
         row: &FindingInsert,
         finding_type: &str,
         found_by_job: Option<i64>,
-    ) -> sqlx::Result<(i64, bool)> {
+    ) -> Result<(i64, bool), FindingInsertError> {
         // Check if already exists
         let fingerprint = &row.fingerprint;
         let existing = sqlx::query_scalar!(
@@ -4145,7 +4164,8 @@ impl Store {
              missing_tests, test_file, smell_type, suggested_refactor, \
              modernization_class, current_approach, proposed_approach, standard_section, \
              status, created_at, updated_at, found_by_job) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27, ?28, ?29, ?30, ?31)",
+             SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27, ?28, ?29, ?30, ?31 \
+             WHERE EXISTS (SELECT 1 FROM repos WHERE id = ?2 AND deleted_at IS NULL)",
             finding_type, repo_id, fingerprint, file, symbol, line, bug_class,
             severity, confidence, summary, detail, evidence_plan, introduced_by,
             ecosystem, package, current_version, latest_version, update_type, security_advisory,
@@ -4155,6 +4175,9 @@ impl Store {
         )
         .execute(&self.pool)
         .await?;
+        if result.rows_affected() == 0 {
+            return Err(FindingInsertError::RepoDeleted { repo_id });
+        }
         Ok((result.last_insert_rowid(), true))
     }
 
