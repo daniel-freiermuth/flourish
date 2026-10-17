@@ -713,10 +713,16 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         if summary.awaits_pr_sync {
             // The cycle met a PR the forge has ended and the database has
             // not: picking again before a sync records it would pick the
-            // same work.
+            // same work. A pass that still could not record it counts
+            // against the engage, so a sync that keeps failing on one PR
+            // holds that engage instead of keeping the lane on it.
             pr_sync_passes
                 .next(&scheduler.pr_sync_wake, &shutdown_rx)
                 .await;
+            // Woken by shutdown instead, no pass has run: nothing to count.
+            if !*shutdown_rx.borrow() {
+                crate::scheduler::count_unrecorded_pr_end(&jobs.scope(), &summary).await;
+            }
         }
         let sleep_s = compute_sleep_s(&store, &summary).await;
         let (state_label, detail) = describe_cycle(&summary);

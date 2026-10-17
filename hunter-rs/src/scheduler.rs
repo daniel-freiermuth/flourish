@@ -5990,6 +5990,61 @@ async fn engage_view(
     }
 }
 
+/// The streak key of an engage whose PR the forge showed ended while the
+/// PR sync, given a pass to catch up, still had not recorded it
+/// ([`count_unrecorded_pr_end`]).
+pub const PR_END_UNRECORDED: &str = "PR ended on the forge, unrecorded by the PR sync";
+
+/// After the PR sync pass a cycle's [`CycleSummary::awaits_pr_sync`] waited
+/// for: count it against the engage if that pass did not record the end
+/// of the PR the engage found ended on the forge.
+///
+/// The end is the sync's to record, and it logs why it could not (a PR
+/// view or a write that failed). Left alone, the finding stays `pr_open`
+/// and flagged, so the engage tier -- the top one -- picks the same engage
+/// at once, which views the PR again and waits for another pass, without
+/// end, and no tier below it ever runs. Counted as the engage's failure,
+/// the [`MAX_CONSECUTIVE_SAME_FAILURE`]th holds the engage for the
+/// operator (WORK-MODEL.md §7), and the selection moves on. A pass that
+/// did record it, or a PR that is no longer the finding's, counts nothing.
+pub async fn count_unrecorded_pr_end(scope: &CycleScope<'_>, summary: &CycleSummary) {
+    let (true, Some(fid), Some(pr_number)) = (
+        summary.awaits_pr_sync,
+        summary.finding_id,
+        summary.pr_number,
+    ) else {
+        return;
+    };
+    let store = scope.store();
+    let Ok(Some(finding)) = store.get_finding(fid).await else {
+        return;
+    };
+    let open_on_it = finding.status == FindingStatus::PrOpen
+        && store
+            .get_pr_state(fid)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|ps| ps.pr_number)
+            == Some(pr_number);
+    if !open_on_it {
+        return;
+    }
+    let detail = format!(
+        "{PR_END_UNRECORDED}: PR #{pr_number} has ended, and a PR sync pass since \
+         still shows it open"
+    );
+    record_engage_failure(
+        store,
+        fid,
+        None,
+        PR_END_UNRECORDED,
+        &detail,
+        HoldReason::Stuck,
+    )
+    .await;
+}
+
 /// A step before the worker, `step`'s outcome, with a failure handed to
 /// [`engage_prefetch_failed`]: the network's ends the cycle denied
 /// (`Ok(Err(summary))`), anything else stays the error it was.

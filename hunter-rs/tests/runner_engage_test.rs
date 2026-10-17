@@ -3704,6 +3704,109 @@ esac"#,
     );
 }
 
+/// `gh` answering every view with the PR merged.
+fn gh_merged(bins: &FakeBins) {
+    bins.ok(
+        "gh",
+        r#"{"state":"MERGED","title":"a fix","body":"because","comments":[],"reviews":[],"statusCheckRollup":[],"headRefName":"fix/some-bug","headRefOid":"deadbeef"}"#,
+    );
+}
+
+/// The engage tier is the top one, and after a cycle that found its PR
+/// ended on the forge the job lane waits for a PR sync pass and picks
+/// again. If that pass cannot record the end (its view or its write keeps
+/// failing for this one PR), the same engage is picked at once, views the
+/// PR, waits for another pass, and so on for good, with no tier below it
+/// ever running. Each such round counts against the engage, so the limit
+/// holds it for the operator and the selection moves on.
+#[tokio::test]
+async fn an_ended_pr_the_sync_cannot_record_holds_its_engage() {
+    let f = fixture("engage-ended-unrecorded").await;
+    let bins = FakeBins::acquire("engage-ended-unrecorded");
+    gh_merged(&bins);
+    let never = ScriptedBackend::new(|_| panic!("no worker may run on a merged PR"));
+
+    for _ in 0..3 {
+        let scope = support::scope(&f.store);
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        let summary = hunter::scheduler::run_engage(
+            &scope,
+            f.store.test_lane(),
+            &f.cfg,
+            Attempt::Cold(&finding),
+            &never,
+        )
+        .await
+        .unwrap();
+        assert!(summary.awaits_pr_sync, "{summary:?}");
+        // The pass the job lane waited for ran, and failed to record it.
+        hunter::scheduler::count_unrecorded_pr_end(&scope, &summary).await;
+    }
+
+    let hold = support::hold_of(&f.store, f.fid, hunter::domain::FindingJobKind::Engage)
+        .await
+        .expect("held at the limit");
+    assert!(
+        hold.detail
+            .starts_with(hunter::scheduler::PR_END_UNRECORDED),
+        "{hold:?}"
+    );
+    let next = hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
+        .await
+        .unwrap();
+    assert!(
+        !matches!(
+            next,
+            Some(hunter::scheduler::Candidate::Finding {
+                kind: hunter::domain::FindingJobKind::Engage,
+                ..
+            })
+        ),
+        "the held engage is picked no more: {next:?}"
+    );
+}
+
+/// A pass that did record the end leaves nothing to count, or to log: the
+/// finding has left `pr_open`, the common case, and the engage is no
+/// failure of its own.
+#[tokio::test]
+async fn an_ended_pr_the_sync_recorded_counts_nothing() {
+    let f = fixture("engage-ended-recorded").await;
+    let bins = FakeBins::acquire("engage-ended-recorded");
+    gh_merged(&bins);
+    let never = ScriptedBackend::new(|_| panic!("no worker may run on a merged PR"));
+    let scope = support::scope(&f.store);
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let summary = hunter::scheduler::run_engage(
+        &scope,
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Cold(&finding),
+        &never,
+    )
+    .await
+    .unwrap();
+    merge_finding(&f.db, f.fid).await;
+
+    hunter::scheduler::count_unrecorded_pr_end(&scope, &summary).await;
+
+    assert_eq!(
+        f.store
+            .work_streak(f.fid, hunter::domain::FindingJobKind::Engage)
+            .await
+            .unwrap()
+            .streak,
+        0
+    );
+    let logged = f.store.recent_events(50).await.unwrap();
+    assert!(
+        !logged
+            .iter()
+            .any(|e| e.message.contains(hunter::scheduler::PR_END_UNRECORDED)),
+        "{logged:?}"
+    );
+}
+
 /// A merge recorded while the engage's worker runs leaves its `BLOCKED.md`
 /// nothing to hold: the finding has left the engage tier. That is the
 /// attempt's outcome, logged, not the cycle's error, which would back
