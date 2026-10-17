@@ -454,8 +454,8 @@ async fn a_pr_already_read_in_the_pass_is_an_error_and_not_read_again() {
 }
 
 /// A pass asked to stop reads no further PR: a daemon shutting down waits
-/// for its admin pass, and each PR is a forge round trip. The finding is
-/// left as it was, for the next daemon's first pass.
+/// for its PR sync's run, and each PR is a forge round trip. The finding is
+/// left as it was, for the next daemon's first sync.
 #[tokio::test]
 async fn a_pass_told_to_stop_reads_no_more_prs() {
     let f = fixture("sync-stop").await;

@@ -757,38 +757,38 @@ async fn cycle_starts_returns_202() {
 }
 
 /// Contract §2: the 202 is not cosmetic -- it must actually reach both
-/// lanes: the job lane's next cycle, and the admin lane's PR sync. The
+/// lanes: the job lane's next cycle, and the admin lane's PR sync duty. The
 /// handler notifies before responding, so each permit is already held and
 /// `notified()` resolves immediately.
 #[tokio::test]
 async fn cycle_wakes_both_scheduler_lanes() {
     let state = test_state().await;
     let wake = Arc::clone(&state.scheduler.wake);
-    let admin_wake = Arc::clone(&state.scheduler.admin_wake);
+    let pr_sync_wake = Arc::clone(&state.scheduler.pr_sync_wake);
     let (status, _) = post(&state, "/api/cycle", json!({})).await;
     assert_eq!(status, StatusCode::ACCEPTED);
     tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified())
         .await
         .expect("POST /api/cycle must wake the job lane");
-    tokio::time::timeout(std::time::Duration::from_secs(1), admin_wake.notified())
+    tokio::time::timeout(std::time::Duration::from_secs(1), pr_sync_wake.notified())
         .await
-        .expect("POST /api/cycle must wake the admin lane");
+        .expect("POST /api/cycle must wake the PR sync");
 }
 
 /// Contract §2: a cycle already under way is refused, not queued twice --
-/// but the admin lane is still woken: a manual PR sync is most useful
+/// but the PR sync is still woken: a manual PR sync is most useful
 /// exactly while a long job runs, and the admin lane does not wait for it.
 #[tokio::test]
 async fn cycle_while_running_is_409_busy_and_still_wakes_the_admin_lane() {
     let state = test_state().await;
-    let admin_wake = Arc::clone(&state.scheduler.admin_wake);
+    let pr_sync_wake = Arc::clone(&state.scheduler.pr_sync_wake);
     state.scheduler.running.store(true, Ordering::SeqCst);
     let (status, body) = post(&state, "/api/cycle", json!({})).await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["error"], "busy");
-    tokio::time::timeout(std::time::Duration::from_secs(1), admin_wake.notified())
+    tokio::time::timeout(std::time::Duration::from_secs(1), pr_sync_wake.notified())
         .await
-        .expect("a busy trigger must still wake the admin lane");
+        .expect("a busy trigger must still wake the PR sync");
 }
 
 /// Deleting a repo must remove its notes file.
@@ -915,7 +915,7 @@ async fn a_repo_whose_files_survive_keeps_its_id_reserved_until_reaped() {
 
     // The reaper finishes the job once the obstruction is gone.
     let reaped = hunter::server::reap_deleted_repos(
-        &state.store,
+        &support::admin(&state.store),
         &state.config.work_root,
         &state.repo_notes,
     )
@@ -992,7 +992,7 @@ async fn notes_that_cannot_be_removed_keep_the_id_reserved_too() {
     // makes the retained row a retry rather than a wedge.
     std::fs::remove_dir_all(&notes_path).unwrap();
     let reaped = hunter::server::reap_deleted_repos(
-        &state.store,
+        &support::admin(&state.store),
         &state.config.work_root,
         &state.repo_notes,
     )
@@ -1252,8 +1252,12 @@ async fn a_retried_delete_is_a_success_while_reclamation_is_pending() {
     assert_eq!(retry, StatusCode::OK, "a retry must not 404: {retry_body}");
 
     // Once reclaimed, the id is ordinary again and answers 404.
-    hunter::server::reap_deleted_repos(&state.store, &state.config.work_root, &state.repo_notes)
-        .await;
+    hunter::server::reap_deleted_repos(
+        &support::admin(&state.store),
+        &state.config.work_root,
+        &state.repo_notes,
+    )
+    .await;
     let (after, _) = post(&state, "/api/repo/delete", json!({ "id": rid })).await;
     assert_eq!(after, StatusCode::NOT_FOUND);
 
@@ -1292,8 +1296,12 @@ async fn a_reclaimed_id_is_never_reissued() {
     // the state in which a rowid alias would be reissued.
     let (status, _) = post(&state, "/api/repo/delete", json!({ "id": first })).await;
     assert_eq!(status, StatusCode::OK);
-    hunter::server::reap_deleted_repos(&state.store, &state.config.work_root, &state.repo_notes)
-        .await;
+    hunter::server::reap_deleted_repos(
+        &support::admin(&state.store),
+        &state.config.work_root,
+        &state.repo_notes,
+    )
+    .await;
     assert_eq!(
         state.store.deleted_repo_ids().await.unwrap(),
         [] as [i64; 0]
@@ -1846,17 +1854,17 @@ async fn pausing_and_resuming_the_scheduler_round_trips() {
     );
     // The pause rang both lanes; take that permit, so the next one is the
     // trigger's.
-    let admin_wake = Arc::clone(&state.scheduler.admin_wake);
-    tokio::time::timeout(std::time::Duration::from_secs(1), admin_wake.notified())
+    let pr_sync_wake = Arc::clone(&state.scheduler.pr_sync_wake);
+    tokio::time::timeout(std::time::Duration::from_secs(1), pr_sync_wake.notified())
         .await
-        .expect("the pause wakes the admin lane");
+        .expect("the pause wakes the PR sync");
 
     let (status, body) = post(&state, "/api/cycle", json!({})).await;
     assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
     assert_eq!(body, json!({ "error": "paused" }));
-    tokio::time::timeout(std::time::Duration::from_secs(1), admin_wake.notified())
+    tokio::time::timeout(std::time::Duration::from_secs(1), pr_sync_wake.notified())
         .await
-        .expect("a trigger while paused still wakes the admin lane");
+        .expect("a trigger while paused still wakes the PR sync");
 
     let (status, body) = post(&state, "/api/scheduler", json!({ "paused": false })).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");

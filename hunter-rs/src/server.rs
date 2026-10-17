@@ -60,18 +60,20 @@ pub struct SchedulerHandle {
     /// immediately. A notify delivered mid-cycle is held as a permit, so a
     /// trigger is never lost -- it just lands on the following iteration.
     pub wake: Arc<tokio::sync::Notify>,
-    /// The same for the admin lane's next pass.
-    pub admin_wake: Arc<tokio::sync::Notify>,
-    /// The admin lane's current task.
+    /// Interrupts the sleep of the admin lane's PR sync duty, so open PRs
+    /// are read now. Held as a permit while a sync runs, like `wake`.
+    pub pr_sync_wake: Arc<tokio::sync::Notify>,
+    /// The admin lane's duties running now.
     pub admin: AdminStatus,
     /// The job lane's current phase outside its worker.
     pub job: JobStatus,
 }
 
 impl SchedulerHandle {
-    /// Wake both lanes: the admin lane syncs, the job lane picks.
+    /// Wake the PR sync and the job lane: open PRs are read, the job lane
+    /// picks.
     pub fn wake_both(&self) {
-        self.admin_wake.notify_one();
+        self.pr_sync_wake.notify_one();
         self.wake.notify_one();
     }
 }
@@ -1113,7 +1115,7 @@ async fn release_repo_hold(
 /// permit and runs on the following iteration rather than being dropped.
 async fn cycle(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
     post_gate(&headers)?;
-    state.scheduler.admin_wake.notify_one();
+    state.scheduler.pr_sync_wake.notify_one();
     if state.scheduler.paused.load(Ordering::SeqCst) {
         return Ok(error_body(StatusCode::CONFLICT, "paused"));
     }
@@ -1688,8 +1690,8 @@ async fn reap_in(
     let store = lane.store().clone();
     // Taken here rather than by the callers, because there are two of
     // them and only one used to hold it: the delete handler did, but the
-    // reaper pass that runs at startup and on every admin-lane pass did not.
-    // An append interleaving with that pass recreates the notes file
+    // reaper that runs at startup and as an admin-lane duty did not.
+    // An append interleaving with the reaper recreates the notes file
     // after the reaper has walked past it, and the row is dropped a
     // moment later — leaving a file for a repo that no longer exists and
     // nothing that will ever retry it. Python takes the lock inside its
@@ -1864,12 +1866,14 @@ pub fn migrate_repo_notes(work_root: &Path) -> usize {
     moved
 }
 
-/// Finish any deletion left flagged by a crash or a failed reclamation.
+/// Finish any deletion left flagged by a crash or a failed reclamation:
+/// the admin lane's reaper duty, and once at daemon startup.
 pub async fn reap_deleted_repos(
-    store: &Store,
+    admin: &crate::recovery::AdminAuthority,
     work_root: &Path,
     notes_lock: &tokio::sync::Mutex<()>,
 ) -> usize {
+    let store = admin.store();
     let repos_dir = work_root.join("repos");
     let ids = store.deleted_repo_ids().await.unwrap_or_default();
     let mut reaped = 0;

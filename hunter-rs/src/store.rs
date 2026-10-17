@@ -5060,8 +5060,10 @@ impl Store {
     }
 
     /// Record that Renovate had no answer for `repo_id` just now, so its
-    /// AI `dep_update` scan is due on the job lane (migration 032).
-    pub async fn request_dep_update_fallback(&self, repo_id: i64) -> sqlx::Result<()> {
+    /// AI `dep_update` scan is due on the job lane (migration 032). Only
+    /// through the admin lane's authority
+    /// ([`crate::recovery::AdminAuthority::request_dep_update_fallback`]).
+    pub(crate) async fn request_dep_update_fallback(&self, repo_id: i64) -> sqlx::Result<()> {
         let now = now_ms();
         sqlx::query!(
             "INSERT INTO dep_scan_fallbacks (repo_id, requested_at) VALUES (?1, ?2) \

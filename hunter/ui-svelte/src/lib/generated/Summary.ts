@@ -29,13 +29,13 @@ type_counts: { [key in string]: number }, repos: Array<RepoBrief>, last_cycle: E
  */
 cycle_running: boolean, scheduler_paused: boolean, scheduler_overdrive: boolean, current_job: Job | null, next_candidate: NextCandidate | null, scheduler_state: SchedulerState | null, activity_status: ActivityStatus, 
 /**
- * What the admin lane is doing right now, beside the job lane; `null`
- * between its passes.
+ * The admin lane's duties running now, beside the job lane and each
+ * other, by task; empty between their runs.
  */
-admin_activity: AdminActivity | null, 
+admin_activity: Array<AdminActivity>, 
 /**
  * The job lane's current phase outside its worker -- waiting for a
- * clone an admin duty holds, a fetch, the tree, a Renovate scan,
- * publishing, ingesting; `null` otherwise.
+ * clone an admin duty holds, cloning, fetching, the tree, publishing,
+ * ingesting; `null` otherwise.
  */
 job_activity: JobActivity | null, };

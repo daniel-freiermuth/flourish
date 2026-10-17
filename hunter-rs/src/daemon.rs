@@ -10,25 +10,35 @@
 //!   next work, run its job. Only it holds the
 //!   [`JobAuthority`](crate::recovery::JobAuthority), so only it creates
 //!   jobs and claims fixes, one cycle at a time.
-//! - The admin lane runs [`admin_pass`] on a timer: PR sync, reaping
-//!   deleted repos, the workspace sweep. Only it holds the
-//!   [`AdminAuthority`], so only it syncs PRs. None of its work spends
-//!   tokens, so none of it waits for a job any more, and a pause, which
-//!   stops new jobs, does not stop it.
+//! - The admin lane runs its duties ([`ADMIN_DUTIES`]): PR sync, reaping
+//!   deleted repos, fetch-ahead, the Renovate dependency scans, the
+//!   workspace sweep. Each is its own task on its own timer
+//!   ([`spawn_admin_lane`]), so a slow one -- a Renovate scan, the fetch
+//!   of a large repo -- delays none of the others, and PR sync above all
+//!   records a merge within its interval whatever else the lane is doing.
+//!   Each run is its own task too ([`supervise_duty`]): a run that panics
+//!   is logged and the duty runs again at its next tick. Only this lane
+//!   holds the [`AdminAuthority`], which its duties take, so only it
+//!   syncs PRs and runs them. None of its work spends tokens, so none of
+//!   it waits for a job any more, and a pause, which stops new jobs, does
+//!   not stop it.
 //!
-//! What the two touch at once is guarded where it lives, not by running
-//! them apart: a finding's status moves only by guarded transitions, a
-//! PR's `pr_state` columns have one writer per group, a clone changes only
-//! under its permit, and a tree a runner still uses is leased. The lanes
-//! meet through the database: a sync pass that made work wakes the job
-//! lane, which picks from what the sync recorded.
+//! What the lanes and duties touch at once is guarded where it lives, not
+//! by running them apart: a finding's status moves only by guarded
+//! transitions, a PR's `pr_state` columns have one writer per group, a
+//! clone changes only under its permit, and a tree a runner still uses is
+//! leased. The lanes meet through the database: a duty that made work
+//! wakes the job lane, which picks from what the duty recorded.
 
+use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::{Notify, watch};
+use tokio::task::JoinHandle;
 
 use crate::activity::AdminStatus;
 use crate::backend::Backend;
@@ -45,9 +55,21 @@ const USAGE_PROBE_TICK_S: u64 = 60;
 /// stopped. Bounded so a wedged client cannot keep the daemon alive past
 /// the unit's `TimeoutStopSec`, which would turn a graceful stop into a
 /// SIGKILL.
-const UI_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
-/// How often the admin lane runs a pass when nothing wakes it sooner.
-pub const ADMIN_INTERVAL: std::time::Duration = std::time::Duration::from_mins(5);
+const UI_DRAIN: Duration = Duration::from_secs(5);
+/// How often each admin duty runs when nothing wakes it sooner.
+pub const ADMIN_INTERVAL: Duration = Duration::from_mins(5);
+/// How long fetch-ahead leaves a clone alone after its last full fetch,
+/// whichever lane made it ([`crate::scheduler::fetch_ahead`]).
+pub const FETCH_AHEAD_MIN_AGE: Duration = Duration::from_mins(30);
+
+/// The admin lane's duties, each its own task ([`spawn_admin_lane`]).
+pub const ADMIN_DUTIES: [AdminTask; 5] = [
+    AdminTask::PrSync,
+    AdminTask::Reap,
+    AdminTask::FetchAhead,
+    AdminTask::DependencyScan,
+    AdminTask::Sweep,
+];
 
 /// Install a signal handler now; `None` (logged) if the OS refuses.
 fn install_signal(kind: SignalKind, name: &str) -> Option<Signal> {
@@ -70,9 +92,10 @@ async fn next_signal(sig: Option<Signal>) {
 /// previous layout's leftovers (`workspace::sweep`). Safe beside a running
 /// job: the sweep releases no tree a live job or a runner's lease keeps,
 /// and changes a clone only under its permit. Best effort, since a failed
-/// pass is retried on the next.
-async fn sweep_workspaces(store: &Store, work_root: &Path) {
-    let swept = store
+/// run is retried on the next.
+async fn sweep_workspaces(admin: &AdminAuthority, work_root: &Path) {
+    let swept = admin
+        .store()
         .lane(async |lane| crate::workspace::sweep(lane, work_root, crate::util::now_ms()).await)
         .await
         .map_err(anyhow::Error::from)
@@ -86,81 +109,64 @@ async fn sweep_workspaces(store: &Store, work_root: &Path) {
     }
 }
 
-/// What one [`admin_pass`] did.
-#[derive(Debug, Default)]
-pub struct AdminPass {
-    /// The PR sync's counts; `None` when another pass was syncing.
-    pub sync: Option<SyncResult>,
-    /// The fetch-ahead's counts; `None` when the pass stopped before it.
-    pub fetched: Option<FetchAhead>,
-    /// The dependency scans' counts; `None` when the pass stopped before
-    /// them.
-    pub dependencies: Option<DepScans>,
+/// What one run of an admin duty did ([`admin_duty`]).
+#[derive(Debug)]
+pub enum DutyRun {
+    /// The PR sync's counts; `None` when another sync pass was live.
+    Synced(Option<SyncResult>),
+    /// How many deleted repos' directories were removed.
+    Reaped(usize),
+    Fetched(FetchAhead),
+    Scanned(DepScans),
+    Swept,
 }
 
-impl AdminPass {
-    /// Whether this pass gave the job lane work it did not have: a PR's
-    /// end or flag ([`SyncResult::made_work`]), or a repo whose AI
-    /// dependency scan is now due.
+impl DutyRun {
+    /// Whether this run gave the job lane work it did not have: a PR's end
+    /// or flag ([`SyncResult::made_work`]), or a repo whose AI dependency
+    /// scan is now due.
     pub fn made_work(&self) -> bool {
-        self.sync.as_ref().is_some_and(SyncResult::made_work)
-            || self.dependencies.is_some_and(|d| d.fallbacks > 0)
+        match self {
+            Self::Synced(sync) => sync.as_ref().is_some_and(SyncResult::made_work),
+            Self::Scanned(scans) => scans.fallbacks > 0,
+            Self::Reaped(_) | Self::Fetched(_) | Self::Swept => false,
+        }
     }
 }
 
-/// One pass of the admin lane: sync every open PR, remove what deleted
-/// repos left, fetch every enabled clone ahead of its jobs, run the
-/// zero-token Renovate scan of every repo whose dependencies are due,
-/// sweep the workspaces. Each task shows on the status page while it
-/// runs (`status`). None of it creates a job; that takes the job lane's
+/// Run admin duty `task` once, shown on the status page while it runs
+/// (`status`). None of it creates a job; that takes the job lane's
 /// authority, which this does not have.
 ///
-/// Once `shutdown` is set the pass stops at the next step, and the sync at
-/// the next PR: the daemon waits for the pass, and a pass over many open
-/// PRs is many forge round trips.
-pub async fn admin_pass(
+/// Once `shutdown` is set, a sync stops at the next PR, and fetch-ahead
+/// and the dependency scans at the next repo: the daemon waits for every
+/// duty's run in progress, and a run over many PRs or repos is many
+/// round trips.
+pub async fn admin_duty(
     admin: &AdminAuthority,
     cfg: &Config,
     notes_lock: &tokio::sync::Mutex<()>,
     status: &AdminStatus,
+    task: AdminTask,
     shutdown: &watch::Receiver<bool>,
-) -> AdminPass {
-    let store = admin.store();
-    let stopping = || *shutdown.borrow();
-    let mut pass = AdminPass::default();
-    {
-        let _task = status.begin(AdminTask::PrSync);
-        pass.sync = sync_open_prs(admin, cfg, shutdown).await;
+) -> DutyRun {
+    let _shown = status.begin(task);
+    match task {
+        AdminTask::PrSync => DutyRun::Synced(sync_open_prs(admin, cfg, shutdown).await),
+        AdminTask::Reap => DutyRun::Reaped(
+            crate::server::reap_deleted_repos(admin, &cfg.work_root, notes_lock).await,
+        ),
+        AdminTask::FetchAhead => DutyRun::Fetched(
+            crate::scheduler::fetch_ahead(admin, FETCH_AHEAD_MIN_AGE, shutdown).await,
+        ),
+        AdminTask::DependencyScan => {
+            DutyRun::Scanned(crate::scheduler::dependency_scans(admin, cfg, shutdown).await)
+        }
+        AdminTask::Sweep => {
+            sweep_workspaces(admin, &cfg.work_root).await;
+            DutyRun::Swept
+        }
     }
-    if stopping() {
-        return pass;
-    }
-    {
-        let _task = status.begin(AdminTask::Reap);
-        crate::server::reap_deleted_repos(store, &cfg.work_root, notes_lock).await;
-    }
-    if stopping() {
-        return pass;
-    }
-    {
-        let _task = status.begin(AdminTask::FetchAhead);
-        pass.fetched = Some(crate::scheduler::fetch_ahead(store, shutdown).await);
-    }
-    if stopping() {
-        return pass;
-    }
-    {
-        let _task = status.begin(AdminTask::DependencyScan);
-        pass.dependencies = Some(crate::scheduler::dependency_scans(store, cfg, shutdown).await);
-    }
-    if stopping() {
-        return pass;
-    }
-    {
-        let _task = status.begin(AdminTask::Sweep);
-        sweep_workspaces(store, &cfg.work_root).await;
-    }
-    pass
 }
 
 /// [`crate::scheduler::sync_prs`], logged as a `prsync` event when it made
@@ -172,7 +178,7 @@ async fn sync_open_prs(
     shutdown: &watch::Receiver<bool>,
 ) -> Option<SyncResult> {
     let Some(sync_pass) = admin.begin_pr_sync() else {
-        // Only this lane syncs, one pass at a time; refused all the same
+        // Only this duty syncs, one run at a time; refused all the same
         // rather than read a PR twice at once.
         tracing::warn!("PR sync skipped: another sync pass is running");
         return None;
@@ -189,39 +195,116 @@ async fn sync_open_prs(
     Some(s)
 }
 
-/// What the admin lane shares with the rest of the daemon.
-struct AdminLane {
-    admin: AdminAuthority,
-    cfg: Config,
-    notes_lock: Arc<tokio::sync::Mutex<()>>,
-    status: AdminStatus,
-    /// Its own wake: a trigger.
-    wake: Arc<Notify>,
-    /// The job lane's: rung when a pass made work for it.
-    job_wake: Arc<Notify>,
+/// What the admin lane's duties share.
+pub struct AdminLane {
+    pub admin: AdminAuthority,
+    pub cfg: Config,
+    pub notes_lock: Arc<tokio::sync::Mutex<()>>,
+    pub status: AdminStatus,
+    /// The PR sync duty's wake (`SchedulerHandle::pr_sync_wake`): a
+    /// trigger.
+    pub pr_sync_wake: Arc<Notify>,
+    /// The job lane's wake: rung when a duty's run made work for it.
+    pub job_wake: Arc<Notify>,
 }
 
-/// Run admin passes every [`ADMIN_INTERVAL`], or sooner when woken, until
-/// shutdown. Pausing the scheduler does not stop them: a pause stops new
-/// jobs, which spend tokens, while this lane spends none, and a paused
-/// daemon still records merges, closes and review comments and sweeps
-/// finished trees. A pass stops early at shutdown ([`admin_pass`]).
-async fn run_admin_lane(lane: AdminLane, mut shutdown: watch::Receiver<bool>) {
+/// Start every admin duty ([`ADMIN_DUTIES`]) as its own task, each run
+/// every [`ADMIN_INTERVAL`] ([`supervise_duty`]); PR sync also whenever
+/// `pr_sync_wake` is notified. Pausing the scheduler does not stop them: a
+/// pause stops new jobs, which spend tokens, while these spend none, and a
+/// paused daemon still records merges, closes and review comments and
+/// sweeps finished trees. The tasks end at shutdown, once their run in
+/// progress has ([`admin_duty`]).
+pub fn spawn_admin_lane(lane: AdminLane, shutdown: &watch::Receiver<bool>) -> Vec<JoinHandle<()>> {
+    let lane = Arc::new(lane);
+    ADMIN_DUTIES
+        .into_iter()
+        .map(|task| {
+            let timer = DutyTimer {
+                interval: ADMIN_INTERVAL,
+                wake: (task == AdminTask::PrSync).then(|| Arc::clone(&lane.pr_sync_wake)),
+            };
+            let run = {
+                let (lane, shutdown) = (Arc::clone(&lane), shutdown.clone());
+                move || {
+                    let (lane, shutdown) = (Arc::clone(&lane), shutdown.clone());
+                    async move {
+                        admin_duty(
+                            &lane.admin,
+                            &lane.cfg,
+                            &lane.notes_lock,
+                            &lane.status,
+                            task,
+                            &shutdown,
+                        )
+                        .await
+                    }
+                }
+            };
+            tokio::spawn(supervise_duty(
+                lane.admin.store().clone(),
+                task,
+                timer,
+                Arc::clone(&lane.job_wake),
+                shutdown.clone(),
+                run,
+            ))
+        })
+        .collect()
+}
+
+/// When an admin duty runs: every `interval`, and at once when `wake` is
+/// notified.
+pub struct DutyTimer {
+    pub interval: Duration,
+    pub wake: Option<Arc<Notify>>,
+}
+
+/// Run admin duty `task` by `run` until shutdown: once now, then on every
+/// tick of `timer`, waking `job_wake` after a run that made work for the
+/// job lane.
+///
+/// Each run is a task of its own, so a run that panics ends that run
+/// only: it is logged as an `error` event, and the duty runs again at its
+/// next tick. Run inline, one panic would end the duty for good while the
+/// job lane went on, with nothing on the status page to say so -- no PR
+/// sync, no merge recorded, no tree swept until a restart.
+pub async fn supervise_duty<F, Fut>(
+    store: Store,
+    task: AdminTask,
+    timer: DutyTimer,
+    job_wake: Arc<Notify>,
+    mut shutdown: watch::Receiver<bool>,
+    run: F,
+) where
+    F: Fn() -> Fut,
+    Fut: Future<Output = DutyRun> + Send + 'static,
+{
     while !*shutdown.borrow() {
-        let pass = admin_pass(
-            &lane.admin,
-            &lane.cfg,
-            &lane.notes_lock,
-            &lane.status,
-            &shutdown,
-        )
-        .await;
-        if pass.made_work() {
-            lane.job_wake.notify_one();
+        match tokio::spawn(run()).await {
+            Ok(done) => {
+                if done.made_work() {
+                    job_wake.notify_one();
+                }
+            }
+            Err(e) => {
+                let message = format!(
+                    "admin duty {task:?} failed: {e}; it runs again in {}s",
+                    timer.interval.as_secs()
+                );
+                tracing::error!("{message}");
+                let _ = store.log_event("error", &message, None, None).await;
+            }
         }
+        let woken = async {
+            match &timer.wake {
+                Some(wake) => wake.notified().await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
-            () = tokio::time::sleep(ADMIN_INTERVAL) => {},
-            () = lane.wake.notified() => {},
+            () = tokio::time::sleep(timer.interval) => {},
+            () = woken => {},
             _ = shutdown.changed() => {},
         }
     }
@@ -400,12 +483,12 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     // that `repos/repo-<id>` is still on disk, so it may only be dropped
     // once those files are gone -- which is what this does.
     crate::server::migrate_repo_notes(&cfg.work_root);
-    let reaped = crate::server::reap_deleted_repos(&store, &cfg.work_root, &repo_notes).await;
+    let reaped = crate::server::reap_deleted_repos(&admin, &cfg.work_root, &repo_notes).await;
     if reaped > 0 {
         tracing::info!("reclaimed {reaped} repo director(ies) left by earlier deletions");
     }
     quiet_clones(&store, &cfg.work_root).await;
-    sweep_workspaces(&store, &cfg.work_root).await;
+    sweep_workspaces(&admin, &cfg.work_root).await;
     anyhow::ensure!(
         cfg.backend_type == "omp-scavenge",
         "unknown backend_type: {:?}",
@@ -514,18 +597,18 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         }
     });
 
-    // Admin lane: its own task, beside the job lane below.
-    let admin_handle = tokio::spawn(run_admin_lane(
+    // Admin lane: its duties, each its own task, beside the job lane below.
+    let admin_duties = spawn_admin_lane(
         AdminLane {
             admin,
             cfg: cfg.clone(),
             notes_lock: repo_notes.clone(),
             status: scheduler.admin.clone(),
-            wake: scheduler.admin_wake.clone(),
+            pr_sync_wake: scheduler.pr_sync_wake.clone(),
             job_wake: wake.clone(),
         },
-        shutdown_rx.clone(),
-    ));
+        &shutdown_rx,
+    );
 
     // Job lane
     let mut stop = false;
@@ -581,9 +664,12 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         stop = *shutdown_rx.borrow();
     }
 
-    // The admin lane saw the same latch; let its pass in progress finish.
-    if let Err(e) = admin_handle.await {
-        tracing::error!("admin lane: {e}");
+    // The admin duties saw the same latch; let their runs in progress
+    // finish.
+    for duty in admin_duties {
+        if let Err(e) = duty.await {
+            tracing::error!("admin duty: {e}");
+        }
     }
     signal_handle.abort();
     prober_handle.abort();

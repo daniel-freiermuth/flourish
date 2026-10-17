@@ -305,6 +305,26 @@ describe("isSummary repos entries", () => {
   });
 });
 
+// StatusPage renders `{#each admin_activity as aa (aa.task)}`.
+describe("isSummary admin_activity", () => {
+  const duty = (task: unknown) => ({ task, started_at: 1 });
+
+  it("accepts absent, empty, and one entry per duty", () => {
+    expect(isSummary({ ...summary, admin_activity: undefined })).toBe(true);
+    expect(isSummary({ ...summary, admin_activity: [] })).toBe(true);
+    expect(
+      isSummary({ ...summary, admin_activity: [duty("pr_sync"), duty("dependency_scan")] }),
+    ).toBe(true);
+  });
+
+  it("rejects entries the page cannot key by task", () => {
+    expect(isSummary({ ...summary, admin_activity: [duty("pr_sync"), duty("pr_sync")] })).toBe(false);
+    expect(isSummary({ ...summary, admin_activity: [{ started_at: 1 }] })).toBe(false);
+    expect(isSummary({ ...summary, admin_activity: [duty(1)] })).toBe(false);
+    expect(isSummary({ ...summary, admin_activity: "pr_sync" })).toBe(false);
+  });
+});
+
 // RepoWork renders `{#each holds as hold (hold.kind)}`, each hold's
 // `{#each hold.actions as action (action)}`, and
 // `{#each failing as f (f.kind)}`.
