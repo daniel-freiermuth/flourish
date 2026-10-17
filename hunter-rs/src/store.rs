@@ -35,7 +35,8 @@ use crate::domain::{
     RepoWorkKind, Severity,
 };
 use crate::recovery::{
-    DaemonLock, Owner, RecordedJob, Recovery, StrandedClaim, StrandedJob, Unreconciled,
+    DaemonLock, JobAuthority, Owner, RecordedJob, Recovered, Recovery, StrandedClaim, StrandedJob,
+    Unreconciled,
 };
 use crate::transition::{
     Moved, PrEnded, PrEnding, PrRef, Record, ReleaseVerdict, Sources, Transition, Unclaimed,
@@ -2810,7 +2811,8 @@ impl Store {
     /// Give up `finding_id`'s `kind` checkpoint at `job_id`, logging `msg`
     /// as a `resume` event in the same transaction. The job row is left as
     /// it ended. A pointer that has moved on since is left alone: `false`.
-    pub async fn drop_checkpoint(
+    /// The job lane's alone, through [`JobStore`].
+    async fn drop_checkpoint(
         &self,
         finding_id: i64,
         kind: FindingJobKind,
@@ -2881,8 +2883,9 @@ impl Store {
 
     /// Give up `repo_id`'s `kind` checkpoint at `job_id`, logging `msg` as a
     /// `resume` event in the same transaction, as [`Self::drop_checkpoint`]
-    /// does for a finding's work. The job row is left as it ended.
-    pub async fn drop_repo_checkpoint(
+    /// does for a finding's work. The job row is left as it ended. The job
+    /// lane's alone, through [`JobStore`].
+    async fn drop_repo_checkpoint(
         &self,
         repo_id: i64,
         kind: RepoJobKind,
@@ -4269,13 +4272,14 @@ impl Store {
         };
         let revived = open.status == FindingStatus::Superseded
             && open.verdict_reason.as_deref() == Some(DEP_UNPROPOSED_REASON);
+        let revive = Transition::Reproposed(ScanEdge(()));
         if revived
             && let Moved::Conflict { now } =
-                Self::apply_transition(&mut tx, finding_id, &Transition::Reproposed).await?
+                Self::apply_transition(&mut tx, finding_id, &revive).await?
         {
             return Err(StoreWriteError::Refused(format!(
                 "#{finding_id} moved from {} to {now:?} inside its refresh",
-                Transition::Reproposed.from()
+                revive.from()
             )));
         }
         let now = now_ms();
@@ -4338,7 +4342,10 @@ impl Store {
     /// Returns how many were retired. Each edge's status is read in this
     /// transaction, so a conflict is a store fault: refused, and nothing is
     /// retired.
-    pub async fn supersede_unproposed_dep_updates(
+    ///
+    /// Only the admin lane's Renovate scan decides what Renovate no longer
+    /// proposes, so only [`AdminStore`] exposes this.
+    async fn supersede_unproposed_dep_updates(
         &self,
         repo_id: i64,
         proposed: &[String],
@@ -4362,6 +4369,7 @@ impl Store {
         .await?;
         let retire = Transition::Unproposed {
             reason: DEP_UNPROPOSED_REASON,
+            scan: ScanEdge(()),
         };
         for &id in &unproposed {
             if let Moved::Conflict { now } = Self::apply_transition(&mut tx, id, &retire).await? {
@@ -4397,8 +4405,9 @@ impl Store {
     /// is held: handing it over would drop the work a paused fix has done for a
     /// fresh fix of the scan's finding (WORK-MODEL.md G2). `moves` is every
     /// move of every finding the scan produced. Returns how many were
-    /// handed over.
-    pub async fn hand_over_queued_dep_updates(
+    /// handed over. Only the admin lane's Renovate scan proposes moves, so
+    /// only [`AdminStore`] exposes this.
+    async fn hand_over_queued_dep_updates(
         &self,
         repo_id: i64,
         moves: &[ProposedMove],
@@ -4443,9 +4452,13 @@ impl Store {
             // would leave a queue place given up with nobody taking it:
             // the whole handover is refused, rolled back with `tx`.
             let reason = format!("replaced by #{} from the dependency scan", pair.to_id);
-            let gives = Transition::HandedOver { reason: &reason };
+            let gives = Transition::HandedOver {
+                reason: &reason,
+                scan: ScanEdge(()),
+            };
             let takes = Transition::TakesOver {
                 from_id: pair.from_id,
+                scan: ScanEdge(()),
             };
             for (id, edge) in [(pair.from_id, &gives), (pair.to_id, &takes)] {
                 if let Moved::Conflict { now } = Self::apply_transition(&mut tx, id, edge).await? {
@@ -4695,7 +4708,9 @@ impl Store {
     /// new attempt (a fetch, a PR view, a runner that would not start) did
     /// no work that could replace the paused one, so throwing it away would
     /// lose that work to what is most often a network that is not back yet.
-    pub async fn record_work_failure(
+    ///
+    /// The job lane's alone, through [`JobStore`].
+    async fn record_work_failure(
         &self,
         finding_id: i64,
         kind: FindingJobKind,
@@ -4827,8 +4842,8 @@ impl Store {
     /// Only while the finding is in that kind's tier (invariant 2): work
     /// that has left it is over, and `false` says nothing was held. `false`
     /// too when the work item is already held, which the partial unique
-    /// index enforces.
-    pub async fn hold_work(
+    /// index enforces. The job lane's alone, through [`JobStore`].
+    async fn hold_work(
         &self,
         finding_id: i64,
         kind: FindingJobKind,
@@ -5086,9 +5101,9 @@ impl Store {
 
     /// Record that Renovate had no answer for `repo_id` just now, so its
     /// AI `dep_update` scan is due on the job lane (migration 032). Only
-    /// through the admin lane's authority
-    /// ([`crate::recovery::AdminAuthority::request_dep_update_fallback`]).
-    pub(crate) async fn request_dep_update_fallback(&self, repo_id: i64) -> sqlx::Result<()> {
+    /// the admin lane's Renovate scan decides that, so only [`AdminStore`]
+    /// exposes this: the job lane cannot request its own AI scan.
+    async fn request_dep_update_fallback(&self, repo_id: i64) -> sqlx::Result<()> {
         let now = now_ms();
         sqlx::query!(
             "INSERT INTO dep_scan_fallbacks (repo_id, requested_at) VALUES (?1, ?2) \
@@ -5468,6 +5483,147 @@ impl Store {
         )
         .fetch_all(&self.pool)
         .await
+    }
+}
+
+/// What only the store's dependency-scan writes can make: the finding
+/// transitions that carry one ([`Transition::Unproposed`],
+/// [`Transition::HandedOver`], [`Transition::TakesOver`] and
+/// [`Transition::Reproposed`]) cannot be built anywhere else, so
+/// [`Store::transition`] cannot be handed one. The first three are made
+/// only through [`AdminStore`], Renovate's; the last by the guarded
+/// `dep_update` refresh both lanes' ingest runs.
+#[derive(Debug, Clone, Copy)]
+pub struct ScanEdge(());
+
+/// The store as the job lane writes it: everything a [`Store`] does,
+/// through `Deref`, and the writes only the job lane makes. Those end a
+/// chain's checkpoint and count or hold a finding's work, which only the
+/// lane's own selection and runners may decide.
+///
+/// Made only from the [`JobAuthority`] (by its
+/// [`CycleScope`](crate::recovery::CycleScope)), so an admin duty or a
+/// handler, holding a plain [`Store`], has none of these writes to call.
+pub struct JobStore(Store);
+
+impl JobStore {
+    pub(crate) fn of(_jobs: &JobAuthority, store: Store) -> Self {
+        Self(store)
+    }
+
+    /// Give up `finding_id`'s `kind` checkpoint at `job_id`, with its
+    /// `resume` event; `false` when the pointer has moved on since.
+    pub async fn drop_checkpoint(
+        &self,
+        finding_id: i64,
+        kind: FindingJobKind,
+        job_id: i64,
+        msg: &str,
+    ) -> sqlx::Result<bool> {
+        self.0.drop_checkpoint(finding_id, kind, job_id, msg).await
+    }
+
+    /// Give up `repo_id`'s `kind` checkpoint at `job_id`, as
+    /// [`Self::drop_checkpoint`] does for a finding's work.
+    pub async fn drop_repo_checkpoint(
+        &self,
+        repo_id: i64,
+        kind: RepoJobKind,
+        job_id: i64,
+        msg: &str,
+    ) -> sqlx::Result<bool> {
+        self.0
+            .drop_repo_checkpoint(repo_id, kind, job_id, msg)
+            .await
+    }
+
+    /// Count a failure of `finding_id`'s `kind` work under `key`: the
+    /// streak it makes, or `None` when the finding has left the kind's
+    /// tier and nothing was counted (WORK-MODEL.md §7).
+    pub async fn record_work_failure(
+        &self,
+        finding_id: i64,
+        kind: FindingJobKind,
+        key: &str,
+    ) -> sqlx::Result<Option<i64>> {
+        self.0.record_work_failure(finding_id, kind, key).await
+    }
+
+    /// Hold `finding_id`'s `kind` work for the operator (WORK-MODEL.md
+    /// §9); `false` when the finding has left the kind's tier or the work
+    /// is already held.
+    pub async fn hold_work(
+        &self,
+        finding_id: i64,
+        kind: FindingJobKind,
+        reason: HoldReason,
+        detail: &str,
+        job: Option<i64>,
+    ) -> sqlx::Result<bool> {
+        self.0
+            .hold_work(finding_id, kind, reason, detail, job)
+            .await
+    }
+}
+
+impl std::ops::Deref for JobStore {
+    type Target = Store;
+
+    fn deref(&self) -> &Store {
+        &self.0
+    }
+}
+
+/// The store as the admin lane writes it: everything a [`Store`] does,
+/// through `Deref`, and the writes only the admin lane's Renovate scan
+/// makes. Only that scan decides what Renovate proposes, retires or hands
+/// over, and when the job lane's AI scan is wanted instead.
+///
+/// Made only with the startup proof ([`Recovered`]), by
+/// [`Recovered::into_lanes`] for the [`AdminAuthority`], which only the
+/// admin lane holds.
+pub struct AdminStore(Store);
+
+impl AdminStore {
+    pub(crate) fn of(_recovered: &Recovered, store: Store) -> Self {
+        Self(store)
+    }
+
+    /// Retire the repo's `new` `dep_update` findings Renovate no longer
+    /// proposes; see the private `Store` method of the same name.
+    pub async fn supersede_unproposed_dep_updates(
+        &self,
+        repo_id: i64,
+        proposed: &[String],
+        unchecked: &[String],
+    ) -> Result<u64, StoreWriteError> {
+        self.0
+            .supersede_unproposed_dep_updates(repo_id, proposed, unchecked)
+            .await
+    }
+
+    /// Hand each queued `dep_update` in `moves` over to the scan's finding
+    /// for the same move; see the private `Store` method of the same name.
+    pub async fn hand_over_queued_dep_updates(
+        &self,
+        repo_id: i64,
+        moves: &[ProposedMove],
+    ) -> Result<u64, StoreWriteError> {
+        self.0.hand_over_queued_dep_updates(repo_id, moves).await
+    }
+
+    /// Ask for the job lane's AI dependency scan of `repo_id`: Renovate had
+    /// no answer (migration 032).
+    pub async fn request_dep_update_fallback(&self, repo_id: i64) -> sqlx::Result<()> {
+        self.0.request_dep_update_fallback(repo_id).await
+    }
+}
+
+impl std::ops::Deref for AdminStore {
+    type Target = Store;
+
+    fn deref(&self) -> &Store {
+        &self.0
     }
 }
 

@@ -250,7 +250,12 @@ async fn pick_next_empty_db_is_none() {
     let (_dir, path, pool) = fresh_db().await;
     let store = open_store(pool, &path).await;
     let cfg = test_config(3600.0);
-    assert!(pick_next(&store, &cfg, None).await.unwrap().is_none());
+    assert!(
+        pick_next(&support::scope(&store), &cfg, None)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -259,7 +264,12 @@ async fn pick_next_disabled_repo_never_selected() {
     seed_repo(&pool, 1, "alpha", 0, "/nonexistent/alpha").await;
     let store = open_store(pool, &path).await;
     let cfg = test_config(3600.0);
-    assert!(pick_next(&store, &cfg, None).await.unwrap().is_none());
+    assert!(
+        pick_next(&support::scope(&store), &cfg, None)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -270,7 +280,10 @@ async fn pick_next_queued_finding_beats_huntable_repo() {
     seed_finding(&pool, 5, 1, "queued", "queued bug").await;
     let store = open_store(pool, &path).await;
     let cfg = test_config(3600.0);
-    let c = pick_next(&store, &cfg, None).await.unwrap().unwrap();
+    let c = pick_next(&support::scope(&store), &cfg, None)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(c.job_kind(), FindingJobKind::Fix.into());
     assert_eq!(c.target_id(), 5);
     assert_eq!(c.repo_id(), 1);
@@ -300,7 +313,10 @@ async fn pick_next_skips_the_places_running_jobs_hold() {
     let store = open_store(pool, &path).await;
     let cfg = test_config(3600.0);
 
-    let c = pick_next(&store, &cfg, None).await.unwrap().unwrap();
+    let c = pick_next(&support::scope(&store), &cfg, None)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         (c.job_kind(), c.repo_id()),
         (RepoJobKind::Hunt.into(), 2),
@@ -332,7 +348,10 @@ async fn pick_next_attention_beats_queued_fix_and_orders_by_attention_since() {
     }
     let store = open_store(pool, &path).await;
     let cfg = test_config(3600.0);
-    let c = pick_next(&store, &cfg, None).await.unwrap().unwrap();
+    let c = pick_next(&support::scope(&store), &cfg, None)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(c.job_kind(), FindingJobKind::Engage.into());
     assert_eq!(c.target_id(), 7, "oldest-outstanding attention first");
     assert!(matches!(c, hunter::scheduler::Candidate::Finding { .. }));
@@ -360,7 +379,10 @@ async fn pick_next_budget_override_jumps_the_queue() {
         .unwrap();
     let store = open_store(pool, &path).await;
     let cfg = test_config(3600.0);
-    let c = pick_next(&store, &cfg, None).await.unwrap().unwrap();
+    let c = pick_next(&support::scope(&store), &cfg, None)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(c.job_kind(), FindingJobKind::Fix.into());
     assert_eq!(c.target_id(), 5);
     assert_eq!(
@@ -424,7 +446,10 @@ async fn rotation_pick(ran: Ran) -> Option<RepoJobKind> {
     let store = open_store(pool, &path).await;
     let mut cfg = test_config(3600.0);
     cfg.scan_interval_days = 2.0;
-    match pick_next(&store, &cfg, None).await.unwrap() {
+    match pick_next(&support::scope(&store), &cfg, None)
+        .await
+        .unwrap()
+    {
         None => None,
         Some(hunter::scheduler::Candidate::Repo { kind, .. }) => Some(kind),
         Some(other) => panic!("expected a rotation pick, got {other:?}"),
@@ -492,13 +517,16 @@ async fn a_forced_repo_is_picked_over_a_staler_one() {
     let store = open_store(pool, &path).await;
     let cfg = test_config(3600.0);
 
-    let unforced = pick_next(&store, &cfg, None).await.unwrap().unwrap();
+    let unforced = pick_next(&support::scope(&store), &cfg, None)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         unforced.repo_id(),
         1,
         "unforced, the stalest repo goes first"
     );
-    let forced = pick_next(&store, &cfg, Some("beta"))
+    let forced = pick_next(&support::scope(&store), &cfg, Some("beta"))
         .await
         .unwrap()
         .unwrap();
@@ -516,7 +544,10 @@ async fn pick_next_rechecking_beats_queued_fix_oldest_first() {
     seed_finding(&pool, 9, 1, "rechecking", "newer recheck").await;
     let store = open_store(pool, &path).await;
     let cfg = test_config(3600.0);
-    let c = pick_next(&store, &cfg, None).await.unwrap().unwrap();
+    let c = pick_next(&support::scope(&store), &cfg, None)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(c.job_kind(), FindingJobKind::Recheck.into());
     assert_eq!(c.target_id(), 6, "oldest recheck first");
     assert_eq!(c.budget_override(), None);
@@ -547,7 +578,10 @@ async fn pick_next_budget_override_keeps_its_tier_kind_and_order() {
         .unwrap();
     let store = open_store(pool, &path).await;
     let cfg = test_config(3600.0);
-    let c = pick_next(&store, &cfg, None).await.unwrap().unwrap();
+    let c = pick_next(&support::scope(&store), &cfg, None)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(c.job_kind(), FindingJobKind::Recheck.into());
     assert_eq!(c.target_id(), 6);
     assert_eq!(
@@ -574,7 +608,10 @@ async fn pick_next_no_finding_work_hunts_least_recently_hunted_enabled_repo() {
     }
     let store = open_store(pool, &path).await;
     let cfg = test_config(3600.0);
-    let c = pick_next(&store, &cfg, None).await.unwrap().unwrap();
+    let c = pick_next(&support::scope(&store), &cfg, None)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(c.job_kind(), RepoJobKind::Hunt.into());
     assert_eq!(c.repo_id(), 2);
     assert!(matches!(c, hunter::scheduler::Candidate::Repo { .. }));
@@ -592,7 +629,10 @@ async fn pick_next_never_hunted_repo_beats_hunted_one() {
         .unwrap();
     let store = open_store(pool, &path).await;
     let cfg = test_config(3600.0);
-    let c = pick_next(&store, &cfg, None).await.unwrap().unwrap();
+    let c = pick_next(&support::scope(&store), &cfg, None)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(c.job_kind(), RepoJobKind::Hunt.into());
     assert_eq!(c.repo_id(), 2);
 }
@@ -603,7 +643,9 @@ async fn pick_next_unknown_force_repo_is_an_error() {
     seed_repo(&pool, 1, "alpha", 1, "/nonexistent/alpha").await;
     let store = open_store(pool, &path).await;
     let cfg = test_config(3600.0);
-    let err = pick_next(&store, &cfg, Some("nosuch")).await.unwrap_err();
+    let err = pick_next(&support::scope(&store), &cfg, Some("nosuch"))
+        .await
+        .unwrap_err();
     assert_eq!(err.to_string(), r#"unknown repo "nosuch""#);
 }
 
@@ -737,7 +779,10 @@ async fn a_requested_full_rehunt_jumps_a_staler_repo() {
     let store = open_store(pool, &path).await;
     let cfg = test_config(3600.0);
 
-    let picked = pick_next(&store, &cfg, None).await.unwrap().unwrap();
+    let picked = pick_next(&support::scope(&store), &cfg, None)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(picked.repo_id(), 2);
     assert_eq!(picked.job_kind(), RepoJobKind::Hunt.into());
 }

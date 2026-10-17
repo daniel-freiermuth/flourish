@@ -186,7 +186,9 @@ fn suspended_at(tree: &std::path::Path) -> RunResult {
 async fn a_closed_unharvested_pr_is_picked_once() {
     let f = fixture("harvest-pick", FindingStatus::Closed).await;
 
-    let picked = pick_next(&f.store, &f.cfg, None).await.unwrap();
+    let picked = pick_next(&support::scope(&f.store), &f.cfg, None)
+        .await
+        .unwrap();
     match picked {
         Some(Candidate::Finding {
             kind: FindingJobKind::Harvest,
@@ -197,7 +199,9 @@ async fn a_closed_unharvested_pr_is_picked_once() {
     }
 
     f.store.mark_pr_harvested(f.fid, 2).await.unwrap();
-    let after = pick_next(&f.store, &f.cfg, None).await.unwrap();
+    let after = pick_next(&support::scope(&f.store), &f.cfg, None)
+        .await
+        .unwrap();
     assert!(
         !matches!(
             after,
@@ -553,7 +557,9 @@ async fn assert_held(f: &Fixture, last: ReleaseAction) {
         .expect("held at the limit");
     assert_eq!(hold.reason, hunter::domain::HoldReason::Stuck);
     assert_eq!(hold.actions().last(), Some(&last), "{hold:?}");
-    let picked = pick_next(&f.store, &f.cfg, None).await.unwrap();
+    let picked = pick_next(&support::scope(&f.store), &f.cfg, None)
+        .await
+        .unwrap();
     assert!(
         !matches!(
             picked,
@@ -709,7 +715,10 @@ fn suspending_with_follow_up() -> ScriptedBackend {
 
 /// Resume the suspended harvest `pick_next` offers with `worker`.
 async fn resume_harvest(f: &Fixture, worker: &ScriptedBackend) -> hunter::scheduler::CycleSummary {
-    let plan = match pick_next(&f.store, &f.cfg, None).await.unwrap() {
+    let plan = match pick_next(&support::scope(&f.store), &f.cfg, None)
+        .await
+        .unwrap()
+    {
         Some(Candidate::Resume { plan, .. }) => *plan,
         other => panic!("expected the suspended harvest to be resumed, got {other:?}"),
     };
@@ -1045,7 +1054,9 @@ async fn a_failing_pr_diff_counts_toward_the_streak() {
         assert!(err.to_string().contains("diff failed"), "{err}");
 
         let ps = f.store.get_pr_state(f.fid).await.unwrap().unwrap();
-        let picked = pick_next(&f.store, &f.cfg, None).await.unwrap();
+        let picked = pick_next(&support::scope(&f.store), &f.cfg, None)
+            .await
+            .unwrap();
         let still_pending = matches!(
             picked,
             Some(Candidate::Finding {
@@ -1100,7 +1111,9 @@ async fn a_failing_pr_view_counts_toward_the_streak() {
         assert!(err.to_string().contains("view failed"), "{err}");
 
         let ps = f.store.get_pr_state(f.fid).await.unwrap().unwrap();
-        let picked = pick_next(&f.store, &f.cfg, None).await.unwrap();
+        let picked = pick_next(&support::scope(&f.store), &f.cfg, None)
+            .await
+            .unwrap();
         let still_pending = matches!(
             picked,
             Some(Candidate::Finding {
@@ -1156,7 +1169,9 @@ async fn a_failing_fetch_counts_toward_the_streak() {
         assert!(err.to_string().contains("fetch failed"), "{err}");
 
         let ps = f.store.get_pr_state(f.fid).await.unwrap().unwrap();
-        let picked = pick_next(&f.store, &f.cfg, None).await.unwrap();
+        let picked = pick_next(&support::scope(&f.store), &f.cfg, None)
+            .await
+            .unwrap();
         let still_pending = matches!(
             picked,
             Some(Candidate::Finding {
@@ -1314,7 +1329,9 @@ async fn a_huge_diff_is_cut_with_a_marker() {
 async fn a_closed_pr_whose_finding_a_human_moved_on_is_not_picked() {
     for status in [FindingStatus::Wontfix, FindingStatus::Queued] {
         let f = fixture(&format!("harvest-moved-on-{status}"), status).await;
-        let picked = pick_next(&f.store, &f.cfg, None).await.unwrap();
+        let picked = pick_next(&support::scope(&f.store), &f.cfg, None)
+            .await
+            .unwrap();
         assert!(
             !matches!(
                 picked,
@@ -1341,7 +1358,9 @@ async fn a_finding_rejected_after_its_pr_closed_is_not_picked() {
         .await
         .unwrap();
 
-    let picked = pick_next(&f.store, &f.cfg, None).await.unwrap();
+    let picked = pick_next(&support::scope(&f.store), &f.cfg, None)
+        .await
+        .unwrap();
     assert!(
         !matches!(
             picked,
@@ -1451,7 +1470,10 @@ async fn a_resumed_closed_harvest_gets_neither_the_playbook_nor_the_diff_again()
     assert_eq!(cold.state, Some(JobState::Suspended), "{cold:?}");
     assert_eq!(diff_fetches(&bins), 1, "the cold review carries the diff");
 
-    let plan = match pick_next(&f.store, &f.cfg, None).await.unwrap() {
+    let plan = match pick_next(&support::scope(&f.store), &f.cfg, None)
+        .await
+        .unwrap()
+    {
         Some(Candidate::Resume { plan, .. }) => *plan,
         other => panic!("expected the suspended harvest to be resumed, got {other:?}"),
     };
@@ -1568,7 +1590,10 @@ async fn a_worker_that_never_reached_its_provider_keeps_the_checkpoint() {
     .unwrap();
     let provider = support::PROVIDER_HOST;
     served_at(&mut f, support::FORGE_HOST).await;
-    let plan = match pick_next(&f.store, &f.cfg, None).await.unwrap() {
+    let plan = match pick_next(&support::scope(&f.store), &f.cfg, None)
+        .await
+        .unwrap()
+    {
         Some(Candidate::Resume { plan, .. }) => *plan,
         other => panic!("the paused harvest resumes, got {other:?}"),
     };

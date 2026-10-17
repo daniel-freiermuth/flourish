@@ -63,6 +63,10 @@ pub struct SchedulerHandle {
     /// Interrupts the sleep of the admin lane's PR sync duty, so open PRs
     /// are read now. Held as a permit while a sync runs, like `wake`.
     pub pr_sync_wake: Arc<tokio::sync::Notify>,
+    /// Interrupts the sleep of the admin lane's reaper duty, so a repo
+    /// just deleted has its files removed now. Held as a permit, like
+    /// `wake`.
+    pub reap_wake: Arc<tokio::sync::Notify>,
     /// The admin lane's duties running now.
     pub admin: AdminStatus,
     /// The job lane's current phase outside its worker.
@@ -1668,7 +1672,10 @@ async fn add_repo(
 /// row accounts for and no pass will ever revisit. Leaving it flagged is
 /// always safe — the repo is already invisible, and the next pass tries
 /// again.
-pub async fn reap_repo(
+///
+/// Only [`reap_deleted_repos`], the admin lane's, removes a clone: a
+/// handler wakes that duty instead.
+async fn reap_repo(
     store: &Store,
     repos_dir: &Path,
     rid: i64,
@@ -1866,8 +1873,9 @@ pub fn migrate_repo_notes(work_root: &Path) -> usize {
     moved
 }
 
-/// Finish any deletion left flagged by a crash or a failed reclamation:
-/// the admin lane's reaper duty, and once at daemon startup.
+/// Remove the clone of every repo flagged deleted, then drop its row
+/// ([`reap_repo`]): the admin lane's reaper duty, woken by the delete
+/// handler (`SchedulerHandle::reap_wake`), and once at daemon startup.
 pub async fn reap_deleted_repos(
     admin: &crate::recovery::AdminAuthority,
     work_root: &Path,
@@ -1899,10 +1907,7 @@ async fn delete_repo(
     post_gate(&headers)?;
     let body = parse_object(&raw)?;
     let rid = require_int(&body, "id", "id must be an integer")?;
-    // Not `_guard`: this one is released explicitly below, before
-    // reclamation takes the same lock itself.
     let guard = state.repo_notes.lock().await;
-    let repos_dir = state.config.work_root.join("repos");
     let Some(repo) = state.store.get_repo_by_id(rid).await? else {
         // Deleting something already deleted is not an error. A client
         // that lost the first response and retried must not be told the
@@ -1914,7 +1919,7 @@ async fn delete_repo(
         // from one that was never used.
         if state.store.repo_is_deleted(rid).await? {
             drop(guard);
-            let _ = reap_repo(&state.store, &repos_dir, rid, &state.repo_notes).await;
+            state.scheduler.reap_wake.notify_one();
             return Ok(Json(json!({ "ok": true })).into_response());
         }
         return Err(ApiError::NotFound(format!("no repo {rid}")));
@@ -1933,24 +1938,15 @@ async fn delete_repo(
             None,
         )
         .await?;
-    // Phase two, attempted inline so the common case finishes before the
-    // response: reclaim the directory, then drop the row. The row is what
-    // records that `repos/repo-<id>` is still on disk, so it goes only once
-    // the files have -- the id itself is never reissued (`repos.id` is
-    // AUTOINCREMENT, migration 009). A failure here is not an error for the
-    // caller — the repo *is* deleted — it just leaves the files on disk
-    // until the reaper retries on the next cycle.
-    // The guard goes before reclamation, which now takes the lock
-    // itself: holding it here as well would deadlock, and the row is
-    // already flagged, so an append can no longer resolve this repo.
+    // Phase two is the admin lane's reaper, woken here: it removes the
+    // directory, then drops the row. The row is what records that
+    // `repos/repo-<id>` is still on disk, so it goes only once the files
+    // have -- the id itself is never reissued (`repos.id` is
+    // AUTOINCREMENT, migration 009). The caller is told the truth by the
+    // 200 all the same: the repo *is* deleted, and only its files wait for
+    // the reaper, which retries a removal that fails on every later run.
     drop(guard);
-    if let Err(e) = reap_repo(&state.store, &repos_dir, rid, &state.repo_notes).await {
-        tracing::warn!(
-            "repo {rid} deleted, but reclaiming {} failed ({e}); \
-             its files stay until the reaper retries",
-            Store::repo_dir(&repos_dir, rid).display()
-        );
-    }
+    state.scheduler.reap_wake.notify_one();
     Ok(Json(json!({ "ok": true })).into_response())
 }
 
