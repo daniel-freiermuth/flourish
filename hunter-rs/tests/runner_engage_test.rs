@@ -3489,6 +3489,64 @@ async fn an_engage_whose_pr_ended_after_the_pick_never_starts() {
     );
 }
 
+/// An engage picked from a `pr_open` row whose PR the forge already shows
+/// merged -- the PR sync, on its own timer, has not recorded it yet, as
+/// right after a restart -- runs no worker and writes no job. The PR's
+/// end is the sync's to record, so the finding is left as it is, the
+/// cycle asks the job lane to wait for a sync, and nothing counts against
+/// the finding. Run, the worker would spend a session on a merged PR.
+#[tokio::test]
+async fn an_engage_whose_pr_the_forge_shows_merged_never_starts() {
+    let f = fixture("engage-merged-on-forge").await;
+    f.store
+        .set_budget_override(f.fid, Some(BudgetOverride::Once))
+        .await
+        .unwrap();
+    let bins = FakeBins::acquire("engage-merged-on-forge");
+    // As `gh` answers: a PR's state only when the view asks for it.
+    bins.script(
+        "gh",
+        r#"case "$*" in
+  *"--json state"*|*",state"*) echo '{"state":"MERGED","title":"a fix","body":"because","comments":[],"reviews":[],"statusCheckRollup":[],"headRefName":"fix/some-bug","headRefOid":"deadbeef"}' ;;
+  *) echo '{"title":"a fix","body":"because","comments":[],"reviews":[],"statusCheckRollup":[],"headRefName":"fix/some-bug","headRefOid":"deadbeef"}' ;;
+esac"#,
+    );
+    push_to(&f, None).await;
+    let backend = ScriptedBackend::new(|_| panic!("no worker may run on a merged PR"));
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Cold(&finding),
+        &backend,
+    )
+    .await
+    .expect("a PR the forge has ended is a skip, not the cycle's error");
+
+    assert!(summary.awaits_pr_sync, "{summary:?}");
+    assert!(backend.runs().is_empty());
+    assert!(
+        f.store.jobs_by_finding(f.fid).await.unwrap().is_empty(),
+        "no job row"
+    );
+    assert_eq!(
+        f.store
+            .work_streak(f.fid, hunter::domain::FindingJobKind::Engage)
+            .await
+            .unwrap()
+            .streak,
+        0
+    );
+    let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(after.status, FindingStatus::PrOpen, "left for the sync");
+    assert_eq!(
+        after.budget_override, None,
+        "the one-shot override is spent"
+    );
+}
+
 /// A merge recorded while the engage's worker runs leaves its `BLOCKED.md`
 /// nothing to hold: the finding has left the engage tier. That is the
 /// attempt's outcome, logged, not the cycle's error, which would back

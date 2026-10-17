@@ -28,7 +28,10 @@
 //! transitions, a PR's `pr_state` columns have one writer per group, a
 //! clone changes only under its permit, and a tree a runner still uses is
 //! leased. The lanes meet through the database: a duty that made work
-//! wakes the job lane, which picks from what the duty recorded.
+//! wakes the job lane, which picks from what the duty recorded. Where the
+//! database may be behind the forge, the job lane waits for a PR sync
+//! pass ([`PrSyncPasses`]): before its first pick, and after a cycle that
+//! met a PR the forge has ended and the database has not.
 
 use std::future::Future;
 use std::path::Path;
@@ -195,6 +198,63 @@ async fn sync_open_prs(
     Some(s)
 }
 
+/// The PR sync passes the admin lane has begun and finished, so the job
+/// lane can wait until the forge's state of every open PR is recorded
+/// before it picks from it: once at startup, when the database may be
+/// hours behind the forge, and after a cycle that found a PR already
+/// ended there ([`CycleSummary::awaits_pr_sync`]). Picked from a
+/// `pr_open` row the sync has not yet caught up with, an engage would
+/// run a whole worker session on a merged PR.
+#[derive(Clone, Default)]
+pub struct PrSyncPasses(Arc<watch::Sender<SyncCount>>);
+
+#[derive(Clone, Copy, Default)]
+struct SyncCount {
+    begun: u64,
+    finished: u64,
+}
+
+/// A PR sync pass in progress: counted finished when dropped, so a pass
+/// that panics still releases a job lane waiting for it.
+struct SyncPassCount<'a>(&'a PrSyncPasses);
+
+impl Drop for SyncPassCount<'_> {
+    fn drop(&mut self) {
+        self.0.0.send_modify(|c| c.finished += 1);
+    }
+}
+
+impl PrSyncPasses {
+    fn begin(&self) -> SyncPassCount<'_> {
+        self.0.send_modify(|c| c.begun += 1);
+        SyncPassCount(self)
+    }
+
+    /// Wait until a first pass has finished, or for shutdown.
+    pub async fn first(&self, shutdown: &watch::Receiver<bool>) {
+        self.finished_after(0, shutdown).await;
+    }
+
+    /// Wake the PR sync (`wake`) and wait until a pass begun after this
+    /// call has finished, or for shutdown. A pass already running when
+    /// this is called may have read a PR before it ended, so it does not
+    /// count.
+    pub async fn next(&self, wake: &Notify, shutdown: &watch::Receiver<bool>) {
+        let begun = self.0.borrow().begun;
+        wake.notify_one();
+        self.finished_after(begun, shutdown).await;
+    }
+
+    async fn finished_after(&self, passes: u64, shutdown: &watch::Receiver<bool>) {
+        let mut counts = self.0.subscribe();
+        let mut shutdown = shutdown.clone();
+        tokio::select! {
+            _ = counts.wait_for(|c| c.finished > passes) => {},
+            _ = shutdown.wait_for(|stop| *stop) => {},
+        }
+    }
+}
+
 /// What the admin lane's duties share.
 pub struct AdminLane {
     pub admin: AdminAuthority,
@@ -204,6 +264,8 @@ pub struct AdminLane {
     /// The PR sync duty's wake (`SchedulerHandle::pr_sync_wake`): a
     /// trigger.
     pub pr_sync_wake: Arc<Notify>,
+    /// Counts the PR sync duty's passes, for the job lane to wait on.
+    pub pr_sync_passes: PrSyncPasses,
     /// The job lane's wake: rung when a duty's run made work for it.
     pub job_wake: Arc<Notify>,
 }
@@ -229,6 +291,8 @@ pub fn spawn_admin_lane(lane: AdminLane, shutdown: &watch::Receiver<bool>) -> Ve
                 move || {
                     let (lane, shutdown) = (Arc::clone(&lane), shutdown.clone());
                     async move {
+                        let _pass =
+                            (task == AdminTask::PrSync).then(|| lane.pr_sync_passes.begin());
                         admin_duty(
                             &lane.admin,
                             &lane.cfg,
@@ -598,6 +662,7 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     });
 
     // Admin lane: its duties, each its own task, beside the job lane below.
+    let pr_sync_passes = PrSyncPasses::default();
     let admin_duties = spawn_admin_lane(
         AdminLane {
             admin,
@@ -605,13 +670,17 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
             notes_lock: repo_notes.clone(),
             status: scheduler.admin.clone(),
             pr_sync_wake: scheduler.pr_sync_wake.clone(),
+            pr_sync_passes: pr_sync_passes.clone(),
             job_wake: wake.clone(),
         },
         &shutdown_rx,
     );
 
-    // Job lane
-    let mut stop = false;
+    // Job lane. Not before the first PR sync: what the forge did while
+    // the daemon was down -- a merge, a close -- is not in the database
+    // until that pass records it.
+    pr_sync_passes.first(&shutdown_rx).await;
+    let mut stop = *shutdown_rx.borrow();
     while !stop {
         // Not atomic with the `cycle_running.store(true)` below, on
         // purpose. A pause stored between the two (a window of a few
@@ -641,6 +710,14 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         let summary = crate::scheduler::run_cycle(&mut jobs, &cfg, &*backend, None).await;
         cycle_running.store(false, Ordering::SeqCst);
 
+        if summary.awaits_pr_sync {
+            // The cycle met a PR the forge has ended and the database has
+            // not: picking again before a sync records it would pick the
+            // same work.
+            pr_sync_passes
+                .next(&scheduler.pr_sync_wake, &shutdown_rx)
+                .await;
+        }
         let sleep_s = compute_sleep_s(&store, &summary).await;
         let (state_label, detail) = describe_cycle(&summary);
         let next_wake = next_wake_ms(crate::util::now_ms(), sleep_s);

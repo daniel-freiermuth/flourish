@@ -1335,6 +1335,13 @@ pub struct CycleSummary {
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idle: Option<String>,
+    /// The cycle found the forge ahead of the database -- a PR the
+    /// database still has open is merged or closed -- and recorded
+    /// nothing, since that is the PR sync's to record. The job lane waits
+    /// for a fresh sync pass before it picks again
+    /// ([`crate::daemon::PrSyncPasses::next`]).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub awaits_pr_sync: bool,
 }
 
 /// Maximum consecutive identical failures before giving up (`scheduler.MAX_CONSECUTIVE_SAME_FAILURE`).
@@ -5896,6 +5903,13 @@ struct EngageStart {
 /// is not back would count against it for nothing. A failed view is a
 /// failed engage ([`engage_prefetch_failed`]), or the network's, which
 /// ends the cycle denied (`Ok(Err(summary))`).
+///
+/// A PR the forge shows merged or closed ends the cycle too, before any
+/// job row: the engage was picked from a `pr_open` row the PR sync has not
+/// yet brought up to date, which the sync records, not the engage
+/// ([`CycleSummary::awaits_pr_sync`]). Nothing is counted against the
+/// finding; a one-shot override is spent, as [`engage_unpublished`]
+/// spends it.
 async fn engage_view(
     store: &Store,
     (cfg, backend): (&Config, &dyn Backend),
@@ -5908,7 +5922,32 @@ async fn engage_view(
     };
     let fg = forge::forge_for(repo.forge);
     match fg.view_pr_engage(&repo.url, pr_number, &cfg.review_bots) {
-        Ok(p) => Ok(Ok(Some(p))),
+        Ok(p) if p.state == forge::PrState::Open => Ok(Ok(Some(p))),
+        Ok(p) => {
+            let fid = finding.id;
+            let ended = p.state.as_str();
+            let _ = store
+                .log_event(
+                    "engage",
+                    &format!(
+                        "engage #{fid}: PR #{pr_number} is {ended} on the forge -- \
+                         not started; the PR sync records it"
+                    ),
+                    None,
+                    Some(fid),
+                )
+                .await;
+            spend_once_override(store, finding).await;
+            Ok(Err(CycleSummary {
+                kind: Some(FindingJobKind::Engage.into()),
+                repo: Some(repo.name.clone()),
+                finding_id: Some(fid),
+                pr_number: Some(pr_number),
+                skipped: Some(format!("PR #{pr_number} is {ended} on the forge")),
+                awaits_pr_sync: true,
+                ..Default::default()
+            }))
+        }
         Err(e) => {
             let fid = finding.id;
             let _ = store
