@@ -232,6 +232,7 @@ impl Recovered {
         (
             JobAuthority {
                 store: self.store.clone(),
+                status: crate::activity::JobStatus::default(),
             },
             AdminAuthority { store: self.store },
         )
@@ -244,11 +245,24 @@ impl Recovered {
 /// a time. Two cycles at once do not compile.
 pub struct JobAuthority {
     store: Store,
+    /// Where the lane's cycles report their phases
+    /// (`crate::activity::job_phase`); nowhere until [`Self::report_to`].
+    status: crate::activity::JobStatus,
 }
 
 impl JobAuthority {
     pub const fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// Report this lane's cycle phases to `status` (the status page's).
+    pub fn report_to(&mut self, status: crate::activity::JobStatus) {
+        self.status = status;
+    }
+
+    /// Where this lane's cycles report their phases.
+    pub fn status(&self) -> crate::activity::JobStatus {
+        self.status.clone()
     }
 
     /// Open the cycle's scope. It borrows this authority until it is

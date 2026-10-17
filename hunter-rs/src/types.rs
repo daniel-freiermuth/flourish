@@ -409,7 +409,7 @@ pub enum ActivityStatus {
         job: Box<Job>,
     },
     /// The job lane is inside a cycle with no `running` job: picking,
-    /// preparing a job (fetch, clone, a Renovate scan) or finishing one
+    /// preparing a job (fetch, clone, worktree) or finishing one
     /// (push, PR, ingest).
     Working,
     Error {
@@ -456,6 +456,10 @@ pub struct Summary {
     /// What the admin lane is doing right now, beside the job lane; `null`
     /// between its passes.
     pub admin_activity: Option<AdminActivity>,
+    /// The job lane's current phase outside its worker -- waiting for a
+    /// clone an admin duty holds, a fetch, the tree, a Renovate scan,
+    /// publishing, ingesting; `null` otherwise.
+    pub job_activity: Option<JobActivity>,
 }
 
 /// One task of the admin lane (`crate::daemon`), which runs beside the
@@ -476,6 +480,36 @@ pub enum AdminTask {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
 pub struct AdminActivity {
     pub task: AdminTask,
+    pub started_at: i64,
+}
+
+/// A phase of a job-lane cycle outside its worker, reported by the
+/// helpers that do it (`crate::activity::job_phase`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum JobPhase {
+    /// Waiting for a repo's clone that an admin duty holds (fetch-ahead,
+    /// a dependency scan, the sweep): reported only while the wait lasts.
+    WaitingForClone,
+    /// Cloning a repo for its first job.
+    Cloning,
+    /// `git fetch` into a repo's clone.
+    Fetching,
+    /// Adding the job's worktree.
+    PreparingTree,
+    /// The zero-token Renovate dependency scan.
+    ScanningDependencies,
+    /// Pushing and opening or answering a PR, or withdrawing one.
+    Publishing,
+    /// Filing a worker's findings.
+    Ingesting,
+}
+
+/// /`api/summary.job_activity`: the job lane's current phase, since when
+/// (epoch ms).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+pub struct JobActivity {
+    pub phase: JobPhase,
     pub started_at: i64,
 }
 

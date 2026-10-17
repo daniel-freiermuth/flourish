@@ -1,7 +1,7 @@
 <script lang="ts">
   import { store, post } from "../lib/api.svelte";
   import { ts, clock, countdown, dur, ktok } from "../lib/format";
-  import type { AdminTask, NextCandidate } from "../lib/types";
+  import type { AdminTask, JobPhase, NextCandidate } from "../lib/types";
 
   let btnText = $state("Run Cycle");
   let btnDisabled = $state(false);
@@ -98,6 +98,15 @@
     reap: "removing deleted repos' clones",
     sweep: "sweeping finished workspaces",
   };
+  const JOB_PHASE_LABEL: Record<JobPhase, string> = {
+    waiting_for_clone: "waiting for an admin duty to release the repo",
+    cloning: "cloning the repo",
+    fetching: "fetching the repo",
+    preparing_tree: "preparing the job's worktree",
+    scanning_dependencies: "scanning dependencies with Renovate",
+    publishing: "publishing to the PR",
+    ingesting: "filing findings",
+  };
 </script>
 
 <div class="page-enter">
@@ -164,11 +173,21 @@
           <b class="running">running</b>
           <span>{cj.kind}: {label}</span>
           <span class="dim">({dur(cj.started_at, cj.finished_at)}, {ktok(cj.tokens_new)} tok, job #{cj.id})</span>
+          {#if store.summary.job_activity}
+            {@const ja = store.summary.job_activity}
+            <span class="dim">&middot; {JOB_PHASE_LABEL[ja.phase]} ({dur(ja.started_at, null)})</span>
+          {/if}
         </div>
       {:else if store.summary.activity_status.kind === "working"}
         <div class="row">
           <span class="status-icon running">▶</span>
-          <b class="running">running</b> picking, preparing or finishing a job&hellip;
+          {#if store.summary.job_activity}
+            {@const ja = store.summary.job_activity}
+            <b class="running">running</b> {JOB_PHASE_LABEL[ja.phase]}&hellip;
+            <span class="dim">({dur(ja.started_at, null)})</span>
+          {:else}
+            <b class="running">running</b> picking, preparing or finishing a job&hellip;
+          {/if}
         </div>
       {:else if store.summary.activity_status.kind === "error"}
         <div class="row">

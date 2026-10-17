@@ -239,6 +239,12 @@ impl Lane {
 /// Wait for `clone`'s lock and make its permit. Private: the lifetime is
 /// whatever the caller says, so only [`Lane`]'s methods, which tie it to
 /// their `&mut self`, may call it.
+///
+/// A lock another lane holds is waited for as the job lane's
+/// [`JobPhase::WaitingForClone`](crate::types::JobPhase::WaitingForClone),
+/// so the status page names the wait instead of showing nothing while an
+/// admin duty finishes with the clone. Off the job lane nothing is
+/// reported; a free lock is taken before the status page could show it.
 async fn acquire<'l>(store: &Store, clone: CloneRef) -> ClonePermit<'l> {
     let clones = store.clones().clone();
     let slot = lock(&clones.0.locks)
@@ -247,6 +253,7 @@ async fn acquire<'l>(store: &Store, clone: CloneRef) -> ClonePermit<'l> {
         .clone();
     let guard = {
         let _waiting = Waiting::new(&slot.waiting);
+        let _phase = crate::activity::job_phase(crate::types::JobPhase::WaitingForClone);
         slot.mutex.clone().lock_owned().await
     };
     ClonePermit {
@@ -646,5 +653,70 @@ impl Drop for TreeLease {
                 leases.remove(&self.what);
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::activity::{JobStatus, reporting_job_phases};
+    use crate::types::JobPhase;
+
+    /// A store over a fresh copy of the schema-only `dev.db` with repo 1.
+    async fn store(name: &str) -> Store {
+        let dir = std::env::temp_dir().join(format!("clones-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("hunter.db");
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("dev.db"),
+            &db,
+        )
+        .unwrap();
+        let pool =
+            sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&db))
+                .await
+                .unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO repos (id, name, url, path, forge, default_branch, enabled, added_at) \
+             VALUES (1, 'alpha', 'https://example.com/alpha.git', '/tmp/alpha', 'github', \
+             'main', 1, 1000);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+        Store::connect(&db).await.unwrap()
+    }
+
+    /// While the job lane waits for a clone another lane holds, its status
+    /// says so, and only for as long as it waits: a job queued behind an
+    /// admin duty's fetch is visible as that, not as nothing.
+    #[tokio::test]
+    async fn the_job_lane_shows_its_wait_for_a_held_clone() {
+        let store = store("wait-shown").await;
+        let held = store.test_lane().lock_clone(1).await.unwrap();
+        let status = JobStatus::default();
+        let waiter = tokio::spawn(reporting_job_phases(status.clone(), {
+            let store = store.clone();
+            async move {
+                drop(store.test_lane().lock_clone(1).await.unwrap());
+            }
+        }));
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while store.clone_waiters(1) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let waiting = status.current().map(|a| a.phase);
+
+        drop(held);
+        waiter.await.unwrap();
+
+        assert_eq!(waiting, Some(JobPhase::WaitingForClone));
+        assert_eq!(status.current(), None);
     }
 }

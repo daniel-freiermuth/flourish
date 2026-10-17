@@ -1,3 +1,4 @@
+pub mod activity;
 pub mod attention;
 pub mod auth;
 pub mod backend;
