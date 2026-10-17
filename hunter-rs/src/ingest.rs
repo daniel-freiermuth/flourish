@@ -6,7 +6,7 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::domain::{BugClass, FindingType, Severity};
-use crate::store::{FindingInsert, Store};
+use crate::store::{FindingInsert, FindingInsertError, Store};
 
 /// Typed result from `ingest_findings`.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -21,6 +21,10 @@ pub struct IngestResult {
     /// (`suppression::reopen_if_changed`).
     pub reopened: i64,
     pub invalid: i64,
+    /// The repo was deleted while its work ran, so nothing more was filed
+    /// (`FindingInsertError::RepoDeleted`): the rest of the file is not
+    /// read. The work has nowhere to record an outcome either.
+    pub repo_deleted: bool,
 }
 
 /// Which finding types a worker's output may hold.
@@ -445,7 +449,23 @@ async fn ingest(
                     }
                 }
             }
-            Err(e) => {
+            Err(FindingInsertError::RepoDeleted { .. }) => {
+                let _ = store
+                    .log_event(
+                        "repo",
+                        &format!(
+                            "ingest: repo {repo_id} was deleted while its work ran; \
+                             {} entries not filed",
+                            arr.len() - i
+                        ),
+                        job,
+                        source_finding,
+                    )
+                    .await;
+                result.repo_deleted = true;
+                break;
+            }
+            Err(FindingInsertError::Db(e)) => {
                 let _ = store
                     .log_event(
                         "error",
