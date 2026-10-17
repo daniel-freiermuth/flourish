@@ -260,6 +260,13 @@ pub enum PrEnding<'a> {
     Closed { reason: &'a str },
 }
 
+/// The verdict reason the PR sync records for a PR it saw closed without
+/// merging: a closure nobody has classified yet. An engage that withdrew
+/// the same PR takes such a closure over ([`Store::adopt_closure`]).
+///
+/// [`Store::adopt_closure`]: crate::store::Store::adopt_closure
+pub const PR_CLOSED_AWAITING_HARVEST: &str = "PR closed without merge; awaiting harvest";
+
 impl<'a> PrEnding<'a> {
     /// The status an end applies from: only a `pr_open` finding has a PR
     /// to end.
