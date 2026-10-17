@@ -77,6 +77,7 @@ Handler: server.py:216-217 -> `_summary()` (server.py:256-333) -> `_validate_sum
 | `scheduler_state` | object or null | `store.get_scheduler_state()`: `SELECT * FROM scheduler_state WHERE id = 1` (store.py:1295-1301). Shape (types.py:109-114): `id:1, state:str ("idle"\|"denied"\|"error"; the Rust daemon also writes "offline"), detail:str, next_wake_at:int\|null (epoch ms), updated_at:int`. Null until the daemon loop has run once. |
 | `activity_status` | tagged union on `kind` | `_activity_status(...)` (server.py:1070-1138); see below. |
 | `admin_activity` | object or null | Rust only: the admin lane's current task, `{task: "pr_sync"\|"reap"\|"sweep", started_at: int}` (epoch ms), from `SchedulerHandle.admin` (`AdminStatus`, set only for the length of the task); null between its passes. It runs beside the job lane, so it can be non-null whatever `activity_status` says. |
+| `job_activity` | object or null | Rust only: the job lane's current phase outside its worker, `{phase: "cloning"\|"fetching"\|"preparing_tree"\|"scanning_dependencies"\|"publishing"\|"ingesting", started_at: int}` (epoch ms), from `SchedulerHandle.job` (`activity::JobStatus`, set by the helper doing the work for its length, `activity::job_phase`); null while the job lane picks, gates, runs a worker or sleeps. It says what a `working` status is doing, and what a `running` job does after its worker (tree, publish, ingest). |
 
 ### current_job (store.py:1243-1280)
 
@@ -103,7 +104,7 @@ Built from `scheduler.pick_next(store, cfg)` (exceptions swallowed -> null) and 
 
 Discriminated union on `kind`, priority order:
 1. `{"kind":"running","job":<JobDict>}` — when `current_job` non-null
-2. `{"kind":"working"}` — `cycle_running` true, no job row: the job lane is picking, or preparing a job (fetch, clone, a Renovate scan) or finishing one (push, PR, ingest). PR sync is not part of it in Rust (`admin_activity`).
+2. `{"kind":"working"}` — `cycle_running` true, no job row: the job lane is picking, or preparing a job (fetch, clone, a Renovate scan) or finishing one (push, PR, ingest); which of those, `job_activity` says. PR sync is not part of it in Rust (`admin_activity`).
 3. `{"kind":"error","detail":<scheduler_state.detail>}` — `scheduler_state.state == "error"`
 4. `{"kind":"offline","detail":<scheduler_state.detail>}` — `scheduler_state.state == "offline"`: the last cycle was denied by the network gate, and `detail` is `"<host> unreachable"` (Rust addition; no Python counterpart)
 5. `{"kind":"paused","candidate":<NextCandidateDict>}` — candidate present with `budget_state == "denied"`

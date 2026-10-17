@@ -10,6 +10,7 @@ export type { Event } from "./generated/Event";
 export type { FindingDetail } from "./generated/FindingDetail";
 export type { FindingOut } from "./generated/FindingOut";
 export type { JobListEntry } from "./generated/JobListEntry";
+export type { JobPhase } from "./generated/JobPhase";
 export type { NextCandidate } from "./generated/NextCandidate";
 export type { RepoBrief } from "./generated/RepoBrief";
 export type { RepoNotesResponse } from "./generated/RepoNotesResponse";

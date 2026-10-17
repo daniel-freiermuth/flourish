@@ -13,9 +13,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use hunter::activity::AdminStatus;
 use hunter::config::Config;
 use hunter::domain::{FindingStatus, JobState};
-use hunter::server::AdminStatus;
 use hunter::store::{FindingInsert, Store};
 use support::{FakeBins, GitRepo, ScriptedBackend, TempDir};
 

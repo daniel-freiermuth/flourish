@@ -3,6 +3,7 @@ import type { ActivityStatus } from "./ActivityStatus";
 import type { AdminActivity } from "./AdminActivity";
 import type { Event } from "./Event";
 import type { Job } from "./Job";
+import type { JobActivity } from "./JobActivity";
 import type { NextCandidate } from "./NextCandidate";
 import type { RepoBrief } from "./RepoBrief";
 import type { SchedulerState } from "./SchedulerState";
@@ -31,4 +32,9 @@ cycle_running: boolean, scheduler_paused: boolean, scheduler_overdrive: boolean,
  * What the admin lane is doing right now, beside the job lane; `null`
  * between its passes.
  */
-admin_activity: AdminActivity | null, };
+admin_activity: AdminActivity | null, 
+/**
+ * The job lane's current phase outside its worker -- a fetch, the
+ * tree, a Renovate scan, publishing, ingesting; `null` otherwise.
+ */
+job_activity: JobActivity | null, };

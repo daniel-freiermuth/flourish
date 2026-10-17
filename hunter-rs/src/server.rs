@@ -26,6 +26,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 use tower_http::set_header::SetResponseHeaderLayer;
 
+use crate::activity::{AdminStatus, JobStatus};
 use crate::auth::{self, CurrentUser};
 use crate::clones::{ClonePermit, Lane, Unheld};
 use crate::config::{Config, HostAllowList};
@@ -36,9 +37,8 @@ use crate::domain::{
 use crate::store::{FindingFilter, HoldRelease, RepoUpdate, Store, StoreWriteError};
 use crate::transition::{Moved, OperatorVerdict, Transition, VerdictRefused};
 use crate::types::{
-    ActivityStatus, AdminActivity, AdminTask, BudgetState, Event, Finding, FindingDetail,
-    FindingOut, HoldOut, JobListEntry, Repo, RepoBrief, RepoHoldOut, RepoOut, RepoStreakOut,
-    RepoWorkOut, Stats, Summary,
+    ActivityStatus, BudgetState, Event, Finding, FindingDetail, FindingOut, HoldOut, JobListEntry,
+    Repo, RepoBrief, RepoHoldOut, RepoOut, RepoStreakOut, RepoWorkOut, Stats, Summary,
 };
 
 /// Handle to this process's two scheduler lanes: the job lane, which runs
@@ -64,6 +64,8 @@ pub struct SchedulerHandle {
     pub admin_wake: Arc<tokio::sync::Notify>,
     /// The admin lane's current task.
     pub admin: AdminStatus,
+    /// The job lane's current phase outside its worker.
+    pub job: JobStatus,
 }
 
 impl SchedulerHandle {
@@ -71,46 +73,6 @@ impl SchedulerHandle {
     pub fn wake_both(&self) {
         self.admin_wake.notify_one();
         self.wake.notify_one();
-    }
-}
-
-/// What the admin lane is doing right now. Set only by
-/// [`AdminStatus::begin`], whose guard clears it when dropped, so it never
-/// names a task that has ended, however the task returned.
-#[derive(Clone, Default)]
-pub struct AdminStatus(Arc<std::sync::Mutex<Option<AdminActivity>>>);
-
-impl AdminStatus {
-    /// Record `task` as running from now until the guard is dropped.
-    pub fn begin(&self, task: AdminTask) -> AdminTaskGuard {
-        *self.cell() = Some(AdminActivity {
-            task,
-            started_at: crate::util::now_ms(),
-        });
-        AdminTaskGuard(self.clone())
-    }
-
-    /// The task running now, if any.
-    pub fn current(&self) -> Option<AdminActivity> {
-        *self.cell()
-    }
-
-    /// Never held across an await, so a poisoned lock only means a panic
-    /// between two plain assignments: the value is intact.
-    fn cell(&self) -> std::sync::MutexGuard<'_, Option<AdminActivity>> {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-}
-
-/// An admin task in progress ([`AdminStatus::begin`]); dropped, it ends.
-#[must_use = "the task shows as running only while its guard is held"]
-pub struct AdminTaskGuard(AdminStatus);
-
-impl Drop for AdminTaskGuard {
-    fn drop(&mut self) {
-        *self.0.cell() = None;
     }
 }
 
@@ -426,6 +388,7 @@ async fn summary(State(state): State<AppState>) -> Result<Json<Summary>, ApiErro
     let scheduler_paused = state.scheduler.paused.load(Ordering::SeqCst);
     let scheduler_overdrive = state.scheduler.overdrive.load(Ordering::SeqCst);
     let admin_activity = state.scheduler.admin.current();
+    let job_activity = state.scheduler.job.current();
 
     // "What's next" preview (`server.Handler._summary`): only when nothing is
     // running, from the SAME selection the scheduler itself makes, minus its
@@ -520,6 +483,7 @@ async fn summary(State(state): State<AppState>) -> Result<Json<Summary>, ApiErro
         scheduler_state,
         activity_status,
         admin_activity,
+        job_activity,
     }))
 }
 

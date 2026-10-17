@@ -137,6 +137,7 @@ async fn ingest(
     source_finding: Option<i64>,
     on_suppressed: OnSuppressed,
 ) -> IngestResult {
+    let _phase = crate::activity::job_phase(crate::types::JobPhase::Ingesting);
     let mut result = IngestResult::default();
     let text = match std::fs::read_to_string(findings_path) {
         Ok(t) => t,

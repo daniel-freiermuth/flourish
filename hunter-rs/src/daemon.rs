@@ -30,12 +30,13 @@ use std::sync::atomic::Ordering;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::{Notify, watch};
 
+use crate::activity::AdminStatus;
 use crate::backend::Backend;
 use crate::config::Config;
 use crate::domain::JobState;
 use crate::recovery::AdminAuthority;
 use crate::scheduler::{CycleSummary, SyncResult};
-use crate::server::{AdminStatus, AppState, router};
+use crate::server::{AppState, router};
 use crate::store::Store;
 use crate::types::AdminTask;
 
@@ -382,6 +383,7 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     // The overdrive flag is the handle's, shared with the backend wrapper
     // that reads it on every decision.
     let scheduler = crate::server::SchedulerHandle::default();
+    jobs.report_to(scheduler.job.clone());
     let provider_backend: Arc<dyn Backend> =
         Arc::new(crate::backends::omp_scavenge::OmpScavengeBackend {
             cfg: cfg.clone(),
