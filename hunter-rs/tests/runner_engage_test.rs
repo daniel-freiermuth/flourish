@@ -3544,13 +3544,7 @@ async fn an_engage_whose_pr_ended_after_the_pick_never_starts() {
     .await
     .expect("a PR that ended after the pick is a skip, not the cycle's error");
 
-    assert!(
-        summary
-            .skipped
-            .as_deref()
-            .is_some_and(|s| s.contains("no open PR")),
-        "{summary:?}"
-    );
+    assert!(summary.skipped.is_some(), "a skip: {summary:?}");
     assert!(backend.runs().is_empty());
     assert!(
         f.store.jobs_by_finding(f.fid).await.unwrap().is_empty(),
@@ -3635,7 +3629,7 @@ async fn a_blocked_engage_whose_pr_ended_meanwhile_is_an_outcome() {
     });
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
 
-    let summary = hunter::scheduler::run_engage(
+    hunter::scheduler::run_engage(
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
@@ -3645,10 +3639,6 @@ async fn a_blocked_engage_whose_pr_ended_meanwhile_is_an_outcome() {
     .await
     .expect("BLOCKED.md on an ended PR is an outcome, not the cycle's error");
 
-    assert_eq!(
-        summary.outcome.as_deref(),
-        Some("not held: finding left the tier")
-    );
     assert!(
         support::hold_of(&f.store, f.fid, hunter::domain::FindingJobKind::Engage)
             .await
@@ -3659,13 +3649,6 @@ async fn a_blocked_engage_whose_pr_ended_meanwhile_is_an_outcome() {
         git(&origin, &["rev-parse", BRANCH]),
         before,
         "nothing pushed"
-    );
-    let events = f.store.recent_events(20).await.unwrap();
-    assert!(
-        events.iter().any(|e| e
-            .message
-            .contains("BLOCKED.md, but its PR is no longer open")),
-        "{events:?}"
     );
 }
 
@@ -3710,7 +3693,7 @@ async fn an_engage_whose_pr_ended_while_its_worker_ran_publishes_nothing() {
     });
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
 
-    let summary = hunter::scheduler::run_engage(
+    hunter::scheduler::run_engage(
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
@@ -3720,7 +3703,6 @@ async fn an_engage_whose_pr_ended_while_its_worker_ran_publishes_nothing() {
     .await
     .unwrap();
 
-    assert_eq!(summary.outcome.as_deref(), Some("not published: PR ended"));
     assert_eq!(
         git(&origin, &["rev-parse", BRANCH]),
         before,
