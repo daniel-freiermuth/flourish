@@ -478,9 +478,10 @@ Parameters: `repo` (repository name), `type`, `class`, `severity`, `status`
 for multiple values; omit it for all, or use an empty value (`type=`) for
 none. Explicit choices remain selected even while their options are absent
 from the current data. Selecting the last currently offered option keeps a
-deep-linked list explicit; future options are not silently admitted. Use
-the All control to return to an unrestricted selection. Defaults are omitted
-when controls update the URL.
+deep-linked list explicit; future options are not silently admitted.
+Checking again every option you unchecked from All returns the dimension to
+all. Use the All control to return to an unrestricted selection. Defaults
+are omitted when controls update the URL.
 
 Card numbers (`F#123`) link to the finding on All Findings
 (`#findings:123`), carrying the current page's filters and sort, and can be
