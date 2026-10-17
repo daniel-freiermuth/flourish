@@ -1457,6 +1457,26 @@ impl Store {
     }
 
     /// UPDATE findings SET `budget_override` = NULL, `updated_at` = now
+    /// WHERE id = ? AND `budget_override` = 'once': an attempt spending the
+    /// one-shot override it ran under. Conditional on the override still
+    /// being `once`, so one the operator changed while the job ran (say to
+    /// `exempt`) is theirs and stays.
+    pub async fn spend_once_override(&self, finding_id: i64) -> sqlx::Result<()> {
+        let now = now_ms();
+        let once = BudgetOverride::Once;
+        sqlx::query!(
+            "UPDATE findings SET budget_override = NULL, updated_at = ?1 \
+             WHERE id = ?2 AND budget_override = ?3",
+            now,
+            finding_id,
+            once
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// UPDATE findings SET `budget_override` = NULL, `updated_at` = now
     /// WHERE `budget_override` IS NOT NULL; returns rows affected.
     pub async fn clear_all_overrides(&self) -> sqlx::Result<i64> {
         let now = now_ms();
