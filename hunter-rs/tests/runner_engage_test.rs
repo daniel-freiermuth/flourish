@@ -1851,29 +1851,30 @@ async fn an_unrecorded_closed_verdict_starts_no_harvest_and_waits_for_the_sync()
 }
 
 /// The finding left `pr_open` between the engage's read and its `closed`
-/// verdict: here the PR sync recorded the closure first. That decision
-/// owns the finding, so the engage neither overwrites its verdict nor
-/// starts the harvest it would hand to, and no second harvest of the one
-/// closure can start.
+/// verdict, closed by a decision other than the PR sync's record of this
+/// closure (here an operator's). That decision owns the finding, so the
+/// engage neither overwrites its verdict nor starts the harvest it would
+/// hand to.
 ///
 /// The race is staged with a trigger: the engage's UPDATE first moves the
-/// row the way the sync would and is then skipped, exactly as if the
-/// sync's write had landed in between.
+/// row the way that decision would and is then skipped, exactly as if its
+/// write had landed in between.
 #[tokio::test]
-async fn a_withdrawal_the_sync_recorded_first_keeps_the_syncs_verdict() {
-    let f = fixture("handoff-sync-first").await;
-    let bins = FakeBins::acquire("handoff-sync-first");
+async fn a_withdrawal_whose_finding_another_decision_closed_keeps_that_verdict() {
+    let f = fixture("handoff-other-first").await;
+    let bins = FakeBins::acquire("handoff-other-first");
     gh_for_handoff(&bins);
     let pool =
         sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
             .await
             .unwrap();
     sqlx::query(
-        "CREATE TRIGGER sync_first BEFORE UPDATE OF status ON findings \
-         WHEN NEW.status = 'closed' AND NEW.verdict_reason IS NOT 'sync: closed' \
+        "CREATE TRIGGER other_first BEFORE UPDATE OF status ON findings \
+         WHEN NEW.status = 'closed' AND NEW.verdict_reason IS NOT 'operator: closed' \
          BEGIN \
-           UPDATE findings SET status = 'closed', verdict_reason = 'sync: closed' \
+           UPDATE findings SET status = 'closed', verdict_reason = 'operator: closed' \
              WHERE id = OLD.id; \
+           UPDATE pr_state SET state = 'CLOSED' WHERE finding_id = OLD.id; \
            SELECT RAISE(IGNORE); \
          END",
     )
@@ -1893,7 +1894,6 @@ async fn a_withdrawal_the_sync_recorded_first_keeps_the_syncs_verdict() {
     .await
     .unwrap();
 
-    assert_eq!(summary.outcome.as_deref(), Some("withdrawn"));
     let engage_job = summary.job_id.unwrap();
     let runs = backend.runs();
     assert_eq!(runs.len(), 1, "only the engage may run: {runs:?}");
@@ -1904,7 +1904,76 @@ async fn a_withdrawal_the_sync_recorded_first_keeps_the_syncs_verdict() {
     );
     let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
     assert_eq!(after.status, FindingStatus::Closed);
-    assert_eq!(after.verdict_reason.as_deref(), Some("sync: closed"));
+    assert_eq!(after.verdict_reason.as_deref(), Some("operator: closed"));
+}
+
+/// The PR sync runs beside the engage, so it can see the PR the engage
+/// has just closed on the forge and record that closure before the
+/// engage's own write lands. It is the same closure: the engage takes it
+/// over and continues into its harvest in the same session, as if its
+/// write had landed. Left to the sync, the warm handoff would be lost and
+/// a cold harvest would review the closure from scratch.
+///
+/// Staged with a trigger that records the closure exactly as the sync
+/// does -- `closed` with the sync's reason, `pr_state` CLOSED -- in place
+/// of the engage's write.
+#[tokio::test]
+async fn a_withdrawal_the_sync_recorded_first_still_continues_into_its_harvest() {
+    let f = fixture("handoff-sync-first").await;
+    let bins = FakeBins::acquire("handoff-sync-first");
+    gh_for_handoff(&bins);
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    assert_eq!(
+        hunter::transition::PR_CLOSED_AWAITING_HARVEST,
+        "PR closed without merge; awaiting harvest",
+        "the trigger below writes the sync's reason"
+    );
+    sqlx::query(
+        "CREATE TRIGGER sync_first BEFORE UPDATE OF status ON findings \
+         WHEN NEW.status = 'closed' AND OLD.status = 'pr_open' \
+         BEGIN \
+           UPDATE findings SET status = 'closed', \
+             verdict_reason = 'PR closed without merge; awaiting harvest' \
+             WHERE id = OLD.id; \
+           UPDATE pr_state SET state = 'CLOSED' WHERE finding_id = OLD.id; \
+           SELECT RAISE(IGNORE); \
+         END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let backend = withdraw_then_classify(true);
+
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Cold(&finding),
+        &backend,
+    )
+    .await
+    .unwrap();
+
+    let engage_job = summary.job_id.unwrap();
+    let runs = backend.runs();
+    assert_eq!(runs.len(), 2, "the harvest continues the engage: {runs:?}");
+    assert_eq!(runs[1].tree, runs[0].tree);
+    let jobs = f.jobs().await;
+    let harvest = jobs
+        .iter()
+        .find(|j| j.1 == "harvest")
+        .expect("a harvest ran");
+    assert_eq!(harvest.3, Some(engage_job), "resumed from the engage job");
+    let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(
+        after.status,
+        FindingStatus::Superseded,
+        "the harvest's classification landed"
+    );
 }
 
 /// The same for the closed PR's view, which the harvest fetches before
