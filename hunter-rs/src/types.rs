@@ -471,6 +471,9 @@ pub enum AdminTask {
     PrSync,
     /// Removing the clones of deleted repos (`server::reap_deleted_repos`).
     Reap,
+    /// Fetching every enabled repo's clone ahead of its jobs
+    /// (`scheduler::fetch_ahead`).
+    FetchAhead,
     /// Releasing finished chains' trees (`workspace::sweep`).
     Sweep,
 }

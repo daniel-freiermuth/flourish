@@ -35,7 +35,7 @@ use crate::backend::Backend;
 use crate::config::Config;
 use crate::domain::JobState;
 use crate::recovery::AdminAuthority;
-use crate::scheduler::{CycleSummary, SyncResult};
+use crate::scheduler::{CycleSummary, FetchAhead, SyncResult};
 use crate::server::{AppState, router};
 use crate::store::Store;
 use crate::types::AdminTask;
@@ -91,12 +91,15 @@ async fn sweep_workspaces(store: &Store, work_root: &Path) {
 pub struct AdminPass {
     /// The PR sync's counts; `None` when another pass was syncing.
     pub sync: Option<SyncResult>,
+    /// The fetch-ahead's counts; `None` when the pass stopped before it.
+    pub fetched: Option<FetchAhead>,
 }
 
 /// One pass of the admin lane: sync every open PR, remove what deleted
-/// repos left, sweep the workspaces. Each task shows on the status page
-/// while it runs (`status`). None of it creates a job; that takes the job
-/// lane's authority, which this does not have.
+/// repos left, fetch every enabled clone ahead of its jobs, sweep the
+/// workspaces. Each task shows on the status page while it runs
+/// (`status`). None of it creates a job; that takes the job lane's
+/// authority, which this does not have.
 ///
 /// Once `shutdown` is set the pass stops at the next step, and the sync at
 /// the next PR: the daemon waits for the pass, and a pass over many open
@@ -121,6 +124,13 @@ pub async fn admin_pass(
     {
         let _task = status.begin(AdminTask::Reap);
         crate::server::reap_deleted_repos(store, &cfg.work_root, notes_lock).await;
+    }
+    if stopping() {
+        return pass;
+    }
+    {
+        let _task = status.begin(AdminTask::FetchAhead);
+        pass.fetched = Some(crate::scheduler::fetch_ahead(store, shutdown).await);
     }
     if stopping() {
         return pass;

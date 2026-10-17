@@ -273,3 +273,57 @@ fn an_admin_task_shows_only_while_its_guard_lives() {
     drop(guard);
     assert_eq!(reader.current(), None);
 }
+
+/// The admin lane fetches every enabled clone ahead of its jobs: a commit
+/// pushed to `alpha`'s origin is in its clone's `origin/main` after one
+/// pass, with no job involved. A repo with no clone is left to its first
+/// hunt, enabled or not: fetch-ahead never clones.
+#[tokio::test]
+async fn fetch_ahead_brings_every_enabled_clone_up_to_its_origin() {
+    let (dir, store, _cfg, _fid) = fixture("lanes-fetch-ahead").await;
+    store
+        .update_repo(
+            2,
+            &hunter::store::RepoUpdate {
+                enabled: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let alpha = store.get_repo_by_id(1).await.unwrap().unwrap();
+    let widget = store.get_repo_by_id(2).await.unwrap().unwrap();
+    let pusher = dir.path().join("pusher");
+    support::git(
+        dir.path(),
+        &["clone", "-q", &alpha.url, &pusher.to_string_lossy()],
+    );
+    support::git(
+        &pusher,
+        &["commit", "--allow-empty", "-qm", "upstream moved"],
+    );
+    support::git(&pusher, &["push", "-q", "origin", "HEAD:main"]);
+    let upstream = support::git(&pusher, &["rev-parse", "HEAD"]);
+    let clone = std::path::Path::new(&alpha.path);
+    assert_ne!(
+        support::git(clone, &["rev-parse", "origin/main"]),
+        upstream,
+        "fixture: the clone starts behind its origin"
+    );
+
+    let (_keep, running_on) = tokio::sync::watch::channel(false);
+    let done = hunter::scheduler::fetch_ahead(&store, &running_on).await;
+
+    assert_eq!(
+        done,
+        hunter::scheduler::FetchAhead {
+            fetched: 1,
+            failed: 0
+        }
+    );
+    assert_eq!(support::git(clone, &["rev-parse", "origin/main"]), upstream);
+    assert!(
+        !std::path::Path::new(&widget.path).exists(),
+        "fetch-ahead cloned a repo"
+    );
+}
