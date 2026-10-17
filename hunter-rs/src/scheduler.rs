@@ -1249,7 +1249,26 @@ impl SyncResult {
     pub const fn made_work(&self) -> bool {
         self.merged + self.closed + self.raised + self.requeued > 0
     }
+
+    /// Add one PR's counts to the pass's.
+    const fn add(mut self, other: &Self) -> Self {
+        self.synced += other.synced;
+        self.merged += other.merged;
+        self.closed += other.closed;
+        self.attention += other.attention;
+        self.raised += other.raised;
+        self.requeued += other.requeued;
+        self.errors += other.errors;
+        self
+    }
 }
+
+/// How many open PRs one sync pass reads from the forge at once. Each read
+/// is several `gh`/`glab` round trips, so a serial pass costs their sum,
+/// once per open PR. A small bound, because GitHub's secondary rate limit
+/// counts concurrent requests from one token, and the job lane's own
+/// forge calls share it.
+pub const PR_SYNC_CONCURRENCY: usize = 4;
 
 /// Cycle summary — typed replacement for raw JSON returned by all
 /// run_* functions. Fields are Option so each runner sets only what it needs.
@@ -5200,205 +5219,232 @@ fn civil_to_days(y: i64, m: u32, d: u32) -> i64 {
 /// Sync PRs for all `pr_open` findings (`scheduler.sync_prs`), as `pass`:
 /// no other sync of the store runs meanwhile, and each PR is read once
 /// ([`PrSyncPass`]).
-#[allow(
-    clippy::too_many_lines,
-    reason = "one pass per open PR with a flat decision table over PR \
-              state (merged, closed, review comments, checks); the arms \
-              read as a table only while they sit together"
-)]
+///
+/// Up to [`PR_SYNC_CONCURRENCY`] PRs are read at once ([`sync_one_pr`]).
+/// Each touches only its own finding's rows, every write is guarded where
+/// it lands, and a pass reads a PR once, so their order does not matter;
+/// only the order of their events does change. A pass asked to stop
+/// ([`PrSyncPass::until`]) starts no further read and lets those already
+/// out finish.
 pub async fn sync_prs(pass: &PrSyncPass, cfg: &Config) -> SyncResult {
-    let store = pass.store();
-    let mut summary = SyncResult::default();
-    let findings = store
+    use futures_util::StreamExt;
+    use futures_util::stream::FuturesUnordered;
+    let findings = pass
+        .store()
         .list_findings(&FindingFilter {
             status: Some(FindingStatus::PrOpen),
             ..FindingFilter::default()
         })
         .await
         .unwrap_or_default();
-
-    for f in &findings {
-        // A daemon shutting down finishes the PR it is on, not every one:
-        // each read is a forge round trip, and SIGTERM waits for the pass.
-        if pass.stopping() {
-            tracing::info!("PR sync stopped for shutdown");
-            break;
+    // A plain loop rather than `buffer_unordered`: closures over `pass`
+    // make the future fail the `Send` check the admin lane's spawn needs.
+    let mut todo = findings.iter();
+    let mut reading = FuturesUnordered::new();
+    let mut summary = SyncResult::default();
+    loop {
+        // Topped up as reads finish, so a shutdown starts no further one.
+        while reading.len() < PR_SYNC_CONCURRENCY && !pass.stopping() {
+            let Some(f) = todo.next() else { break };
+            reading.push(sync_one_pr(pass, cfg, f));
         }
-        let fid = f.id;
-        let url = match f.pr_url.as_deref() {
-            Some(u) if !u.is_empty() => u,
-            _ => {
-                // pr_open with no PR URL = a fix attempt failed before creating
-                // the PR. Requeue so it gets retried instead of sitting stuck.
-                tracing::warn!(
-                    finding_id = fid,
-                    "pr_open finding has no pr_url — requeueing"
-                );
-                if make_transition(store, fid, None, "fix", &Transition::PrMissing).await {
-                    summary.requeued += 1;
-                    let _ = store.log_event(
+        let Some(one) = reading.next().await else {
+            break;
+        };
+        summary = summary.add(&one);
+    }
+    if pass.stopping() {
+        tracing::info!("PR sync stopped for shutdown");
+    }
+    summary
+}
+
+/// One `pr_open` finding's part of [`sync_prs`]: read its PR and record
+/// what the forge shows, as counts for the pass to add up.
+#[allow(
+    clippy::too_many_lines,
+    reason = "a flat decision table over PR state (merged, closed, review \
+              comments, checks); the arms read as a table only while they \
+              sit together"
+)]
+async fn sync_one_pr(pass: &PrSyncPass, cfg: &Config, f: &Finding) -> SyncResult {
+    let store = pass.store();
+    let mut summary = SyncResult::default();
+    // Every early exit below returns the counts so far.
+    let fid = f.id;
+    let url = match f.pr_url.as_deref() {
+        Some(u) if !u.is_empty() => u,
+        _ => {
+            // pr_open with no PR URL = a fix attempt failed before creating
+            // the PR. Requeue so it gets retried instead of sitting stuck.
+            tracing::warn!(
+                finding_id = fid,
+                "pr_open finding has no pr_url — requeueing"
+            );
+            if make_transition(store, fid, None, "fix", &Transition::PrMissing).await {
+                summary.requeued += 1;
+                let _ = store.log_event(
                         "fix", &format!("#{fid} requeued: pr_open with no pr_url (prior fix failed before PR creation)"),
                         None, Some(fid),
                     ).await;
-                }
-                continue;
             }
-        };
-        let Ok(Some(repo)) = store.get_repo_by_id(f.repo_id).await else {
-            let _ = store
-                .log_event(
-                    "error",
-                    &format!("sync #{fid}: repo {} missing", f.repo_id),
-                    None,
-                    Some(fid),
-                )
-                .await;
-            summary.errors += 1;
-            continue;
-        };
-        let fg = forge::forge_for(repo.forge);
-        let Some(read_pr) = PrRef::parse(&*fg, url) else {
-            let _ = store
-                .log_event(
-                    "error",
-                    &format!("sync #{fid}: unparseable pr_url {url:?}"),
-                    None,
-                    Some(fid),
-                )
-                .await;
-            summary.errors += 1;
-            continue;
-        };
-        let pr_number = read_pr.number();
-        // Begun before the read, not after: the observation's `synced_at`
-        // is when the forge was asked, and the push count it carries is the
-        // one before the forge answered, so a push landing while the read
-        // is out leaves this observation counted as older than that push.
-        let begun = log_write_failure(
-            pass.begin_read(fid, &read_pr).await,
-            format_args!("#{fid}: beginning a PR read"),
-        );
-        let read = match begun {
-            Some(Some(read)) => read,
-            Some(None) => {
-                // `list_findings` lists each finding once, so this pass
-                // cannot reach a finding twice; refused if it ever does.
-                let _ = store
-                    .log_event(
-                        "error",
-                        &format!("sync #{fid}: PR already read in this pass"),
-                        None,
-                        Some(fid),
-                    )
-                    .await;
-                summary.errors += 1;
-                continue;
-            }
-            None => {
-                summary.errors += 1;
-                continue;
-            }
-        };
-        // On a blocking thread: the view is several `gh`/`glab` round
-        // trips, and the job lane and the UI share this runtime.
-        let (forge_name, repo_url, bots) = (repo.forge, repo.url.clone(), cfg.review_bots.clone());
-        let viewed = tokio::task::spawn_blocking(move || {
-            forge::forge_for(forge_name).view_pr_sync(&repo_url, pr_number, &bots)
-        })
-        .await
-        .unwrap_or_else(|e| Err(anyhow::anyhow!("PR view task: {e}")));
-        let pr = match viewed {
-            Ok(pr) => pr,
-            Err(e) => {
-                let _ = store
-                    .log_event(
-                        "error",
-                        &format!("sync #{fid}: PR view failed: {e}"),
-                        None,
-                        Some(fid),
-                    )
-                    .await;
-                summary.errors += 1;
-                continue;
-            }
-        };
-
-        match pr.state {
-            forge::PrState::Merged => {
-                // The finding's move and the PR's record are one write: a
-                // failed write leaves both for the next sync, and a
-                // conflict leaves the finding to what moved it.
-                if !sync_pr_end(store, fid, "ship", &read_pr, PrEnding::Merged, &mut summary).await
-                {
-                    continue;
-                }
-                let _ = store
-                    .log_event("ship", &format!("#{fid} PR merged: {url}"), None, Some(fid))
-                    .await;
-                summary.merged += 1;
-                continue;
-            }
-            forge::PrState::Closed => {
-                // Not a rejection: a closure alone does not say whether the
-                // finding was wrong, and suppression is permanent and silent.
-                // Of the first 16 closed PRs only one was closed by a human.
-                // The finding waits here until its harvest classifies why.
-                // `closed` and `pr_state` CLOSED land together: sync_prs only
-                // revisits pr_open findings, so a finding set closed while
-                // pr_state still read OPEN would never be looked at again.
-                let closed = PrEnding::Closed {
-                    reason: "PR closed without merge; awaiting harvest",
-                };
-                if !sync_pr_end(store, fid, "verdict", &read_pr, closed, &mut summary).await {
-                    continue;
-                }
-                let _ = store
-                    .log_event(
-                        "verdict",
-                        &format!("#{fid} PR closed without merge: {url}"),
-                        None,
-                        Some(fid),
-                    )
-                    .await;
-                summary.closed += 1;
-                continue;
-            }
-            forge::PrState::Open => { /* fall through to attention logic below */ }
+            return summary;
         }
+    };
+    let Ok(Some(repo)) = store.get_repo_by_id(f.repo_id).await else {
+        let _ = store
+            .log_event(
+                "error",
+                &format!("sync #{fid}: repo {} missing", f.repo_id),
+                None,
+                Some(fid),
+            )
+            .await;
+        summary.errors += 1;
+        return summary;
+    };
+    let fg = forge::forge_for(repo.forge);
+    let Some(read_pr) = PrRef::parse(&*fg, url) else {
+        let _ = store
+            .log_event(
+                "error",
+                &format!("sync #{fid}: unparseable pr_url {url:?}"),
+                None,
+                Some(fid),
+            )
+            .await;
+        summary.errors += 1;
+        return summary;
+    };
+    let pr_number = read_pr.number();
+    // Begun before the read, not after: the observation's `synced_at`
+    // is when the forge was asked, and the push count it carries is the
+    // one before the forge answered, so a push landing while the read
+    // is out leaves this observation counted as older than that push.
+    let begun = log_write_failure(
+        pass.begin_read(fid, &read_pr).await,
+        format_args!("#{fid}: beginning a PR read"),
+    );
+    let read = match begun {
+        Some(Some(read)) => read,
+        Some(None) => {
+            // `list_findings` lists each finding once, so this pass
+            // cannot reach a finding twice; refused if it ever does.
+            let _ = store
+                .log_event(
+                    "error",
+                    &format!("sync #{fid}: PR already read in this pass"),
+                    None,
+                    Some(fid),
+                )
+                .await;
+            summary.errors += 1;
+            return summary;
+        }
+        None => {
+            summary.errors += 1;
+            return summary;
+        }
+    };
+    // On a blocking thread: the view is several `gh`/`glab` round
+    // trips, and the job lane and the UI share this runtime.
+    let (forge_name, repo_url, bots) = (repo.forge, repo.url.clone(), cfg.review_bots.clone());
+    let viewed = tokio::task::spawn_blocking(move || {
+        forge::forge_for(forge_name).view_pr_sync(&repo_url, pr_number, &bots)
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("PR view task: {e}")));
+    let pr = match viewed {
+        Ok(pr) => pr,
+        Err(e) => {
+            let _ = store
+                .log_event(
+                    "error",
+                    &format!("sync #{fid}: PR view failed: {e}"),
+                    None,
+                    Some(fid),
+                )
+                .await;
+            summary.errors += 1;
+            return summary;
+        }
+    };
 
-        // -- Open PR: record what the forge shows; the attention it calls
-        // for is settled from that and engage's last answer, in the same
-        // write (`crate::attention`). Nothing here reads the row first, so
-        // an engage answering meanwhile cannot be written over, and the
-        // write lands only while the finding is still `pr_open`, so an
-        // engage that withdrew the PR meanwhile is not undone either.
-        let observed = ObservedOpenPr::from_view(read, &pr);
-        // Bound first: the `format_args!` temporary is not `Send`, and the
-        // arms below await.
-        let recorded = log_write_failure(
-            store.record_open_pr(fid, &observed).await,
-            format_args!("#{fid}: recording synced PR state"),
-        );
-        let change = match recorded {
-            Some(OpenPrRecorded::Recorded(change)) => change,
-            Some(OpenPrRecorded::NotPrOpen { now }) => {
-                // Something else decided the finding since it was listed,
-                // and recorded the PR's end if it had one; that stands.
-                let now = now.map_or_else(|| "gone".to_owned(), |s| format!("'{s}'"));
-                let _ = store
-                    .log_event(
-                        "engage",
-                        &format!("#{fid} PR #{pr_number} seen open, not recorded: it is {now} now"),
-                        None,
-                        Some(fid),
-                    )
-                    .await;
-                continue;
+    match pr.state {
+        forge::PrState::Merged => {
+            // The finding's move and the PR's record are one write: a
+            // failed write leaves both for the next sync, and a
+            // conflict leaves the finding to what moved it.
+            if !sync_pr_end(store, fid, "ship", &read_pr, PrEnding::Merged, &mut summary).await {
+                return summary;
             }
-            Some(OpenPrRecorded::OtherPr) => {
-                // The PR read ended and the finding shipped a new one while
-                // the read was out; the new PR's next sync records that one.
-                let _ = store
+            let _ = store
+                .log_event("ship", &format!("#{fid} PR merged: {url}"), None, Some(fid))
+                .await;
+            summary.merged += 1;
+            return summary;
+        }
+        forge::PrState::Closed => {
+            // Not a rejection: a closure alone does not say whether the
+            // finding was wrong, and suppression is permanent and silent.
+            // Of the first 16 closed PRs only one was closed by a human.
+            // The finding waits here until its harvest classifies why.
+            // `closed` and `pr_state` CLOSED land together: sync_prs only
+            // revisits pr_open findings, so a finding set closed while
+            // pr_state still read OPEN would never be looked at again.
+            let closed = PrEnding::Closed {
+                reason: "PR closed without merge; awaiting harvest",
+            };
+            if !sync_pr_end(store, fid, "verdict", &read_pr, closed, &mut summary).await {
+                return summary;
+            }
+            let _ = store
+                .log_event(
+                    "verdict",
+                    &format!("#{fid} PR closed without merge: {url}"),
+                    None,
+                    Some(fid),
+                )
+                .await;
+            summary.closed += 1;
+            return summary;
+        }
+        forge::PrState::Open => { /* fall through to attention logic below */ }
+    }
+
+    // -- Open PR: record what the forge shows; the attention it calls
+    // for is settled from that and engage's last answer, in the same
+    // write (`crate::attention`). Nothing here reads the row first, so
+    // an engage answering meanwhile cannot be written over, and the
+    // write lands only while the finding is still `pr_open`, so an
+    // engage that withdrew the PR meanwhile is not undone either.
+    let observed = ObservedOpenPr::from_view(read, &pr);
+    // Bound first: the `format_args!` temporary is not `Send`, and the
+    // arms below await.
+    let recorded = log_write_failure(
+        store.record_open_pr(fid, &observed).await,
+        format_args!("#{fid}: recording synced PR state"),
+    );
+    let change = match recorded {
+        Some(OpenPrRecorded::Recorded(change)) => change,
+        Some(OpenPrRecorded::NotPrOpen { now }) => {
+            // Something else decided the finding since it was listed,
+            // and recorded the PR's end if it had one; that stands.
+            let now = now.map_or_else(|| "gone".to_owned(), |s| format!("'{s}'"));
+            let _ = store
+                .log_event(
+                    "engage",
+                    &format!("#{fid} PR #{pr_number} seen open, not recorded: it is {now} now"),
+                    None,
+                    Some(fid),
+                )
+                .await;
+            return summary;
+        }
+        Some(OpenPrRecorded::OtherPr) => {
+            // The PR read ended and the finding shipped a new one while
+            // the read was out; the new PR's next sync records that one.
+            let _ = store
                     .log_event(
                         "engage",
                         &format!("#{fid} PR #{pr_number} seen open, not recorded: the finding has another PR now"),
@@ -5406,29 +5452,28 @@ pub async fn sync_prs(pass: &PrSyncPass, cfg: &Config) -> SyncResult {
                         Some(fid),
                     )
                     .await;
-                continue;
-            }
-            None => {
-                summary.errors += 1;
-                continue;
-            }
-        };
+            return summary;
+        }
+        None => {
+            summary.errors += 1;
+            return summary;
+        }
+    };
 
-        if let Some(reasons) = change.raised() {
-            summary.raised += 1;
-            let _ = store
-                .log_event(
-                    "engage",
-                    &format!("#{fid} PR #{pr_number} needs attention: {reasons}"),
-                    None,
-                    Some(fid),
-                )
-                .await;
-        }
-        summary.synced += 1;
-        if change.now.is_some() {
-            summary.attention += 1;
-        }
+    if let Some(reasons) = change.raised() {
+        summary.raised += 1;
+        let _ = store
+            .log_event(
+                "engage",
+                &format!("#{fid} PR #{pr_number} needs attention: {reasons}"),
+                None,
+                Some(fid),
+            )
+            .await;
+    }
+    summary.synced += 1;
+    if change.now.is_some() {
+        summary.attention += 1;
     }
     summary
 }

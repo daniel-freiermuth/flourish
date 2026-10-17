@@ -237,6 +237,84 @@ fn now_ms() -> i64 {
     .unwrap()
 }
 
+/// A pass reads its open PRs side by side, but never more than
+/// `PR_SYNC_CONCURRENCY` at once: each `gh pr view` is a forge round trip,
+/// and a serial pass cost their sum. Every PR is still synced once.
+///
+/// The fake `gh` marks itself live in `live/` for half a second and
+/// records how many reads were live when it started. Serial reads would
+/// each see only themselves.
+#[tokio::test]
+async fn a_pass_reads_its_open_prs_side_by_side_within_the_bound() {
+    const PRS: i64 = 7;
+    let f = fixture("sync-parallel").await;
+    let bins = FakeBins::acquire("sync-parallel");
+    let rid = f.store.get_finding(f.fid).await.unwrap().unwrap().repo_id;
+    for n in 2..=PRS {
+        let (fid, _) = f
+            .store
+            .upsert_finding(
+                rid,
+                &FindingInsert {
+                    fingerprint: format!("fp-sync-{n}"),
+                    file: "src/lib.rs".to_owned(),
+                    summary: "a fix".to_owned(),
+                    ..Default::default()
+                },
+                "bug",
+                None,
+            )
+            .await
+            .unwrap();
+        f.store
+            .set_finding_pr_open(fid, &format!("{REPO_URL}/pull/{}", 100 + n))
+            .await
+            .unwrap();
+    }
+    let live = f.cfg.work_root.join("live");
+    let seen = f.cfg.work_root.join("seen");
+    std::fs::create_dir_all(&live).unwrap();
+    std::fs::create_dir_all(&seen).unwrap();
+    bins.script(
+        "gh",
+        &format!(
+            "touch '{live}/'$$\n\
+             ls '{live}' | wc -l > '{seen}/'$$\n\
+             sleep 0.5\n\
+             rm -f '{live}/'$$\n\
+             cat <<'__PR_EOF__'\n{view}\n__PR_EOF__\nexit 0",
+            live = live.display(),
+            seen = seen.display(),
+            view = pr(&json!({})),
+        ),
+    );
+
+    let result = f.sync().await;
+
+    assert_eq!((result.synced, result.errors), (PRS, 0), "{result:?}");
+    let overlaps: Vec<usize> = std::fs::read_dir(&seen)
+        .unwrap()
+        .map(|e| {
+            std::fs::read_to_string(e.unwrap().path())
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(
+        overlaps.len(),
+        usize::try_from(PRS).unwrap(),
+        "one read per PR"
+    );
+    let most = overlaps.iter().copied().max().unwrap();
+    assert!(most >= 2, "the reads ran one at a time: {overlaps:?}");
+    assert!(
+        most <= hunter::scheduler::PR_SYNC_CONCURRENCY,
+        "more than the bound at once: {overlaps:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Leaving pr_open, and the paths that must not
 // ---------------------------------------------------------------------------
