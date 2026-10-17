@@ -4608,6 +4608,13 @@ impl Store {
     /// failure had the same key, else 1. One statement, so two writers
     /// cannot both read the old streak and lose a count.
     ///
+    /// `None`, and nothing counted, when the finding is no longer in the
+    /// kind's tier, or a harvest's PR is harvested already: that work is
+    /// over, and leaving the tier ended its streak (migration 024). PR sync
+    /// runs beside the job lane and can end an engage's PR while its worker
+    /// runs; counted, that failure would start the streak of the next PR's
+    /// engage, which `hold_work` refuses for the same reason.
+    ///
     /// The checkpoint is left alone (WORK-MODEL.md §6.3): an attempt that
     /// ran has moved it in `complete_job` already, and a failure without a
     /// new attempt (a fetch, a PR view, a runner that would not start) did
@@ -4618,10 +4625,16 @@ impl Store {
         finding_id: i64,
         kind: FindingJobKind,
         key: &str,
-    ) -> sqlx::Result<i64> {
+    ) -> sqlx::Result<Option<i64>> {
+        let harvest = FindingJobKind::Harvest;
         sqlx::query_scalar!(
             r#"INSERT INTO finding_work (finding_id, kind, streak, last_failure)
-               VALUES (?1, ?2, 1, ?3)
+               SELECT ?1, ?2, 1, ?3
+               WHERE EXISTS (SELECT 1 FROM findings f
+                             JOIN work_tiers t ON t.status = f.status AND t.kind = ?2
+                             WHERE f.id = ?1)
+                 AND (?2 <> ?4 OR NOT EXISTS (SELECT 1 FROM pr_state p
+                      WHERE p.finding_id = ?1 AND p.harvested_at IS NOT NULL))
                ON CONFLICT(finding_id, kind) DO UPDATE SET
                  streak = CASE WHEN finding_work.last_failure IS excluded.last_failure
                      THEN finding_work.streak + 1 ELSE 1 END,
@@ -4629,9 +4642,10 @@ impl Store {
                RETURNING streak AS "streak!: i64""#,
             finding_id,
             kind,
-            key
+            key,
+            harvest
         )
-        .fetch_one(&self.pool)
+        .fetch_optional(&self.pool)
         .await
     }
 

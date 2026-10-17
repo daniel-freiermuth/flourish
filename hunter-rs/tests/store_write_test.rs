@@ -3604,7 +3604,7 @@ async fn counting_a_failure_keeps_the_checkpoint() {
         .await
         .unwrap();
 
-    assert_eq!(streak, 1);
+    assert_eq!(streak, Some(1));
     assert_eq!(
         store
             .checkpoint_job(2, FindingJobKind::Fix)
@@ -3755,4 +3755,47 @@ async fn repo_holds_are_held_once_released_and_go_with_their_repo() {
     .await
     .unwrap();
     assert_eq!(left, 0);
+}
+
+/// A failure is counted only while its work is live: the finding in the
+/// kind's tier, and a harvest's PR not harvested yet. PR sync runs beside
+/// the job lane and can end an engage's PR while its worker runs; counted,
+/// that failure would open the streak of the next PR's engage.
+#[tokio::test]
+async fn a_failure_counts_only_while_the_finding_is_in_the_kinds_tier() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo_and_findings(&pool).await;
+    sqlx::raw_sql(
+        "UPDATE findings SET status = 'merged' WHERE id = 3;
+         INSERT INTO pr_state (finding_id, pr_number, state, synced_at, harvested_at)
+         VALUES (3, 7, 'MERGED', 1, 2);",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let store = rw_store(&path).await;
+
+    assert_eq!(
+        store
+            .record_work_failure(2, FindingJobKind::Fix, "push failed")
+            .await
+            .unwrap(),
+        Some(1),
+        "a queued finding is in the fix tier"
+    );
+    for (fid, kind) in [
+        (2, FindingJobKind::Engage),
+        (1, FindingJobKind::Recheck),
+        (3, FindingJobKind::Harvest),
+    ] {
+        assert_eq!(
+            store
+                .record_work_failure(fid, kind, "push failed")
+                .await
+                .unwrap(),
+            None,
+            "#{fid} {kind}"
+        );
+        assert_eq!(store.work_streak(fid, kind).await.unwrap().streak, 0);
+    }
 }

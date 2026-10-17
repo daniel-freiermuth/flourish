@@ -3503,18 +3503,7 @@ async fn a_blocked_engage_whose_pr_ended_meanwhile_is_an_outcome() {
     let (db, fid) = (f.db.clone(), f.fid);
     let backend = ScriptedBackend::new(move |tree| {
         std::fs::write(tree.join("BLOCKED.md"), "two reviewers want opposite APIs").unwrap();
-        // The worker runs inside the runner's future, so the admin lane's
-        // write comes from a thread with a runtime of its own.
-        let db = db.clone();
-        std::thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(merge_finding(&db, fid));
-        })
-        .join()
-        .unwrap();
+        merge_finding_from_worker(&db, fid);
         support::done_with_transcript(tree)
     });
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
@@ -3550,6 +3539,83 @@ async fn a_blocked_engage_whose_pr_ended_meanwhile_is_an_outcome() {
             .message
             .contains("BLOCKED.md, but its PR is no longer open")),
         "{events:?}"
+    );
+}
+
+/// [`merge_finding`] from inside a worker: the worker runs inside the
+/// runner's future, so the admin lane's write comes from a thread with a
+/// runtime of its own.
+fn merge_finding_from_worker(db: &Path, fid: i64) {
+    let db = db.to_owned();
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(merge_finding(&db, fid));
+    })
+    .join()
+    .unwrap();
+}
+
+/// A merge recorded while the engage's worker runs leaves it nothing to
+/// publish: its commits are not pushed to the merged PR's branch and its
+/// reply is not posted, and nothing is counted against the next PR's
+/// engage. A one-shot override is spent, so the harvest does not jump the
+/// queue on it.
+#[tokio::test]
+async fn an_engage_whose_pr_ended_while_its_worker_ran_publishes_nothing() {
+    let f = fixture("engage-ended-mid-run").await;
+    f.store
+        .set_budget_override(f.fid, Some(BudgetOverride::Once))
+        .await
+        .unwrap();
+    let bins = FakeBins::acquire("engage-ended-mid-run");
+    bins.ok("gh", PR_VIEW_JSON);
+    let origin = push_to(&f, None).await;
+    let before = git(&origin, &["rev-parse", BRANCH]);
+    let (db, fid) = (f.db.clone(), f.fid);
+    let backend = ScriptedBackend::new(move |tree| {
+        std::fs::write(tree.join("PR-REPLY.md"), "addressed").unwrap();
+        git(tree, &["commit", "--allow-empty", "-qm", "address review"]);
+        merge_finding_from_worker(&db, fid);
+        support::done_with_transcript(tree)
+    });
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Cold(&finding),
+        &backend,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("not published: PR ended"));
+    assert_eq!(
+        git(&origin, &["rev-parse", BRANCH]),
+        before,
+        "nothing pushed"
+    );
+    let calls = bins.calls_to("gh");
+    assert!(
+        calls.iter().all(|c| !c.iter().any(|a| a == "comment")),
+        "nothing posted: {calls:?}"
+    );
+    assert_eq!(
+        f.store
+            .work_streak(f.fid, hunter::domain::FindingJobKind::Engage)
+            .await
+            .unwrap()
+            .streak,
+        0
+    );
+    let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(
+        after.budget_override, None,
+        "the one-shot override is spent"
     );
 }
 

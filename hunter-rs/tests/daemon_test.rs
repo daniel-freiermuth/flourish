@@ -103,6 +103,27 @@ async fn wait_for_summary(
     }
 }
 
+/// Poll `check` until it holds, or fail with `what`; fails at once if the
+/// daemon has returned, as [`wait_for_summary`] does.
+async fn wait_until<F, Fut>(
+    daemon: &std::thread::JoinHandle<anyhow::Result<()>>,
+    what: &str,
+    check: F,
+) where
+    F: Fn() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !check().await {
+        assert!(
+            !daemon.is_finished(),
+            "run_daemon returned while waiting for {what}"
+        );
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 #[tokio::test]
 async fn a_paused_daemon_reports_it_and_stops_on_sigterm() {
     let bins = FakeBins::acquire("daemon");
@@ -182,36 +203,15 @@ async fn a_paused_daemon_reports_it_and_stops_on_sigterm() {
         .expect("run_daemon returned an error");
 }
 
-/// The admin lane runs inside `run_daemon`, on its own: with no job to
-/// run, a started daemon syncs its open PR and records what the forge
-/// showed, and the summary carries the lane's activity.
-#[tokio::test]
-async fn a_running_daemon_syncs_open_prs_on_its_admin_lane() {
-    let bins = FakeBins::acquire("daemon-admin");
-    bins.script("omp", "exit 0");
-    bins.ok(
-        "gh",
-        r#"{"state":"OPEN","mergeable":"CONFLICTING","reviewDecision":"","comments":[],"reviews":[],"statusCheckRollup":[],"updatedAt":"2026-01-02T03:04:05Z","headRefName":"fix/some-bug","headRefOid":"deadbeef"}"#,
-    );
-    let root = TempDir::new("daemon-admin-root");
-    let _home = bins.env("HOME", root.path());
-    let port = free_port();
-    std::fs::write(
-        root.join("config.json"),
-        format!(r#"{{"ompBin": "omp", "serve": {{"port": {port}}}}}"#),
-    )
-    .unwrap();
-    let cfg = support::load_config(root.path());
-    std::fs::create_dir_all(cfg.db_path.parent().unwrap()).unwrap();
-    let store = hunter::store::Store::connect(&cfg.db_path).await.unwrap();
-    let cookie = support::auth_cookie(&store).await;
-    let repos = root.join("repos");
-    std::fs::create_dir_all(&repos).unwrap();
+/// A GitHub repo `widget` cloned under `repos`, and one finding of it with
+/// PR #7 open: its id.
+async fn seed_open_pr(store: &hunter::store::Store, repos: &std::path::Path) -> i64 {
+    std::fs::create_dir_all(repos).unwrap();
     let rid = store
         .add_repo(
             "widget",
             "https://github.com/acme/widget",
-            &repos,
+            repos,
             "main",
             hunter::domain::ForgeName::Github,
         )
@@ -237,6 +237,34 @@ async fn a_running_daemon_syncs_open_prs_on_its_admin_lane() {
         .set_finding_pr_open(fid, "https://github.com/acme/widget/pull/7")
         .await
         .unwrap();
+    fid
+}
+
+/// The admin lane runs inside `run_daemon`, on its own: with no job to
+/// run, a started daemon syncs its open PR and records what the forge
+/// showed, and the summary carries the lane's activity. A pause stops
+/// only jobs: paused, a trigger still syncs, and the PR's merge lands.
+#[tokio::test]
+async fn a_running_daemon_syncs_open_prs_on_its_admin_lane_even_paused() {
+    let bins = FakeBins::acquire("daemon-admin");
+    bins.script("omp", "exit 0");
+    bins.ok(
+        "gh",
+        r#"{"state":"OPEN","mergeable":"CONFLICTING","reviewDecision":"","comments":[],"reviews":[],"statusCheckRollup":[],"updatedAt":"2026-01-02T03:04:05Z","headRefName":"fix/some-bug","headRefOid":"deadbeef"}"#,
+    );
+    let root = TempDir::new("daemon-admin-root");
+    let _home = bins.env("HOME", root.path());
+    let port = free_port();
+    std::fs::write(
+        root.join("config.json"),
+        format!(r#"{{"ompBin": "omp", "serve": {{"port": {port}}}}}"#),
+    )
+    .unwrap();
+    let cfg = support::load_config(root.path());
+    std::fs::create_dir_all(cfg.db_path.parent().unwrap()).unwrap();
+    let store = hunter::store::Store::connect(&cfg.db_path).await.unwrap();
+    let cookie = support::auth_cookie(&store).await;
+    let fid = seed_open_pr(&store, &root.join("repos")).await;
 
     let daemon = std::thread::spawn(move || {
         tokio::runtime::Builder::new_multi_thread()
@@ -258,19 +286,39 @@ async fn a_running_daemon_syncs_open_prs_on_its_admin_lane() {
         summary.as_object().unwrap().contains_key("admin_activity"),
         "{summary}"
     );
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
+    wait_until(&daemon, "the admin lane to sync the open PR", || async {
         let ps = store.get_pr_state(fid).await.unwrap();
-        if ps.as_ref().and_then(|p| p.mergeable.as_deref()) == Some("CONFLICTING") {
-            break;
-        }
-        assert!(!daemon.is_finished(), "run_daemon returned before syncing");
-        assert!(
-            Instant::now() < deadline,
-            "the admin lane never synced the open PR: {ps:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+        ps.as_ref().and_then(|p| p.mergeable.as_deref()) == Some("CONFLICTING")
+    })
+    .await;
+
+    let (status, body) = http(
+        port,
+        "POST",
+        "/api/scheduler",
+        r#"{"paused": true}"#,
+        &cookie,
+    )
+    .await
+    .expect("POST /api/scheduler");
+    assert_eq!(status, 200, "body: {body}");
+    bins.ok(
+        "gh",
+        r#"{"state":"MERGED","mergedAt":"2026-01-02T03:04:05Z","mergeable":"UNKNOWN","reviewDecision":"","comments":[],"reviews":[],"statusCheckRollup":[],"updatedAt":"2026-01-02T03:04:05Z","headRefName":"fix/some-bug","headRefOid":"deadbeef"}"#,
+    );
+    let (status, body) = http(port, "POST", "/api/cycle", "{}", &cookie)
+        .await
+        .expect("POST /api/cycle");
+    assert_eq!((status, body["error"].as_str()), (409, Some("paused")));
+    wait_until(
+        &daemon,
+        "a paused daemon's trigger to sync the merge",
+        || async {
+            let status = store.get_finding(fid).await.unwrap().unwrap().status;
+            status == hunter::domain::FindingStatus::Merged
+        },
+    )
+    .await;
 
     nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGTERM)
         .expect("send SIGTERM to this test process");
@@ -464,6 +512,34 @@ async fn a_skipped_cycle_restarts_at_once() {
     assert_eq!(hunter::daemon::compute_sleep_s(&store, &skipped).await, 0.0);
     let idle = hunter::scheduler::CycleSummary::default();
     assert_eq!(hunter::daemon::compute_sleep_s(&store, &idle).await, 900.0);
+}
+
+/// While a PR is open the job lane never sleeps past the admin lane's
+/// interval: the admin lane wakes it only for work a sync made, and an
+/// engage due a retry on a PR already flagged is not that. A budget
+/// denial keeps its own backoff, which only the budget can lift.
+#[tokio::test]
+#[allow(
+    clippy::float_cmp,
+    reason = "the sleeps are exact constants, not computed values"
+)]
+async fn an_open_pr_caps_the_job_lanes_sleep_unless_denied() {
+    let dir = TempDir::new("daemon-pr-cap");
+    let (_db, store) = support::fresh_store(&dir, "pr-cap").await;
+    let idle = hunter::scheduler::CycleSummary::default();
+    let denied = hunter::scheduler::CycleSummary {
+        denied: Some("pacing".into()),
+        ..Default::default()
+    };
+    seed_open_pr(&store, &dir.path().join("repos")).await;
+    assert_eq!(
+        hunter::daemon::compute_sleep_s(&store, &idle).await,
+        hunter::daemon::ADMIN_INTERVAL.as_secs_f64()
+    );
+    assert_eq!(
+        hunter::daemon::compute_sleep_s(&store, &denied).await,
+        1800.0
+    );
 }
 
 /// The status page counts down to the loop's wake: now plus the sleep,

@@ -133,9 +133,16 @@ async fn an_admin_pass_runs_while_a_job_runs() {
 
     let status = AdminStatus::default();
     let notes_lock = tokio::sync::Mutex::new(());
+    let (_keep, running_on) = tokio::sync::watch::channel(false);
     let pass = tokio::time::timeout(
         BOUND,
-        hunter::daemon::admin_pass(&support::admin(&store), &cfg, &notes_lock, &status),
+        hunter::daemon::admin_pass(
+            &support::admin(&store),
+            &cfg,
+            &notes_lock,
+            &status,
+            &running_on,
+        ),
     )
     .await
     .expect("the admin pass waited for the running job");
@@ -189,11 +196,13 @@ async fn a_pass_that_changes_nothing_makes_no_work_and_logs_nothing() {
     );
     let (_dir, store, cfg, fid) = fixture("lanes-quiet").await;
 
+    let (_keep, running_on) = tokio::sync::watch::channel(false);
     let pass = hunter::daemon::admin_pass(
         &support::admin(&store),
         &cfg,
         &tokio::sync::Mutex::new(()),
         &AdminStatus::default(),
+        &running_on,
     )
     .await;
 

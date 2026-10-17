@@ -20,8 +20,10 @@ use crate::attention::{
     self, AnswerRecorded, AttentionChange, EngageAnswer, ObservedOpenPr, OpenPrRecorded,
 };
 use crate::domain::FindingStatus;
+use crate::recovery::AdminAuthority;
 use crate::transition::{PrEnd, PrEnded, PrEnding, PrRef, Sources};
 use crate::util::now_ms;
+use tokio::sync::watch;
 
 /// One pass of PR sync over a store: the only way to begin a [`PrRead`].
 ///
@@ -37,19 +39,24 @@ use crate::util::now_ms;
 ///
 /// So the last observation written of a PR is always the newest.
 ///
-/// Begun only with proof of startup recovery, by the admin lane that holds
-/// it (`AdminAuthority::begin_pr_sync`). Outside a `test-support` build
-/// only the daemon's store, opened under its `DaemonLock`, ever has that
-/// proof, so no other process can sync alongside the daemon either.
+/// Begun only through the admin lane's authority ([`Self::begin`] takes an
+/// [`AdminAuthority`], which only `Recovered::into_lanes` makes), so only
+/// the store whose startup recovery ran can sync. Outside a `test-support`
+/// build only the daemon's store, opened under its `DaemonLock`, ever gets
+/// that far, so no other process can sync alongside the daemon either.
 pub struct PrSyncPass {
     store: Store,
     /// The findings whose PR this pass has begun a read of.
     read: Mutex<HashSet<i64>>,
+    /// The daemon's shutdown latch, when the pass should stop at the next
+    /// PR once it is set ([`Self::until`]).
+    stop: Option<watch::Receiver<bool>>,
 }
 
 impl PrSyncPass {
-    /// Begin `store`'s pass, or `None` while another one is live.
-    pub(crate) fn begin(store: &Store) -> Option<Self> {
+    /// Begin `admin`'s store's pass, or `None` while another one is live.
+    pub(crate) fn begin(admin: &AdminAuthority) -> Option<Self> {
+        let store = admin.store();
         store
             .pr_sync
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -57,7 +64,21 @@ impl PrSyncPass {
         Some(Self {
             store: store.clone(),
             read: Mutex::default(),
+            stop: None,
         })
+    }
+
+    /// Stop this pass at the next PR once `stop` reads true: a daemon
+    /// shutting down finishes the PR it is reading, not every open one.
+    #[must_use]
+    pub fn until(mut self, stop: watch::Receiver<bool>) -> Self {
+        self.stop = Some(stop);
+        self
+    }
+
+    /// Whether the pass was asked to stop ([`Self::until`]).
+    pub fn stopping(&self) -> bool {
+        self.stop.as_ref().is_some_and(|s| *s.borrow())
     }
 
     /// The store this pass syncs.

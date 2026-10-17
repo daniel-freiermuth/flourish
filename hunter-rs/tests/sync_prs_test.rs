@@ -375,6 +375,25 @@ async fn a_pr_already_read_in_the_pass_is_an_error_and_not_read_again() {
     );
 }
 
+/// A pass asked to stop reads no further PR: a daemon shutting down waits
+/// for its admin pass, and each PR is a forge round trip. The finding is
+/// left as it was, for the next daemon's first pass.
+#[tokio::test]
+async fn a_pass_told_to_stop_reads_no_more_prs() {
+    let f = fixture("sync-stop").await;
+    let bins = FakeBins::acquire("sync-stop");
+    serve_pr(&bins, &pr(&json!({"state": "MERGED"})));
+    let (stop, stopping) = tokio::sync::watch::channel(false);
+    let pass = pr_sync(&f.store).until(stopping);
+    stop.send_replace(true);
+
+    let result = hunter::scheduler::sync_prs(&pass, &f.cfg).await;
+
+    assert_eq!((result.synced, result.merged, result.errors), (0, 0, 0));
+    assert!(bins.calls_to("gh").is_empty(), "{:?}", bins.calls());
+    assert_eq!(f.status().await, FindingStatus::PrOpen);
+}
+
 /// A read whose push count cannot be taken is never begun: an error, the
 /// forge not asked, the finding left `pr_open` for the next sync.
 #[tokio::test]

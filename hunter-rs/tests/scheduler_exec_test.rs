@@ -1109,50 +1109,33 @@ async fn work_failure_streak_tracking() {
     seed_repo(&pool).await;
     seed_findings(&pool).await;
     let store = rw_store(&path).await;
+    // #2 is `queued`: in the fix tier, out of every other kind's.
     let streak = |kind| {
         let store = store.clone();
-        async move { store.work_streak(1, kind).await.unwrap() }
+        async move { store.work_streak(2, kind).await.unwrap() }
+    };
+    let fail = |kind, key: &'static str| {
+        let store = store.clone();
+        async move { store.record_work_failure(2, kind, key).await.unwrap() }
     };
 
     // Same failure twice
-    assert_eq!(
-        store
-            .record_work_failure(1, Fix, "push failed")
-            .await
-            .unwrap(),
-        1
-    );
+    assert_eq!(fail(Fix, "push failed").await, Some(1));
     assert_eq!(
         streak(Fix).await.last_failure.as_deref(),
         Some("push failed")
     );
-    assert_eq!(
-        store
-            .record_work_failure(1, Fix, "push failed")
-            .await
-            .unwrap(),
-        2
-    );
+    assert_eq!(fail(Fix, "push failed").await, Some(2));
     assert_eq!(streak(Fix).await.streak, 2);
 
-    // Each kind keeps its own streak
-    assert_eq!(
-        store
-            .record_work_failure(1, Harvest, "push failed")
-            .await
-            .unwrap(),
-        1
-    );
+    // Each kind keeps its own streak, and only the tier's kind counts: a
+    // harvest of a `queued` finding has no work to fail.
+    assert_eq!(fail(Harvest, "push failed").await, None);
+    assert_eq!(streak(Harvest).await.streak, 0);
     assert_eq!(streak(Fix).await.streak, 2);
 
     // Different failure resets streak
-    assert_eq!(
-        store
-            .record_work_failure(1, Fix, "PR create failed")
-            .await
-            .unwrap(),
-        1
-    );
+    assert_eq!(fail(Fix, "PR create failed").await, Some(1));
     assert_eq!(
         streak(Fix).await.last_failure.as_deref(),
         Some("PR create failed")

@@ -49,8 +49,9 @@ pub struct SchedulerHandle {
     /// `cycle_running`, the "working" activity status, and the busy check
     /// on manual triggers.
     pub running: Arc<AtomicBool>,
-    /// Prevents new passes of either lane; an already-running worker is
-    /// allowed to finish and remains visible as running.
+    /// Prevents new job-lane cycles; an already-running worker is allowed
+    /// to finish and remains visible as running. The admin lane, which
+    /// spends no tokens, runs on regardless.
     pub paused: Arc<AtomicBool>,
     /// Promotes every budget decision to the backend's prioritized path.
     /// Pacing limits are bypassed, but provider hard stops remain enforced.
@@ -1138,20 +1139,20 @@ async fn release_repo_hold(
 // -- POST /api/cycle (contract §2) --------------------------------------------
 
 /// Trigger both lanes now (contract §2): the admin lane syncs PRs at
-/// once, and the job lane starts its next cycle. 409 while paused (neither
-/// lane runs); 409 `busy` while a cycle is already running, which still
-/// wakes the admin lane: that is exactly when a manual sync is worth
-/// having, since the admin lane does not wait for the job.
+/// once, and the job lane starts its next cycle. The admin lane is woken
+/// whatever the job lane is doing: a pause stops only jobs, and a manual
+/// sync is most useful exactly while a long job runs. Then 409 `paused`
+/// while paused, 409 `busy` while a cycle is already running, else 202.
 ///
 /// The busy check is advisory, as Python's non-blocking lock acquire was:
 /// a trigger that races the loop into its next cycle is held as a notify
 /// permit and runs on the following iteration rather than being dropped.
 async fn cycle(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
     post_gate(&headers)?;
+    state.scheduler.admin_wake.notify_one();
     if state.scheduler.paused.load(Ordering::SeqCst) {
         return Ok(error_body(StatusCode::CONFLICT, "paused"));
     }
-    state.scheduler.admin_wake.notify_one();
     if state.scheduler.running.load(Ordering::SeqCst) {
         return Ok(error_body(StatusCode::CONFLICT, "busy"));
     }

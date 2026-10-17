@@ -13,7 +13,8 @@
 //! - The admin lane runs [`admin_pass`] on a timer: PR sync, reaping
 //!   deleted repos, the workspace sweep. Only it holds the
 //!   [`AdminAuthority`], so only it syncs PRs. None of its work spends
-//!   tokens, so none of it waits for a job any more.
+//!   tokens, so none of it waits for a job any more, and a pause, which
+//!   stops new jobs, does not stop it.
 //!
 //! What the two touch at once is guarded where it lives, not by running
 //! them apart: a finding's status moves only by guarded transitions, a
@@ -24,7 +25,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::{Notify, watch};
@@ -95,21 +96,33 @@ pub struct AdminPass {
 /// repos left, sweep the workspaces. Each task shows on the status page
 /// while it runs (`status`). None of it creates a job; that takes the job
 /// lane's authority, which this does not have.
+///
+/// Once `shutdown` is set the pass stops at the next step, and the sync at
+/// the next PR: the daemon waits for the pass, and a pass over many open
+/// PRs is many forge round trips.
 pub async fn admin_pass(
     admin: &AdminAuthority,
     cfg: &Config,
     notes_lock: &tokio::sync::Mutex<()>,
     status: &AdminStatus,
+    shutdown: &watch::Receiver<bool>,
 ) -> AdminPass {
     let store = admin.store();
+    let stopping = || *shutdown.borrow();
     let mut pass = AdminPass::default();
     {
         let _task = status.begin(AdminTask::PrSync);
-        pass.sync = sync_open_prs(admin, cfg).await;
+        pass.sync = sync_open_prs(admin, cfg, shutdown).await;
+    }
+    if stopping() {
+        return pass;
     }
     {
         let _task = status.begin(AdminTask::Reap);
         crate::server::reap_deleted_repos(store, &cfg.work_root, notes_lock).await;
+    }
+    if stopping() {
+        return pass;
     }
     {
         let _task = status.begin(AdminTask::Sweep);
@@ -121,14 +134,18 @@ pub async fn admin_pass(
 /// [`crate::scheduler::sync_prs`], logged as a `prsync` event when it made
 /// work for the job lane. Its failures are already events of their own,
 /// one per PR (`sync #<id>: ...`).
-async fn sync_open_prs(admin: &AdminAuthority, cfg: &Config) -> Option<SyncResult> {
+async fn sync_open_prs(
+    admin: &AdminAuthority,
+    cfg: &Config,
+    shutdown: &watch::Receiver<bool>,
+) -> Option<SyncResult> {
     let Some(sync_pass) = admin.begin_pr_sync() else {
         // Only this lane syncs, one pass at a time; refused all the same
         // rather than read a PR twice at once.
         tracing::warn!("PR sync skipped: another sync pass is running");
         return None;
     };
-    let s = crate::scheduler::sync_prs(&sync_pass, cfg).await;
+    let s = crate::scheduler::sync_prs(&sync_pass.until(shutdown.clone()), cfg).await;
     let line = format!(
         "prsync {}s/{}m/{}c/{}a/{}r/{}q/{}e",
         s.synced, s.merged, s.closed, s.attention, s.raised, s.requeued, s.errors
@@ -146,26 +163,27 @@ struct AdminLane {
     cfg: Config,
     notes_lock: Arc<tokio::sync::Mutex<()>>,
     status: AdminStatus,
-    paused: Arc<AtomicBool>,
-    /// Its own wake: a trigger, an unpause.
+    /// Its own wake: a trigger.
     wake: Arc<Notify>,
     /// The job lane's: rung when a pass made work for it.
     job_wake: Arc<Notify>,
 }
 
 /// Run admin passes every [`ADMIN_INTERVAL`], or sooner when woken, until
-/// shutdown; none while the scheduler is paused. A pass in progress always
-/// finishes.
+/// shutdown. Pausing the scheduler does not stop them: a pause stops new
+/// jobs, which spend tokens, while this lane spends none, and a paused
+/// daemon still records merges, closes and review comments and sweeps
+/// finished trees. A pass stops early at shutdown ([`admin_pass`]).
 async fn run_admin_lane(lane: AdminLane, mut shutdown: watch::Receiver<bool>) {
     while !*shutdown.borrow() {
-        if lane.paused.load(Ordering::SeqCst) {
-            tokio::select! {
-                () = lane.wake.notified() => {},
-                _ = shutdown.changed() => {},
-            }
-            continue;
-        }
-        let pass = admin_pass(&lane.admin, &lane.cfg, &lane.notes_lock, &lane.status).await;
+        let pass = admin_pass(
+            &lane.admin,
+            &lane.cfg,
+            &lane.notes_lock,
+            &lane.status,
+            &shutdown,
+        )
+        .await;
         if pass.sync.as_ref().is_some_and(SyncResult::made_work) {
             lane.job_wake.notify_one();
         }
@@ -288,7 +306,27 @@ pub async fn compute_sleep_s(store: &Store, summary: &CycleSummary) -> f64 {
     } else {
         sleep_s = 15.0 * 60.0;
     }
+    // While a PR is open, never sleep past the admin lane's interval
+    // (budget backoff excepted, which only the budget can lift). The admin
+    // lane wakes this one when a sync makes new work, but not for work that
+    // was already there: an engage whose last attempt failed and is due a
+    // retry, or a PR still flagged from an earlier pass.
+    if summary.denied.is_none() && has_open_pr(store).await {
+        return sleep_s.min(ADMIN_INTERVAL.as_secs_f64());
+    }
     sleep_s
+}
+
+/// Whether any finding has an open PR; `false` when that cannot be read,
+/// which only leaves the sleep as it was.
+async fn has_open_pr(store: &Store) -> bool {
+    store
+        .list_findings(&crate::store::FindingFilter {
+            status: Some(crate::domain::FindingStatus::PrOpen),
+            ..crate::store::FindingFilter::default()
+        })
+        .await
+        .is_ok_and(|open| !open.is_empty())
 }
 
 /// When a loop that sleeps `sleep_s` from `now_ms` wakes, in epoch ms:
@@ -450,7 +488,6 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
             cfg: cfg.clone(),
             notes_lock: repo_notes.clone(),
             status: scheduler.admin.clone(),
-            paused: scheduler_paused.clone(),
             wake: scheduler.admin_wake.clone(),
             job_wake: wake.clone(),
         },

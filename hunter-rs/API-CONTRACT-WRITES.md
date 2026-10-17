@@ -119,9 +119,9 @@ Handler `_cycle` (server.py:489-518). **Never reads the body** (only the §0.1 g
 - Reconcile writes (store.py:1303-1352): findings stuck at `'fixing'` -> `set_status(id, "queued")` (store.py:1339-1341); jobs stuck at `'running'` -> `update_job(state="killed", killed_reason="orphaned", finished_at=now_ms(), notes="reconciled at cycle startup -- prior process died mid-job")` (store.py:1343-1351; `update_job` store.py:1191-1198). Each touched row also gets a `log_event("error", ...)` with the exact formats at server.py:126-139 (`f"reconciled #{f['id']} stuck 'fixing' -> 'queued' -- prior process died mid-fix"` / `f"reconciled orphaned {r['kind']} job #{r['id']} (finding {r.get('finding_id')}) -- prior process died mid-job"`).
 - `run_cycle` itself spawns workers, writes jobs/findings/pr_state, shells out to git/gh — the entire scheduler.
 
-**Rust implementation**: `AppState.scheduler: SchedulerHandle` carries the job lane's `running`, `paused`, and `overdrive` atomics plus the two lanes' `wake` and `admin_wake` notifies. `/api/cycle` returns 409 `{"error":"paused"}` while paused (neither lane runs). Otherwise it notifies the admin lane, so open PRs are synced at once even while a job runs, and then returns 409 `{"error":"busy"}` while a cycle is running, or notifies the job lane and returns 202 `{"started":true}`. The busy check is advisory: a trigger racing the loop into its next cycle is held as a notify permit and runs on the following iteration instead of being dropped.
+**Rust implementation**: `AppState.scheduler: SchedulerHandle` carries the job lane's `running`, `paused`, and `overdrive` atomics plus the two lanes' `wake` and `admin_wake` notifies. `/api/cycle` first notifies the admin lane, so open PRs are synced at once whatever the job lane is doing (a pause stops only jobs, §2.1). Then it returns 409 `{"error":"paused"}` while paused, 409 `{"error":"busy"}` while a cycle is running, or notifies the job lane and returns 202 `{"started":true}`. The busy check is advisory: a trigger racing the loop into its next cycle is held as a notify permit and runs on the following iteration instead of being dropped.
 
-**UI** (`StatusPage.runCycle`, `ui-svelte/src/pages/StatusPage.svelte`): `post("/api/cycle", {})` — header and `{}` body per §0.1, so the gate passes and the real status codes are reached. This is the one caller that compares `status` to literals rather than reading `r.ok`, because here the code *is* the information: 409 `busy` -> button text "syncing PRs…" (the admin lane was still woken), any other 409 -> "busy", 202 -> "started…", anything else -> "error"; then `store.refresh()`. While `cycle_running` the button stays enabled and reads "Sync PRs now"; it is disabled only while paused. The button is re-armed after 2.5 s in `finally`, so it recovers even when the request never reached the server.
+**UI** (`StatusPage.runCycle`, `ui-svelte/src/pages/StatusPage.svelte`): `post("/api/cycle", {})` — header and `{}` body per §0.1, so the gate passes and the real status codes are reached. This is the one caller that compares `status` to literals rather than reading `r.ok`, because here the code *is* the information: 409 (`busy` or `paused`; the admin lane was woken either way) -> button text "syncing PRs…", 202 -> "started…", anything else -> "error"; then `store.refresh()`. While a cycle runs or the jobs are paused, the button reads "Sync PRs now"; it is never disabled except while a request is in flight. The button is re-armed after 2.5 s in `finally`, so it recovers even when the request never reached the server.
 
 ---
 ## 2.1 POST /api/scheduler — pause or resume the scheduler
@@ -130,8 +130,11 @@ Handler `_cycle` (server.py:489-518). **Never reads the body** (only the §0.1 g
 `400 {"error":"paused must be a boolean"}`.
 
 **Success**: `200 {"paused": <value>}`. The process-local flag changes
-immediately and the loop is notified. Pausing blocks new cycles; a worker
-already running is allowed to finish. The flag resets to false on restart.
+immediately and both lanes are notified. Pausing blocks new job-lane cycles;
+a worker already running is allowed to finish. It does not stop the admin
+lane, which spends no tokens: PR sync, the reaper and the workspace sweep
+keep running, so merges, closes and review comments are still recorded
+while jobs are paused. The flag resets to false on restart.
 
 ## 2.2 POST /api/overdrive — global prioritized budget mode
 

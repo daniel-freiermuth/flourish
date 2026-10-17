@@ -288,7 +288,7 @@ impl AdminAuthority {
     /// ([`PrSyncPass`]). Sync needs this proof so that only the daemon's
     /// store, the one held under its [`DaemonLock`], can sync.
     pub fn begin_pr_sync(&self) -> Option<PrSyncPass> {
-        PrSyncPass::begin(&self.store)
+        PrSyncPass::begin(self)
     }
 }
 

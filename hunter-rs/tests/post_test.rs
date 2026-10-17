@@ -1821,6 +1821,7 @@ async fn summary_paused(state: &AppState) -> bool {
 /// Pausing is a round trip the dashboard can see: the flag the daemon
 /// loop reads, the summary field the button renders from, and the refusal
 /// of a manual cycle while paused -- then all three undone by resuming.
+/// A pause stops only jobs: the refused trigger still wakes the admin lane.
 #[tokio::test]
 async fn pausing_and_resuming_the_scheduler_round_trips() {
     let state = test_state().await;
@@ -1843,10 +1844,19 @@ async fn pausing_and_resuming_the_scheduler_round_trips() {
         summary_paused(&state).await,
         "the dashboard must see the pause"
     );
+    // The pause rang both lanes; take that permit, so the next one is the
+    // trigger's.
+    let admin_wake = Arc::clone(&state.scheduler.admin_wake);
+    tokio::time::timeout(std::time::Duration::from_secs(1), admin_wake.notified())
+        .await
+        .expect("the pause wakes the admin lane");
 
     let (status, body) = post(&state, "/api/cycle", json!({})).await;
     assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
     assert_eq!(body, json!({ "error": "paused" }));
+    tokio::time::timeout(std::time::Duration::from_secs(1), admin_wake.notified())
+        .await
+        .expect("a trigger while paused still wakes the admin lane");
 
     let (status, body) = post(&state, "/api/scheduler", json!({ "paused": false })).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");

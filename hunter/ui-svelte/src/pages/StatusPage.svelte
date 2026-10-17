@@ -46,11 +46,11 @@
   async function runCycle() {
     btnDisabled = true;
     try {
-      const r = await post<{ error?: string }>("/api/cycle", {});
+      const r = await post<unknown>("/api/cycle", {});
       if (r.status === 409) {
-        // "busy" still woke the admin lane: while a cycle runs, the button
-        // syncs open PRs.
-        btnText = r.body?.error === "busy" ? "syncing PRs\u2026" : "busy";
+        // "busy" and "paused" both still woke the admin lane: while a cycle
+        // runs or jobs are paused, the button syncs open PRs.
+        btnText = "syncing PRs\u2026";
       } else {
         btnText = r.status === 202 ? "started\u2026" : "error";
       }
@@ -87,6 +87,11 @@
   });
 
   const activityKind = $derived(store.summary?.activity_status?.kind ?? null);
+  // No cycle can start (one is running, or jobs are paused): the button
+  // still wakes the admin lane, which syncs open PRs.
+  const syncOnly = $derived(
+    !!store.summary && (store.summary.cycle_running || store.summary.scheduler_paused),
+  );
 
   const ADMIN_TASK_LABEL: Record<AdminTask, string> = {
     pr_sync: "syncing open PRs",
@@ -113,10 +118,11 @@
             class:paused={store.summary.scheduler_paused}
             disabled={schedulerBusy}
             onclick={toggleScheduler}
-            aria-label={store.summary.scheduler_paused ? "Resume hunter" : "Pause hunter"}
+            aria-label={store.summary.scheduler_paused ? "Resume jobs" : "Pause jobs"}
+            title="Pauses new jobs. PR sync and workspace cleanup keep running."
           >
             <span class="scheduler-icon">{store.summary.scheduler_paused ? "▶" : "⏸"}</span>
-            <span>{store.summary.scheduler_paused ? "Resume hunter" : "Pause hunter"}</span>
+            <span>{store.summary.scheduler_paused ? "Resume jobs" : "Pause jobs"}</span>
           </button>
           <button
             class="overdrive-btn"
@@ -131,12 +137,12 @@
         </div>
         <button
           class="cycle-btn"
-          class:ready={activityKind === "ready" && !btnDisabled && !store.summary.cycle_running}
-          disabled={btnDisabled || store.summary.scheduler_paused}
+          class:ready={activityKind === "ready" && !btnDisabled && !syncOnly}
+          disabled={btnDisabled}
           onclick={runCycle}
-          title={store.summary.cycle_running ? "A cycle is running; this syncs open PRs now." : undefined}
+          title={syncOnly ? "No cycle can start now; this syncs open PRs." : undefined}
         >
-          {btnDisabled ? btnText : store.summary.cycle_running ? "Sync PRs now" : btnText}
+          {btnDisabled ? btnText : syncOnly ? "Sync PRs now" : btnText}
         </button>
         {#if store.summary.last_cycle}
           <div class="last-cycle">

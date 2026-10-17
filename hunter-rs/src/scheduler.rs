@@ -2779,16 +2779,22 @@ async fn handle_recheck_failure(
         .record_work_failure(fid, FindingJobKind::Recheck, failure)
         .await
     {
+        Ok(None) => {
+            log(format!(
+                "#{fid}: job {job} {detail} -- not counted: it is no longer rechecking"
+            ))
+            .await;
+        }
         Err(e) => {
             log(format!(
                 "#{fid}: job {job} {detail} -- will retry (not counted: {e})"
             ))
             .await;
         }
-        Ok(streak) if streak < MAX_CONSECUTIVE_SAME_FAILURE => {
+        Ok(Some(streak)) if streak < MAX_CONSECUTIVE_SAME_FAILURE => {
             log(format!("#{fid}: job {job} {detail} -- will retry")).await;
         }
-        Ok(streak) => match store
+        Ok(Some(streak)) => match store
             .hold_work(fid, FindingJobKind::Recheck, at_limit, detail, Some(job))
             .await
         {
@@ -4424,7 +4430,15 @@ async fn record_fix_failure(
         .record_work_failure(fid, FindingJobKind::Fix, failure)
         .await
     {
-        Ok(streak) => streak,
+        Ok(Some(streak)) => streak,
+        Ok(None) => {
+            let message = format!(
+                "#{fid} incomplete ({failure}), not counted: it has left the fix tier. \
+                 tail: {detail}"
+            );
+            let _ = fix_event(store, "fix", fid, job, message).await;
+            return;
+        }
         Err(e) => {
             let message =
                 format!("#{fid} incomplete ({failure}), not counted: {e}. tail: {detail}");
@@ -5188,6 +5202,12 @@ pub async fn sync_prs(pass: &PrSyncPass, cfg: &Config) -> SyncResult {
         .unwrap_or_default();
 
     for f in &findings {
+        // A daemon shutting down finishes the PR it is on, not every one:
+        // each read is a forge round trip, and SIGTERM waits for the pass.
+        if pass.stopping() {
+            tracing::info!("PR sync stopped for shutdown");
+            break;
+        }
         let fid = f.id;
         let url = match f.pr_url.as_deref() {
             Some(u) if !u.is_empty() => u,
@@ -6180,7 +6200,14 @@ async fn record_engage_failure(
         .record_work_failure(fid, FindingJobKind::Engage, key)
         .await
     {
-        Ok(streak) => streak,
+        Ok(Some(streak)) => streak,
+        Ok(None) => {
+            log(format!(
+                "#{fid} incomplete ({detail}), not counted: its PR is no longer open"
+            ))
+            .await;
+            return false;
+        }
         Err(e) => {
             log(format!("#{fid} incomplete ({detail}), not counted: {e}")).await;
             return false;
@@ -6385,24 +6412,28 @@ pub async fn run_engage(
     // would have its classification kept as if a human had set that
     // status while the PR is marked harvested all the same.
     let withdraw = start.ws.tree.join("WITHDRAW.md");
-    let closed_on_forge = if withdraw.exists() {
+    // PR sync runs on the admin lane, beside this one, and may have recorded
+    // the PR's merge or close while the worker ran. Then there is nothing
+    // to withdraw and nothing to push or post to: the PR's end is the
+    // harvest's now. A BLOCKED.md is still offered to the hold, which
+    // refuses a finding out of the tier on its own (`engage_blocked`).
+    let ended = pr_ended(store, fid, &start.pr_ref).await;
+    let closed_on_forge = if ended.is_none() && withdraw.exists() {
         let reason = std::fs::read_to_string(&withdraw).unwrap_or_default();
         // The withdrawal is this attempt's end, whatever the forge does
         // with it, so it spends a `once` override here, before the handoff
         // reloads the finding: left set, the closed PR's harvest would run
         // prioritized and jump the queue on it.
-        if finding.budget_override == Some(BudgetOverride::Once) {
-            log_write_failure(
-                store.set_budget_override(fid, None).await,
-                format_args!("#{fid}: clearing one-shot budget override"),
-            );
-        }
+        spend_once_override(store, finding).await;
         withdraw_pr(store, (cfg, backend), fid, &start, &reason, &mut summary).await
     } else if let Some(report) = blocked_report(&start.ws.tree)? {
         if let Err(e) = engage_blocked(lane.store(), fid, &start, &report, &mut summary).await {
             close_workspace(lane, start.ws).await;
             return Err(e);
         }
+        false
+    } else if let Some(now) = ended {
+        engage_unpublished(store, finding, &start, &now, &mut summary).await;
         false
     } else {
         let published = push_and_reply(&start, state).await;
@@ -6435,6 +6466,63 @@ pub async fn run_engage(
     }
     close_workspace(lane, start.ws).await;
     Ok(summary)
+}
+
+/// Why `pr`, the PR an engage of `fid` answers, is no longer the finding's
+/// open PR: its status now, or that it has another PR. `None` while it
+/// still is, and when the finding cannot be read, which leaves the engage
+/// to publish as it did before this check.
+async fn pr_ended(store: &Store, fid: i64, pr: &PrRef) -> Option<String> {
+    match store.get_finding(fid).await {
+        Ok(Some(f)) if f.status == FindingStatus::PrOpen => {
+            (f.pr_url.as_deref() != Some(pr.url())).then(|| "on another PR".to_owned())
+        }
+        Ok(Some(f)) => Some(format!("'{}'", f.status.as_str())),
+        Ok(None) => Some("gone".to_owned()),
+        Err(e) => {
+            tracing::warn!("engage #{fid}: reading the finding before publishing: {e}");
+            None
+        }
+    }
+}
+
+/// An engage whose PR ended while its worker ran ([`pr_ended`]): nothing
+/// is pushed, posted or withdrawn, nothing is counted as a failure, and a
+/// one-shot override is spent, as the withdrawal spends it: left set, the
+/// ended PR's harvest would run prioritized and jump the queue.
+async fn engage_unpublished(
+    store: &Store,
+    finding: &Finding,
+    start: &EngageStart,
+    now: &str,
+    summary: &mut CycleSummary,
+) {
+    let fid = finding.id;
+    let _ = store
+        .log_event(
+            "engage",
+            &format!(
+                "#{fid} PR #{} ended while the worker ran (the finding is {now} now); \
+                 nothing pushed, posted or withdrawn",
+                start.pr_ref.number()
+            ),
+            Some(start.job),
+            Some(fid),
+        )
+        .await;
+    spend_once_override(store, finding).await;
+    summary.outcome = Some("not published: PR ended".into());
+}
+
+/// Spend `finding`'s one-shot budget override, if it has one.
+async fn spend_once_override(store: &Store, finding: &Finding) {
+    if finding.budget_override == Some(BudgetOverride::Once) {
+        let fid = finding.id;
+        log_write_failure(
+            store.set_budget_override(fid, None).await,
+            format_args!("#{fid}: clearing one-shot budget override"),
+        );
+    }
 }
 
 /// An engage whose feedback needs a decision only a maintainer can make
@@ -6672,7 +6760,14 @@ async fn record_harvest_failure(
         .record_work_failure(fid, FindingJobKind::Harvest, key)
         .await
     {
-        Ok(streak) => streak,
+        Ok(Some(streak)) => streak,
+        Ok(None) => {
+            log(format!(
+                "harvest #{fid}: {detail}, not counted: it no longer awaits its harvest"
+            ))
+            .await;
+            return false;
+        }
         Err(e) => {
             log(format!(
                 "harvest #{fid}: {detail}, will retry (not counted: {e})"
