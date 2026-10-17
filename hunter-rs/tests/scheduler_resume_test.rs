@@ -1589,7 +1589,7 @@ async fn a_cycle_dispatches_a_resume_to_the_suspended_kinds_executor() {
     );
 
     let summary =
-        hunter::scheduler::run_cycle(&support::recovered(&store), &cfg, &backend, None).await;
+        hunter::scheduler::run_cycle(&mut support::jobs(&store), &cfg, &backend, None).await;
 
     assert_eq!(summary.kind.map(|k| k.to_string()), Some("hunt".to_owned()));
     assert_eq!(summary.state, Some(JobState::Done));
@@ -1721,12 +1721,7 @@ async fn previewed_reservation(store: &Arc<Store>, root: &Path) -> Option<i64> {
         config: Arc::new(config),
         backend: probe.clone(),
         repo_notes: Arc::new(tokio::sync::Mutex::new(())),
-        scheduler: SchedulerHandle {
-            running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            overdrive: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            wake: Arc::new(tokio::sync::Notify::new()),
-        },
+        scheduler: SchedulerHandle::default(),
     };
     let cookie = support::auth_cookie(&state.store).await;
     let response = router(state)
@@ -2427,7 +2422,7 @@ async fn a_recheck_that_keeps_overrunning_is_held_instead_of_restarting_forever(
     let mut kinds = Vec::new();
     for _ in 0..12 {
         let summary =
-            hunter::scheduler::run_cycle(&support::recovered(&store), &cfg, &overrunning, None)
+            hunter::scheduler::run_cycle(&mut support::jobs(&store), &cfg, &overrunning, None)
                 .await;
         kinds.push(summary.kind.map(|k| k.to_string()));
     }

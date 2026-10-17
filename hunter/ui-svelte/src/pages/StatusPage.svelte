@@ -1,7 +1,7 @@
 <script lang="ts">
   import { store, post } from "../lib/api.svelte";
   import { ts, clock, countdown, dur, ktok } from "../lib/format";
-  import type { NextCandidate } from "../lib/types";
+  import type { AdminTask, NextCandidate } from "../lib/types";
 
   let btnText = $state("Run Cycle");
   let btnDisabled = $state(false);
@@ -48,7 +48,9 @@
     try {
       const r = await post<unknown>("/api/cycle", {});
       if (r.status === 409) {
-        btnText = "busy";
+        // "busy" and "paused" both still woke the admin lane: while a cycle
+        // runs or jobs are paused, the button syncs open PRs.
+        btnText = "syncing PRs\u2026";
       } else {
         btnText = r.status === 202 ? "started\u2026" : "error";
       }
@@ -85,6 +87,17 @@
   });
 
   const activityKind = $derived(store.summary?.activity_status?.kind ?? null);
+  // No cycle can start (one is running, or jobs are paused): the button
+  // still wakes the admin lane, which syncs open PRs.
+  const syncOnly = $derived(
+    !!store.summary && (store.summary.cycle_running || store.summary.scheduler_paused),
+  );
+
+  const ADMIN_TASK_LABEL: Record<AdminTask, string> = {
+    pr_sync: "syncing open PRs",
+    reap: "removing deleted repos' clones",
+    sweep: "sweeping finished workspaces",
+  };
 </script>
 
 <div class="page-enter">
@@ -105,10 +118,11 @@
             class:paused={store.summary.scheduler_paused}
             disabled={schedulerBusy}
             onclick={toggleScheduler}
-            aria-label={store.summary.scheduler_paused ? "Resume hunter" : "Pause hunter"}
+            aria-label={store.summary.scheduler_paused ? "Resume jobs" : "Pause jobs"}
+            title="Pauses new jobs. PR sync and workspace cleanup keep running."
           >
             <span class="scheduler-icon">{store.summary.scheduler_paused ? "▶" : "⏸"}</span>
-            <span>{store.summary.scheduler_paused ? "Resume hunter" : "Pause hunter"}</span>
+            <span>{store.summary.scheduler_paused ? "Resume jobs" : "Pause jobs"}</span>
           </button>
           <button
             class="overdrive-btn"
@@ -123,11 +137,12 @@
         </div>
         <button
           class="cycle-btn"
-          class:ready={activityKind === "ready" && !btnDisabled && !store.summary.cycle_running}
-          disabled={btnDisabled || store.summary.cycle_running || store.summary.scheduler_paused}
+          class:ready={activityKind === "ready" && !btnDisabled && !syncOnly}
+          disabled={btnDisabled}
           onclick={runCycle}
+          title={syncOnly ? "No cycle can start now; this syncs open PRs." : undefined}
         >
-          {store.summary.cycle_running ? "cycle running…" : btnText}
+          {btnDisabled ? btnText : syncOnly ? "Sync PRs now" : btnText}
         </button>
         {#if store.summary.last_cycle}
           <div class="last-cycle">
@@ -153,7 +168,7 @@
       {:else if store.summary.activity_status.kind === "working"}
         <div class="row">
           <span class="status-icon running">▶</span>
-          <b class="running">running</b> cycle in progress&hellip;
+          <b class="running">running</b> picking, preparing or finishing a job&hellip;
         </div>
       {:else if store.summary.activity_status.kind === "error"}
         <div class="row">
@@ -218,6 +233,15 @@
         {/if}
       {:else if store.summary.activity_status.kind === "warming_up"}
         <div class="row dim">warming up &mdash; no cycle has run yet</div>
+      {/if}
+
+      <!-- Admin lane: runs beside the job lane above -->
+      {#if store.summary.admin_activity}
+        {@const aa = store.summary.admin_activity}
+        <div class="row dim">
+          <span class="status-icon running">▶</span>
+          admin: {ADMIN_TASK_LABEL[aa.task]} ({dur(aa.started_at, null)})
+        </div>
       {/if}
 
       <!-- Scheduler detail (last log) -->

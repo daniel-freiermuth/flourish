@@ -1,21 +1,43 @@
-//! Daemon loop — UI server + scheduler loop + usage prober, one process,
-//! three tokio tasks. Port of server.py daemon/_`compute_sleep_s`/
+//! Daemon — UI server, usage prober, and the scheduler's two lanes, one
+//! process. Port of server.py daemon/_`compute_sleep_s`/
 //! _`usage_prober_loop`/_`describe_cycle`; the lockfile
 //! (`_acquire_lockfile`) and the startup reconcile are [`crate::recovery`].
+//!
+//! The scheduler runs as two lanes side by side, each with its own part of
+//! the startup proof ([`crate::recovery::Recovered::into_lanes`]):
+//!
+//! - The job lane runs cycles ([`crate::scheduler::run_cycle`]): pick the
+//!   next work, run its job. Only it holds the
+//!   [`JobAuthority`](crate::recovery::JobAuthority), so only it creates
+//!   jobs and claims fixes, one cycle at a time.
+//! - The admin lane runs [`admin_pass`] on a timer: PR sync, reaping
+//!   deleted repos, the workspace sweep. Only it holds the
+//!   [`AdminAuthority`], so only it syncs PRs. None of its work spends
+//!   tokens, so none of it waits for a job any more, and a pause, which
+//!   stops new jobs, does not stop it.
+//!
+//! What the two touch at once is guarded where it lives, not by running
+//! them apart: a finding's status moves only by guarded transitions, a
+//! PR's `pr_state` columns have one writer per group, a clone changes only
+//! under its permit, and a tree a runner still uses is leased. The lanes
+//! meet through the database: a sync pass that made work wakes the job
+//! lane, which picks from what the sync recorded.
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
 use tokio::signal::unix::{Signal, SignalKind, signal};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 
 use crate::backend::Backend;
 use crate::config::Config;
 use crate::domain::JobState;
-use crate::scheduler::CycleSummary;
-use crate::server::{AppState, router};
+use crate::recovery::AdminAuthority;
+use crate::scheduler::{CycleSummary, SyncResult};
+use crate::server::{AdminStatus, AppState, router};
 use crate::store::Store;
+use crate::types::AdminTask;
 
 const USAGE_PROBE_TICK_S: u64 = 60;
 /// How long to let in-flight HTTP responses finish once the scheduler has
@@ -23,7 +45,8 @@ const USAGE_PROBE_TICK_S: u64 = 60;
 /// the unit's `TimeoutStopSec`, which would turn a graceful stop into a
 /// SIGKILL.
 const UI_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
-const PR_SYNC_INTERVAL_S: f64 = 300.0; // 5 min, matching Python
+/// How often the admin lane runs a pass when nothing wakes it sooner.
+pub const ADMIN_INTERVAL: std::time::Duration = std::time::Duration::from_mins(5);
 
 /// Install a signal handler now; `None` (logged) if the OS refuses.
 fn install_signal(kind: SignalKind, name: &str) -> Option<Signal> {
@@ -43,9 +66,10 @@ async fn next_signal(sig: Option<Signal>) {
 }
 
 /// Release finished chains' trees and reclaim old workspaces and the
-/// previous layout's leftovers (`workspace::sweep`). Runs between cycles
-/// only, so no job is mid-flight; best effort, since a failed pass is
-/// retried before the next cycle.
+/// previous layout's leftovers (`workspace::sweep`). Safe beside a running
+/// job: the sweep releases no tree a live job or a runner's lease keeps,
+/// and changes a clone only under its permit. Best effort, since a failed
+/// pass is retried on the next.
 async fn sweep_workspaces(store: &Store, work_root: &Path) {
     let swept = store
         .lane(async |lane| crate::workspace::sweep(lane, work_root, crate::util::now_ms()).await)
@@ -58,6 +82,116 @@ async fn sweep_workspaces(store: &Store, work_root: &Path) {
         }
         Ok(_) => {}
         Err(e) => tracing::warn!("workspace sweep failed: {e}"),
+    }
+}
+
+/// What one [`admin_pass`] did.
+#[derive(Debug, Default)]
+pub struct AdminPass {
+    /// The PR sync's counts; `None` when another pass was syncing.
+    pub sync: Option<SyncResult>,
+}
+
+/// One pass of the admin lane: sync every open PR, remove what deleted
+/// repos left, sweep the workspaces. Each task shows on the status page
+/// while it runs (`status`). None of it creates a job; that takes the job
+/// lane's authority, which this does not have.
+///
+/// Once `shutdown` is set the pass stops at the next step, and the sync at
+/// the next PR: the daemon waits for the pass, and a pass over many open
+/// PRs is many forge round trips.
+pub async fn admin_pass(
+    admin: &AdminAuthority,
+    cfg: &Config,
+    notes_lock: &tokio::sync::Mutex<()>,
+    status: &AdminStatus,
+    shutdown: &watch::Receiver<bool>,
+) -> AdminPass {
+    let store = admin.store();
+    let stopping = || *shutdown.borrow();
+    let mut pass = AdminPass::default();
+    {
+        let _task = status.begin(AdminTask::PrSync);
+        pass.sync = sync_open_prs(admin, cfg, shutdown).await;
+    }
+    if stopping() {
+        return pass;
+    }
+    {
+        let _task = status.begin(AdminTask::Reap);
+        crate::server::reap_deleted_repos(store, &cfg.work_root, notes_lock).await;
+    }
+    if stopping() {
+        return pass;
+    }
+    {
+        let _task = status.begin(AdminTask::Sweep);
+        sweep_workspaces(store, &cfg.work_root).await;
+    }
+    pass
+}
+
+/// [`crate::scheduler::sync_prs`], logged as a `prsync` event when it made
+/// work for the job lane. Its failures are already events of their own,
+/// one per PR (`sync #<id>: ...`).
+async fn sync_open_prs(
+    admin: &AdminAuthority,
+    cfg: &Config,
+    shutdown: &watch::Receiver<bool>,
+) -> Option<SyncResult> {
+    let Some(sync_pass) = admin.begin_pr_sync() else {
+        // Only this lane syncs, one pass at a time; refused all the same
+        // rather than read a PR twice at once.
+        tracing::warn!("PR sync skipped: another sync pass is running");
+        return None;
+    };
+    let s = crate::scheduler::sync_prs(&sync_pass.until(shutdown.clone()), cfg).await;
+    let line = format!(
+        "prsync {}s/{}m/{}c/{}a/{}r/{}q/{}e",
+        s.synced, s.merged, s.closed, s.attention, s.raised, s.requeued, s.errors
+    );
+    tracing::debug!("{line}");
+    if s.made_work() {
+        let _ = admin.store().log_event("prsync", &line, None, None).await;
+    }
+    Some(s)
+}
+
+/// What the admin lane shares with the rest of the daemon.
+struct AdminLane {
+    admin: AdminAuthority,
+    cfg: Config,
+    notes_lock: Arc<tokio::sync::Mutex<()>>,
+    status: AdminStatus,
+    /// Its own wake: a trigger.
+    wake: Arc<Notify>,
+    /// The job lane's: rung when a pass made work for it.
+    job_wake: Arc<Notify>,
+}
+
+/// Run admin passes every [`ADMIN_INTERVAL`], or sooner when woken, until
+/// shutdown. Pausing the scheduler does not stop them: a pause stops new
+/// jobs, which spend tokens, while this lane spends none, and a paused
+/// daemon still records merges, closes and review comments and sweeps
+/// finished trees. A pass stops early at shutdown ([`admin_pass`]).
+async fn run_admin_lane(lane: AdminLane, mut shutdown: watch::Receiver<bool>) {
+    while !*shutdown.borrow() {
+        let pass = admin_pass(
+            &lane.admin,
+            &lane.cfg,
+            &lane.notes_lock,
+            &lane.status,
+            &shutdown,
+        )
+        .await;
+        if pass.sync.as_ref().is_some_and(SyncResult::made_work) {
+            lane.job_wake.notify_one();
+        }
+        tokio::select! {
+            () = tokio::time::sleep(ADMIN_INTERVAL) => {},
+            () = lane.wake.notified() => {},
+            _ = shutdown.changed() => {},
+        }
     }
 }
 
@@ -172,11 +306,27 @@ pub async fn compute_sleep_s(store: &Store, summary: &CycleSummary) -> f64 {
     } else {
         sleep_s = 15.0 * 60.0;
     }
-    // PR sync cap (free reads only — never override budget denial backoff)
-    if summary.sync.is_some() && summary.denied.is_none() {
-        return sleep_s.min(PR_SYNC_INTERVAL_S);
+    // While a PR is open, never sleep past the admin lane's interval
+    // (budget backoff excepted, which only the budget can lift). The admin
+    // lane wakes this one when a sync makes new work, but not for work that
+    // was already there: an engage whose last attempt failed and is due a
+    // retry, or a PR still flagged from an earlier pass.
+    if summary.denied.is_none() && has_open_pr(store).await {
+        return sleep_s.min(ADMIN_INTERVAL.as_secs_f64());
     }
     sleep_s
+}
+
+/// Whether any finding has an open PR; `false` when that cannot be read,
+/// which only leaves the sleep as it was.
+async fn has_open_pr(store: &Store) -> bool {
+    store
+        .list_findings(&crate::store::FindingFilter {
+            status: Some(crate::domain::FindingStatus::PrOpen),
+            ..crate::store::FindingFilter::default()
+        })
+        .await
+        .is_ok_and(|open| !open.is_empty())
 }
 
 /// When a loop that sleeps `sleep_s` from `now_ms` wakes, in epoch ms:
@@ -185,7 +335,8 @@ pub fn next_wake_ms(now_ms: i64, sleep_s: f64) -> i64 {
     now_ms + (sleep_s * 1000.0) as i64
 }
 
-/// Run the daemon: axum serve + scheduler loop + usage prober.
+/// Run the daemon: axum serve, usage prober, the job lane and the admin
+/// lane.
 #[allow(
     clippy::too_many_lines,
     reason = "process entry point: every line is wiring (lockfile, store, \
@@ -197,7 +348,7 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     // token comes only with the lock, and the store holds the lock until
     // its last clone is gone. Before anything else reads the job table:
     // every `running` row and every `fixing` claim is the dead prior
-    // process's. The loop needs the `Recovered` the token becomes, so
+    // process's. The lanes need the `Recovered` the token becomes, so
     // this runs exactly once and before any job exists. The sweep below
     // then releases the trees of the chains this ended.
     let lock = crate::recovery::DaemonLock::acquire(&cfg.work_root, &cfg.db_path)?;
@@ -206,6 +357,7 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     let (recovered, settled) =
         crate::recovery::reconcile_and_log(unreconciled, &cfg.work_root).await?;
     tracing::info!("startup reconcile: {settled:?}");
+    let (mut jobs, admin) = recovered.into_lanes();
     // One mutex for the whole process, shared by the HTTP handlers and
     // the reaper passes below: it exists to keep a note append from
     // recreating a file that reclamation is removing, which only works
@@ -227,7 +379,9 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         "unknown backend_type: {:?}",
         cfg.backend_type
     );
-    let scheduler_overdrive = Arc::new(AtomicBool::new(false));
+    // The overdrive flag is the handle's, shared with the backend wrapper
+    // that reads it on every decision.
+    let scheduler = crate::server::SchedulerHandle::default();
     let provider_backend: Arc<dyn Backend> =
         Arc::new(crate::backends::omp_scavenge::OmpScavengeBackend {
             cfg: cfg.clone(),
@@ -237,24 +391,19 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         });
     let backend: Arc<dyn Backend> = Arc::new(crate::backend::OverdriveBackend::new(
         provider_backend,
-        scheduler_overdrive.clone(),
+        scheduler.overdrive.clone(),
     ));
 
-    let cycle_running = Arc::new(AtomicBool::new(false));
-    let scheduler_paused = Arc::new(AtomicBool::new(false));
-    let wake = Arc::new(Notify::new());
+    let cycle_running = scheduler.running.clone();
+    let scheduler_paused = scheduler.paused.clone();
+    let wake = scheduler.wake.clone();
 
     let state = AppState {
         store: store.clone(),
         config: Arc::new(cfg.clone()),
         backend: backend.clone(),
         repo_notes: repo_notes.clone(),
-        scheduler: crate::server::SchedulerHandle {
-            running: cycle_running.clone(),
-            paused: scheduler_paused.clone(),
-            overdrive: scheduler_overdrive,
-            wake: wake.clone(),
-        },
+        scheduler: scheduler.clone(),
     };
 
     // Loopback unless `serve.host` opts in to more. Widening the listener
@@ -262,7 +411,7 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     // loopback names and `serve.allowedHosts` (`server::host_guard`).
     let addr = std::net::SocketAddr::new(cfg.serve_host, cfg.serve_port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("daemon started: ui http://{addr}/ -- scheduler loop live");
+    tracing::info!("daemon started: ui http://{addr}/ -- job and admin lanes live");
 
     // One shutdown source for the whole daemon, created before the loop.
     // A signal future built inside the loop's select! cannot replay a
@@ -284,7 +433,7 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
             () = next_signal(sigint) => "SIGINT",
             () = next_signal(sigterm) => "SIGTERM",
         };
-        tracing::info!("received {name}: finishing current cycle, then stopping");
+        tracing::info!("received {name}: finishing the lanes' current work, then stopping");
         shutdown_tx.send_replace(true);
         // Hold the sender forever: dropping it would make `changed()`
         // resolve instantly with an error on every iteration, spinning
@@ -303,7 +452,7 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     //
     // The operator wants the opposite — a stopping daemon that still
     // answers "what is it doing?" until it has actually stopped. So this
-    // is notified after the scheduler loop exits, and nothing else
+    // is notified after both scheduler lanes exit, and nothing else
     // resolves it.
     let ui_stop = Arc::new(Notify::new());
     let ui_stop_rx = ui_stop.clone();
@@ -332,7 +481,20 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         }
     });
 
-    // Scheduler loop
+    // Admin lane: its own task, beside the job lane below.
+    let admin_handle = tokio::spawn(run_admin_lane(
+        AdminLane {
+            admin,
+            cfg: cfg.clone(),
+            notes_lock: repo_notes.clone(),
+            status: scheduler.admin.clone(),
+            wake: scheduler.admin_wake.clone(),
+            job_wake: wake.clone(),
+        },
+        shutdown_rx.clone(),
+    ));
+
+    // Job lane
     let mut stop = false;
     while !stop {
         // Not atomic with the `cycle_running.store(true)` below, on
@@ -360,9 +522,7 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         }
 
         cycle_running.store(true, Ordering::SeqCst);
-        crate::server::reap_deleted_repos(&store, &cfg.work_root, &repo_notes).await;
-        sweep_workspaces(&store, &cfg.work_root).await;
-        let summary = crate::scheduler::run_cycle(&recovered, &cfg, &*backend, None).await;
+        let summary = crate::scheduler::run_cycle(&mut jobs, &cfg, &*backend, None).await;
         cycle_running.store(false, Ordering::SeqCst);
 
         let sleep_s = compute_sleep_s(&store, &summary).await;
@@ -379,7 +539,7 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         tokio::select! {
             () = tokio::time::sleep(std::time::Duration::from_secs_f64(sleep_s)) => {},
             () = wake.notified() => {
-                tracing::debug!("daemon woken by notify");
+                tracing::debug!("job lane woken by notify");
             },
             _ = shutdown_rx.changed() => {},
         }
@@ -388,9 +548,13 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         stop = *shutdown_rx.borrow();
     }
 
+    // The admin lane saw the same latch; let its pass in progress finish.
+    if let Err(e) = admin_handle.await {
+        tracing::error!("admin lane: {e}");
+    }
     signal_handle.abort();
     prober_handle.abort();
-    // Only now: the cycle is over, so the UI has nothing left to report.
+    // Only now: both lanes are done, so the UI has nothing left to report.
     // Notified rather than aborted, so in-flight responses finish.
     ui_stop.notify_waiters();
     let _ = tokio::time::timeout(UI_DRAIN, ui_handle).await;

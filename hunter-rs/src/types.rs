@@ -408,6 +408,9 @@ pub enum ActivityStatus {
     Running {
         job: Box<Job>,
     },
+    /// The job lane is inside a cycle with no `running` job: picking,
+    /// preparing a job (fetch, clone, a Renovate scan) or finishing one
+    /// (push, PR, ingest).
     Working,
     Error {
         detail: String,
@@ -442,6 +445,7 @@ pub struct Summary {
     pub type_counts: std::collections::BTreeMap<String, i64>,
     pub repos: Vec<RepoBrief>,
     pub last_cycle: Option<Event>,
+    /// Whether the job lane is inside a cycle.
     pub cycle_running: bool,
     pub scheduler_paused: bool,
     pub scheduler_overdrive: bool,
@@ -449,6 +453,30 @@ pub struct Summary {
     pub next_candidate: Option<NextCandidate>,
     pub scheduler_state: Option<SchedulerState>,
     pub activity_status: ActivityStatus,
+    /// What the admin lane is doing right now, beside the job lane; `null`
+    /// between its passes.
+    pub admin_activity: Option<AdminActivity>,
+}
+
+/// One task of the admin lane (`crate::daemon`), which runs beside the
+/// job lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminTask {
+    /// Reading every open PR from its forge (`scheduler::sync_prs`).
+    PrSync,
+    /// Removing the clones of deleted repos (`server::reap_deleted_repos`).
+    Reap,
+    /// Releasing finished chains' trees (`workspace::sweep`).
+    Sweep,
+}
+
+/// /`api/summary.admin_activity`: the admin lane's current task, since
+/// when (epoch ms).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+pub struct AdminActivity {
+    pub task: AdminTask,
+    pub started_at: i64,
 }
 
 // ---------------------------------------------------------------------------

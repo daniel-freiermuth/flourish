@@ -297,7 +297,7 @@ async fn create_job_refuses_a_second_running_job_on_one_place() {
         .job;
     let jobs_before = store.list_jobs(10).await.unwrap().len();
 
-    for kind in [FindingJobKind::Fix, FindingJobKind::Engage] {
+    for kind in [FindingJobKind::Fix, FindingJobKind::Recheck] {
         let Err(err) = create(JobStart::fresh_finding(kind, 2)).await else {
             panic!("a {kind} job started beside a running fix of #2");
         };
@@ -331,7 +331,7 @@ async fn create_job_refuses_a_second_running_job_on_one_place() {
     );
 
     // Other places are free: another finding, another repo-level kind.
-    create(JobStart::fresh_finding(FindingJobKind::Engage, 3))
+    create(JobStart::fresh_finding(FindingJobKind::Recheck, 3))
         .await
         .unwrap()
         .job
@@ -357,7 +357,7 @@ async fn create_job_refuses_a_second_running_job_on_one_place() {
     })
     .await
     .unwrap();
-    create(JobStart::fresh_finding(FindingJobKind::Engage, 2))
+    create(JobStart::fresh_finding(FindingJobKind::Recheck, 2))
         .await
         .unwrap()
         .job
@@ -387,7 +387,7 @@ async fn fresh_finding_work_runs_in_its_findings_repo() {
 
     let job = scope
         .create_job(
-            JobStart::fresh_finding(FindingJobKind::Engage, 3),
+            JobStart::fresh_finding(FindingJobKind::Recheck, 3),
             None,
             None,
         )
@@ -396,7 +396,7 @@ async fn fresh_finding_work_runs_in_its_findings_repo() {
         .job;
     assert_eq!(
         job_place(&pool, job.id()).await,
-        ("engage".to_owned(), 2, Some(3), None)
+        ("recheck".to_owned(), 2, Some(3), None)
     );
     job.disown();
 
@@ -445,7 +445,7 @@ async fn job_place(pool: &SqlitePool, id: i64) -> (String, i64, Option<i64>, Opt
 
 /// A fresh `kind` job on `finding`, ended as `state`.
 async fn ended_job(
-    scope: &hunter::recovery::CycleScope,
+    scope: &hunter::recovery::CycleScope<'_>,
     kind: FindingJobKind,
     finding: i64,
     state: FinishedState,
@@ -499,16 +499,78 @@ async fn close_pr_of_finding_3(pool: &SqlitePool) {
     .unwrap();
 }
 
+/// An engage of finding 3 that ran, `done`, while its PR was open, after
+/// which the PR closed: the engage a handoff continues. An engage starts
+/// only on a `pr_open` finding (`JobInsertError::NoEngageDue`).
+async fn engaged_then_closed(pool: &SqlitePool, scope: &hunter::recovery::CycleScope<'_>) -> i64 {
+    sqlx::query("UPDATE findings SET status = 'pr_open', pr_url = ?1 WHERE id = 3")
+        .bind("https://example.com/alpha/pull/7")
+        .execute(pool)
+        .await
+        .unwrap();
+    let engage = ended_job(scope, FindingJobKind::Engage, 3, FinishedState::Done).await;
+    close_pr_of_finding_3(pool).await;
+    engage
+}
+
+/// An engage goes in only while its finding is `pr_open`. PR sync runs on
+/// the admin lane, beside the job lane, and can record the PR's end after
+/// the engage was picked; the insert reads the status under its write lock.
+#[tokio::test]
+async fn an_engage_starts_only_while_its_finding_is_pr_open() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo_and_findings(&pool).await;
+    let store = rw_store(&path).await;
+    let scope = support::scope(&store);
+
+    for status in ["new", "merged", "closed"] {
+        sqlx::query("UPDATE findings SET status = ?1 WHERE id = 3")
+            .bind(status)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let Err(err) = scope
+            .create_job(
+                JobStart::fresh_finding(FindingJobKind::Engage, 3),
+                None,
+                None,
+            )
+            .await
+        else {
+            panic!("an engage of a {status} finding started");
+        };
+        assert!(
+            matches!(err, JobInsertError::NoEngageDue { finding_id: 3 }),
+            "{status}: got {err:?}"
+        );
+    }
+    assert!(store.list_jobs(10).await.unwrap().is_empty());
+
+    sqlx::query("UPDATE findings SET status = 'pr_open' WHERE id = 3")
+        .execute(&pool)
+        .await
+        .unwrap();
+    scope
+        .create_job(
+            JobStart::fresh_finding(FindingJobKind::Engage, 3),
+            None,
+            None,
+        )
+        .await
+        .expect("a pr_open finding's engage starts")
+        .job
+        .disown();
+}
+
 /// A handoff names only its engage, and is that engage's finding's
 /// harvest, once. Nothing but an engage hands over.
 #[tokio::test]
 async fn an_engage_hands_over_to_its_findings_harvest_once() {
     let (_dir, path, pool) = fresh_db().await;
     seed_repo_and_findings(&pool).await;
-    close_pr_of_finding_3(&pool).await;
     let store = rw_store(&path).await;
     let scope = support::scope(&store);
-    let engage = ended_job(&scope, FindingJobKind::Engage, 3, FinishedState::Done).await;
+    let engage = engaged_then_closed(&pool, &scope).await;
     let fix = ended_job(&scope, FindingJobKind::Fix, 2, FinishedState::Done).await;
 
     let harvest = scope
@@ -544,10 +606,9 @@ async fn an_engage_hands_over_to_its_findings_harvest_once() {
 async fn a_harvest_starts_only_while_its_pr_awaits_one() {
     let (_dir, path, pool) = fresh_db().await;
     seed_repo_and_findings(&pool).await;
-    close_pr_of_finding_3(&pool).await;
     let store = rw_store(&path).await;
     let scope = support::scope(&store);
-    let engage = ended_job(&scope, FindingJobKind::Engage, 3, FinishedState::Done).await;
+    let engage = engaged_then_closed(&pool, &scope).await;
     sqlx::query("UPDATE pr_state SET harvested_at = 3000 WHERE finding_id = 3")
         .execute(&pool)
         .await
@@ -1274,14 +1335,14 @@ async fn a_pr_sync_pass_begins_only_once_the_last_one_ended() {
     let (_dir, path, pool) = fresh_db().await;
     seed_repo_and_findings(&pool).await;
     let store = rw_store(&path).await;
-    let recovered = support::recovered(&store);
+    let admin = support::admin(&store);
 
-    let first = recovered.begin_pr_sync().expect("no pass is live yet");
-    assert!(recovered.begin_pr_sync().is_none());
-    assert!(support::recovered(&store.clone()).begin_pr_sync().is_none());
+    let first = admin.begin_pr_sync().expect("no pass is live yet");
+    assert!(admin.begin_pr_sync().is_none());
+    assert!(support::admin(&store.clone()).begin_pr_sync().is_none());
 
     drop(first);
-    assert!(recovered.begin_pr_sync().is_some());
+    assert!(admin.begin_pr_sync().is_some());
 }
 
 /// A pass reads each finding's PR once: a second read of it in the same
@@ -3543,7 +3604,7 @@ async fn counting_a_failure_keeps_the_checkpoint() {
         .await
         .unwrap();
 
-    assert_eq!(streak, 1);
+    assert_eq!(streak, Some(1));
     assert_eq!(
         store
             .checkpoint_job(2, FindingJobKind::Fix)
@@ -3694,4 +3755,47 @@ async fn repo_holds_are_held_once_released_and_go_with_their_repo() {
     .await
     .unwrap();
     assert_eq!(left, 0);
+}
+
+/// A failure is counted only while its work is live: the finding in the
+/// kind's tier, and a harvest's PR not harvested yet. PR sync runs beside
+/// the job lane and can end an engage's PR while its worker runs; counted,
+/// that failure would open the streak of the next PR's engage.
+#[tokio::test]
+async fn a_failure_counts_only_while_the_finding_is_in_the_kinds_tier() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo_and_findings(&pool).await;
+    sqlx::raw_sql(
+        "UPDATE findings SET status = 'merged' WHERE id = 3;
+         INSERT INTO pr_state (finding_id, pr_number, state, synced_at, harvested_at)
+         VALUES (3, 7, 'MERGED', 1, 2);",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let store = rw_store(&path).await;
+
+    assert_eq!(
+        store
+            .record_work_failure(2, FindingJobKind::Fix, "push failed")
+            .await
+            .unwrap(),
+        Some(1),
+        "a queued finding is in the fix tier"
+    );
+    for (fid, kind) in [
+        (2, FindingJobKind::Engage),
+        (1, FindingJobKind::Recheck),
+        (3, FindingJobKind::Harvest),
+    ] {
+        assert_eq!(
+            store
+                .record_work_failure(fid, kind, "push failed")
+                .await
+                .unwrap(),
+            None,
+            "#{fid} {kind}"
+        );
+        assert_eq!(store.work_streak(fid, kind).await.unwrap().streak, 0);
+    }
 }

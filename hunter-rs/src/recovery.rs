@@ -12,11 +12,19 @@
 //!   ([`Store::connect_exclusive`]), so no second process can reconcile
 //!   under a live one. It cannot run twice on a store, and it
 //!   cannot run once a job exists: creating a job takes a [`CycleScope`],
-//!   a scope takes a [`Recovered`], and the only way to a [`Recovered`]
-//!   consumes that same token. (Tests may take the token of a store they
-//!   just created without a lock, and skip the reconcile through
+//!   a scope is opened only through the [`JobAuthority`], and the only way
+//!   to that is through a [`Recovered`], which only consuming that same
+//!   token makes. (Tests may take the token of a store they just created
+//!   without a lock, and skip the reconcile through
 //!   `Unreconciled::assume_clean`, both behind the `test-support` feature;
 //!   the daemon's build has no such way.)
+//! - The daemon runs two lanes side by side, and [`Recovered::into_lanes`]
+//!   hands each its own authority: the job lane the [`JobAuthority`],
+//!   which opens one [`CycleScope`] at a time and is the only way to
+//!   create a job or claim a fix, and the admin lane the
+//!   [`AdminAuthority`], which is the only way to sync PRs. Neither can
+//!   do the other's work, and since the split consumes the store's one
+//!   [`Recovered`], the daemon has one of each.
 //! - A live process's rows are owned by values. [`CycleScope::create_job`]
 //!   returns the job as a [`RunningJob`], and [`CycleScope::claim_fix`] the
 //!   `fixing` claim as a [`FixClaim`]. Neither can be copied or made
@@ -30,7 +38,7 @@
 //! - A value dropped without being ended -- its runner returned early, a
 //!   write failed, a future was cancelled -- has no holder left, so its
 //!   `Drop` owes the row to the store's ledger. [`CycleScope::settle`]
-//!   and [`Recovered::settle_unsettled`] settle what is owed: what was
+//!   and [`JobAuthority::settle_unsettled`] settle what is owed: what was
 //!   dropped, and nothing that is still held, however many scopes are
 //!   live at once. Dropped is not stopped -- a worker on a blocking
 //!   thread outlives its cancelled future -- so an owed job whose tree a
@@ -51,6 +59,7 @@
 
 use std::collections::BTreeSet;
 use std::fs::File;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -204,12 +213,11 @@ impl Unreconciled {
 }
 
 /// Proof that `store`'s dead-process rows are settled, so jobs may be
-/// created in it ([`CycleScope::open`]). Made only from the store's
-/// [`Unreconciled`] token, by [`reconcile_and_log`]: the holder of that
-/// one value, and whoever it is handed (or cloned) to, is what may create
-/// jobs. Tests can also read it back from a store (`Store::recovered`,
+/// created in it. Made only from the store's [`Unreconciled`] token, by
+/// [`reconcile_and_log`], and neither `Clone` nor `Copy`: the daemon holds
+/// exactly one, and spends it on its two lanes ([`Self::into_lanes`]).
+/// Tests can also read it back from a store (`Store::recovered`,
 /// `test-support` only).
-#[derive(Clone)]
 pub struct Recovered {
     store: Store,
 }
@@ -219,11 +227,68 @@ impl Recovered {
         &self.store
     }
 
+    /// Hand the proof to the daemon's two lanes, each its own part of it.
+    pub fn into_lanes(self) -> (JobAuthority, AdminAuthority) {
+        (
+            JobAuthority {
+                store: self.store.clone(),
+            },
+            AdminAuthority { store: self.store },
+        )
+    }
+}
+
+/// The job lane's authority: the only way to a [`CycleScope`], and so to
+/// creating jobs and claiming fixes. Neither `Clone` nor `Copy`, and a
+/// scope borrows it mutably, so one lane holds it and opens one scope at
+/// a time. Two cycles at once do not compile.
+pub struct JobAuthority {
+    store: Store,
+}
+
+impl JobAuthority {
+    pub const fn store(&self) -> &Store {
+        &self.store
+    }
+
+    /// Open the cycle's scope. It borrows this authority until it is
+    /// settled or dropped, so no second scope opens beside it.
+    pub fn scope(&mut self) -> CycleScope<'_> {
+        CycleScope {
+            store: self.store.clone(),
+            _jobs: PhantomData,
+        }
+    }
+
+    /// A scope for a test fixture that calls runners directly, bound to no
+    /// authority: the one-at-a-time rule does not hold for it. Only in a
+    /// `test-support` build, like `Store::test_lane`.
+    #[cfg(feature = "test-support")]
+    pub fn into_test_scope(self) -> CycleScope<'static> {
+        CycleScope {
+            store: self.store,
+            _jobs: PhantomData,
+        }
+    }
+}
+
+/// The admin lane's authority: the only way to begin a PR sync pass.
+/// Neither `Clone` nor `Copy`: the admin lane holds it. It creates no job
+/// and claims no fix; those take the [`JobAuthority`].
+pub struct AdminAuthority {
+    store: Store,
+}
+
+impl AdminAuthority {
+    pub const fn store(&self) -> &Store {
+        &self.store
+    }
+
     /// Begin the store's PR sync pass, or `None` while another is live
     /// ([`PrSyncPass`]). Sync needs this proof so that only the daemon's
     /// store, the one held under its [`DaemonLock`], can sync.
     pub fn begin_pr_sync(&self) -> Option<PrSyncPass> {
-        PrSyncPass::begin(&self.store)
+        PrSyncPass::begin(self)
     }
 }
 
@@ -363,31 +428,22 @@ static NEXT_CLAIM: AtomicU64 = AtomicU64::new(0);
 pub struct Owner(());
 
 /// The authority jobs are created and fixes claimed through, for one
-/// cycle. [`CycleScope::open`] takes a [`Recovered`], so nothing is created
-/// before the startup reconcile. What it creates is owned by the values
-/// it returns, not by the scope: [`CycleScope::settle`] settles what was
-/// dropped unended. Its runners take clone permits in the cycle's
-/// [`Lane`](crate::clones::Lane), which they are lent beside it: a permit borrows the lane, not
-/// the scope, so a runner holding one can still create its job.
-pub struct CycleScope {
+/// cycle. Opened only by [`JobAuthority::scope`], which it borrows
+/// mutably, so nothing is created before the startup reconcile, nothing
+/// outside the job lane, and no two cycles run at once. What it creates
+/// is owned by the values it returns, not by the scope:
+/// [`CycleScope::settle`] settles what was dropped unended. Its runners
+/// take clone permits in the cycle's [`Lane`](crate::clones::Lane), which
+/// they are lent beside it: a permit borrows the lane, not the scope, so
+/// a runner holding one can still create its job.
+pub struct CycleScope<'a> {
     store: Store,
+    _jobs: PhantomData<&'a mut JobAuthority>,
 }
 
-impl CycleScope {
-    pub fn open(recovered: &Recovered) -> Self {
-        Self {
-            store: recovered.store.clone(),
-        }
-    }
-
+impl CycleScope<'_> {
     pub const fn store(&self) -> &Store {
         &self.store
-    }
-
-    /// [`Recovered::begin_pr_sync`] for the cycle: a scope is opened only
-    /// from a [`Recovered`].
-    pub fn begin_pr_sync(&self) -> Option<PrSyncPass> {
-        PrSyncPass::begin(&self.store)
     }
 
     /// Create a job, owned by the [`RunningJob`] returned. The INSERT and
@@ -623,7 +679,7 @@ impl Drop for FixClaim {
     }
 }
 
-impl Recovered {
+impl JobAuthority {
     /// Settle what is owed (as [`CycleScope::settle`]) before anything new is
     /// created: what earlier cycles dropped unended, or failed to settle.
     pub async fn settle_unsettled(&self, work_root: &Path) -> anyhow::Result<Settled> {
@@ -862,9 +918,10 @@ mod tests {
     async fn what_is_dropped_while_a_settle_runs_stays_owed() {
         use crate::domain::RepoJobKind;
         let (dir, recovered) = fixture("drop-during-settle").await;
-        let store = recovered.store();
+        let mut jobs = recovered.into_lanes().0;
+        let store = &jobs.store().clone();
         let work_root = dir.join("work_root");
-        let scope = CycleScope::open(&recovered);
+        let scope = jobs.scope();
         drop(scope.claim_fix(2).await.unwrap().unwrap());
 
         // A settle takes the ledger and releases that claim ...
@@ -884,7 +941,7 @@ mod tests {
         // ... and only then does the settle strike what it settled.
         forget_settled(store, owed, &deferred);
 
-        let next = recovered.settle_unsettled(&work_root).await.unwrap();
+        let next = jobs.settle_unsettled(&work_root).await.unwrap();
 
         assert_eq!(
             next,
@@ -911,9 +968,10 @@ mod tests {
     async fn a_settle_leaves_a_job_ended_since_it_read_it() {
         use crate::domain::RepoJobKind;
         let (dir, recovered) = fixture("ended-since-read").await;
-        let store = recovered.store();
+        let mut jobs = recovered.into_lanes().0;
+        let store = &jobs.store().clone();
         let work_root = dir.join("work_root");
-        let scope = CycleScope::open(&recovered);
+        let scope = jobs.scope();
         let create =
             |kind: RepoJobKind| scope.create_job(JobStart::fresh_repo(kind, 1), None, None);
         let with_work = create(RepoJobKind::Hunt).await.unwrap().job;
