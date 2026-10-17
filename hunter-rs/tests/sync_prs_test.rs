@@ -292,6 +292,7 @@ async fn a_pass_reads_its_open_prs_side_by_side_within_the_bound() {
     let result = f.sync().await;
 
     assert_eq!((result.synced, result.errors), (PRS, 0), "{result:?}");
+    assert!(result.complete, "a pass that read every PR");
     let overlaps: Vec<usize> = std::fs::read_dir(&seen)
         .unwrap()
         .map(|e| {
@@ -468,6 +469,7 @@ async fn a_pass_told_to_stop_reads_no_more_prs() {
     let result = hunter::scheduler::sync_prs(&pass, &f.cfg).await;
 
     assert_eq!((result.synced, result.merged, result.errors), (0, 0, 0));
+    assert!(!result.complete, "a stopped pass read every PR");
     assert!(bins.calls_to("gh").is_empty(), "{:?}", bins.calls());
     assert_eq!(f.status().await, FindingStatus::PrOpen);
 }

@@ -1297,7 +1297,7 @@ impl Forge for GitHubForge {
         let mut pr = gh_pr_view(
             &slug,
             pr_number,
-            "title,body,comments,reviews,statusCheckRollup,headRefName,headRefOid",
+            "state,title,body,comments,reviews,statusCheckRollup,headRefName,headRefOid",
         )?;
         // Engage acts on what reviewers said about specific lines, and
         // `gh pr view` returns only the conversation and review summaries.
