@@ -21,7 +21,7 @@ use crate::attention::{
 };
 use crate::domain::FindingStatus;
 use crate::recovery::AdminAuthority;
-use crate::transition::{PrEnd, PrEnded, PrEnding, PrRef, Sources};
+use crate::transition::{PR_CLOSED_AWAITING_HARVEST, PrEnd, PrEnded, PrEnding, PrRef, Sources};
 use crate::util::now_ms;
 use tokio::sync::watch;
 
@@ -309,6 +309,47 @@ pub(super) async fn end(
             Ok(PrEnded::Applied)
         }
     }
+}
+
+/// A withdrawal whose closure the PR sync recorded first: the sync saw the
+/// PR the engage had just closed and ended it (`closed`, with the sync's
+/// own reason, [`PR_CLOSED_AWAITING_HARVEST`]) before the engage's
+/// [`end`] landed. It is the same closure, so the engage takes it over:
+/// the worker's reason replaces the sync's, and `true` lets the engage
+/// continue into its harvest as if its own end had landed.
+///
+/// Only that closure, checked under `tx`'s write lock: the finding is
+/// `closed` on `pr` with the sync's reason, and `pr_state` records `pr`
+/// CLOSED and not yet harvested. Anything else -- an operator's verdict,
+/// a harvest's classification, another PR -- decided the finding, and
+/// `false` leaves it to that. No second harvest can start from the
+/// sync's closure meanwhile: only the job lane creates jobs, and it is
+/// running this engage.
+pub(super) async fn adopt_closure(
+    tx: &mut ImmediateTx,
+    finding_id: i64,
+    pr: &PrRef,
+    reason: &str,
+) -> sqlx::Result<bool> {
+    let (closed, url, number, now) = (FindingStatus::Closed, pr.url(), pr.number(), now_ms());
+    let adopted = sqlx::query!(
+        "UPDATE findings SET verdict_reason = ?1, updated_at = ?2 \
+         WHERE id = ?3 AND status = ?4 AND pr_url = ?5 AND verdict_reason = ?6 \
+           AND EXISTS (SELECT 1 FROM pr_state p WHERE p.finding_id = findings.id \
+               AND p.state = 'CLOSED' AND p.pr_number = ?7 AND p.harvested_at IS NULL)",
+        reason,
+        now,
+        finding_id,
+        closed,
+        url,
+        PR_CLOSED_AWAITING_HARVEST,
+        number
+    )
+    .execute(&mut **tx)
+    .await?
+    .rows_affected()
+        > 0;
+    Ok(adopted)
 }
 
 /// [`record_end`] with no check of the finding: a fixture write, only in a

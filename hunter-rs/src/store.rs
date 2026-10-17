@@ -1400,6 +1400,22 @@ impl Store {
         Ok(ended)
     }
 
+    /// Take over the PR sync's record of the closure an engage's
+    /// withdrawal made, the sync having recorded it first: the worker's
+    /// `reason` replaces the sync's. `true` when it was that closure
+    /// (`pr_state::adopt_closure`).
+    pub async fn adopt_closure(
+        &self,
+        finding_id: i64,
+        pr: &PrRef,
+        reason: &str,
+    ) -> sqlx::Result<bool> {
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
+        let adopted = pr_state::adopt_closure(&mut tx, finding_id, pr, reason).await?;
+        tx.commit().await?;
+        Ok(adopted)
+    }
+
     /// Move `finding_id` from one of `from` to `to`, writing `record` with
     /// it; `true` when the finding was at one of `from` and moved.
     #[allow(

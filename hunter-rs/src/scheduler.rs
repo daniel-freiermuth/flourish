@@ -22,7 +22,9 @@ use crate::store::{
     FindingFilter, JobInsertError, JobOutcome, JobPlace, JobStart, PrSyncPass, SeenActivity, Store,
     StoreWriteError,
 };
-use crate::transition::{Moved, PrEnded, PrEnding, PrRef, Transition, Unclaimed};
+use crate::transition::{
+    Moved, PR_CLOSED_AWAITING_HARVEST, PrEnded, PrEnding, PrRef, Transition, Unclaimed,
+};
 use crate::types::{Finding, Job, JobPhase, Repo};
 use crate::util::now_ms;
 
@@ -5625,7 +5627,7 @@ async fn sync_one_pr(pass: &PrSyncPass, cfg: &Config, f: &Finding) -> SyncResult
             // revisits pr_open findings, so a finding set closed while
             // pr_state still read OPEN would never be looked at again.
             let closed = PrEnding::Closed {
-                reason: "PR closed without merge; awaiting harvest",
+                reason: PR_CLOSED_AWAITING_HARVEST,
             };
             if !sync_pr_end(store, fid, "verdict", &read_pr, closed, &mut summary).await {
                 return summary;
@@ -6200,11 +6202,30 @@ async fn withdraw_pr(
 
 /// Record a withdrawn PR's finding `closed` and its `pr_state` CLOSED, in
 /// one write, only while `pr` is still the finding's; `true` when it was.
+///
+/// The PR sync, on the admin lane, may see the PR closed and record it
+/// between the engage's close on the forge and this write. That is this
+/// withdrawal's closure, so the engage takes it over
+/// ([`Store::adopt_closure`]): its reason replaces the sync's, and it
+/// continues into its harvest as if its own write had landed.
 async fn set_withdrawn_closed(store: &Store, fid: i64, job: i64, pr: &PrRef, reason: &str) -> bool {
     let pr_number = pr.number();
     let now = match store.end_pr(fid, pr, PrEnding::Closed { reason }).await {
         Ok(PrEnded::Applied) => return true,
-        // Something moved the finding off pr_open since the engage read it,
+        Ok(PrEnded::Conflict {
+            now: Some(FindingStatus::Closed),
+        }) if store
+            .adopt_closure(fid, pr, reason)
+            .await
+            .inspect_err(|err| {
+                tracing::warn!(finding = fid, pr = pr_number, error = %err, "adopting the sync's closure failed");
+            })
+            .unwrap_or(false) =>
+        {
+            return true;
+        }
+        // Something else moved the finding off pr_open since the engage
+        // read it -- an operator's verdict, a closure already classified --
         // or it went on to another PR, and that decision owns the finding
         // now: no handoff, the harvest it would start is that decision's to
         // start.
