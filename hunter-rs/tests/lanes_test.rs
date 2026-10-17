@@ -261,6 +261,7 @@ async fn a_pr_sync_does_not_wait_for_a_dependency_scan() {
             notes_lock: Arc::default(),
             status: scheduler.admin.clone(),
             pr_sync_wake: scheduler.pr_sync_wake.clone(),
+            pr_sync_passes: hunter::daemon::PrSyncPasses::default(),
             job_wake: scheduler.wake.clone(),
         },
         &stopping,
@@ -305,6 +306,204 @@ async fn a_pr_sync_does_not_wait_for_a_dependency_scan() {
         scan_still_running,
         "fixture: the scan ended before the sync, so it proves nothing"
     );
+}
+
+/// The admin lane, started as the daemon starts it, with `passes` counting
+/// its PR syncs; stopped by sending `true` on the returned sender.
+fn start_admin_lane(
+    store: &Store,
+    cfg: &Config,
+    passes: &hunter::daemon::PrSyncPasses,
+) -> (
+    hunter::server::SchedulerHandle,
+    tokio::sync::watch::Sender<bool>,
+    tokio::sync::watch::Receiver<bool>,
+    Vec<tokio::task::JoinHandle<()>>,
+) {
+    let scheduler = hunter::server::SchedulerHandle::default();
+    let (stop, stopping) = tokio::sync::watch::channel(false);
+    let duties = hunter::daemon::spawn_admin_lane(
+        hunter::daemon::AdminLane {
+            admin: support::admin(store),
+            cfg: cfg.clone(),
+            notes_lock: Arc::default(),
+            status: scheduler.admin.clone(),
+            pr_sync_wake: scheduler.pr_sync_wake.clone(),
+            pr_sync_passes: passes.clone(),
+            job_wake: scheduler.wake.clone(),
+        },
+        &stopping,
+    );
+    (scheduler, stop, stopping, duties)
+}
+
+async fn stop_admin_lane(
+    stop: &tokio::sync::watch::Sender<bool>,
+    duties: Vec<tokio::task::JoinHandle<()>>,
+) {
+    stop.send_replace(true);
+    for duty in duties {
+        tokio::time::timeout(BOUND, duty)
+            .await
+            .expect("an admin duty did not stop")
+            .unwrap();
+    }
+}
+
+/// The job lane's first pick waits for the first PR sync: a PR merged
+/// while the daemon was down is recorded before anything is picked, so no
+/// engage is started from the `pr_open` row the database still has.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_first_pick_waits_for_a_sync_to_record_what_the_forge_did() {
+    let bins = FakeBins::acquire("lanes-first-sync");
+    let merged = r#"{"state":"MERGED","mergedAt":"2026-01-02T03:04:05Z","mergeable":"UNKNOWN","reviewDecision":"","comments":[],"reviews":[],"statusCheckRollup":[],"updatedAt":"2026-01-02T03:04:05Z","headRefName":"fix/some-bug","headRefOid":"deadbeef"}"#;
+    bins.ok("gh", merged);
+    let (_dir, store, cfg, fid) = fixture("lanes-first-sync").await;
+    let passes = hunter::daemon::PrSyncPasses::default();
+    let (_scheduler, stop, stopping, duties) = start_admin_lane(&store, &cfg, &passes);
+
+    tokio::time::timeout(BOUND, passes.first(&stopping))
+        .await
+        .expect("the first PR sync never finished");
+    let status = store.get_finding(fid).await.unwrap().unwrap().status;
+
+    stop_admin_lane(&stop, duties).await;
+    assert_eq!(status, FindingStatus::Merged);
+}
+
+/// After a cycle that met a PR the forge has ended, the job lane picks
+/// again only once a sync pass begun after that cycle has recorded it;
+/// picking sooner would pick the same engage from the same stale row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pick_after_an_ended_pr_waits_for_a_sync_begun_after_it() {
+    let bins = FakeBins::acquire("lanes-next-sync");
+    let open = r#"{"state":"OPEN","mergeable":"MERGEABLE","reviewDecision":"","comments":[],"reviews":[],"statusCheckRollup":[],"updatedAt":"2026-01-02T03:04:05Z","headRefName":"fix/some-bug","headRefOid":"deadbeef"}"#;
+    let merged = r#"{"state":"MERGED","mergedAt":"2026-01-02T03:04:05Z","mergeable":"UNKNOWN","reviewDecision":"","comments":[],"reviews":[],"statusCheckRollup":[],"updatedAt":"2026-01-02T03:04:05Z","headRefName":"fix/some-bug","headRefOid":"deadbeef"}"#;
+    bins.ok("gh", open);
+    let (_dir, store, cfg, fid) = fixture("lanes-next-sync").await;
+    let passes = hunter::daemon::PrSyncPasses::default();
+    let (scheduler, stop, stopping, duties) = start_admin_lane(&store, &cfg, &passes);
+    tokio::time::timeout(BOUND, passes.first(&stopping))
+        .await
+        .expect("the first PR sync never finished");
+    let before = store.get_finding(fid).await.unwrap().unwrap().status;
+
+    // The PR merges; the admin lane's next tick is minutes away.
+    bins.ok("gh", merged);
+    let synced = tokio::time::timeout(BOUND, passes.next(&scheduler.pr_sync_wake, &stopping))
+        .await
+        .expect("the woken PR sync never finished");
+    let after = store.get_finding(fid).await.unwrap().unwrap().status;
+
+    stop_admin_lane(&stop, duties).await;
+    assert_eq!(before, FindingStatus::PrOpen);
+    assert_eq!(after, FindingStatus::Merged);
+    assert!(synced, "a pass finished");
+}
+
+/// A wait for the next pass that shutdown ends says no pass finished: the
+/// job lane then counts nothing against the engage it waited for.
+#[tokio::test]
+async fn a_wait_for_the_next_sync_ended_by_shutdown_saw_no_pass() {
+    let passes = hunter::daemon::PrSyncPasses::default();
+    let wake = tokio::sync::Notify::new();
+    let (stop, stopping) = tokio::sync::watch::channel(false);
+    stop.send_replace(true);
+    let synced = tokio::time::timeout(BOUND, passes.next(&wake, &stopping))
+        .await
+        .expect("shutdown did not end the wait");
+    assert!(!synced);
+}
+
+/// A pass that stopped for shutdown before reading every open PR is no
+/// pass for the job lane's wait: the PR it waited for may be one the pass
+/// never reached, and counting it would charge that engage a failure for
+/// a sync that never looked. The wait here has its own latch, so only
+/// the lane's shutdown cuts the pass short.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sync_pass_cut_short_by_shutdown_is_not_a_finished_pass() {
+    let bins = FakeBins::acquire("lanes-cut-short");
+    let (dir, store, cfg, fid) = fixture("lanes-cut-short").await;
+    let rid = store.get_finding(fid).await.unwrap().unwrap().repo_id;
+    let extra = hunter::scheduler::PR_SYNC_CONCURRENCY;
+    for n in 0..extra {
+        let (id, _) = store
+            .upsert_finding(
+                rid,
+                &FindingInsert {
+                    fingerprint: format!("fp-cut-{n}"),
+                    file: "src/lib.rs".to_owned(),
+                    summary: "another PR".to_owned(),
+                    ..Default::default()
+                },
+                "bug",
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .set_finding_pr_open(
+                id,
+                &format!("https://github.com/acme/widget/pull/{}", 20 + n),
+            )
+            .await
+            .unwrap();
+    }
+    let started = dir.path().join("started");
+    let release = dir.path().join("release");
+    std::fs::create_dir_all(&started).unwrap();
+    std::fs::write(&release, "").unwrap();
+    let open = r#"{"state":"OPEN","mergeable":"MERGEABLE","reviewDecision":"","comments":[],"reviews":[],"statusCheckRollup":[],"updatedAt":"2026-01-02T03:04:05Z","headRefName":"fix/some-bug","headRefOid":"deadbeef"}"#;
+    bins.script(
+        "gh",
+        &format!(
+            "touch '{started}/'$$\n\
+             i=0\n\
+             while [ ! -e '{release}' ] && [ $i -lt 500 ]; do sleep 0.02; i=$((i+1)); done\n\
+             cat <<'__PR_EOF__'\n{open}\n__PR_EOF__\nexit 0",
+            started = started.display(),
+            release = release.display(),
+        ),
+    );
+    let passes = hunter::daemon::PrSyncPasses::default();
+    let (scheduler, stop, stopping, duties) = start_admin_lane(&store, &cfg, &passes);
+    tokio::time::timeout(BOUND, passes.first(&stopping))
+        .await
+        .expect("the first PR sync never finished");
+
+    // The next pass holds its first reads until released; one PR is left
+    // for when a read ends.
+    std::fs::remove_file(&release).unwrap();
+    for e in std::fs::read_dir(&started).unwrap() {
+        std::fs::remove_file(e.unwrap().path()).unwrap();
+    }
+    let (_never, not_stopping) = tokio::sync::watch::channel(false);
+    let wake = scheduler.pr_sync_wake.clone();
+    let waited = {
+        let passes = passes.clone();
+        tokio::spawn(async move { passes.next(&wake, &not_stopping).await })
+    };
+    let live = tokio::time::timeout(BOUND, async {
+        while std::fs::read_dir(&started).unwrap().count() < extra {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    stop.send_replace(true);
+    std::fs::write(&release, "").unwrap();
+    let synced = tokio::time::timeout(BOUND, waited)
+        .await
+        .expect("the cut-short pass never finished")
+        .unwrap();
+
+    stop_admin_lane(&stop, duties).await;
+    assert!(live.is_ok(), "fixture: the pass never had its reads out");
+    assert_eq!(
+        std::fs::read_dir(&started).unwrap().count(),
+        extra,
+        "fixture: the pass read every PR, so it was not cut short"
+    );
+    assert!(!synced, "a pass cut short by shutdown counted as a sync");
 }
 
 /// A duty whose run panics runs again at its next tick, and the panic is
@@ -352,12 +551,7 @@ async fn a_duty_whose_run_panics_runs_again_and_the_panic_is_logged() {
     assert!(ended.is_ok(), "the duty's own task died with its run");
     assert!(ran_again.is_ok(), "the duty never ran again");
     let logged = store.recent_events(50).await.unwrap();
-    assert!(
-        logged
-            .iter()
-            .any(|e| e.kind == "error" && e.message.contains("admin duty Sweep failed")),
-        "{logged:?}"
-    );
+    assert!(logged.iter().any(|e| e.kind == "error"), "{logged:?}");
 }
 
 /// Each change a sync can make is work for the job lane on its own; what

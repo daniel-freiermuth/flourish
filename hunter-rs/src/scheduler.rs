@@ -1247,6 +1247,10 @@ pub struct SyncResult {
     /// `pr_open` findings without a PR, put back to `queued`.
     pub requeued: i64,
     pub errors: i64,
+    /// Whether the pass began a read of every `pr_open` finding it listed:
+    /// not one stopped for shutdown first, nor one that could not list
+    /// them. A failed read still counts as read (`errors`).
+    pub complete: bool,
 }
 
 impl SyncResult {
@@ -1335,6 +1339,13 @@ pub struct CycleSummary {
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idle: Option<String>,
+    /// The cycle found the forge ahead of the database -- a PR the
+    /// database still has open is merged or closed -- and recorded
+    /// nothing, since that is the PR sync's to record. The job lane waits
+    /// for a fresh sync pass before it picks again
+    /// ([`crate::daemon::PrSyncPasses::next`]).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub awaits_pr_sync: bool,
 }
 
 /// Maximum consecutive identical failures before giving up (`scheduler.MAX_CONSECUTIVE_SAME_FAILURE`).
@@ -5450,14 +5461,20 @@ fn civil_to_days(y: i64, m: u32, d: u32) -> i64 {
 pub async fn sync_prs(pass: &PrSyncPass, cfg: &Config) -> SyncResult {
     use futures_util::StreamExt;
     use futures_util::stream::FuturesUnordered;
-    let findings = pass
+    let findings = match pass
         .store()
         .list_findings(&FindingFilter {
             status: Some(FindingStatus::PrOpen),
             ..FindingFilter::default()
         })
         .await
-        .unwrap_or_default();
+    {
+        Ok(findings) => findings,
+        Err(e) => {
+            tracing::warn!("PR sync: listing open PRs: {e}");
+            return SyncResult::default();
+        }
+    };
     // A plain loop rather than `buffer_unordered`: closures over `pass`
     // make the future fail the `Send` check the admin lane's spawn needs.
     let mut todo = findings.iter();
@@ -5474,7 +5491,8 @@ pub async fn sync_prs(pass: &PrSyncPass, cfg: &Config) -> SyncResult {
         };
         summary = summary.add(&one);
     }
-    if pass.stopping() {
+    summary.complete = todo.len() == 0;
+    if !summary.complete {
         tracing::info!("PR sync stopped for shutdown");
     }
     summary
@@ -5890,12 +5908,22 @@ struct EngageStart {
     seen_activity: Option<SeenActivity>,
 }
 
-/// The PR as the forge shows it, for a fresh engage's playbook. Only a
-/// fresh engage reads it: a paused one continues without the forge (a
-/// resume sends no playbook), where a view that failed while the network
-/// is not back would count against it for nothing. A failed view is a
-/// failed engage ([`engage_prefetch_failed`]), or the network's, which
-/// ends the cycle denied (`Ok(Err(summary))`).
+/// The PR as the forge shows it, for a fresh engage's playbook. A failed
+/// view is a failed engage ([`engage_prefetch_failed`]), or the
+/// network's, which ends the cycle denied (`Ok(Err(summary))`).
+///
+/// A PR the forge shows merged or closed ends the cycle too, before any
+/// job row: the engage was picked from a `pr_open` row the PR sync has not
+/// yet brought up to date, which the sync records, not the engage
+/// ([`CycleSummary::awaits_pr_sync`]). Nothing is counted against the
+/// finding; a one-shot override is spent, as [`engage_unpublished`]
+/// spends it.
+///
+/// A resume reads the PR for that check only. Its transcript holds the
+/// playbook, so it is handed no view (`Ok(Ok(None))`), and a view that
+/// fails does not stop it: a paused engage continues without the forge,
+/// where a view failing while the network is not back would count
+/// against it for nothing.
 async fn engage_view(
     store: &Store,
     (cfg, backend): (&Config, &dyn Backend),
@@ -5903,12 +5931,37 @@ async fn engage_view(
     repo: &Repo,
     pr_number: i64,
 ) -> anyhow::Result<Result<Option<PrView>, CycleSummary>> {
-    let Attempt::Cold(finding) = attempt else {
-        return Ok(Ok(None));
-    };
+    let finding = attempt.subject();
+    let cold = matches!(attempt, Attempt::Cold(_));
     let fg = forge::forge_for(repo.forge);
     match fg.view_pr_engage(&repo.url, pr_number, &cfg.review_bots) {
-        Ok(p) => Ok(Ok(Some(p))),
+        Ok(p) if p.state == forge::PrState::Open => Ok(Ok(cold.then_some(p))),
+        Ok(p) => {
+            let fid = finding.id;
+            let ended = p.state.as_str();
+            let _ = store
+                .log_event(
+                    "engage",
+                    &format!(
+                        "engage #{fid}: PR #{pr_number} is {ended} on the forge -- \
+                         not started; the PR sync records it"
+                    ),
+                    None,
+                    Some(fid),
+                )
+                .await;
+            spend_once_override(store, finding).await;
+            Ok(Err(CycleSummary {
+                kind: Some(FindingJobKind::Engage.into()),
+                repo: Some(repo.name.clone()),
+                finding_id: Some(fid),
+                pr_number: Some(pr_number),
+                skipped: Some(format!("PR #{pr_number} is {ended} on the forge")),
+                awaits_pr_sync: true,
+                ..Default::default()
+            }))
+        }
+        Err(_) if !cold => Ok(Ok(None)),
         Err(e) => {
             let fid = finding.id;
             let _ = store
@@ -5928,6 +5981,61 @@ async fn engage_view(
             anyhow::bail!("PR/MR view failed");
         }
     }
+}
+
+/// The streak key of an engage whose PR the forge showed ended while the
+/// PR sync, given a pass to catch up, still had not recorded it
+/// ([`count_unrecorded_pr_end`]).
+pub const PR_END_UNRECORDED: &str = "PR ended on the forge, unrecorded by the PR sync";
+
+/// After the PR sync pass a cycle's [`CycleSummary::awaits_pr_sync`] waited
+/// for: count it against the engage if that pass did not record the end
+/// of the PR the engage found ended on the forge.
+///
+/// The end is the sync's to record, and it logs why it could not (a PR
+/// view or a write that failed). Left alone, the finding stays `pr_open`
+/// and flagged, so the engage tier -- the top one -- picks the same engage
+/// at once, which views the PR again and waits for another pass, without
+/// end, and no tier below it ever runs. Counted as the engage's failure,
+/// the [`MAX_CONSECUTIVE_SAME_FAILURE`]th holds the engage for the
+/// operator (WORK-MODEL.md §7), and the selection moves on. A pass that
+/// did record it, or a PR that is no longer the finding's, counts nothing.
+pub async fn count_unrecorded_pr_end(scope: &CycleScope<'_>, summary: &CycleSummary) {
+    let (true, Some(fid), Some(pr_number)) = (
+        summary.awaits_pr_sync,
+        summary.finding_id,
+        summary.pr_number,
+    ) else {
+        return;
+    };
+    let store = scope.store();
+    let Ok(Some(finding)) = store.get_finding(fid).await else {
+        return;
+    };
+    let open_on_it = finding.status == FindingStatus::PrOpen
+        && store
+            .get_pr_state(fid)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|ps| ps.pr_number)
+            == Some(pr_number);
+    if !open_on_it {
+        return;
+    }
+    let detail = format!(
+        "{PR_END_UNRECORDED}: PR #{pr_number} has ended, and a PR sync pass since \
+         still shows it open"
+    );
+    record_engage_failure(
+        store,
+        fid,
+        None,
+        PR_END_UNRECORDED,
+        &detail,
+        HoldReason::Stuck,
+    )
+    .await;
 }
 
 /// A step before the worker, `step`'s outcome, with a failure handed to
