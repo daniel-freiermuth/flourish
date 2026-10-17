@@ -96,6 +96,7 @@
   const ADMIN_TASK_LABEL: Record<AdminTask, string> = {
     pr_sync: "syncing open PRs",
     reap: "removing deleted repos' clones",
+    fetch_ahead: "fetching repos ahead of their jobs",
     sweep: "sweeping finished workspaces",
   };
   const JOB_PHASE_LABEL: Record<JobPhase, string> = {
