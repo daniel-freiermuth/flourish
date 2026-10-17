@@ -11,10 +11,11 @@ Read-only: do NOT modify the repo, do NOT commit anything, do NOT run
 formatters or full test suites, do NOT comment on or reopen the PR. The
 worktree at {{WORKTREE}} is {{WORKTREE_STATE}}.
 
-"The current code" below always means `origin/{{DEFAULT_BRANCH}}`, which
-was fetched for this run. Read it with
-`git -C {{WORKTREE}} show origin/{{DEFAULT_BRANCH}}:<path>` and
-`git -C {{WORKTREE}} grep -n <pattern> origin/{{DEFAULT_BRANCH}}`, not from
+"The current code" below always means commit `{{BASE}}`, the tip of
+`{{DEFAULT_BRANCH}}` as fetched for this run. Name it by that sha, never as
+`origin/{{DEFAULT_BRANCH}}`: the ref may move while you work. Read it with
+`git -C {{WORKTREE}} show {{BASE}}:<path>` and
+`git -C {{WORKTREE}} grep -n <pattern> {{BASE}}`, not from
 whatever files happen to be checked out.
 
 # Repository Context
@@ -66,8 +67,8 @@ makes a closure `wrong` or `unwanted`.
 2. Establish why it closed, from the discussion AND the current code.
    Closing comments are often terse ("superseded", "not needed"). Check
    whatever they point at: find the commit or PR that superseded it
-   (`git -C {{WORKTREE}} log --oneline -30 origin/{{DEFAULT_BRANCH}}`,
-   `git log -S<symbol> origin/{{DEFAULT_BRANCH}}`, `git show`), and confirm
+   (`git -C {{WORKTREE}} log --oneline -30 {{BASE}}`,
+   `git log -S<symbol> {{BASE}}`, `git show`), and confirm
    that the code the PR touched is changed, fixed or gone in the current
    code. If nobody said why, the code is the only witness: look at it
    before concluding anything.
@@ -108,7 +109,7 @@ makes a closure `wrong` or `unwanted`.
 # Evidence
 Every `file:line` you write, in CLOSE-REASON.json or FOLLOW-UPS.json, must
 be a line you READ IN THIS SESSION from the current version of that file
-(`origin/{{DEFAULT_BRANCH}}`, as above), with the line number that version
+(`{{BASE}}`, as above), with the line number that version
 shows. Never cite a line number taken from the PR's diff (it numbers the
 PR's version, or the version it was written against), from the
 discussion, or from memory: those point at other versions of the file, and

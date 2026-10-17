@@ -1261,7 +1261,8 @@ async fn a_harvest_whose_tree_can_never_be_made_is_held() {
 }
 
 /// The cold review runs in a tree at the default branch, which does not
-/// hold the PR's changes: the prompt must say so and carry the diff.
+/// hold the PR's changes: the prompt must say so, name that commit, and
+/// carry the diff.
 #[tokio::test]
 async fn the_prompt_carries_the_diff_and_what_the_tree_holds() {
     let bins = FakeBins::acquire("harvest-prompt");
@@ -1270,7 +1271,7 @@ async fn the_prompt_carries_the_diff_and_what_the_tree_holds() {
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let backend = classifying(close_reason("superseded"));
 
-    run_harvest(
+    let summary = run_harvest(
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
@@ -1284,8 +1285,22 @@ async fn the_prompt_carries_the_diff_and_what_the_tree_holds() {
     assert_eq!(runs.len(), 1);
     let prompt = &runs[0].prompt;
     assert!(prompt.contains(PR_DIFF), "{prompt}");
+    let job = summary.job_id.unwrap();
+    let base = f
+        .store
+        .base_sha(job)
+        .await
+        .unwrap()
+        .expect("a recorded base");
+    assert_eq!(
+        Some(&base),
+        f.store.pinned_sha(job).await.unwrap().as_ref(),
+        "a cold tree is created at the commit the harvest judges against"
+    );
     assert!(
-        prompt.contains("checked out at main's HEAD, which does NOT contain this PR's changes"),
+        prompt.contains(&format!(
+            "checked out at main's HEAD ({base}), which does NOT contain this PR's changes"
+        )),
         "{prompt}"
     );
     assert_eq!(runs[0].resume_from, None);

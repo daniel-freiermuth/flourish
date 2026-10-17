@@ -1520,10 +1520,20 @@ async fn a_withdrawal_continues_into_its_harvest_in_the_same_session() {
         .join("session")
         .join("engage.jsonl");
     assert_eq!(runs[1].resume_from.as_deref(), Some(transcript.as_path()));
+    // Nothing moves `origin/main` in this test, so the clone's tip is the
+    // commit the harvest resolved after its fetch.
+    let repo = f
+        .store
+        .get_repo_by_id(finding.repo_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let base = git(Path::new(&repo.path), &["rev-parse", "origin/main"]);
+    let base = base.trim();
     assert!(
-        runs[1]
-            .prompt
-            .contains("checked out at the PR's head branch; main is origin/main"),
+        runs[1].prompt.contains(&format!(
+            "checked out at the PR's head branch; main is commit {base}"
+        )),
         "{}",
         runs[1].prompt
     );
@@ -1562,6 +1572,90 @@ async fn a_withdrawal_continues_into_its_harvest_in_the_same_session() {
         "the engage's leftover FOLLOW-UPS.json must not be filed as the harvest's: {all:?}"
     );
     assert!(!runs[0].tree.exists(), "the chain's tree must be released");
+}
+
+/// The admin lane fetches clones while a job's worker runs, so
+/// `origin/main` can move under a harvest continuing a withdrawal. The
+/// verdict must still be anchored at the commit the harvest resolved right
+/// after its own fetch and named to the worker, never at whatever the ref
+/// says when the worker is done: commits in between were never judged, and
+/// anchoring past them hides their changes from suppression for good.
+#[tokio::test]
+async fn a_handoff_verdict_is_anchored_at_the_commit_its_worker_was_shown() {
+    let f = fixture("handoff-base-moves").await;
+    let bins = FakeBins::acquire("handoff-base-moves");
+    gh_for_handoff(&bins);
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    // What `origin/main` named when the harvest's worker started, read by
+    // the worker itself; the backend then moves the ref as a fetch would.
+    let shown: Arc<OnceLock<String>> = Arc::default();
+    let backend = ScriptedBackend::staged({
+        let shown = shown.clone();
+        move |tree, resume_from| {
+            let session = tree.parent().unwrap().join("session").join("engage.jsonl");
+            if let Some(file) = resume_from {
+                let tip = git(tree, &["rev-parse", "origin/main"]).trim().to_owned();
+                shown.set(tip).unwrap();
+                // A fetch landing while the worker runs: `origin/main` now
+                // names the PR's head, a commit the worker never judged.
+                let head = git(tree, &["rev-parse", "HEAD"]).trim().to_owned();
+                git(tree, &["update-ref", "refs/remotes/origin/main", &head]);
+                std::fs::write(
+                    tree.join("CLOSE-REASON.json"),
+                    serde_json::json!({
+                        "classification": "wrong",
+                        "reason": "the guard rejects it",
+                        "evidence": "abc1234",
+                        "holds_while": "the guard at src/lib.rs:1 rejects it",
+                        "depends_on": ["src/lib.rs:1"],
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+                return RunResult {
+                    session_file: Some(file.to_string_lossy().into_owned()),
+                    ..done()
+                };
+            }
+            std::fs::write(tree.join("WITHDRAW.md"), "the guard rejects it").unwrap();
+            std::fs::write(&session, format!("{USAGE}\n")).unwrap();
+            RunResult {
+                session_file: Some(session.to_string_lossy().into_owned()),
+                ..done()
+            }
+        }
+    });
+
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Cold(&finding),
+        &backend,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("withdrawn"));
+    let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(after.status, FindingStatus::Rejected);
+    let shown = shown.get().expect("the harvest's worker ran").clone();
+    let runs = backend.runs();
+    assert!(
+        runs[1].prompt.contains(&shown),
+        "the worker is named the commit by its sha: {}",
+        runs[1].prompt
+    );
+    let anchors = f
+        .store
+        .suppression_anchors(finding.repo_id, finding.kind.as_str())
+        .await
+        .unwrap();
+    let anchor = anchors.get(&f.fid).expect("a rejected verdict is anchored");
+    assert_eq!(
+        anchor.sha, shown,
+        "anchored at the commit the worker was shown, not the ref's later tip"
+    );
 }
 
 /// A sweep while the handoff stands at the harvest's budget gate keeps

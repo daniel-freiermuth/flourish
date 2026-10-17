@@ -7378,11 +7378,16 @@ pub async fn run_harvest(
     // repo's other changes (a sync, the sweep, a URL update) waiting while
     // it is held, and a PR view and diff are several network round trips.
     let permit = lane.lock_clone(repo.id).await?;
-    // Fetch the default branch into the clone for a fresh attempt; a cold
-    // tree is added at it once the job exists, and a handoff's worker
-    // reads it as `origin/<default>`. Never on a resume: the chain
-    // continues in its own tree.
-    if fresh {
+    // Fetch the default branch into the clone for a fresh attempt, and
+    // resolve the commit it compares against right here, under the
+    // permit: a cold tree is created at that commit, and a handoff's worker
+    // is named it by its sha. Never `origin/<default>` after this point:
+    // the admin lane fetches the clone while the worker runs, so the ref may
+    // name a later commit than the one the worker read by the time the
+    // worker or the verdict's anchor reads it. Never on a resume: the chain
+    // continues in its own tree, against the commit its first attempt
+    // recorded (`jobs.base_sha`).
+    let base = if fresh {
         let db = repo.default_branch.as_str();
         let (rc, out) = fetch_held(&permit, &[db]).await;
         if rc != 0 {
@@ -7399,7 +7404,19 @@ pub async fn run_harvest(
             }
             anyhow::bail!("fetch failed: {tail}");
         }
-    }
+        let rev = format!("origin/{db}");
+        let tip = permit
+            .blocking(move |hold| crate::workspace::resolve(hold.clone_dir(), &rev))
+            .await
+            .ok()
+            .flatten();
+        let Some(tip) = tip else {
+            anyhow::bail!("origin/{db} does not resolve");
+        };
+        Some(tip)
+    } else {
+        None
+    };
 
     let created = match scope
         .create_job(
@@ -7425,7 +7442,9 @@ pub async fn run_harvest(
         created,
         resume,
         TreeSpec::Detached {
-            at: format!("origin/{}", repo.default_branch),
+            at: base
+                .clone()
+                .unwrap_or_else(|| format!("origin/{}", repo.default_branch)),
         },
         FindingJobKind::Harvest.into(),
         &format!("harvest #{fid}"),
@@ -7454,6 +7473,18 @@ pub async fn run_harvest(
             return Ok(failed);
         }
     };
+    // A resume inherited its chain's commit at INSERT; a fresh attempt
+    // records the one it resolved, for its own anchor and its resumes'.
+    let base = match base {
+        Some(sha) => {
+            log_write_failure(
+                store.set_base_sha(job, &sha).await,
+                format_args!("job {job}: base sha -> {sha}"),
+            );
+            Some(sha)
+        }
+        None => store.base_sha(job).await.ok().flatten(),
+    };
     let worktree = ws.tree.clone();
     let repo_notes = Store::repo_notes(&cfg.work_root, repo.id);
     let prompt = match &pr {
@@ -7476,6 +7507,9 @@ pub async fn run_harvest(
             } else {
                 playbooks::ClosedTree::DefaultBranch
             },
+            // Every fresh attempt resolved one above; only a resume goes
+            // without, and a resume builds no playbook.
+            base.as_deref().unwrap_or(&pinned),
             &repo_notes,
         )?,
         Some(pr) => playbooks::build_harvest_prompt(
@@ -7685,10 +7719,12 @@ pub async fn run_harvest(
     // and why a verdict a human set in the meantime is kept.
     let reviewed = if let Some(Ok(verdict)) = &closure {
         let status = FindingStatus::from(Unclaimed::from(verdict.class));
-        // The verdict is about the default branch. A cold harvest's tree is
-        // at its tip; a continued one's tree is the PR's head, so the tip
-        // is read from the clone instead.
-        let judged_at = if resume.is_some() {
+        // The verdict is about the default branch at the commit the worker
+        // was shown (`base`). A chain that started before that was
+        // recorded falls back to the clone's tip, as it always did.
+        let judged_at = if let Some(sha) = &base {
+            sha.clone()
+        } else if resume.is_some() {
             let clone = PathBuf::from(&repo.path);
             let tip = format!("origin/{}", repo.default_branch);
             tokio::task::spawn_blocking(move || crate::workspace::resolve(&clone, &tip))

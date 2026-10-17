@@ -305,6 +305,7 @@ fn pr_prompts_keep_bot_reviews_apart_from_maintainer_feedback() {
                 7,
                 "",
                 playbooks::ClosedTree::DefaultBranch,
+                "0123456789abcdef0123456789abcdef01234567",
                 "",
             )
             .unwrap(),

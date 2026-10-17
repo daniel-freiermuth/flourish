@@ -356,6 +356,7 @@ fn harvest_closed_prompt_renders() {
             7,
             "diff --git a/x b/x\n",
             tree,
+            "0123456789abcdef0123456789abcdef01234567",
             "repo notes",
         )
         .expect(

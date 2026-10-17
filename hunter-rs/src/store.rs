@@ -3169,10 +3169,12 @@ impl Store {
     /// holds its branch checked out, and git refuses to check one branch
     /// out in two worktrees.
     ///
-    /// A resumed attempt copies `pinned_sha` and `seen_activity_at` from the
-    /// attempt it continues, here in the INSERT, so every link of a chain
-    /// names the commit its shared tree was created at and the newest PR
-    /// feedback an engage chain's worker was shown.
+    /// A resumed attempt copies `pinned_sha`, `base_sha` and
+    /// `seen_activity_at` from the attempt it continues, here in the
+    /// INSERT, so every link of a chain names the commit its shared tree
+    /// was created at, the default-branch commit a harvest chain judges
+    /// against, and the newest PR feedback an engage chain's worker was
+    /// shown.
     ///
     /// At most one job is `running` per finding, and per (repo, kind) for
     /// repo-level work (migration 031's indexes). An insert that would be
@@ -3430,9 +3432,11 @@ impl Store {
         let result = sqlx::query!(
             "INSERT INTO jobs \
              (kind, repo_id, finding_id, cap_tokens, state, started_at, estimated_tokens, \
-              resumed_from, pinned_sha, seen_activity_at, full_history, full_hunt_request) \
+              resumed_from, pinned_sha, base_sha, seen_activity_at, full_history, \
+              full_hunt_request) \
              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, \
                     (SELECT p.pinned_sha FROM jobs p WHERE p.id = ?8), \
+                    (SELECT p.base_sha FROM jobs p WHERE p.id = ?8), \
                     (SELECT p.seen_activity_at FROM jobs p WHERE p.id = ?8), \
                     COALESCE((SELECT p.full_history FROM jobs p WHERE p.id = ?8), 0), \
                     (SELECT p.full_hunt_request FROM jobs p WHERE p.id = ?8) \
@@ -3547,6 +3551,27 @@ impl Store {
     pub async fn pinned_sha(&self, job_id: i64) -> sqlx::Result<Option<String>> {
         Ok(
             sqlx::query_scalar!("SELECT pinned_sha FROM jobs WHERE id = ?1", job_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .flatten(),
+        )
+    }
+
+    /// Record the default-branch commit a harvest judges against
+    /// (migration 033), resolved right after its own fetch. A resumed
+    /// attempt inherits it ([`CycleScope::create_job`](crate::recovery::CycleScope::create_job)).
+    pub async fn set_base_sha(&self, job_id: i64, sha: &str) -> sqlx::Result<()> {
+        sqlx::query!("UPDATE jobs SET base_sha = ?1 WHERE id = ?2", sha, job_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// The default-branch commit `job_id`'s harvest chain judges against,
+    /// if one was recorded ([`Self::set_base_sha`]).
+    pub async fn base_sha(&self, job_id: i64) -> sqlx::Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar!("SELECT base_sha FROM jobs WHERE id = ?1", job_id)
                 .fetch_optional(&self.pool)
                 .await?
                 .flatten(),
