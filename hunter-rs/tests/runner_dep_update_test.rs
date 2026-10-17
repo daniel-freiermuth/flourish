@@ -306,7 +306,8 @@ async fn a_repo_renovate_cannot_read_is_handed_to_the_job_lanes_ai_scan() {
     .execute(&rig.pool)
     .await
     .unwrap();
-    let picked = || hunter::scheduler::pick_next(&rig.store, &rig.cfg, None);
+    let scope = support::scope(&rig.store);
+    let picked = || hunter::scheduler::pick_next(&scope, &rig.cfg, None);
     let is_dep_update = |c: &Option<Candidate>| {
         matches!(
             c,
@@ -371,8 +372,8 @@ async fn the_dependency_pass_scans_due_repos_and_leaves_the_ai_scans_alone() {
     let admin = support::admin(&rig.store);
     let pass = || hunter::scheduler::dependency_scans(&admin, &rig.cfg, &running_on);
 
-    admin
-        .request_dep_update_fallback(rig.repo.id)
+    rig.store
+        .request_dep_update_fallback(&admin, rig.repo.id)
         .await
         .unwrap();
     assert_eq!(pass().await, hunter::scheduler::DepScans::default());

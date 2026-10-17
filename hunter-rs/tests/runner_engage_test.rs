@@ -639,7 +639,7 @@ async fn a_failed_withdrawal_counts_toward_the_engage_streak() {
         .expect("held at the limit");
     assert_eq!(hold.reason, hunter::domain::HoldReason::Stuck);
     assert!(hold.detail.starts_with("PR close failed"), "{hold:?}");
-    let picked = hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+    let picked = hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
         .await
         .unwrap();
     assert!(
@@ -703,7 +703,7 @@ async fn a_withdrawal_spends_only_a_once_override() {
             let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
             assert_eq!(after.budget_override, left, "{outcome}, {mode} override");
             if !close_fails {
-                let next = hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+                let next = hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
                     .await
                     .unwrap()
                     .expect("the closed PR's harvest is pending");
@@ -1469,7 +1469,7 @@ async fn assert_left_for_the_cold_harvest(f: &Fixture, tree: &std::path::Path) {
         "a failed handoff is not a harvest failure"
     );
     assert!(!tree.exists(), "the chain's tree must be released");
-    match hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+    match hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
         .await
         .unwrap()
     {
@@ -2597,7 +2597,7 @@ async fn suspend_and_resume(
 
     meanwhile();
 
-    let plan = match hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+    let plan = match hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
         .await
         .unwrap()
     {
@@ -3034,7 +3034,7 @@ async fn a_held_engage_stays_held_through_new_pr_activity() {
         .await
         .expect("still held");
     assert!(after.new_activity);
-    let picked = hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+    let picked = hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
         .await
         .unwrap();
     assert!(
@@ -3057,7 +3057,7 @@ async fn a_paused_engage_continues_without_the_forge() {
     assert_eq!(paused.outcome.as_deref(), Some("suspended"));
     bins.script("gh", "echo 'dial tcp: no route to host' >&2\nexit 1");
     let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
-        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
             .await
             .unwrap()
     else {
@@ -3263,7 +3263,7 @@ async fn paused_then_served_at(
             .unwrap();
     }
     f.cfg.network_gate = true;
-    match hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+    match hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
         .await
         .unwrap()
     {
@@ -3319,7 +3319,7 @@ async fn a_failed_reply_counts_only_while_the_forge_is_reachable() {
         assert_eq!(summary.unreachable.as_deref(), Some(host), "{summary:?}");
         assert_eq!(streak, 0, "the network's failure counts nothing");
         let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
-            hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+            hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
                 .await
                 .unwrap()
         else {
@@ -3813,7 +3813,7 @@ async fn a_continued_stuck_engage_resumes_with_its_reason() {
     )
     .await;
     let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
-        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
             .await
             .unwrap()
     else {

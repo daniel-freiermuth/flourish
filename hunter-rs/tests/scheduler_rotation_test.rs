@@ -155,7 +155,7 @@ async fn run_while(
     wanted: impl Fn(&Candidate) -> bool,
 ) -> usize {
     let mut cycles = 0;
-    while pick_next(store, cfg, None)
+    while pick_next(&support::scope(store), cfg, None)
         .await
         .unwrap()
         .is_some_and(|c| wanted(&c))
@@ -172,7 +172,7 @@ async fn run_while(
 /// turn passes to the next-stalest kind. The timestamp never moves.
 async fn three_failures_hold_test_gap(store: &Store, cfg: &Config, backend: &ScriptedBackend) {
     for attempt in 1..=3 {
-        let picked = pick_next(store, cfg, None).await.unwrap();
+        let picked = pick_next(&support::scope(store), cfg, None).await.unwrap();
         assert!(
             is_repo_pick(picked.as_ref(), 1, RepoJobKind::TestGap),
             "attempt {attempt}: a failing scan is retried at once, got {picked:?}"
@@ -200,7 +200,7 @@ async fn three_failures_hold_test_gap(store: &Store, cfg: &Config, backend: &Scr
         (0, None),
         "a hold ends the streak"
     );
-    let picked = pick_next(store, cfg, None).await.unwrap();
+    let picked = pick_next(&support::scope(store), cfg, None).await.unwrap();
     assert!(
         is_repo_pick(picked.as_ref(), 1, RepoJobKind::Refactor),
         "a held kind is skipped: the next-stalest kind gets the turn, got {picked:?}"
@@ -241,7 +241,10 @@ async fn a_killed_analysis_attempt_is_retried_then_held() {
     );
     assert!(
         is_repo_pick(
-            pick_next(&store, &cfg, None).await.unwrap().as_ref(),
+            pick_next(&support::scope(&store), &cfg, None)
+                .await
+                .unwrap()
+                .as_ref(),
             1,
             RepoJobKind::Refactor
         ),
@@ -281,7 +284,9 @@ async fn a_suspended_analysis_attempt_is_a_pause() {
     assert_eq!(summary.state, Some(JobState::Suspended), "{summary:?}");
     assert_eq!(last_test_gap_at(&store).await, STALE_TEST_GAP);
     assert_eq!(streak(&store, 1, RepoWorkKind::TestGap).await, (0, None));
-    let picked = pick_next(&store, &cfg, None).await.unwrap();
+    let picked = pick_next(&support::scope(&store), &cfg, None)
+        .await
+        .unwrap();
     let plan = match picked {
         Some(Candidate::Resume { plan, .. }) => plan,
         other => panic!("the resume tier must claim the suspension, got {other:?}"),
@@ -330,7 +335,9 @@ async fn an_attempt_that_died_after_doing_work_is_suspended_for_resume() {
     assert_eq!(summary.state, Some(JobState::Suspended), "{summary:?}");
     assert_eq!(last_test_gap_at(&store).await, STALE_TEST_GAP);
     assert_eq!(streak(&store, 1, RepoWorkKind::TestGap).await, (0, None));
-    let picked = pick_next(&store, &cfg, None).await.unwrap();
+    let picked = pick_next(&support::scope(&store), &cfg, None)
+        .await
+        .unwrap();
     match picked {
         Some(Candidate::Resume { plan, .. }) => {
             assert_eq!(plan.predecessor_id(), summary.job_id.unwrap());
@@ -425,7 +432,10 @@ async fn an_abandoned_analysis_chain_is_counted_and_held_on_the_third() {
     );
     assert!(
         is_repo_pick(
-            pick_next(&store, &cfg, None).await.unwrap().as_ref(),
+            pick_next(&support::scope(&store), &cfg, None)
+                .await
+                .unwrap()
+                .as_ref(),
             1,
             RepoJobKind::Refactor
         ),
@@ -453,7 +463,9 @@ async fn a_continued_scan_resumes_its_chain_past_the_ceiling() {
         .await
         .unwrap();
 
-    let picked = pick_next(&store, &cfg, None).await.unwrap();
+    let picked = pick_next(&support::scope(&store), &cfg, None)
+        .await
+        .unwrap();
     let plan = match picked {
         Some(Candidate::Resume { plan, .. }) => plan,
         other => panic!("a continued hold resumes its chain, got {other:?}"),
@@ -509,7 +521,10 @@ async fn a_killed_resume_of_an_analysis_chain_is_counted() {
     assert_eq!(last_test_gap_at(&store).await, STALE_TEST_GAP);
     assert!(
         is_repo_pick(
-            pick_next(&store, &cfg, None).await.unwrap().as_ref(),
+            pick_next(&support::scope(&store), &cfg, None)
+                .await
+                .unwrap()
+                .as_ref(),
             1,
             RepoJobKind::TestGap
         ),
@@ -676,7 +691,7 @@ async fn hold_alpha_then_beta(
     let alpha = store.get_repo_by_id(1).await.unwrap().unwrap();
     assert_eq!(alpha.last_hunt_at, Some(STALE_HUNT), "no failure moves it");
     assert_eq!(alpha.last_hunt_sha, None, "nothing is marked hunted");
-    let picked = pick_next(store, cfg, None).await.unwrap();
+    let picked = pick_next(&support::scope(store), cfg, None).await.unwrap();
     assert!(
         is_repo_pick(picked.as_ref(), 2, RepoJobKind::Hunt),
         "beta's hunt must get the next turn, got {picked:?}"
@@ -783,7 +798,7 @@ async fn a_repo_whose_fetch_fails_is_held_once_for_every_kind() {
 
     // Forced onto alpha, nothing of it is picked either.
     assert!(
-        pick_next(&store, &cfg, Some("alpha"))
+        pick_next(&support::scope(&store), &cfg, Some("alpha"))
             .await
             .unwrap()
             .is_none()
@@ -796,7 +811,10 @@ async fn a_repo_whose_fetch_fails_is_held_once_for_every_kind() {
         .await
         .unwrap();
     assert!(is_repo_pick(
-        pick_next(&store, &cfg, None).await.unwrap().as_ref(),
+        pick_next(&support::scope(&store), &cfg, None)
+            .await
+            .unwrap()
+            .as_ref(),
         1,
         RepoJobKind::Hunt
     ));
@@ -840,7 +858,12 @@ async fn a_repo_whose_clone_keeps_failing_is_left_alone_once_held() {
 
     let held = hold_of(&store, 1, RepoWorkKind::Sync).await.unwrap();
     assert!(held.detail.starts_with("clone failed"), "{held:?}");
-    assert!(pick_next(&store, &cfg, None).await.unwrap().is_none());
+    assert!(
+        pick_next(&support::scope(&store), &cfg, None)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 // -- what a hold takes out of the selection ---------------------------------
@@ -899,14 +922,19 @@ async fn hold(store: &Store, rid: i64, kind: RepoWorkKind) {
 async fn an_uncloned_repo_whose_hunt_is_held_is_skipped() {
     let (_dir, store, cfg) = two_repos_for_selection("rotation-uncloned-held", false).await;
     assert!(is_repo_pick(
-        pick_next(&store, &cfg, None).await.unwrap().as_ref(),
+        pick_next(&support::scope(&store), &cfg, None)
+            .await
+            .unwrap()
+            .as_ref(),
         1,
         RepoJobKind::Hunt
     ));
 
     hold(&store, 1, RepoWorkKind::Hunt).await;
 
-    let picked = pick_next(&store, &cfg, None).await.unwrap();
+    let picked = pick_next(&support::scope(&store), &cfg, None)
+        .await
+        .unwrap();
     assert!(
         is_repo_pick(picked.as_ref(), 2, RepoJobKind::Hunt),
         "{picked:?}"
@@ -922,7 +950,10 @@ async fn a_held_hunt_takes_its_full_rehunt_request_out_of_the_queue() {
     assert!(store.request_full_hunt(1).await.unwrap());
     assert!(
         is_repo_pick(
-            pick_next(&store, &cfg, None).await.unwrap().as_ref(),
+            pick_next(&support::scope(&store), &cfg, None)
+                .await
+                .unwrap()
+                .as_ref(),
             1,
             RepoJobKind::Hunt
         ),
@@ -931,7 +962,9 @@ async fn a_held_hunt_takes_its_full_rehunt_request_out_of_the_queue() {
 
     hold(&store, 1, RepoWorkKind::Hunt).await;
 
-    let picked = pick_next(&store, &cfg, None).await.unwrap();
+    let picked = pick_next(&support::scope(&store), &cfg, None)
+        .await
+        .unwrap();
     assert!(
         is_repo_pick(picked.as_ref(), 2, RepoJobKind::Hunt),
         "beta's staler hunt goes first, not alpha's test_gap, got {picked:?}"
@@ -962,7 +995,9 @@ async fn a_running_hunt_takes_its_full_rehunt_request_out_of_the_queue() {
     .unwrap();
     pool.close().await;
 
-    let picked = pick_next(&store, &cfg, None).await.unwrap();
+    let picked = pick_next(&support::scope(&store), &cfg, None)
+        .await
+        .unwrap();
     assert!(
         is_repo_pick(picked.as_ref(), 2, RepoJobKind::Hunt),
         "beta's staler hunt goes first, not alpha's test_gap, got {picked:?}"
@@ -1004,7 +1039,9 @@ async fn a_held_sync_keeps_the_resume_tier_off_the_repos_chains() {
     pool.close().await;
     assert!(
         matches!(
-            pick_next(&store, &cfg, None).await.unwrap(),
+            pick_next(&support::scope(&store), &cfg, None)
+                .await
+                .unwrap(),
             Some(Candidate::Resume { .. })
         ),
         "unheld, the chain is resumed"
@@ -1012,7 +1049,9 @@ async fn a_held_sync_keeps_the_resume_tier_off_the_repos_chains() {
 
     hold(&store, 1, RepoWorkKind::Sync).await;
 
-    let picked = pick_next(&store, &cfg, None).await.unwrap();
+    let picked = pick_next(&support::scope(&store), &cfg, None)
+        .await
+        .unwrap();
     assert!(
         is_repo_pick(picked.as_ref(), 2, RepoJobKind::Hunt),
         "{picked:?}"

@@ -87,7 +87,7 @@ JobDict keys (types.py:117-140): `id:int, kind:str, repo_id:int, repo_name:str, 
 
 ### next_candidate (server.py:276-308, TypedDict server.py:970-983)
 
-Built from `scheduler.pick_next(store, cfg)` (exceptions swallowed -> null) and `backend.decide(anticipated_tokens=...)`; verdict = `outlook.prioritized` when the finding has `budget_override` set or scheduler overdrive is enabled, else `outlook.normal`.
+Built from `scheduler::preview_next(store, cfg)` (the write-free selection; the job lane's `pick_next` takes its `CycleScope`) (exceptions swallowed -> null) and `backend.decide(anticipated_tokens=...)`; verdict = `outlook.prioritized` when the finding has `budget_override` set or scheduler overdrive is enabled, else `outlook.normal`.
 
 | key | type | source |
 |---|---|---|

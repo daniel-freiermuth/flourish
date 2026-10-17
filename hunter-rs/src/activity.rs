@@ -136,7 +136,11 @@ pub type JobStatus = LaneStatus<JobActivity>;
 
 impl JobStatus {
     /// Record `phase` as running from now until the guard is dropped.
-    pub fn begin(&self, phase: JobPhase) -> ActivityGuard<JobActivity> {
+    /// Crate-private: the job lane's phases are set only through
+    /// [`job_phase`], inside the cycle `run_cycle` runs under
+    /// [`reporting_job_phases`], so no handler or admin duty can show a
+    /// job phase while no cycle runs.
+    pub(crate) fn begin(&self, phase: JobPhase) -> ActivityGuard<JobActivity> {
         self.show(JobActivity {
             phase,
             started_at: crate::util::now_ms(),
@@ -148,8 +152,9 @@ tokio::task_local! {
     static JOB_STATUS: JobStatus;
 }
 
-/// Run `cycle` with its phases ([`job_phase`]) reported to `status`.
-pub async fn reporting_job_phases<F: Future>(status: JobStatus, cycle: F) -> F::Output {
+/// Run `cycle` with its phases ([`job_phase`]) reported to `status`. Only
+/// `run_cycle` does, with the job lane's own status.
+pub(crate) async fn reporting_job_phases<F: Future>(status: JobStatus, cycle: F) -> F::Output {
     JOB_STATUS.scope(status, cycle).await
 }
 

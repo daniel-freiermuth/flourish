@@ -481,7 +481,7 @@ async fn verdict_after_selection_stops_the_fix_before_its_job() {
     .unwrap();
     assert_eq!(summary.outcome.as_deref(), Some("suspended"));
     let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
-        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
             .await
             .unwrap()
     else {
@@ -524,7 +524,7 @@ async fn verdict_after_selection_stops_the_fix_before_its_job() {
         .set_finding_status(f.fid, hunter::domain::FindingStatus::Queued)
         .await
         .unwrap();
-    let picked = hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+    let picked = hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
         .await
         .unwrap();
     assert!(
@@ -629,7 +629,7 @@ async fn a_blocked_report_holds_the_fix_and_keeps_its_checkpoint() {
     assert!(!tree.join("BLOCKED.md").exists());
     assert!(tree.join("PR-DESCRIPTION.md").is_file());
     assert!(f.store.suppressions(1, "bug").await.unwrap().is_empty());
-    let picked = hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+    let picked = hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
         .await
         .unwrap();
     assert!(
@@ -669,7 +669,7 @@ async fn a_continued_fix_resumes_its_checkpoint_and_is_ordinary_again() {
     )
     .await;
     let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
-        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
             .await
             .unwrap()
     else {
@@ -752,7 +752,7 @@ async fn an_interrupted_continue_resumes_as_an_ordinary_resume() {
     )
     .await;
     let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
-        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
             .await
             .unwrap()
     else {
@@ -791,7 +791,7 @@ async fn an_interrupted_continue_resumes_as_an_ordinary_resume() {
         .await
         .unwrap();
     let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
-        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
             .await
             .unwrap()
     else {
@@ -862,7 +862,7 @@ async fn a_continued_fix_that_concludes_ends_ordinarily() {
         )
         .await;
         let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
-            hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+            hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
                 .await
                 .unwrap()
         else {
@@ -950,7 +950,7 @@ async fn resumed_hold_prompt(f: &Fixture) -> String {
     )
     .await;
     let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
-        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
             .await
             .unwrap()
     else {
@@ -1058,7 +1058,7 @@ async fn fix_resume_without_a_blocker_runs_the_plain_continuation() {
     .unwrap();
     assert_eq!(summary.outcome.as_deref(), Some("suspended"));
     let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
-        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
             .await
             .unwrap()
     else {
@@ -1098,7 +1098,7 @@ async fn an_unremovable_stale_report_stops_the_resume_before_its_job() {
     )
     .await;
     let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
-        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
             .await
             .unwrap()
     else {
@@ -1130,7 +1130,7 @@ async fn an_unremovable_stale_report_stops_the_resume_before_its_job() {
 
     std::fs::remove_dir(tree.join("BLOCKED.md")).unwrap();
     let Some(hunter::scheduler::Candidate::Resume { plan: again, .. }) =
-        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
             .await
             .unwrap()
     else {
@@ -1212,7 +1212,7 @@ async fn a_fix_whose_backend_keeps_failing_is_held() {
     .await;
     let failing = ScriptedBackend::failing();
     for attempt in 1..=3 {
-        let plan = match hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        let plan = match hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
             .await
             .unwrap()
         {
@@ -1427,7 +1427,7 @@ async fn a_verdict_after_selection_wins_over_a_stale_report() {
     )
     .await;
     let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
-        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
             .await
             .unwrap()
     else {
@@ -1946,7 +1946,7 @@ async fn a_failed_push_counts_only_while_the_forge_is_reachable() {
         assert!(summary.retry_at.is_some(), "{summary:?}");
         assert_eq!(fix_streak(&f).await.streak, 0);
         let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
-            hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+            hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
                 .await
                 .unwrap()
         else {
@@ -1989,7 +1989,7 @@ async fn a_runner_error_while_the_provider_is_unreachable_counts_nothing() {
         .unwrap();
     f.cfg.network_gate = true;
     let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
-        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
             .await
             .unwrap()
     else {

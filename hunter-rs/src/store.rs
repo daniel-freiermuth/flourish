@@ -35,7 +35,8 @@ use crate::domain::{
     RepoWorkKind, Severity,
 };
 use crate::recovery::{
-    DaemonLock, Owner, RecordedJob, Recovery, StrandedClaim, StrandedJob, Unreconciled,
+    AdminAuthority, DaemonLock, Owner, RecordedJob, Recovery, StrandedClaim, StrandedJob,
+    Unreconciled,
 };
 use crate::transition::{
     Moved, PrEnded, PrEnding, PrRef, Record, ReleaseVerdict, Sources, Transition, Unclaimed,
@@ -4338,8 +4339,12 @@ impl Store {
     /// Returns how many were retired. Each edge's status is read in this
     /// transaction, so a conflict is a store fault: refused, and nothing is
     /// retired.
+    ///
+    /// Only the admin lane's Renovate scan decides what Renovate no longer
+    /// proposes, so this takes its authority.
     pub async fn supersede_unproposed_dep_updates(
         &self,
+        _admin: &AdminAuthority,
         repo_id: i64,
         proposed: &[String],
         unchecked: &[String],
@@ -4397,9 +4402,11 @@ impl Store {
     /// is held: handing it over would drop the work a paused fix has done for a
     /// fresh fix of the scan's finding (WORK-MODEL.md G2). `moves` is every
     /// move of every finding the scan produced. Returns how many were
-    /// handed over.
+    /// handed over. Only the admin lane's Renovate scan proposes moves, so
+    /// this takes its authority.
     pub async fn hand_over_queued_dep_updates(
         &self,
+        _admin: &AdminAuthority,
         repo_id: i64,
         moves: &[ProposedMove],
     ) -> Result<u64, StoreWriteError> {
@@ -5086,9 +5093,13 @@ impl Store {
 
     /// Record that Renovate had no answer for `repo_id` just now, so its
     /// AI `dep_update` scan is due on the job lane (migration 032). Only
-    /// through the admin lane's authority
-    /// ([`crate::recovery::AdminAuthority::request_dep_update_fallback`]).
-    pub(crate) async fn request_dep_update_fallback(&self, repo_id: i64) -> sqlx::Result<()> {
+    /// the admin lane's Renovate scan decides that, so this takes its
+    /// authority: the job lane cannot request its own AI scan.
+    pub async fn request_dep_update_fallback(
+        &self,
+        _admin: &AdminAuthority,
+        repo_id: i64,
+    ) -> sqlx::Result<()> {
         let now = now_ms();
         sqlx::query!(
             "INSERT INTO dep_scan_fallbacks (repo_id, requested_at) VALUES (?1, ?2) \

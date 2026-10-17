@@ -308,7 +308,10 @@ async fn suspend_then_resume_a_hunt(f: &Fixture) -> (String, String, Seen, Seen,
         &["remote", "set-url", "origin", "/nonexistent/origin.git"],
     );
 
-    let plan = match pick_next(&f.store, &f.cfg, None).await.unwrap() {
+    let plan = match pick_next(&support::scope(&f.store), &f.cfg, None)
+        .await
+        .unwrap()
+    {
         Some(Candidate::Resume { plan, .. }) => *plan,
         other => panic!("expected the suspended hunt to be resumed, got {other:?}"),
     };

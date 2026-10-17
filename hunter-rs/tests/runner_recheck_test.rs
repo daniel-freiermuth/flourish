@@ -258,7 +258,7 @@ async fn the_third_identical_failure_holds_the_recheck() {
         "no transcript to continue"
     );
     assert!(
-        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
             .await
             .unwrap()
             .is_none_or(|c| c.job_kind() != FindingJobKind::Recheck.into()),
@@ -283,7 +283,7 @@ async fn a_held_recheck_is_released_by_the_operator() {
         ReleaseAction::Restart,
     )
     .await;
-    let picked = hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+    let picked = hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
         .await
         .unwrap();
     assert!(
@@ -612,7 +612,7 @@ async fn a_stuck_recheck_keeps_its_tree_for_the_continue() {
     )
     .await;
 
-    let picked = hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+    let picked = hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
         .await
         .unwrap();
 
@@ -771,7 +771,7 @@ async fn a_continued_recheck_hold_resumes_with_its_reason() {
     )
     .await;
     let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
-        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
             .await
             .unwrap()
     else {
