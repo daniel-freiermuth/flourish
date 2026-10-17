@@ -372,8 +372,9 @@ async fn the_dependency_pass_scans_due_repos_and_leaves_the_ai_scans_alone() {
     let admin = support::admin(&rig.store);
     let pass = || hunter::scheduler::dependency_scans(&admin, &rig.cfg, &running_on);
 
-    rig.store
-        .request_dep_update_fallback(&admin, rig.repo.id)
+    admin
+        .store()
+        .request_dep_update_fallback(rig.repo.id)
         .await
         .unwrap();
     assert_eq!(pass().await, hunter::scheduler::DepScans::default());
@@ -1116,7 +1117,8 @@ async fn a_held_fix_without_a_checkpoint_keeps_its_queued_update() {
     rig.set_status(fallback, "queued", None).await;
     let fid = rig.id_of(fallback).await;
     assert!(
-        rig.store
+        support::scope(&rig.store)
+            .store()
             .hold_work(
                 fid,
                 hunter::domain::FindingJobKind::Fix,

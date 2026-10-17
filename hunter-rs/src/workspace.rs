@@ -37,6 +37,7 @@ use std::time::SystemTime;
 
 use crate::clones::{CloneHold, ClonePermit, ForeignChain, Lane, TreeLease, Unheld};
 use crate::domain::{FindingJobKind, JobKind, JobState};
+use crate::recovery::AdminAuthority;
 use crate::store::{ChainRef, ChainStatus, CloneLockError, CloneRef, Store};
 
 /// How long a finished chain's transcript is kept.
@@ -678,7 +679,22 @@ pub struct SweepReport {
 /// per-repo cargo build cache every worker compiles into (see
 /// [`Workspace::build_cache`]); `<work_root>/out/`; and a chain's
 /// `session/` while its workspace is inside retention.
-pub async fn sweep(lane: &mut Lane, work_root: &Path, now_ms: i64) -> anyhow::Result<SweepReport> {
+///
+/// The admin lane's alone: it takes the [`AdminAuthority`], and runs in a
+/// lane of its own.
+pub async fn sweep(
+    admin: &AdminAuthority,
+    work_root: &Path,
+    now_ms: i64,
+) -> anyhow::Result<SweepReport> {
+    admin
+        .store()
+        .lane(async |lane| sweep_in(lane, work_root, now_ms).await)
+        .await?
+}
+
+/// [`sweep`] in its lane.
+async fn sweep_in(lane: &mut Lane, work_root: &Path, now_ms: i64) -> anyhow::Result<SweepReport> {
     let mut report = SweepReport::default();
     sweep_chains(lane, work_root, now_ms, &mut report).await?;
     sweep_legacy_trees(lane, work_root, &mut report).await?;

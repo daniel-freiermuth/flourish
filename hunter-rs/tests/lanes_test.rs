@@ -261,6 +261,7 @@ async fn a_pr_sync_does_not_wait_for_a_dependency_scan() {
             notes_lock: Arc::default(),
             status: scheduler.admin.clone(),
             pr_sync_wake: scheduler.pr_sync_wake.clone(),
+            reap_wake: scheduler.reap_wake.clone(),
             pr_sync_passes: hunter::daemon::PrSyncPasses::default(),
             job_wake: scheduler.wake.clone(),
         },
@@ -329,6 +330,7 @@ fn start_admin_lane(
             notes_lock: Arc::default(),
             status: scheduler.admin.clone(),
             pr_sync_wake: scheduler.pr_sync_wake.clone(),
+            reap_wake: scheduler.reap_wake.clone(),
             pr_sync_passes: passes.clone(),
             job_wake: scheduler.wake.clone(),
         },
@@ -348,6 +350,67 @@ async fn stop_admin_lane(
             .expect("an admin duty did not stop")
             .unwrap();
     }
+}
+
+/// A repo `name`, flagged deleted with a stand-in clone on disk: what the
+/// delete handler leaves for the reaper. Its clone's directory.
+async fn deleted_repo(store: &Store, cfg: &Config, name: &str) -> std::path::PathBuf {
+    let repos_root = cfg.work_root.join("repos");
+    std::fs::create_dir_all(&repos_root).unwrap();
+    let url = format!("https://example.com/{name}.git");
+    let rid = store
+        .add_repo(
+            name,
+            &url,
+            &repos_root,
+            "main",
+            hunter::domain::ForgeName::Github,
+        )
+        .await
+        .unwrap();
+    let clone = Store::repo_dir(&repos_root, rid);
+    std::fs::create_dir_all(&clone).unwrap();
+    std::fs::write(clone.join("occupied"), "x").unwrap();
+    store.soft_delete_repo(rid).await.unwrap();
+    clone
+}
+
+/// Wait, within [`BOUND`], until `path` is gone; whether it went.
+async fn gone(path: &std::path::Path) -> bool {
+    tokio::time::timeout(BOUND, async {
+        while path.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+/// The delete handler no longer removes a clone itself: it wakes the
+/// admin lane's reaper (`SchedulerHandle::reap_wake`), which does it at
+/// once instead of at its next tick, minutes away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_woken_reaper_removes_a_deleted_repo_at_once() {
+    let bins = FakeBins::acquire("lanes-reap-wake");
+    bins.ok("gh", r#"{"state":"OPEN","mergeable":"MERGEABLE","reviewDecision":"","comments":[],"reviews":[],"statusCheckRollup":[],"updatedAt":"2026-01-02T03:04:05Z","headRefName":"fix/some-bug","headRefOid":"deadbeef"}"#);
+    let (_dir, store, cfg, _fid) = fixture("lanes-reap-wake").await;
+    // Reaped by the reaper's first run, which the lane makes as it starts:
+    // once it is gone, that run is over and the next is a tick away.
+    let first = deleted_repo(&store, &cfg, "first").await;
+    let passes = hunter::daemon::PrSyncPasses::default();
+    let (scheduler, stop, _stopping, duties) = start_admin_lane(&store, &cfg, &passes);
+    let first_reaped = gone(&first).await;
+
+    let second = deleted_repo(&store, &cfg, "second").await;
+    scheduler.reap_wake.notify_one();
+    let second_reaped = gone(&second).await;
+
+    stop_admin_lane(&stop, duties).await;
+    assert!(first_reaped, "the reaper's first run never ran");
+    assert!(
+        second_reaped,
+        "the woken reaper did not run before its tick"
+    );
 }
 
 /// The job lane's first pick waits for the first PR sync: a PR merged

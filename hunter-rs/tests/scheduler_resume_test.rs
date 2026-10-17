@@ -2354,9 +2354,13 @@ async fn a_checkpoint_whose_finding_moved_on_is_dropped_and_its_tree_released() 
                 .unwrap(),
         );
         assert_eq!(picked.predecessor_id(), 20, "{kind} resumes at {at}");
-        hunter::workspace::sweep(store.test_lane(), &cfg.work_root, hunter::util::now_ms())
-            .await
-            .unwrap();
+        hunter::workspace::sweep(
+            &support::admin(&store),
+            &cfg.work_root,
+            hunter::util::now_ms(),
+        )
+        .await
+        .unwrap();
         assert!(tree.is_dir(), "{kind} at {at} keeps its tree");
 
         set_status(moved_to).await.unwrap();
@@ -2367,9 +2371,13 @@ async fn a_checkpoint_whose_finding_moved_on_is_dropped_and_its_tree_released() 
             !matches!(picked, Some(Candidate::Resume { .. })),
             "{kind} at {moved_to} must not resume, got {picked:?}"
         );
-        hunter::workspace::sweep(store.test_lane(), &cfg.work_root, hunter::util::now_ms())
-            .await
-            .unwrap();
+        hunter::workspace::sweep(
+            &support::admin(&store),
+            &cfg.work_root,
+            hunter::util::now_ms(),
+        )
+        .await
+        .unwrap();
         let (state, reason, notes) = job_row(&pool, 20).await;
         assert_eq!(
             (state.as_str(), reason.as_deref(), notes),
@@ -2882,7 +2890,8 @@ async fn a_dismissed_engage_does_not_resume() {
     seed_finding_suspension(&pool, 20, "engage", 5, &session).await;
     let store = rw_store(&path).await;
     assert!(
-        store
+        support::scope(&store)
+            .store()
             .hold_work(
                 5,
                 FindingJobKind::Engage,

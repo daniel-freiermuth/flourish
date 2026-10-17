@@ -1677,7 +1677,7 @@ async fn a_sweep_during_the_handoff_keeps_the_tree_for_the_harvest() {
         move || {
             let (store, root, sweeps) = (store.clone(), root.clone(), sweeps.clone());
             async move {
-                hunter::workspace::sweep(store.test_lane(), &root, hunter::util::now_ms())
+                hunter::workspace::sweep(&support::admin(&store), &root, hunter::util::now_ms())
                     .await
                     .unwrap();
                 sweeps.fetch_add(1, Ordering::SeqCst);
@@ -3098,7 +3098,8 @@ async fn an_engage_whose_pr_will_not_load_is_held_at_the_streak_limit() {
 async fn a_held_engage_stays_held_through_new_pr_activity() {
     let f = fixture("engage-held-activity").await;
     assert!(
-        f.store
+        support::scope(&f.store)
+            .store()
             .hold_work(
                 f.fid,
                 hunter::domain::FindingJobKind::Engage,

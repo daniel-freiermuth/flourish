@@ -19,8 +19,8 @@ use crate::domain::{
     HoldReason, JobKind, JobState, RepoJobKind, RepoWorkKind, Severity,
 };
 use crate::store::{
-    FindingFilter, JobInsertError, JobOutcome, JobPlace, JobStart, PrSyncPass, SeenActivity, Store,
-    StoreWriteError,
+    FindingFilter, JobInsertError, JobOutcome, JobPlace, JobStart, JobStore, PrSyncPass,
+    SeenActivity, Store, StoreWriteError,
 };
 use crate::transition::{
     Moved, PR_CLOSED_AWAITING_HARVEST, PrEnded, PrEnding, PrRef, Transition, Unclaimed,
@@ -2903,7 +2903,7 @@ pub async fn run_hunt(
 /// stays `rechecking`: sent back to `new` it looked exactly like a finding
 /// nobody had rechecked.
 async fn handle_recheck_failure(
-    store: &Store,
+    store: &JobStore,
     summary: &mut CycleSummary,
     fid: i64,
     job: i64,
@@ -3811,7 +3811,7 @@ async fn settle_dep_updates(
         .collect();
     let retired = admin
         .store()
-        .supersede_unproposed_dep_updates(admin, repo.id, &proposed, &scan.unchecked)
+        .supersede_unproposed_dep_updates(repo.id, &proposed, &scan.unchecked)
         .await
         .map_err(|e| {
             anyhow::anyhow!("dep_update {}: retiring unproposed updates: {e}", repo.name)
@@ -3830,7 +3830,7 @@ async fn settle_dep_updates(
         .collect();
     let handed_over = admin
         .store()
-        .hand_over_queued_dep_updates(admin, repo.id, &moves)
+        .hand_over_queued_dep_updates(repo.id, &moves)
         .await
         .map_err(|e| {
             anyhow::anyhow!("dep_update {}: handing over queued updates: {e}", repo.name)
@@ -4005,7 +4005,7 @@ pub async fn scan_dependencies(
         }
     };
     let Some(scan) = scan else {
-        store.request_dep_update_fallback(admin, repo.id).await?;
+        store.request_dep_update_fallback(repo.id).await?;
         let _ = store
             .log_event(
                 "dep_update",
@@ -4415,7 +4415,7 @@ fn blocked_report(tree: &Path) -> std::io::Result<Option<String>> {
 /// owns it and a resume cannot mistake it for its own outcome. `false`
 /// when nothing was held: the finding has left the kind's tier.
 async fn hold_on_report(
-    store: &Store,
+    store: &JobStore,
     kind: FindingJobKind,
     fid: i64,
     job: i64,
@@ -4701,7 +4701,7 @@ async fn conclude_fix(
 /// on what a stuck fix becomes. A count or a hold that could not be
 /// recorded is reported as such and ends nothing.
 async fn record_fix_failure(
-    store: &Store,
+    store: &JobStore,
     fid: i64,
     job: i64,
     failure: &str,
@@ -4768,7 +4768,7 @@ const TREE_NOT_MADE: &str = "workspace not created";
 /// stays in the engage tier, the highest of them, and is picked every
 /// cycle.
 async fn count_unmade_engage_tree(
-    store: &Store,
+    store: &JobStore,
     fid: i64,
     job: i64,
     mut summary: CycleSummary,
@@ -4830,7 +4830,7 @@ impl WorkOf<'_> {
 /// returned summary ends the cycle denied for the host, as the network
 /// gate's own denial does (#95).
 async fn runner_failed(
-    store: &Store,
+    store: &JobStore,
     (cfg, backend, repo_url): (&Config, &dyn Backend, &str),
     (work, running): (WorkOf<'_>, RunningJob),
     err: &anyhow::Error,
@@ -4932,7 +4932,7 @@ async fn runner_failed(
 /// streak each time. The reason follows it in the report, and the summary
 /// keeps it whole.
 async fn count_unmade_tree(
-    store: &Store,
+    store: &JobStore,
     claim: FixClaim,
     job: i64,
     mut summary: CycleSummary,
@@ -5083,7 +5083,7 @@ async fn fix_event(
 /// where the fix tier skips held work. The budget override is left alone:
 /// nothing concluded.
 async fn hold_prerequisite(
-    store: &Store,
+    store: &JobStore,
     start: &FixStart,
     claim: FixClaim,
     report: &str,
@@ -5176,7 +5176,7 @@ async fn record_declined_fix(
 /// any outcome that leaves the finding `fixing` returns it to `queued`.
 /// Every outcome ends `claim`.
 async fn record_fix_outcome(
-    store: &Store,
+    store: &JobStore,
     (start, claim): (&FixStart, FixClaim),
     outcome: FixOutcome,
     stdout_tail: &str,
@@ -5932,7 +5932,7 @@ struct EngageStart {
 /// finding; a one-shot override is spent, as [`engage_unpublished`]
 /// spends it.
 async fn engage_view(
-    store: &Store,
+    store: &JobStore,
     (cfg, backend): (&Config, &dyn Backend),
     attempt: Attempt<'_, kind::Engage>,
     repo: &Repo,
@@ -6049,7 +6049,7 @@ pub async fn count_unrecorded_pr_end(scope: &CycleScope<'_>, summary: &CycleSumm
 /// [`engage_prefetch_failed`]: the network's ends the cycle denied
 /// (`Ok(Err(summary))`), anything else stays the error it was.
 async fn engage_prefetch<T>(
-    store: &Store,
+    store: &JobStore,
     net: (&Config, &dyn Backend),
     finding: &Finding,
     step: anyhow::Result<T>,
@@ -6186,7 +6186,7 @@ async fn engage_seen_activity(
 /// forge and record the finding `closed`. Returns whether the closure is
 /// complete enough to hand to the closed PR's harvest right away.
 async fn withdraw_pr(
-    store: &Store,
+    store: &JobStore,
     net: (&Config, &dyn Backend),
     fid: i64,
     start: &EngageStart,
@@ -6427,7 +6427,7 @@ async fn push_then_reply(
 /// Record a finished engage: what it published, or why it is incomplete.
 /// Either way a one-shot budget override is spent.
 async fn record_engage(
-    store: &Store,
+    store: &JobStore,
     (net, finding): ((&Config, &dyn Backend), &Finding),
     start: &EngageStart,
     recorded: Option<RecordedJob>,
@@ -6604,7 +6604,7 @@ fn engage_failure_key(fail: &str) -> &str {
 /// is now held. A count or a hold that could not be recorded is reported
 /// as such and ends nothing.
 async fn record_engage_failure(
-    store: &Store,
+    store: &JobStore,
     fid: i64,
     job: Option<i64>,
     key: &str,
@@ -6703,7 +6703,7 @@ async fn unpublished_offline(
 /// ([`unreachable_now`]): then the failure is the network's, nothing is
 /// counted, and the returned summary ends the cycle denied for the host.
 async fn engage_prefetch_failed(
-    store: &Store,
+    store: &JobStore,
     (cfg, backend): (&Config, &dyn Backend),
     finding: &Finding,
     failure: &str,
@@ -6845,7 +6845,7 @@ pub async fn run_engage(
         spend_once_override(store, finding).await;
         withdraw_pr(store, (cfg, backend), fid, &start, &reason, &mut summary).await
     } else if let Some(report) = blocked_report(&start.ws.tree)? {
-        if let Err(e) = engage_blocked(lane.store(), fid, &start, &report, &mut summary).await {
+        if let Err(e) = engage_blocked(store, fid, &start, &report, &mut summary).await {
             close_workspace(lane, start.ws).await;
             return Err(e);
         }
@@ -6954,7 +6954,7 @@ async fn spend_once_override(store: &Store, finding: &Finding) {
 /// fault, so it is an outcome and an event rather than the cycle's error,
 /// which would back all other work off for minutes.
 async fn engage_blocked(
-    store: &Store,
+    store: &JobStore,
     fid: i64,
     start: &EngageStart,
     report: &str,
@@ -7112,7 +7112,7 @@ async fn continue_into_harvest(
 /// runs, part of its budget of tries. It is logged, and the finding stays
 /// `closed` and pending.
 async fn harvest_prefetch_failed(
-    store: &Store,
+    store: &JobStore,
     (cfg, backend, repo_url): (&Config, &dyn Backend, &str),
     fid: i64,
     handoff: bool,
@@ -7164,7 +7164,7 @@ async fn harvest_prefetch_failed(
 /// True when the harvest is now held. A count or a hold that could not be
 /// recorded is reported as such and ends nothing.
 async fn record_harvest_failure(
-    store: &Store,
+    store: &JobStore,
     fid: i64,
     job: Option<i64>,
     key: &str,
@@ -7237,15 +7237,14 @@ async fn record_harvest_failure(
 /// operator's verdict) has nothing to hold, which is an outcome, not the
 /// cycle's error ([`engage_blocked`]).
 async fn harvest_blocked(
-    lane: &mut Lane,
+    (store, lane): (&JobStore, &mut Lane),
     fid: i64,
     (job, state): (i64, JobState),
     pr_number: i64,
     ws: OpenWorkspace,
     report: &str,
 ) -> anyhow::Result<CycleSummary> {
-    let store = lane.store().clone();
-    let held = hold_on_report(&store, FindingJobKind::Harvest, fid, job, &ws, report).await;
+    let held = hold_on_report(store, FindingJobKind::Harvest, fid, job, &ws, report).await;
     close_workspace(lane, ws).await;
     let outcome = if held? {
         "held"
@@ -7627,7 +7626,7 @@ pub async fn run_harvest(
     .unwrap_or(JobState::Failed);
 
     if let Some(report) = blocked_report(&worktree)? {
-        return harvest_blocked(lane, fid, (job, state), pr_number, ws, &report).await;
+        return harvest_blocked((store, lane), fid, (job, state), pr_number, ws, &report).await;
     }
     // A closed PR's review must say why it closed. Without that the
     // finding would sit `closed` for good, so a missing or unusable
@@ -8187,7 +8186,7 @@ async fn run_scoped_cycle(
     backend: &dyn Backend,
     force_repo: Option<&str>,
 ) -> CycleSummary {
-    let store = scope.store().clone();
+    let store = Store::clone(scope.store());
     // Catch-all
     let mut summary = match run_cycle_inner(&scope, lane, cfg, backend, force_repo).await {
         Ok(result) => result,

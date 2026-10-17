@@ -97,12 +97,7 @@ async fn next_signal(sig: Option<Signal>) {
 /// and changes a clone only under its permit. Best effort, since a failed
 /// run is retried on the next.
 async fn sweep_workspaces(admin: &AdminAuthority, work_root: &Path) {
-    let swept = admin
-        .store()
-        .lane(async |lane| crate::workspace::sweep(lane, work_root, crate::util::now_ms()).await)
-        .await
-        .map_err(anyhow::Error::from)
-        .and_then(|r| r);
+    let swept = crate::workspace::sweep(admin, work_root, crate::util::now_ms()).await;
     match swept {
         Ok(r) if r != crate::workspace::SweepReport::default() => {
             tracing::info!("workspace sweep: {r:?}");
@@ -264,6 +259,9 @@ pub struct AdminLane {
     /// The PR sync duty's wake (`SchedulerHandle::pr_sync_wake`): a
     /// trigger.
     pub pr_sync_wake: Arc<Notify>,
+    /// The reaper duty's wake (`SchedulerHandle::reap_wake`): a repo was
+    /// deleted.
+    pub reap_wake: Arc<Notify>,
     /// Counts the PR sync duty's passes, for the job lane to wait on.
     pub pr_sync_passes: PrSyncPasses,
     /// The job lane's wake: rung when a duty's run made work for it.
@@ -272,7 +270,8 @@ pub struct AdminLane {
 
 /// Start every admin duty ([`ADMIN_DUTIES`]) as its own task, each run
 /// every [`ADMIN_INTERVAL`] ([`supervise_duty`]); PR sync also whenever
-/// `pr_sync_wake` is notified. Pausing the scheduler does not stop them: a
+/// `pr_sync_wake` is notified, the reaper whenever `reap_wake` is. Pausing
+/// the scheduler does not stop them: a
 /// pause stops new jobs, which spend tokens, while these spend none, and a
 /// paused daemon still records merges, closes and review comments and
 /// sweeps finished trees. The tasks end at shutdown, once their run in
@@ -284,7 +283,11 @@ pub fn spawn_admin_lane(lane: AdminLane, shutdown: &watch::Receiver<bool>) -> Ve
         .map(|task| {
             let timer = DutyTimer {
                 interval: ADMIN_INTERVAL,
-                wake: (task == AdminTask::PrSync).then(|| Arc::clone(&lane.pr_sync_wake)),
+                wake: match task {
+                    AdminTask::PrSync => Some(Arc::clone(&lane.pr_sync_wake)),
+                    AdminTask::Reap => Some(Arc::clone(&lane.reap_wake)),
+                    _ => None,
+                },
             };
             let run = {
                 let (lane, shutdown) = (Arc::clone(&lane), shutdown.clone());
@@ -306,7 +309,7 @@ pub fn spawn_admin_lane(lane: AdminLane, shutdown: &watch::Receiver<bool>) -> Ve
                 }
             };
             tokio::spawn(supervise_duty(
-                lane.admin.store().clone(),
+                Store::clone(lane.admin.store()),
                 task,
                 timer,
                 Arc::clone(&lane.job_wake),
@@ -670,6 +673,7 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
             notes_lock: repo_notes.clone(),
             status: scheduler.admin.clone(),
             pr_sync_wake: scheduler.pr_sync_wake.clone(),
+            reap_wake: scheduler.reap_wake.clone(),
             pr_sync_passes: pr_sync_passes.clone(),
             job_wake: wake.clone(),
         },

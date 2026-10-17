@@ -643,7 +643,7 @@ async fn a_blocked_report_holds_the_fix_and_keeps_its_checkpoint() {
         "held work is skipped: {picked:?}"
     );
     hunter::workspace::sweep(
-        f.store.test_lane(),
+        &support::admin(&f.store),
         &f.cfg.work_root,
         hunter::util::now_ms(),
     )
@@ -1150,7 +1150,7 @@ async fn rejecting_a_held_fix_lets_the_sweep_release_its_checkpoint() {
     let job = summary.job_id.unwrap();
 
     hunter::workspace::sweep(
-        f.store.test_lane(),
+        &support::admin(&f.store),
         &f.cfg.work_root,
         hunter::util::now_ms(),
     )
@@ -1178,7 +1178,7 @@ async fn rejecting_a_held_fix_lets_the_sweep_release_its_checkpoint() {
         ("rejected", Some("not worth it"))
     );
     hunter::workspace::sweep(
-        f.store.test_lane(),
+        &support::admin(&f.store),
         &f.cfg.work_root,
         hunter::util::now_ms(),
     )
@@ -1703,7 +1703,8 @@ async fn a_shipped_fix_reaches_origin_and_opens_its_pr_from_the_branch() {
     bins.ok("gh", "https://github.com/acme/widget/pull/42");
     let f = fixture("fix-ship-argv").await;
     route_push(&f, None);
-    f.store
+    support::scope(&f.store)
+        .store()
         .record_work_failure(f.fid, FindingJobKind::Fix, "no commits")
         .await
         .unwrap();
@@ -1831,7 +1832,8 @@ async fn unshippable_work_is_requeued_with_the_reason() {
 async fn a_different_failure_restarts_the_streak() {
     let f = fixture("fix-streak-reset").await;
     for _ in 0..2 {
-        f.store
+        support::scope(&f.store)
+            .store()
             .record_work_failure(f.fid, FindingJobKind::Fix, "no commits")
             .await
             .unwrap();

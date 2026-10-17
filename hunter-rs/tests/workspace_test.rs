@@ -436,7 +436,7 @@ async fn the_sweep_releases_only_finished_chains_and_ages_out_their_sessions() {
     let ws = made_workspace(&f, 10, "suspended", now - 1_000).await;
     support::point_repo_checkpoint(&f.pool, 1, "hunt", Some(10)).await;
 
-    workspace::sweep(f.store.test_lane(), &f.cfg.work_root, now)
+    workspace::sweep(&support::admin(&f.store), &f.cfg.work_root, now)
         .await
         .unwrap();
     assert!(ws.tree.is_dir(), "a checkpoint's tree is its resume");
@@ -444,7 +444,7 @@ async fn the_sweep_releases_only_finished_chains_and_ages_out_their_sessions() {
     // The work item lets go of it: given up, superseded, or the repo's
     // work started over. The row stays `suspended`, as it ended.
     support::point_repo_checkpoint(&f.pool, 1, "hunt", None).await;
-    let report = workspace::sweep(f.store.test_lane(), &f.cfg.work_root, now)
+    let report = workspace::sweep(&support::admin(&f.store), &f.cfg.work_root, now)
         .await
         .unwrap();
     assert_eq!(report.trees_released, 1);
@@ -460,7 +460,7 @@ async fn the_sweep_releases_only_finished_chains_and_ages_out_their_sessions() {
     );
 
     workspace::sweep(
-        f.store.test_lane(),
+        &support::admin(&f.store),
         &f.cfg.work_root,
         now + SESSION_RETENTION_MS - 10_000,
     )
@@ -468,7 +468,7 @@ async fn the_sweep_releases_only_finished_chains_and_ages_out_their_sessions() {
     .unwrap();
     assert!(ws.root.is_dir(), "inside retention the workspace stays");
     let report = workspace::sweep(
-        f.store.test_lane(),
+        &support::admin(&f.store),
         &f.cfg.work_root,
         now + SESSION_RETENTION_MS,
     )
@@ -547,7 +547,7 @@ async fn the_sweep_ages_a_resumed_chain_by_its_newest_attempt() {
     let ws = made_workspace(&f, 10, "suspended", origin_finished).await;
     resumed_link(&f, 11, 10, "running", None).await;
 
-    let report = workspace::sweep(f.store.test_lane(), &f.cfg.work_root, now)
+    let report = workspace::sweep(&support::admin(&f.store), &f.cfg.work_root, now)
         .await
         .unwrap();
     assert_eq!(report.trees_released, 0);
@@ -566,7 +566,7 @@ async fn the_sweep_ages_a_resumed_chain_by_its_newest_attempt() {
         "the newest attempt's finish"
     );
 
-    let report = workspace::sweep(f.store.test_lane(), &f.cfg.work_root, now)
+    let report = workspace::sweep(&support::admin(&f.store), &f.cfg.work_root, now)
         .await
         .unwrap();
     assert_eq!(report.trees_released, 1);
@@ -580,7 +580,7 @@ async fn the_sweep_ages_a_resumed_chain_by_its_newest_attempt() {
     );
 
     let report = workspace::sweep(
-        f.store.test_lane(),
+        &support::admin(&f.store),
         &f.cfg.work_root,
         now + SESSION_RETENTION_MS + 1,
     )
@@ -604,7 +604,7 @@ async fn a_chain_given_up_after_several_attempts_releases_its_tree() {
     resumed_link(&f, 13, 12, "suspended", Some(now - 1_000)).await;
     support::point_repo_checkpoint(&f.pool, 1, "hunt", Some(13)).await;
 
-    let report = workspace::sweep(f.store.test_lane(), &f.cfg.work_root, now)
+    let report = workspace::sweep(&support::admin(&f.store), &f.cfg.work_root, now)
         .await
         .unwrap();
     assert_eq!(report.trees_released, 0);
@@ -650,7 +650,7 @@ async fn the_sweep_prunes_a_locked_registration_whose_tree_is_gone() {
     std::fs::remove_dir_all(gone.parent().unwrap()).unwrap();
 
     workspace::sweep(
-        f.store.test_lane(),
+        &support::admin(&f.store),
         &f.cfg.work_root,
         hunter::util::now_ms(),
     )
@@ -689,14 +689,14 @@ async fn the_sweep_keeps_a_finished_chains_tree_while_a_runner_leases_it() {
     )
     .unwrap();
 
-    let report = workspace::sweep(f.store.test_lane(), &f.cfg.work_root, now)
+    let report = workspace::sweep(&support::admin(&f.store), &f.cfg.work_root, now)
         .await
         .unwrap();
     assert_eq!(report.trees_released, 0);
     assert!(ws.tree.is_dir(), "a leased tree is kept");
 
     drop(lease);
-    let report = workspace::sweep(f.store.test_lane(), &f.cfg.work_root, now)
+    let report = workspace::sweep(&support::admin(&f.store), &f.cfg.work_root, now)
         .await
         .unwrap();
     assert_eq!(report.trees_released, 1, "and released once the lease ends");
@@ -736,7 +736,7 @@ async fn the_sweep_removes_the_scan_tree_of_a_repo_no_longer_listed() {
     std::fs::create_dir_all(orphan.join("half-written")).unwrap();
 
     workspace::sweep(
-        f.store.test_lane(),
+        &support::admin(&f.store),
         &f.cfg.work_root,
         hunter::util::now_ms(),
     )
@@ -1003,7 +1003,7 @@ async fn the_sweep_waits_for_the_clones_holder_before_pruning() {
     let held = permit(&f).await;
     let sweep = tokio::spawn({
         let (store, root) = (f.store.clone(), f.cfg.work_root.clone());
-        async move { workspace::sweep(store.test_lane(), &root, hunter::util::now_ms()).await }
+        async move { workspace::sweep(&support::admin(&store), &root, hunter::util::now_ms()).await }
     });
     support::until_waiting(&f.store, 1, 1).await;
     assert!(!sweep.is_finished(), "the sweep waits for the clone");
@@ -1040,7 +1040,7 @@ async fn the_sweep_waits_for_a_deleted_repos_clone_before_its_scan_tree() {
     let held = f.store.test_lane().lock_clone(2).await.unwrap();
     let sweep = tokio::spawn({
         let (store, root) = (f.store.clone(), f.cfg.work_root.clone());
-        async move { workspace::sweep(store.test_lane(), &root, hunter::util::now_ms()).await }
+        async move { workspace::sweep(&support::admin(&store), &root, hunter::util::now_ms()).await }
     });
     support::until_waiting(&f.store, 2, 1).await;
     assert!(scan.is_dir(), "the scan tree stays while its clone is held");
@@ -1090,7 +1090,7 @@ async fn the_sweep_keeps_the_live_scan_tree_of_a_reaped_repo() {
         .unwrap();
     let sweep = async || {
         workspace::sweep(
-            f.store.test_lane(),
+            &support::admin(&f.store),
             &f.cfg.work_root,
             hunter::util::now_ms(),
         )
@@ -1130,7 +1130,7 @@ async fn the_sweep_changes_no_clone_it_holds_no_permit_for() {
     assert!(registered());
 
     workspace::sweep(
-        f.store.test_lane(),
+        &support::admin(&f.store),
         &f.cfg.work_root,
         hunter::util::now_ms(),
     )
@@ -1272,7 +1272,7 @@ async fn the_sweep_removes_legacy_trees_no_live_job_uses() {
     support::point_checkpoint(&f.pool, 5, "engage", 30).await;
 
     let report = workspace::sweep(
-        f.store.test_lane(),
+        &support::admin(&f.store),
         &f.cfg.work_root,
         hunter::util::now_ms(),
     )
@@ -1336,7 +1336,7 @@ async fn a_sweep_that_keeps_every_legacy_tree_holds_no_clone_while_it_waits() {
     let held = f.store.test_lane().lock_clone(2).await.unwrap();
     let sweep = tokio::spawn({
         let (store, root) = (f.store.clone(), f.cfg.work_root.clone());
-        async move { workspace::sweep(store.test_lane(), &root, hunter::util::now_ms()).await }
+        async move { workspace::sweep(&support::admin(&store), &root, hunter::util::now_ms()).await }
     });
     support::until_waiting(&f.store, 2, 1).await;
     let other = tokio::time::timeout(
@@ -1646,7 +1646,7 @@ async fn the_sweep_ages_out_legacy_session_dirs_no_live_job_recorded() {
         .unwrap();
     }
 
-    let report = workspace::sweep(f.store.test_lane(), &f.cfg.work_root, now)
+    let report = workspace::sweep(&support::admin(&f.store), &f.cfg.work_root, now)
         .await
         .unwrap();
 
@@ -1754,7 +1754,7 @@ async fn renovate_runs_holding_no_clone_and_the_sweep_keeps_its_tree() {
             "the clone is held while Renovate runs"
         );
         workspace::sweep(
-            f.store.test_lane(),
+            &support::admin(&f.store),
             &f.cfg.work_root,
             hunter::util::now_ms(),
         )
