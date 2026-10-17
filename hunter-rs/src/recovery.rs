@@ -65,7 +65,9 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::domain::{ClosureClass, FindingStatus, JobState};
-use crate::store::{JobInsertError, JobOutcome, JobStart, PrSyncPass, Store, VerdictAnchor};
+use crate::store::{
+    AdminStore, JobInsertError, JobOutcome, JobStart, JobStore, PrSyncPass, Store, VerdictAnchor,
+};
 use crate::transition::Moved;
 use crate::types::{Finding, Job};
 use crate::workspace::{Workspace, tree_in_use};
@@ -229,12 +231,15 @@ impl Recovered {
 
     /// Hand the proof to the daemon's two lanes, each its own part of it.
     pub fn into_lanes(self) -> (JobAuthority, AdminAuthority) {
+        let admin = AdminAuthority {
+            store: AdminStore::of(&self, self.store.clone()),
+        };
         (
             JobAuthority {
-                store: self.store.clone(),
+                store: self.store,
                 status: crate::activity::JobStatus::default(),
             },
-            AdminAuthority { store: self.store },
+            admin,
         )
     }
 }
@@ -269,7 +274,7 @@ impl JobAuthority {
     /// settled or dropped, so no second scope opens beside it.
     pub fn scope(&mut self) -> CycleScope<'_> {
         CycleScope {
-            store: self.store.clone(),
+            store: JobStore::of(self, self.store.clone()),
             _jobs: PhantomData,
         }
     }
@@ -280,7 +285,7 @@ impl JobAuthority {
     #[cfg(feature = "test-support")]
     pub fn into_test_scope(self) -> CycleScope<'static> {
         CycleScope {
-            store: self.store,
+            store: JobStore::of(&self, self.store.clone()),
             _jobs: PhantomData,
         }
     }
@@ -288,16 +293,20 @@ impl JobAuthority {
 
 /// The admin lane's authority: the only way to begin a PR sync pass, and
 /// what the admin lane's other duties take (`crate::daemon`): the reaper,
-/// fetch-ahead, the Renovate scans and their request for the AI scan, the
-/// sweep. Neither `Clone` nor `Copy`: the admin lane holds it, sharing it
-/// among its duties. It creates no job and claims no fix; those take the
-/// [`JobAuthority`].
+/// fetch-ahead, the Renovate scans, the sweep. The store writes that only
+/// the Renovate scan may make take it too: retiring what Renovate no
+/// longer proposes, handing queued updates over, and requesting the AI
+/// scan (`Store::request_dep_update_fallback`). Neither `Clone` nor
+/// `Copy`: the admin lane holds it, sharing it among its duties. It
+/// creates no job and claims no fix; those take the [`JobAuthority`].
 pub struct AdminAuthority {
-    store: Store,
+    store: AdminStore,
 }
 
 impl AdminAuthority {
-    pub const fn store(&self) -> &Store {
+    /// The store with the writes only the admin lane makes
+    /// ([`AdminStore`]).
+    pub const fn store(&self) -> &AdminStore {
         &self.store
     }
 
@@ -306,14 +315,6 @@ impl AdminAuthority {
     /// store, the one held under its [`DaemonLock`], can sync.
     pub fn begin_pr_sync(&self) -> Option<PrSyncPass> {
         PrSyncPass::begin(self)
-    }
-
-    /// Record that Renovate had no answer for `repo_id` just now, which
-    /// hands the repo's `dep_update` to the job lane's AI scan
-    /// ([`Store::dep_update_fallbacks`]). Only the admin lane's Renovate
-    /// scan decides that, so only its authority records it.
-    pub async fn request_dep_update_fallback(&self, repo_id: i64) -> sqlx::Result<()> {
-        self.store.request_dep_update_fallback(repo_id).await
     }
 }
 
@@ -462,12 +463,13 @@ pub struct Owner(());
 /// they are lent beside it: a permit borrows the lane, not the scope, so
 /// a runner holding one can still create its job.
 pub struct CycleScope<'a> {
-    store: Store,
+    store: JobStore,
     _jobs: PhantomData<&'a mut JobAuthority>,
 }
 
 impl CycleScope<'_> {
-    pub const fn store(&self) -> &Store {
+    /// The store with the writes only the job lane makes ([`JobStore`]).
+    pub const fn store(&self) -> &JobStore {
         &self.store
     }
 

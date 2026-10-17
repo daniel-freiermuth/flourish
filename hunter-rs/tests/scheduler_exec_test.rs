@@ -1116,7 +1116,13 @@ async fn work_failure_streak_tracking() {
     };
     let fail = |kind, key: &'static str| {
         let store = store.clone();
-        async move { store.record_work_failure(2, kind, key).await.unwrap() }
+        async move {
+            support::scope(&store)
+                .store()
+                .record_work_failure(2, kind, key)
+                .await
+                .unwrap()
+        }
     };
 
     // Same failure twice

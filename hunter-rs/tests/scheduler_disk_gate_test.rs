@@ -77,7 +77,10 @@ async fn a_cycle_short_of_disk_is_denied_before_any_job_starts() {
         "no job row is created"
     );
     assert!(
-        pick_next(&store, &cfg, None).await.unwrap().is_some(),
+        pick_next(&support::scope(&store), &cfg, None)
+            .await
+            .unwrap()
+            .is_some(),
         "the work is still waiting"
     );
 }

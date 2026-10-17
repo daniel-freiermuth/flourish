@@ -19,8 +19,8 @@ use crate::domain::{
     HoldReason, JobKind, JobState, RepoJobKind, RepoWorkKind, Severity,
 };
 use crate::store::{
-    FindingFilter, JobInsertError, JobOutcome, JobPlace, JobStart, PrSyncPass, SeenActivity, Store,
-    StoreWriteError,
+    FindingFilter, JobInsertError, JobOutcome, JobPlace, JobStart, JobStore, PrSyncPass,
+    SeenActivity, Store, StoreWriteError,
 };
 use crate::transition::{
     Moved, PR_CLOSED_AWAITING_HARVEST, PrEnded, PrEnding, PrRef, Transition, Unclaimed,
@@ -328,12 +328,17 @@ async fn list_engage(store: &Store) -> sqlx::Result<(Vec<Finding>, BTreeSet<i64>
 /// failed attempt at its work ([`count_given_up_chain`],
 /// [`count_given_up_repo_chain`]).
 /// [`preview_next`] makes the same selection and writes nothing.
+///
+/// Those writes are the job lane's: this takes its [`CycleScope`], which
+/// only the job lane can open, and the writes take it from here
+/// ([`Pick::Run`]). Nothing else -- an admin duty, a handler -- can end a
+/// chain between the job lane's pick and its job.
 pub async fn pick_next(
-    store: &Store,
+    scope: &CycleScope<'_>,
     cfg: &Config,
     force_repo: Option<&str>,
 ) -> anyhow::Result<Option<Candidate>> {
-    select(store, cfg, force_repo, Pick::Run).await
+    select(scope.store(), cfg, force_repo, Pick::Run(scope)).await
 }
 
 /// The `/api/summary` "what's next" preview: [`pick_next`]'s selection
@@ -349,11 +354,13 @@ pub async fn preview_next(store: &Store, cfg: &Config) -> anyhow::Result<Option<
     select(store, cfg, None, Pick::Preview).await
 }
 
-/// Whether a selection records what it finds on the way.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Pick {
+/// Whether a selection records what it finds on the way, and with what
+/// right: only [`Pick::Run`] carries the job lane's scope, which every
+/// write on the way takes.
+#[derive(Clone, Copy)]
+enum Pick<'s> {
     /// The scheduler's own: [`pick_next`].
-    Run,
+    Run(&'s CycleScope<'s>),
     /// The summary's: [`preview_next`], which writes nothing.
     Preview,
 }
@@ -368,7 +375,7 @@ async fn select(
     store: &Store,
     cfg: &Config,
     force_repo: Option<&str>,
-    mode: Pick,
+    mode: Pick<'_>,
 ) -> anyhow::Result<Option<Candidate>> {
     let mut rechecking = findings_with_status(store, FindingStatus::Rechecking).await?;
     let (mut attention, flagged) = list_engage(store).await?;
@@ -802,7 +809,7 @@ async fn pick_resume(
     cfg: &Config,
     force_id: Option<i64>,
     (held, running): (&crate::store::HeldWork, &HashSet<JobPlace>),
-    mode: Pick,
+    mode: Pick<'_>,
 ) -> anyhow::Result<Picked> {
     for job in store.list_resumable_jobs().await? {
         if force_id.is_some_and(|rid| job.repo_id != rid) {
@@ -825,9 +832,9 @@ async fn pick_resume(
                     plan,
                 }));
             }
-            Resumable::GaveUp(why) => {
+            Resumable::GaveUp { why, scope } => {
                 if let JobKind::Repo(kind) = kind {
-                    count_given_up_repo_chain(store, (repo.0, &repo.1), kind, job_id, &why).await;
+                    count_given_up_repo_chain(scope, (repo.0, &repo.1), kind, job_id, &why).await;
                     return Ok(Picked::Ended);
                 }
             }
@@ -857,7 +864,7 @@ async fn finding_pick(
     kind: FindingJobKind,
     f: &Finding,
     may_start: bool,
-    mode: Pick,
+    mode: Pick<'_>,
 ) -> anyhow::Result<Picked> {
     let fresh = || {
         if may_start {
@@ -879,8 +886,8 @@ async fn finding_pick(
                 plan,
             })
         }
-        Resumable::GaveUp(why) => {
-            if count_given_up_chain(store, kind, f.id, job_id, &why).await {
+        Resumable::GaveUp { why, scope } => {
+            if count_given_up_chain(scope, kind, f.id, job_id, &why).await {
                 Picked::Ended
             } else {
                 fresh()
@@ -912,7 +919,7 @@ const CHAIN_GAVE_UP: &str = "resume chain gave up";
 /// and three given-up chains in a row hold it as `gave_up`, with the chain
 /// as its checkpoint for a `continue`.
 async fn count_given_up_repo_chain(
-    store: &Store,
+    scope: &CycleScope<'_>,
     (repo_id, name): (i64, &str),
     kind: RepoJobKind,
     job: i64,
@@ -920,7 +927,7 @@ async fn count_given_up_repo_chain(
 ) {
     let detail = format!("{CHAIN_GAVE_UP}: {why}");
     record_repo_failure(
-        store,
+        scope.store(),
         (repo_id, name),
         (kind.into(), Some(job)),
         CHAIN_GAVE_UP,
@@ -947,12 +954,13 @@ async fn count_given_up_repo_chain(
 /// True when this count ended the work, so the finding has left its
 /// tier.
 async fn count_given_up_chain(
-    store: &Store,
+    scope: &CycleScope<'_>,
     kind: FindingJobKind,
     fid: i64,
     job: i64,
     why: &str,
 ) -> bool {
+    let store = scope.store();
     let failure = CHAIN_GAVE_UP;
     let mut summary = CycleSummary::default();
     match kind {
@@ -998,12 +1006,16 @@ async fn count_given_up_chain(
 }
 
 /// What [`resume_plan`] made of one suspension.
-enum Resumable {
+enum Resumable<'s> {
     /// Continue it with this plan.
     Yes(Box<ResumePlan>),
     /// The chain was past the give-up ceiling, and its checkpoint is now
-    /// ended: why.
-    GaveUp(String),
+    /// ended: why. Only a [`Pick::Run`] ends one, so this carries its
+    /// scope, which counting the end against the work takes.
+    GaveUp {
+        why: String,
+        scope: &'s CycleScope<'s>,
+    },
     /// Not resumable for any other reason.
     No,
 }
@@ -1027,12 +1039,12 @@ enum Resumable {
 /// kind. Ending it takes it out of the walk in this same cycle. A
 /// [`Pick::Preview`] only skips it, and leaves that to the scheduler's own
 /// next selection.
-async fn resume_plan(
+async fn resume_plan<'s>(
     store: &Store,
     cfg: &Config,
     job: Job,
-    mode: Pick,
-) -> anyhow::Result<Resumable> {
+    mode: Pick<'s>,
+) -> anyhow::Result<Resumable<'s>> {
     // Non-NULL by the query's own filter; a row that lost its path
     // between the read and here is simply not resumable.
     let Some(session_file) = job.session_file.as_deref().map(PathBuf::from) else {
@@ -1060,8 +1072,8 @@ async fn resume_plan(
                 job.id,
                 workspace.root.display()
             );
-            if mode == Pick::Run {
-                end_checkpoint(store, &job, &msg).await;
+            if let Pick::Run(scope) = mode {
+                end_checkpoint(scope, &job, &msg).await;
             }
             return Ok(Resumable::No);
         }
@@ -1127,18 +1139,18 @@ async fn resume_plan(
             "resume {} {}: giving up after {} tok across the chain ({why})",
             job.kind, repo.name, own.total
         );
-        if mode == Pick::Preview {
+        let Pick::Run(scope) = mode else {
             return Ok(Resumable::No);
-        }
+        };
         // The chain's end counts as a failure of its work, where its tier
         // or the resume tier caught it ([`count_given_up_chain`],
         // [`count_given_up_repo_chain`]); nothing else moves. Best-effort:
         // the candidate is skipped either way, so a failed write only
         // defers the record — and only a landed give-up is reported as
         // one, so the chain is counted once.
-        let retired = end_checkpoint(store, &job, &msg).await;
+        let retired = end_checkpoint(scope, &job, &msg).await;
         return Ok(if retired {
-            Resumable::GaveUp(msg)
+            Resumable::GaveUp { why: msg, scope }
         } else {
             Resumable::No
         });
@@ -1182,7 +1194,8 @@ async fn resume_plan(
 /// the job row stays as it ended (WORK-MODEL.md §4). True when the write
 /// landed; a failed one, or a pointer that has moved on since, leaves the
 /// checkpoint for the next selection to try again.
-async fn end_checkpoint(store: &Store, job: &Job, msg: &str) -> bool {
+async fn end_checkpoint(scope: &CycleScope<'_>, job: &Job, msg: &str) -> bool {
+    let store = scope.store();
     let dropped = match (job.kind, job.finding_id) {
         (JobKind::Finding(kind), Some(fid)) => store.drop_checkpoint(fid, kind, job.id, msg).await,
         (JobKind::Repo(kind), _) => {
@@ -2894,7 +2907,7 @@ pub async fn run_hunt(
 /// stays `rechecking`: sent back to `new` it looked exactly like a finding
 /// nobody had rechecked.
 async fn handle_recheck_failure(
-    store: &Store,
+    store: &JobStore,
     summary: &mut CycleSummary,
     fid: i64,
     job: i64,
@@ -3791,7 +3804,7 @@ async fn renovate_scan(
 /// the cycle, so the cadence stays put and the next cycle retries it
 /// (re-ingesting the same answer changes nothing).
 async fn settle_dep_updates(
-    store: &Store,
+    admin: &AdminAuthority,
     repo: &Repo,
     scan: &crate::dep_scan::DepScan,
 ) -> anyhow::Result<(u64, u64)> {
@@ -3800,7 +3813,8 @@ async fn settle_dep_updates(
         .iter()
         .map(|cand| cand.fingerprint.clone())
         .collect();
-    let retired = store
+    let retired = admin
+        .store()
         .supersede_unproposed_dep_updates(repo.id, &proposed, &scan.unchecked)
         .await
         .map_err(|e| {
@@ -3818,7 +3832,8 @@ async fn settle_dep_updates(
             })
         })
         .collect();
-    let handed_over = store
+    let handed_over = admin
+        .store()
         .hand_over_queued_dep_updates(repo.id, &moves)
         .await
         .map_err(|e| {
@@ -3848,7 +3863,7 @@ pub enum DependencyScan {
     /// summary says.
     Scanned(Box<CycleSummary>),
     /// Renovate had no answer; the AI scan is now due on the job lane
-    /// (`AdminAuthority::request_dep_update_fallback`).
+    /// (`Store::request_dep_update_fallback`).
     Unavailable,
     /// The clone could not be synced: nothing scanned, nothing counted.
     /// The job lane's own fetches keep the repo's `sync` streak.
@@ -3994,7 +4009,7 @@ pub async fn scan_dependencies(
         }
     };
     let Some(scan) = scan else {
-        admin.request_dep_update_fallback(repo.id).await?;
+        store.request_dep_update_fallback(repo.id).await?;
         let _ = store
             .log_event(
                 "dep_update",
@@ -4049,7 +4064,7 @@ pub async fn scan_dependencies(
         return Ok(DependencyScan::Scanned(Box::new(deleted_during_scan(repo))));
     }
     let (retired, handed_over) = if counts.invalid == 0 {
-        settle_dep_updates(store, repo, &scan).await?
+        settle_dep_updates(admin, repo, &scan).await?
     } else {
         (0, 0)
     };
@@ -4404,7 +4419,7 @@ fn blocked_report(tree: &Path) -> std::io::Result<Option<String>> {
 /// owns it and a resume cannot mistake it for its own outcome. `false`
 /// when nothing was held: the finding has left the kind's tier.
 async fn hold_on_report(
-    store: &Store,
+    store: &JobStore,
     kind: FindingJobKind,
     fid: i64,
     job: i64,
@@ -4690,7 +4705,7 @@ async fn conclude_fix(
 /// on what a stuck fix becomes. A count or a hold that could not be
 /// recorded is reported as such and ends nothing.
 async fn record_fix_failure(
-    store: &Store,
+    store: &JobStore,
     fid: i64,
     job: i64,
     failure: &str,
@@ -4757,7 +4772,7 @@ const TREE_NOT_MADE: &str = "workspace not created";
 /// stays in the engage tier, the highest of them, and is picked every
 /// cycle.
 async fn count_unmade_engage_tree(
-    store: &Store,
+    store: &JobStore,
     fid: i64,
     job: i64,
     mut summary: CycleSummary,
@@ -4819,7 +4834,7 @@ impl WorkOf<'_> {
 /// returned summary ends the cycle denied for the host, as the network
 /// gate's own denial does (#95).
 async fn runner_failed(
-    store: &Store,
+    store: &JobStore,
     (cfg, backend, repo_url): (&Config, &dyn Backend, &str),
     (work, running): (WorkOf<'_>, RunningJob),
     err: &anyhow::Error,
@@ -4921,7 +4936,7 @@ async fn runner_failed(
 /// streak each time. The reason follows it in the report, and the summary
 /// keeps it whole.
 async fn count_unmade_tree(
-    store: &Store,
+    store: &JobStore,
     claim: FixClaim,
     job: i64,
     mut summary: CycleSummary,
@@ -5072,7 +5087,7 @@ async fn fix_event(
 /// where the fix tier skips held work. The budget override is left alone:
 /// nothing concluded.
 async fn hold_prerequisite(
-    store: &Store,
+    store: &JobStore,
     start: &FixStart,
     claim: FixClaim,
     report: &str,
@@ -5165,7 +5180,7 @@ async fn record_declined_fix(
 /// any outcome that leaves the finding `fixing` returns it to `queued`.
 /// Every outcome ends `claim`.
 async fn record_fix_outcome(
-    store: &Store,
+    store: &JobStore,
     (start, claim): (&FixStart, FixClaim),
     outcome: FixOutcome,
     stdout_tail: &str,
@@ -5931,7 +5946,7 @@ struct EngageStart {
 /// where a view failing while the network is not back would count
 /// against it for nothing.
 async fn engage_view(
-    store: &Store,
+    store: &JobStore,
     (cfg, backend): (&Config, &dyn Backend),
     attempt: Attempt<'_, kind::Engage>,
     repo: &Repo,
@@ -6048,7 +6063,7 @@ pub async fn count_unrecorded_pr_end(scope: &CycleScope<'_>, summary: &CycleSumm
 /// [`engage_prefetch_failed`]: the network's ends the cycle denied
 /// (`Ok(Err(summary))`), anything else stays the error it was.
 async fn engage_prefetch<T>(
-    store: &Store,
+    store: &JobStore,
     net: (&Config, &dyn Backend),
     finding: &Finding,
     step: anyhow::Result<T>,
@@ -6185,7 +6200,7 @@ async fn engage_seen_activity(
 /// forge and record the finding `closed`. Returns whether the closure is
 /// complete enough to hand to the closed PR's harvest right away.
 async fn withdraw_pr(
-    store: &Store,
+    store: &JobStore,
     net: (&Config, &dyn Backend),
     fid: i64,
     start: &EngageStart,
@@ -6426,7 +6441,7 @@ async fn push_then_reply(
 /// Record a finished engage: what it published, or why it is incomplete.
 /// Either way a one-shot budget override is spent.
 async fn record_engage(
-    store: &Store,
+    store: &JobStore,
     (net, finding): ((&Config, &dyn Backend), &Finding),
     start: &EngageStart,
     recorded: Option<RecordedJob>,
@@ -6603,7 +6618,7 @@ fn engage_failure_key(fail: &str) -> &str {
 /// is now held. A count or a hold that could not be recorded is reported
 /// as such and ends nothing.
 async fn record_engage_failure(
-    store: &Store,
+    store: &JobStore,
     fid: i64,
     job: Option<i64>,
     key: &str,
@@ -6702,7 +6717,7 @@ async fn unpublished_offline(
 /// ([`unreachable_now`]): then the failure is the network's, nothing is
 /// counted, and the returned summary ends the cycle denied for the host.
 async fn engage_prefetch_failed(
-    store: &Store,
+    store: &JobStore,
     (cfg, backend): (&Config, &dyn Backend),
     finding: &Finding,
     failure: &str,
@@ -6844,7 +6859,7 @@ pub async fn run_engage(
         spend_once_override(store, finding).await;
         withdraw_pr(store, (cfg, backend), fid, &start, &reason, &mut summary).await
     } else if let Some(report) = blocked_report(&start.ws.tree)? {
-        if let Err(e) = engage_blocked(lane.store(), fid, &start, &report, &mut summary).await {
+        if let Err(e) = engage_blocked(store, fid, &start, &report, &mut summary).await {
             close_workspace(lane, start.ws).await;
             return Err(e);
         }
@@ -6953,7 +6968,7 @@ async fn spend_once_override(store: &Store, finding: &Finding) {
 /// fault, so it is an outcome and an event rather than the cycle's error,
 /// which would back all other work off for minutes.
 async fn engage_blocked(
-    store: &Store,
+    store: &JobStore,
     fid: i64,
     start: &EngageStart,
     report: &str,
@@ -7111,7 +7126,7 @@ async fn continue_into_harvest(
 /// runs, part of its budget of tries. It is logged, and the finding stays
 /// `closed` and pending.
 async fn harvest_prefetch_failed(
-    store: &Store,
+    store: &JobStore,
     (cfg, backend, repo_url): (&Config, &dyn Backend, &str),
     fid: i64,
     handoff: bool,
@@ -7163,7 +7178,7 @@ async fn harvest_prefetch_failed(
 /// True when the harvest is now held. A count or a hold that could not be
 /// recorded is reported as such and ends nothing.
 async fn record_harvest_failure(
-    store: &Store,
+    store: &JobStore,
     fid: i64,
     job: Option<i64>,
     key: &str,
@@ -7236,15 +7251,14 @@ async fn record_harvest_failure(
 /// operator's verdict) has nothing to hold, which is an outcome, not the
 /// cycle's error ([`engage_blocked`]).
 async fn harvest_blocked(
-    lane: &mut Lane,
+    (store, lane): (&JobStore, &mut Lane),
     fid: i64,
     (job, state): (i64, JobState),
     pr_number: i64,
     ws: OpenWorkspace,
     report: &str,
 ) -> anyhow::Result<CycleSummary> {
-    let store = lane.store().clone();
-    let held = hold_on_report(&store, FindingJobKind::Harvest, fid, job, &ws, report).await;
+    let held = hold_on_report(store, FindingJobKind::Harvest, fid, job, &ws, report).await;
     close_workspace(lane, ws).await;
     let outcome = if held? {
         "held"
@@ -7592,7 +7606,7 @@ pub async fn run_harvest(
     .unwrap_or(JobState::Failed);
 
     if let Some(report) = blocked_report(&worktree)? {
-        return harvest_blocked(lane, fid, (job, state), pr_number, ws, &report).await;
+        return harvest_blocked((store, lane), fid, (job, state), pr_number, ws, &report).await;
     }
     // A closed PR's review must say why it closed. Without that the
     // finding would sit `closed` for good, so a missing or unusable
@@ -8150,7 +8164,7 @@ async fn run_scoped_cycle(
     backend: &dyn Backend,
     force_repo: Option<&str>,
 ) -> CycleSummary {
-    let store = scope.store().clone();
+    let store = Store::clone(scope.store());
     // Catch-all
     let mut summary = match run_cycle_inner(&scope, lane, cfg, backend, force_repo).await {
         Ok(result) => result,
@@ -8372,7 +8386,7 @@ async fn run_cycle_inner(
         });
     }
 
-    let picked = pick_next(store, cfg, force_repo).await?;
+    let picked = pick_next(scope, cfg, force_repo).await?;
     if picked.is_none() {
         let result = CycleSummary {
             kind: None,

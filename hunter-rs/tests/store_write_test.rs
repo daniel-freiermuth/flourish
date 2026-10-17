@@ -2555,13 +2555,15 @@ async fn dropping_a_repo_checkpoint_that_moved_on_drops_nothing() {
     let store = rw_store(&path).await;
 
     assert!(
-        !store
+        !support::scope(&store)
+            .store()
             .drop_repo_checkpoint(1, RepoJobKind::Hunt, 10, "stale")
             .await
             .unwrap()
     );
     assert!(
-        store
+        support::scope(&store)
+            .store()
             .drop_repo_checkpoint(1, RepoJobKind::Hunt, 11, "given up")
             .await
             .unwrap()
@@ -2907,7 +2909,8 @@ async fn hold_fixture() -> (TempDir, Store, SqlitePool) {
 
 /// Hold finding 2's fix: whether a hold landed.
 async fn hold_fix(store: &Store, reason: HoldReason, detail: &str, job: Option<i64>) -> bool {
-    store
+    support::scope(store)
+        .store()
         .hold_work(2, FindingJobKind::Fix, reason, detail, job)
         .await
         .unwrap()
@@ -2973,7 +2976,8 @@ async fn holding_work_keeps_the_status_and_a_checkpoint_only_with_a_transcript()
         "one active hold per work item"
     );
     assert!(
-        !store
+        !support::scope(&store)
+            .store()
             .hold_work(1, FindingJobKind::Fix, HoldReason::Stuck, "new", None)
             .await
             .unwrap(),
@@ -3261,7 +3265,8 @@ async fn pr_holds_fixture() -> (TempDir, Store) {
         (4, FindingJobKind::Engage),
     ] {
         assert!(
-            store
+            support::scope(&store)
+                .store()
                 .hold_work(fid, kind, HoldReason::Stuck, "pr view failed", None)
                 .await
                 .unwrap()
@@ -3544,14 +3549,26 @@ async fn dropping_a_checkpoint_that_moved_on_changes_nothing() {
             .any(|e| e.message == msg)
     };
 
-    assert!(!store.drop_checkpoint(2, fix, 11, "drop 11").await.unwrap());
+    assert!(
+        !support::scope(&store)
+            .store()
+            .drop_checkpoint(2, fix, 11, "drop 11")
+            .await
+            .unwrap()
+    );
     assert_eq!(
         store.checkpoint_job(2, fix).await.unwrap().map(|j| j.id),
         Some(10)
     );
     assert!(!logged("drop 11").await);
 
-    assert!(store.drop_checkpoint(2, fix, 10, "drop 10").await.unwrap());
+    assert!(
+        support::scope(&store)
+            .store()
+            .drop_checkpoint(2, fix, 10, "drop 10")
+            .await
+            .unwrap()
+    );
     assert_eq!(
         store.checkpoint_job(2, fix).await.unwrap().map(|j| j.id),
         None
@@ -3599,7 +3616,8 @@ async fn counting_a_failure_keeps_the_checkpoint() {
     let (_dir, store, pool) = hold_fixture().await;
     support::point_checkpoint(&pool, 2, "fix", 10).await;
 
-    let streak = store
+    let streak = support::scope(&store)
+        .store()
         .record_work_failure(2, FindingJobKind::Fix, "runner error")
         .await
         .unwrap();
@@ -3776,7 +3794,8 @@ async fn a_failure_counts_only_while_the_finding_is_in_the_kinds_tier() {
     let store = rw_store(&path).await;
 
     assert_eq!(
-        store
+        support::scope(&store)
+            .store()
             .record_work_failure(2, FindingJobKind::Fix, "push failed")
             .await
             .unwrap(),
@@ -3789,7 +3808,8 @@ async fn a_failure_counts_only_while_the_finding_is_in_the_kinds_tier() {
         (3, FindingJobKind::Harvest),
     ] {
         assert_eq!(
-            store
+            support::scope(&store)
+                .store()
                 .record_work_failure(fid, kind, "push failed")
                 .await
                 .unwrap(),

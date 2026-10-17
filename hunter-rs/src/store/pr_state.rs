@@ -62,7 +62,7 @@ impl PrSyncPass {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .ok()?;
         Some(Self {
-            store: store.clone(),
+            store: Store::clone(store),
             read: Mutex::default(),
             stop: None,
         })
