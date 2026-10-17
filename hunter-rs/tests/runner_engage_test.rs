@@ -2172,6 +2172,89 @@ async fn feedback_a_resumed_worker_was_shown_is_answered_by_its_reply() {
     assert_eq!(f.attention().await, None);
 }
 
+/// A resumed worker is only told to carry on, in the tree its chain was
+/// created in, so problems a sync recorded while the chain was suspended
+/// never reached it. A reply without a push must not decline them.
+#[tokio::test]
+async fn a_conflict_recorded_while_an_engage_was_suspended_stays_flagged_after_it_resumes() {
+    let f = fixture("engage-conflict-suspended").await;
+    let bins = FakeBins::acquire("engage-conflict-suspended");
+    bins.ok("gh", PR_VIEW_JSON);
+    push_to(&f, None).await;
+    let backend = suspend_then_reply();
+
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let first =
+        hunter::scheduler::run_engage(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
+            .await
+            .unwrap();
+    assert_eq!(
+        first.state,
+        Some(hunter::domain::JobState::Suspended),
+        "{first:?}"
+    );
+
+    // While it is suspended, the base branch moves: a sync records the
+    // same head, now conflicting.
+    let pass = support::pr_sync(&f.store);
+    let conflicting = ObservedOpenPr::fixture(
+        pass.begin_read_at(f.fid, &support::pr_ref(PR_URL), 2)
+            .await
+            .unwrap()
+            .unwrap(),
+        ObservedFixture {
+            mergeable: Mergeable::Conflicting,
+            changes_requested: true,
+            checks: None,
+            failing_checks: Vec::new(),
+            head_ref: BRANCH.to_owned(),
+            head_sha: "deadbeef".to_owned(),
+            last_activity_at: 1,
+        },
+    );
+    let recorded = f.store.record_open_pr(f.fid, &conflicting).await.unwrap();
+    drop(pass);
+    assert!(
+        matches!(recorded, OpenPrRecorded::Recorded(_)),
+        "{recorded:?}"
+    );
+    let unseen = f.pr_row().await.attention_fingerprint.clone();
+    assert_ne!(unseen.as_deref(), Some(FP), "the conflict is recorded");
+
+    let plan = match hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        .await
+        .unwrap()
+    {
+        Some(hunter::scheduler::Candidate::Resume { plan, .. }) => *plan,
+        other => panic!("expected the suspended engage to be resumed, got {other:?}"),
+    };
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        &f.cfg,
+        &finding,
+        &backend,
+        Some(&plan),
+    )
+    .await
+    .unwrap();
+    assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
+    assert!(bins.called_with("gh", "comment"), "{:?}", bins.calls());
+
+    let row = f.pr_row().await;
+    assert_ne!(
+        row.addressed_fingerprint, unseen,
+        "no worker was shown the conflict"
+    );
+    assert!(
+        row.needs_attention
+            .as_deref()
+            .is_some_and(|a| a.split(',').any(|r| r == "conflict")),
+        "{:?}",
+        row.needs_attention
+    );
+}
+
 /// A push that fails leaves the engage incomplete: no reply is posted, the
 /// finished job is recorded failed, nothing is marked addressed or engaged
 /// (so the next cycle tries again), and the attempt still spends a one-shot
