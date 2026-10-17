@@ -409,7 +409,7 @@ pub enum ActivityStatus {
         job: Box<Job>,
     },
     /// The job lane is inside a cycle with no `running` job: picking,
-    /// preparing a job (fetch, clone, a Renovate scan) or finishing one
+    /// preparing a job (fetch, clone, worktree) or finishing one
     /// (push, PR, ingest).
     Working,
     Error {
@@ -493,6 +493,9 @@ pub struct AdminActivity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum JobPhase {
+    /// Waiting for a repo's clone that an admin duty holds (fetch-ahead,
+    /// a dependency scan, the sweep): reported only while the wait lasts.
+    WaitingForClone,
     /// Cloning a repo for its first job.
     Cloning,
     /// `git fetch` into a repo's clone.

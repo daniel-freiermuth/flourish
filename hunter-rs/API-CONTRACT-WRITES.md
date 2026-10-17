@@ -132,8 +132,8 @@ Handler `_cycle` (server.py:489-518). **Never reads the body** (only the §0.1 g
 **Success**: `200 {"paused": <value>}`. The process-local flag changes
 immediately and both lanes are notified. Pausing blocks new job-lane cycles;
 a worker already running is allowed to finish. It does not stop the admin
-lane, which spends no tokens: PR sync, the reaper and the workspace sweep
-keep running, so merges, closes and review comments are still recorded
+lane, which spends no tokens: PR sync, the reaper, fetch-ahead, the dependency scans and the
+workspace sweep keep running, so merges, closes and review comments are still recorded
 while jobs are paused. The flag resets to false on restart.
 
 ## 2.2 POST /api/overdrive — global prioritized budget mode

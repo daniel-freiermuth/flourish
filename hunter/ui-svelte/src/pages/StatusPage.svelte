@@ -101,6 +101,7 @@
     sweep: "sweeping finished workspaces",
   };
   const JOB_PHASE_LABEL: Record<JobPhase, string> = {
+    waiting_for_clone: "waiting for an admin duty to release the repo",
     cloning: "cloning the repo",
     fetching: "fetching the repo",
     preparing_tree: "preparing the job's worktree",

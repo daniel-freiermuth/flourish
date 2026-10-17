@@ -104,7 +104,7 @@ Built from `scheduler::preview_next(store, cfg)` (the write-free selection; the 
 
 Discriminated union on `kind`, priority order:
 1. `{"kind":"running","job":<JobDict>}` — when `current_job` non-null
-2. `{"kind":"working"}` — `cycle_running` true, no job row: the job lane is picking, or preparing a job (fetch, clone, a Renovate scan) or finishing one (push, PR, ingest); which of those, `job_activity` says. PR sync is not part of it in Rust (`admin_activity`).
+2. `{"kind":"working"}` — `cycle_running` true, no job row: the job lane is picking, or preparing a job (fetch, clone, worktree) or finishing one (push, PR, ingest); which of those, `job_activity` says. PR sync is not part of it in Rust (`admin_activity`).
 3. `{"kind":"error","detail":<scheduler_state.detail>}` — `scheduler_state.state == "error"`
 4. `{"kind":"offline","detail":<scheduler_state.detail>}` — `scheduler_state.state == "offline"`: the last cycle was denied by the network gate, and `detail` is `"<host> unreachable"` (Rust addition; no Python counterpart)
 5. `{"kind":"paused","candidate":<NextCandidateDict>}` — candidate present with `budget_state == "denied"`
