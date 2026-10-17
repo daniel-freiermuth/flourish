@@ -4196,6 +4196,10 @@ fn fix_branch(finding: &Finding) -> String {
 /// [`FixClaim`] [`start_fix`] returns beside it, since they end at
 /// different points.
 struct FixStart {
+    /// The finding as the claim took it ([`FixClaim::finding`]): what the
+    /// worker is asked to fix and its outcome is recorded against, not the
+    /// row the pick read, which a Renovate pass may have rewritten since.
+    finding: Finding,
     repo: Repo,
     job: i64,
     ws: OpenWorkspace,
@@ -4261,7 +4265,6 @@ async fn start_fix(
             .await;
         anyhow::bail!("repo missing");
     };
-    let branch = fix_branch(finding);
     let (cap, anticipated) = match budget_gate(
         backend,
         store,
@@ -4287,6 +4290,8 @@ async fn start_fix(
             "finding #{fid} is no longer queued"
         ))));
     };
+    let finding = claim.finding().clone();
+    let branch = fix_branch(&finding);
     if let Err(e) = remove_stale_report(resume) {
         release_claim(claim).await;
         anyhow::bail!("fix #{fid}: {e}");
@@ -4339,6 +4344,7 @@ async fn start_fix(
     };
     Ok(Ok((
         FixStart {
+            finding,
             repo,
             job,
             ws,
@@ -4421,10 +4427,10 @@ async fn hold_on_report(
 /// configuration fault worth surfacing on either path.
 fn fix_prompt(
     cfg: &Config,
-    attempt: Attempt<'_, kind::Fix>,
+    resume: Option<&ResumePlan>,
     start: &FixStart,
 ) -> anyhow::Result<String> {
-    let (finding, resume) = (attempt.subject(), attempt.plan());
+    let finding = &start.finding;
     let worktree = &start.ws.tree;
     let repo_notes = Store::repo_notes(&cfg.work_root, start.repo.id);
     let built = match finding.kind {
@@ -4610,10 +4616,10 @@ fn header(line: &str) -> Option<(String, String)> {
 /// error leaves the claim to the caller, which releases it.
 async fn conclude_fix(
     (cfg, backend): (&Config, &dyn Backend),
-    finding: &Finding,
     start: &FixStart,
     state: JobState,
 ) -> anyhow::Result<FixOutcome> {
+    let finding = &start.finding;
     let fid = finding.id;
     let worktree = &start.ws.tree;
     let decline_name = if finding.kind == FindingType::Bug {
@@ -5154,12 +5160,12 @@ async fn record_declined_fix(
 /// Every outcome ends `claim`.
 async fn record_fix_outcome(
     store: &Store,
-    finding: &Finding,
     (start, claim): (&FixStart, FixClaim),
     outcome: FixOutcome,
     stdout_tail: &str,
     summary: &mut CycleSummary,
 ) -> anyhow::Result<()> {
+    let finding = &start.finding;
     let fid = finding.id;
     let job = start.job;
     let tail = crate::util::tail(stdout_tail, 300);
@@ -5268,16 +5274,15 @@ pub async fn run_fix(
     attempt: Attempt<'_, kind::Fix>,
     backend: &dyn Backend,
 ) -> anyhow::Result<CycleSummary> {
-    let (finding, resume) = (attempt.subject(), attempt.plan());
+    let (fid, resume) = (attempt.subject().id, attempt.plan());
     let store = scope.store();
-    let fid = finding.id;
     let (start, running, claim) = match start_fix(scope, lane, cfg, attempt, backend).await? {
         Ok(start) => start,
         Err(ended) => return Ok(ended),
     };
     // Any early return from here on drops `running`: the cycle's settle
     // records the abandoned job.
-    let prompt = match fix_prompt(cfg, attempt, &start) {
+    let prompt = match fix_prompt(cfg, resume, &start) {
         Ok(prompt) => prompt,
         Err(e) => {
             release_claim(claim).await;
@@ -5332,7 +5337,7 @@ pub async fn run_fix(
         tokens_new: Some(rr.tokens_new),
         ..Default::default()
     };
-    let outcome = match conclude_fix((cfg, backend), finding, &start, state).await {
+    let outcome = match conclude_fix((cfg, backend), &start, state).await {
         Ok(outcome) => outcome,
         Err(e) => {
             release_claim(claim).await;
@@ -5341,7 +5346,6 @@ pub async fn run_fix(
     };
     record_fix_outcome(
         store,
-        finding,
         (&start, claim),
         outcome,
         &rr.stdout_tail,
