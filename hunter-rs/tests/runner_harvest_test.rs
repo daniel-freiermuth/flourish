@@ -1261,7 +1261,8 @@ async fn a_harvest_whose_tree_can_never_be_made_is_held() {
 }
 
 /// The cold review runs in a tree at the default branch, which does not
-/// hold the PR's changes: the prompt must say so and carry the diff.
+/// hold the PR's changes: the prompt must say so, name that commit, and
+/// carry the diff.
 #[tokio::test]
 async fn the_prompt_carries_the_diff_and_what_the_tree_holds() {
     let bins = FakeBins::acquire("harvest-prompt");
@@ -1270,7 +1271,7 @@ async fn the_prompt_carries_the_diff_and_what_the_tree_holds() {
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let backend = classifying(close_reason("superseded"));
 
-    run_harvest(
+    let summary = run_harvest(
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
@@ -1284,8 +1285,22 @@ async fn the_prompt_carries_the_diff_and_what_the_tree_holds() {
     assert_eq!(runs.len(), 1);
     let prompt = &runs[0].prompt;
     assert!(prompt.contains(PR_DIFF), "{prompt}");
+    let job = summary.job_id.unwrap();
+    let base = f
+        .store
+        .base_sha(job)
+        .await
+        .unwrap()
+        .expect("a recorded base");
+    assert_eq!(
+        Some(&base),
+        f.store.pinned_sha(job).await.unwrap().as_ref(),
+        "a cold tree is created at the commit the harvest judges against"
+    );
     assert!(
-        prompt.contains("checked out at main's HEAD, which does NOT contain this PR's changes"),
+        prompt.contains(&format!(
+            "checked out at main's HEAD ({base}), which does NOT contain this PR's changes"
+        )),
         "{prompt}"
     );
     assert_eq!(runs[0].resume_from, None);
@@ -1497,6 +1512,84 @@ async fn a_resumed_closed_harvest_gets_neither_the_playbook_nor_the_diff_again()
     );
     assert_eq!(runs[0].resume_from.as_deref(), Some(plan.session_file()));
     assert_eq!(diff_fetches(&bins), 1, "{:?}", bins.calls_to("gh"));
+}
+
+/// A resumed harvest judges against the commit its chain's first attempt
+/// recorded, not `origin/main` after the worker: the admin lane fetches the
+/// clone while a worker runs, so the ref may by then name a commit nobody
+/// judged, and a verdict anchored there hides the changes in between from
+/// suppression. The resume's own row carries the chain's base.
+#[tokio::test]
+async fn a_resumed_harvest_keeps_its_chains_base_while_origin_moves() {
+    let bins = FakeBins::acquire("harvest-resume-base");
+    gh_default(&bins);
+    let f = fixture("harvest-resume-base", FindingStatus::Closed).await;
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let cold = run_harvest(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Cold(&finding),
+        &suspending(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(cold.state, Some(JobState::Suspended), "{cold:?}");
+    let base = f
+        .store
+        .base_sha(cold.job_id.unwrap())
+        .await
+        .unwrap()
+        .expect("a cold harvest records its base");
+
+    let plan = match pick_next(&support::scope(&f.store), &f.cfg, None)
+        .await
+        .unwrap()
+    {
+        Some(Candidate::Resume { plan, .. }) => *plan,
+        other => panic!("expected the suspended harvest to be resumed, got {other:?}"),
+    };
+    let wrong = close_reason("wrong");
+    let backend = ScriptedBackend::new(move |tree| {
+        // A fetch landing while the worker runs: `origin/main` moves to a
+        // commit on top of the one the chain judges.
+        let later = support::git(
+            tree,
+            &["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "later"],
+        );
+        support::git(
+            tree,
+            &["update-ref", "refs/remotes/origin/main", later.trim()],
+        );
+        std::fs::write(tree.join("CLOSE-REASON.json"), &wrong).unwrap();
+        support::done()
+    });
+    let resumed = run_harvest(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
+        &backend,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(resumed.outcome.as_deref(), Some("harvested"), "{resumed:?}");
+    assert_eq!(
+        f.store.base_sha(resumed.job_id.unwrap()).await.unwrap(),
+        Some(base.clone()),
+        "the resume's row carries the chain's base"
+    );
+    let anchors = f
+        .store
+        .suppression_anchors(finding.repo_id, finding.kind.as_str())
+        .await
+        .unwrap();
+    let anchor = anchors.get(&f.fid).expect("a rejected verdict is anchored");
+    assert_eq!(
+        anchor.sha, base,
+        "anchored at the chain's base, not the moved ref"
+    );
 }
 
 /// Point the fixture's repo at a forge on `host` and turn the network gate

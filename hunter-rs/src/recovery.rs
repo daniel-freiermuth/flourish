@@ -486,9 +486,33 @@ impl CycleScope<'_> {
         cap_tokens: Option<i64>,
         estimated_tokens: Option<i64>,
     ) -> Result<CreatedJob, JobInsertError> {
+        self.insert(start, None, cap_tokens, estimated_tokens).await
+    }
+
+    /// [`Self::create_job`] for a harvest that resolved the default-branch
+    /// commit it judges against (`jobs.base_sha`), recorded by the same
+    /// INSERT. A resume passes `None` and inherits its chain's.
+    pub async fn create_harvest_job(
+        &self,
+        start: JobStart,
+        base_sha: Option<&str>,
+        cap_tokens: Option<i64>,
+        estimated_tokens: Option<i64>,
+    ) -> Result<CreatedJob, JobInsertError> {
+        self.insert(start, base_sha, cap_tokens, estimated_tokens)
+            .await
+    }
+
+    async fn insert(
+        &self,
+        start: JobStart,
+        base_sha: Option<&str>,
+        cap_tokens: Option<i64>,
+        estimated_tokens: Option<i64>,
+    ) -> Result<CreatedJob, JobInsertError> {
         let inserted = self
             .store
-            .insert_job(&Owner(()), start, cap_tokens, estimated_tokens)
+            .insert_job(&Owner(()), start, base_sha, cap_tokens, estimated_tokens)
             .await?;
         Ok(CreatedJob {
             job: RunningJob {

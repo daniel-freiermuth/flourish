@@ -3171,10 +3171,14 @@ impl Store {
     /// holds its branch checked out, and git refuses to check one branch
     /// out in two worktrees.
     ///
-    /// A resumed attempt copies `pinned_sha` and `seen_activity_at` from the
-    /// attempt it continues, here in the INSERT, so every link of a chain
-    /// names the commit its shared tree was created at and the newest PR
-    /// feedback an engage chain's worker was shown.
+    /// A resumed attempt copies `pinned_sha`, `base_sha` and
+    /// `seen_activity_at` from the attempt it continues, here in the
+    /// INSERT, so every link of a chain names the commit its shared tree
+    /// was created at, the default-branch commit a harvest chain judges
+    /// against, and the newest PR feedback an engage chain's worker was
+    /// shown. `base_sha`, when given, is the commit a harvest resolved for
+    /// itself; it is written by the same INSERT, so no harvest row exists
+    /// without it for a resume to inherit as NULL.
     ///
     /// At most one job is `running` per finding, and per (repo, kind) for
     /// repo-level work (migration 031's indexes). An insert that would be
@@ -3192,6 +3196,7 @@ impl Store {
         &self,
         _owner: &Owner,
         start: JobStart,
+        base_sha: Option<&str>,
         cap_tokens: Option<i64>,
         estimated_tokens: Option<i64>,
     ) -> Result<InsertedJob, JobInsertError> {
@@ -3214,6 +3219,7 @@ impl Store {
             (kind, repo_id, finding_id),
             (cap_tokens, estimated_tokens),
             resumed_from,
+            base_sha,
         )
         .await?;
         let mut retired = Vec::new();
@@ -3420,21 +3426,25 @@ impl Store {
     }
 
     /// [`Self::insert_job`]'s INSERT: the `running` row, its chain's pins
-    /// copied from `resumed_from`. Refused for a deleted repo, and for a
-    /// place another `running` job holds.
+    /// copied from `resumed_from` (`base_sha` from the caller when given).
+    /// Refused for a deleted repo, and for a place another `running` job
+    /// holds.
     async fn insert_running_row(
         tx: &mut ImmediateTx,
         (kind, repo_id, finding_id): (JobKind, i64, Option<i64>),
         (cap_tokens, estimated_tokens): (Option<i64>, Option<i64>),
         resumed_from: Option<i64>,
+        base_sha: Option<&str>,
     ) -> Result<i64, JobInsertError> {
         let now = now_ms();
         let result = sqlx::query!(
             "INSERT INTO jobs \
              (kind, repo_id, finding_id, cap_tokens, state, started_at, estimated_tokens, \
-              resumed_from, pinned_sha, seen_activity_at, full_history, full_hunt_request) \
+              resumed_from, pinned_sha, base_sha, seen_activity_at, full_history, \
+              full_hunt_request) \
              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, \
                     (SELECT p.pinned_sha FROM jobs p WHERE p.id = ?8), \
+                    COALESCE(?9, (SELECT p.base_sha FROM jobs p WHERE p.id = ?8)), \
                     (SELECT p.seen_activity_at FROM jobs p WHERE p.id = ?8), \
                     COALESCE((SELECT p.full_history FROM jobs p WHERE p.id = ?8), 0), \
                     (SELECT p.full_hunt_request FROM jobs p WHERE p.id = ?8) \
@@ -3446,7 +3456,8 @@ impl Store {
             JobState::Running,
             now,
             estimated_tokens,
-            resumed_from
+            resumed_from,
+            base_sha
         )
         .execute(&mut **tx)
         .await;
@@ -3549,6 +3560,17 @@ impl Store {
     pub async fn pinned_sha(&self, job_id: i64) -> sqlx::Result<Option<String>> {
         Ok(
             sqlx::query_scalar!("SELECT pinned_sha FROM jobs WHERE id = ?1", job_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .flatten(),
+        )
+    }
+
+    /// The default-branch commit `job_id`'s harvest chain judges against,
+    /// if one was recorded (by its INSERT, [`Self::insert_job`]).
+    pub async fn base_sha(&self, job_id: i64) -> sqlx::Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar!("SELECT base_sha FROM jobs WHERE id = ?1", job_id)
                 .fetch_optional(&self.pool)
                 .await?
                 .flatten(),

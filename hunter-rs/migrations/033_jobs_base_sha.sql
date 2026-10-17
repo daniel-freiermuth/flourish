@@ -1,0 +1,17 @@
+-- The default-branch commit a harvest chain judges its PR against.
+--
+-- A harvest's worker reads "the current code" and its verdict is anchored
+-- at the commit it read. `origin/<default>` is a ref of the shared clone,
+-- which the admin lane fetches while the worker runs, so neither the
+-- worker nor the anchor may read that ref after the fetch the harvest
+-- made itself: the commit is resolved once, right after that fetch and
+-- under the clone's permit, recorded here, and named to the worker by its
+-- sha. A cold harvest's tree is created at it, so it equals pinned_sha; a
+-- harvest continuing a withdrawn engage runs in the engage's tree at the
+-- PR's head, so pinned_sha cannot stand in for it there.
+--
+-- A resumed attempt copies it from the attempt it continues at INSERT, as
+-- with pinned_sha: a resume fetches nothing and its transcript already
+-- names this commit. NULL for every other kind, and for every row written
+-- before this column existed.
+ALTER TABLE jobs ADD COLUMN base_sha TEXT;
