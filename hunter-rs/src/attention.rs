@@ -292,6 +292,19 @@ impl<'a> EngageAnswer<'a> {
         }
     }
 
+    /// A published engage that did not push, from a resume whose row no
+    /// longer records the problems its chain started from: a sync recorded
+    /// others while it was suspended, which its worker, only told to carry
+    /// on, was never shown. Its feedback answered up to `seen`, nothing
+    /// declined ([`ProblemsAnswer::NoneRecorded`]).
+    pub const fn without_push_unshown(pr: &'a PrRef, seen: Option<SeenActivity>) -> Self {
+        Self {
+            pr,
+            seen,
+            problems: ProblemsAnswer::NoneRecorded,
+        }
+    }
+
     /// A push that landed with the rest of the engage unpublished (its
     /// reply failed): the PR's head moved, so the push is counted
     /// ([`ProblemsAnswer::Pushed`]), but no feedback is answered and the
@@ -338,7 +351,7 @@ pub enum ProblemsAnswer<'a> {
     /// It answered without pushing, declining these problems on this head.
     Declined(Declined<'a>),
     /// It answered without pushing, and the row it started from recorded no
-    /// problems, or no head, to decline.
+    /// problems, or no head, to decline, or none its worker was shown.
     NoneRecorded,
 }
 

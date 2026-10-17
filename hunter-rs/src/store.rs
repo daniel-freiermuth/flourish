@@ -2967,10 +2967,11 @@ impl Store {
     /// holds its branch checked out, and git refuses to check one branch
     /// out in two worktrees.
     ///
-    /// A resumed attempt copies `pinned_sha` and `seen_activity_at` from the
-    /// attempt it continues, here in the INSERT, so every link of a chain
-    /// names the commit its shared tree was created at and the newest PR
-    /// feedback an engage chain's worker was shown.
+    /// A resumed attempt copies `pinned_sha`, `seen_activity_at` and the
+    /// `started_on_*` pair from the attempt it continues, here in the
+    /// INSERT, so every link of a chain names the commit its shared tree was
+    /// created at, the newest PR feedback an engage chain's worker was
+    /// shown, and the problems it started from.
     ///
     /// At most one job is `running` per finding, and per (repo, kind) for
     /// repo-level work (migration 031's indexes). An insert that would be
@@ -3160,10 +3161,13 @@ impl Store {
         let result = sqlx::query!(
             "INSERT INTO jobs \
              (kind, repo_id, finding_id, cap_tokens, state, started_at, estimated_tokens, \
-              resumed_from, pinned_sha, seen_activity_at, full_history, full_hunt_request) \
+              resumed_from, pinned_sha, seen_activity_at, started_on_fingerprint, \
+              started_on_head_sha, full_history, full_hunt_request) \
              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, \
                     (SELECT p.pinned_sha FROM jobs p WHERE p.id = ?8), \
                     (SELECT p.seen_activity_at FROM jobs p WHERE p.id = ?8), \
+                    (SELECT p.started_on_fingerprint FROM jobs p WHERE p.id = ?8), \
+                    (SELECT p.started_on_head_sha FROM jobs p WHERE p.id = ?8), \
                     COALESCE((SELECT p.full_history FROM jobs p WHERE p.id = ?8), 0), \
                     (SELECT p.full_hunt_request FROM jobs p WHERE p.id = ?8) \
              WHERE EXISTS (SELECT 1 FROM repos WHERE id = ?2 AND deleted_at IS NULL)",
@@ -3307,6 +3311,37 @@ impl Store {
                 .flatten()
                 .map(SeenActivity),
         )
+    }
+
+    /// Record the problems and head a cold engage attempt started from, as
+    /// `ps` records them. Resumes inherit them ([`CycleScope::create_job`](crate::recovery::CycleScope::create_job)) instead.
+    pub async fn set_started_on(&self, job_id: i64, ps: &RecordedPrState) -> sqlx::Result<()> {
+        sqlx::query!(
+            "UPDATE jobs SET started_on_fingerprint = ?1, started_on_head_sha = ?2 WHERE id = ?3",
+            ps.attention_fingerprint,
+            ps.head_sha,
+            job_id
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Whether `ps` records the problems, on the head, that `job_id`'s
+    /// engage chain started from ([`Self::set_started_on`]). False for a
+    /// chain that recorded none, or no head.
+    pub async fn started_on(&self, job_id: i64, ps: &RecordedPrState) -> sqlx::Result<bool> {
+        Ok(sqlx::query_scalar!(
+            r#"SELECT started_on_fingerprint = ?2 AND started_on_head_sha = ?3 AS "same?: bool"
+               FROM jobs WHERE id = ?1"#,
+            job_id,
+            ps.attention_fingerprint,
+            ps.head_sha
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten()
+        .unwrap_or(false))
     }
     /// Whether the chain rooted at `origin_id` still needs its working
     /// tree, and how long ago it last did anything.
