@@ -1721,6 +1721,78 @@ async fn fetch_held(permit: &ClonePermit<'_>, refs: &[&str]) -> (i32, String) {
         .unwrap_or((127, "spawn error".to_owned()))
 }
 
+/// What one [`fetch_ahead`] pass did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FetchAhead {
+    /// Clones fetched.
+    pub fetched: usize,
+    /// Clones whose fetch failed, or that could not be fetched at all.
+    pub failed: usize,
+}
+
+/// Fetch every enabled repo's clone ahead of its jobs, so the fetch the
+/// job lane makes before a job ([`sync_to_tip`], an engage's PR head, a
+/// harvest's default branch) finds nothing left to download. Run by the
+/// admin lane (`crate::daemon::admin_pass`), beside whatever job runs.
+///
+/// The same [`sync_repo`] as the job lane's, under the same clone permit,
+/// so a fetch here and one there never overlap, and a clone whose origin
+/// is not the repo's is refused here too. It only fetches: a repo with no
+/// clone yet is left to its first hunt, and the check is made under the
+/// permit, so a clone the reaper removed is not made again. Failures are
+/// logged and counted nowhere: the job lane's own fetch still runs and
+/// keeps the repo's `sync` streak, which is what the operator sees. A
+/// worker's tree only shares the clone's object store and its
+/// remote-tracking refs, which a fetch updates atomically; every commit
+/// range a runner reads after its worker names its own pins or leases.
+///
+/// Stops at the next repo once `stop` is set.
+pub async fn fetch_ahead(store: &Store, stop: &tokio::sync::watch::Receiver<bool>) -> FetchAhead {
+    let repos = match store.list_repos().await {
+        Ok(repos) => repos,
+        Err(e) => {
+            tracing::warn!("fetch-ahead: listing repos: {e}");
+            return FetchAhead::default();
+        }
+    };
+    let ran = store
+        .lane(async |lane| {
+            let mut done = FetchAhead::default();
+            for repo in repos.iter().filter(|r| r.enabled != 0) {
+                if *stop.borrow() {
+                    break;
+                }
+                let permit = match lane.lock_clone(repo.id).await {
+                    Ok(permit) => permit,
+                    // Deleted since it was listed.
+                    Err(e) => {
+                        tracing::debug!("fetch-ahead {}: {e}", repo.name);
+                        continue;
+                    }
+                };
+                if !permit.clone_dir().exists() {
+                    continue;
+                }
+                match sync_repo(store, &permit).await {
+                    Ok(Ok(())) => done.fetched += 1,
+                    Ok(Err(failure)) => {
+                        done.failed += 1;
+                        tracing::info!("fetch-ahead {}: {}", repo.name, failure.detail);
+                    }
+                    Err(e) => {
+                        done.failed += 1;
+                        tracing::warn!("fetch-ahead {}: {e}", repo.name);
+                    }
+                }
+            }
+            done
+        })
+        .await;
+    ran.unwrap_or_else(|e| {
+        tracing::warn!("fetch-ahead: {e}");
+        FetchAhead::default()
+    })
+}
 /// Sync `repo`'s clone ([`sync_repo`]) and resolve the tip of its default
 /// branch: everything every kind of the repo needs before it can start.
 /// Success ends the `sync` work item's streak.
