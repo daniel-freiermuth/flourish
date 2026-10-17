@@ -182,6 +182,109 @@ async fn a_paused_daemon_reports_it_and_stops_on_sigterm() {
         .expect("run_daemon returned an error");
 }
 
+/// The admin lane runs inside `run_daemon`, on its own: with no job to
+/// run, a started daemon syncs its open PR and records what the forge
+/// showed, and the summary carries the lane's activity.
+#[tokio::test]
+async fn a_running_daemon_syncs_open_prs_on_its_admin_lane() {
+    let bins = FakeBins::acquire("daemon-admin");
+    bins.script("omp", "exit 0");
+    bins.ok(
+        "gh",
+        r#"{"state":"OPEN","mergeable":"CONFLICTING","reviewDecision":"","comments":[],"reviews":[],"statusCheckRollup":[],"updatedAt":"2026-01-02T03:04:05Z","headRefName":"fix/some-bug","headRefOid":"deadbeef"}"#,
+    );
+    let root = TempDir::new("daemon-admin-root");
+    let _home = bins.env("HOME", root.path());
+    let port = free_port();
+    std::fs::write(
+        root.join("config.json"),
+        format!(r#"{{"ompBin": "omp", "serve": {{"port": {port}}}}}"#),
+    )
+    .unwrap();
+    let cfg = support::load_config(root.path());
+    std::fs::create_dir_all(cfg.db_path.parent().unwrap()).unwrap();
+    let store = hunter::store::Store::connect(&cfg.db_path).await.unwrap();
+    let cookie = support::auth_cookie(&store).await;
+    let repos = root.join("repos");
+    std::fs::create_dir_all(&repos).unwrap();
+    let rid = store
+        .add_repo(
+            "widget",
+            "https://github.com/acme/widget",
+            &repos,
+            "main",
+            hunter::domain::ForgeName::Github,
+        )
+        .await
+        .unwrap();
+    let (fid, _) = store
+        .upsert_finding(
+            rid,
+            &hunter::store::FindingInsert {
+                fingerprint: "fp-open-pr".to_owned(),
+                file: "src/lib.rs".to_owned(),
+                severity: hunter::domain::Severity::Medium,
+                confidence: 0.9,
+                summary: "a bug with a PR".to_owned(),
+                ..Default::default()
+            },
+            "bug",
+            None,
+        )
+        .await
+        .unwrap();
+    store
+        .set_finding_pr_open(fid, "https://github.com/acme/widget/pull/7")
+        .await
+        .unwrap();
+
+    let daemon = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("daemon runtime")
+            .block_on(hunter::daemon::run_daemon(cfg))
+    });
+
+    let summary = wait_for_summary(
+        port,
+        &daemon,
+        &cookie,
+        "the daemon to serve /api/summary",
+        |_| true,
+    )
+    .await;
+    assert!(
+        summary.as_object().unwrap().contains_key("admin_activity"),
+        "{summary}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let ps = store.get_pr_state(fid).await.unwrap();
+        if ps.as_ref().and_then(|p| p.mergeable.as_deref()) == Some("CONFLICTING") {
+            break;
+        }
+        assert!(!daemon.is_finished(), "run_daemon returned before syncing");
+        assert!(
+            Instant::now() < deadline,
+            "the admin lane never synced the open PR: {ps:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGTERM)
+        .expect("send SIGTERM to this test process");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !daemon.is_finished() {
+        assert!(Instant::now() < deadline, "the daemon never stopped");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    daemon
+        .join()
+        .expect("run_daemon thread panicked")
+        .expect("run_daemon returned an error");
+}
+
 /// `serve.host` is what the daemon binds, not a hard-coded loopback.
 ///
 /// Proven without touching a real interface: Linux routes all of
@@ -345,7 +448,7 @@ async fn a_starting_daemon_turns_automatic_maintenance_off_in_its_clones() {
 
 /// A skipped cycle did no work: its pick was stale (the finding left
 /// `queued`), so the next cycle starts at once rather than idling the
-/// queue for the 15-minute default (or the 5-minute PR-sync cap).
+/// queue for the 15-minute default.
 #[tokio::test]
 #[allow(
     clippy::float_cmp,
@@ -359,14 +462,6 @@ async fn a_skipped_cycle_restarts_at_once() {
         ..Default::default()
     };
     assert_eq!(hunter::daemon::compute_sleep_s(&store, &skipped).await, 0.0);
-    let after_sync = hunter::scheduler::CycleSummary {
-        sync: Some(hunter::scheduler::SyncResult::default()),
-        ..skipped
-    };
-    assert_eq!(
-        hunter::daemon::compute_sleep_s(&store, &after_sync).await,
-        0.0
-    );
     let idle = hunter::scheduler::CycleSummary::default();
     assert_eq!(hunter::daemon::compute_sleep_s(&store, &idle).await, 900.0);
 }

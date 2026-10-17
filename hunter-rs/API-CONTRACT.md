@@ -69,13 +69,14 @@ Handler: server.py:216-217 -> `_summary()` (server.py:256-333) -> `_validate_sum
 | `type_counts` | object: type -> int | `Counter` of `type` over the same rows (server.py:266,315). Only observed types present; may be `{}`. |
 | `repos` | array of Repo | `store.list_repos()`: `SELECT * FROM repos WHERE deleted_at IS NULL ORDER BY name`, rows through `_repo_row` (store.py:592-596, 116-128), then pydantic-narrowed to `RepoDict` (types.py:143-158): `id:int, name:str, url:str, path:str, forge:str, default_branch:str, last_hunt_sha:str\|null, last_hunt_at:int\|null, enabled:int (0/1, NOT bool), added_at:int`. The narrowing drops the 6 `last_*_at` migration columns here; `deleted_at` is already gone before it (§7). Rust (`RepoBrief`) adds an 11th key, `full_hunt_requested_at:int\|null` (migration 020): the pending full re-hunt request the Repos page badges (`API-CONTRACT-WRITES.md` §8.1). It also carries the repo's work (WORK-MODEL.md §17), both keys always present: `holds`, an array of `{kind, reason, detail, held_at, actions}` — one per held work item, oldest first, `kind` a repo job kind or `sync` (`sync` held means nothing of the repo runs), `actions` what `POST /api/hold/release` accepts for it now (`continue` only with a checkpoint, `restart` always) — and `failing`, an array of `{kind, streak, last_failure}` for work failing without a hold yet. |
 | `last_cycle` | Event object or null | first event with `kind == "cycle"` within `recent_events(limit=500)` (server.py:267-270). Event shape: see /api/events. |
-| `cycle_running` | bool | `_cycle_lock.locked()` (server.py:311,326) — true JSON boolean. |
+| `cycle_running` | bool | `_cycle_lock.locked()` (server.py:311,326) — true JSON boolean. Rust: the job lane is inside a cycle (`SchedulerHandle.running`); the admin lane's work does not set it. |
 | `scheduler_paused` | bool | process-local pause flag from `SchedulerHandle`; blocks new cycles but does not interrupt a running worker. |
 | `scheduler_overdrive` | bool | process-local overdrive flag from `SchedulerHandle`; when true every budget decision uses the backend's prioritized verdict. Resets to false on daemon restart. |
 | `current_job` | Job object or null | `store.current_job()` (store.py:1243-1280), see below. |
 | `next_candidate` | object or null | computed only when `current_job` is null AND `scheduler.pick_next` yields a candidate (server.py:276-308); see below. |
 | `scheduler_state` | object or null | `store.get_scheduler_state()`: `SELECT * FROM scheduler_state WHERE id = 1` (store.py:1295-1301). Shape (types.py:109-114): `id:1, state:str ("idle"\|"denied"\|"error"; the Rust daemon also writes "offline"), detail:str, next_wake_at:int\|null (epoch ms), updated_at:int`. Null until the daemon loop has run once. |
 | `activity_status` | tagged union on `kind` | `_activity_status(...)` (server.py:1070-1138); see below. |
+| `admin_activity` | object or null | Rust only: the admin lane's current task, `{task: "pr_sync"\|"reap"\|"sweep", started_at: int}` (epoch ms), from `SchedulerHandle.admin` (`AdminStatus`, set only for the length of the task); null between its passes. It runs beside the job lane, so it can be non-null whatever `activity_status` says. |
 
 ### current_job (store.py:1243-1280)
 
@@ -102,7 +103,7 @@ Built from `scheduler.pick_next(store, cfg)` (exceptions swallowed -> null) and 
 
 Discriminated union on `kind`, priority order:
 1. `{"kind":"running","job":<JobDict>}` — when `current_job` non-null
-2. `{"kind":"working"}` — `cycle_running` true, no job row yet
+2. `{"kind":"working"}` — `cycle_running` true, no job row: the job lane is picking, or preparing a job (fetch, clone, a Renovate scan) or finishing one (push, PR, ingest). PR sync is not part of it in Rust (`admin_activity`).
 3. `{"kind":"error","detail":<scheduler_state.detail>}` — `scheduler_state.state == "error"`
 4. `{"kind":"offline","detail":<scheduler_state.detail>}` — `scheduler_state.state == "offline"`: the last cycle was denied by the network gate, and `detail` is `"<host> unreachable"` (Rust addition; no Python counterpart)
 5. `{"kind":"paused","candidate":<NextCandidateDict>}` — candidate present with `budget_state == "denied"`

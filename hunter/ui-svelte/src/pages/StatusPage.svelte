@@ -1,7 +1,7 @@
 <script lang="ts">
   import { store, post } from "../lib/api.svelte";
   import { ts, clock, countdown, dur, ktok } from "../lib/format";
-  import type { NextCandidate } from "../lib/types";
+  import type { AdminTask, NextCandidate } from "../lib/types";
 
   let btnText = $state("Run Cycle");
   let btnDisabled = $state(false);
@@ -85,6 +85,12 @@
   });
 
   const activityKind = $derived(store.summary?.activity_status?.kind ?? null);
+
+  const ADMIN_TASK_LABEL: Record<AdminTask, string> = {
+    pr_sync: "syncing open PRs",
+    reap: "removing deleted repos' clones",
+    sweep: "sweeping finished workspaces",
+  };
 </script>
 
 <div class="page-enter">
@@ -153,7 +159,7 @@
       {:else if store.summary.activity_status.kind === "working"}
         <div class="row">
           <span class="status-icon running">▶</span>
-          <b class="running">running</b> cycle in progress&hellip;
+          <b class="running">running</b> picking, preparing or finishing a job&hellip;
         </div>
       {:else if store.summary.activity_status.kind === "error"}
         <div class="row">
@@ -218,6 +224,15 @@
         {/if}
       {:else if store.summary.activity_status.kind === "warming_up"}
         <div class="row dim">warming up &mdash; no cycle has run yet</div>
+      {/if}
+
+      <!-- Admin lane: runs beside the job lane above -->
+      {#if store.summary.admin_activity}
+        {@const aa = store.summary.admin_activity}
+        <div class="row dim">
+          <span class="status-icon running">▶</span>
+          admin: {ADMIN_TASK_LABEL[aa.task]} ({dur(aa.started_at, null)})
+        </div>
       {/if}
 
       <!-- Scheduler detail (last log) -->

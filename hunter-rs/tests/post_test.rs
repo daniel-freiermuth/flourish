@@ -155,12 +155,7 @@ async fn test_state() -> TestState {
             config: Arc::new(config),
             backend: Arc::new(hunter::backend::NullBackend),
             repo_notes: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-            scheduler: hunter::server::SchedulerHandle {
-                running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                overdrive: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                wake: Arc::new(tokio::sync::Notify::new()),
-            },
+            scheduler: hunter::server::SchedulerHandle::default(),
         },
         dir,
     }
@@ -761,18 +756,23 @@ async fn cycle_starts_returns_202() {
     assert_eq!(body["started"], true);
 }
 
-/// Contract §2: the 202 is not cosmetic -- it must actually reach the loop.
-/// The handler notifies before responding, so the permit is already held
-/// and `notified()` resolves immediately.
+/// Contract §2: the 202 is not cosmetic -- it must actually reach both
+/// lanes: the job lane's next cycle, and the admin lane's PR sync. The
+/// handler notifies before responding, so each permit is already held and
+/// `notified()` resolves immediately.
 #[tokio::test]
-async fn cycle_wakes_the_scheduler_loop() {
+async fn cycle_wakes_both_scheduler_lanes() {
     let state = test_state().await;
     let wake = Arc::clone(&state.scheduler.wake);
+    let admin_wake = Arc::clone(&state.scheduler.admin_wake);
     let (status, _) = post(&state, "/api/cycle", json!({})).await;
     assert_eq!(status, StatusCode::ACCEPTED);
     tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified())
         .await
-        .expect("POST /api/cycle must wake the scheduler loop");
+        .expect("POST /api/cycle must wake the job lane");
+    tokio::time::timeout(std::time::Duration::from_secs(1), admin_wake.notified())
+        .await
+        .expect("POST /api/cycle must wake the admin lane");
 }
 
 /// Contract §2: a cycle already under way is refused, not queued twice.

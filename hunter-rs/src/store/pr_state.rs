@@ -37,10 +37,10 @@ use crate::util::now_ms;
 ///
 /// So the last observation written of a PR is always the newest.
 ///
-/// Begun only with proof of startup recovery (`Recovered::begin_pr_sync`,
-/// `CycleScope::begin_pr_sync`). Outside a `test-support` build only the
-/// daemon's store, opened under its `DaemonLock`, ever has that proof, so
-/// no other process can sync alongside the daemon either.
+/// Begun only with proof of startup recovery, by the admin lane that holds
+/// it (`AdminAuthority::begin_pr_sync`). Outside a `test-support` build
+/// only the daemon's store, opened under its `DaemonLock`, ever has that
+/// proof, so no other process can sync alongside the daemon either.
 pub struct PrSyncPass {
     store: Store,
     /// The findings whose PR this pass has begun a read of.

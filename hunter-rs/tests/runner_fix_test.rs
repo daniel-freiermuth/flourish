@@ -208,7 +208,7 @@ async fn a_cycle_runs_the_queued_fix() {
         ScriptedBackend::writing("NOT-A-BUG.md", "Classification: wrong\nmisread the code");
 
     let summary =
-        hunter::scheduler::run_cycle(&support::recovered(&f.store), &f.cfg, &backend, None).await;
+        hunter::scheduler::run_cycle(&mut support::jobs(&f.store), &f.cfg, &backend, None).await;
 
     assert_eq!(summary.finding_id, Some(f.fid), "{summary:?}");
     assert_eq!(summary.outcome.as_deref(), Some("rejected"), "{summary:?}");

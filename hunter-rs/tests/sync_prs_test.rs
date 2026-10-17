@@ -459,7 +459,15 @@ async fn a_pr_open_finding_without_a_url_is_requeued() {
 
     let result = f.sync().await;
 
-    assert_eq!((result.errors, result.synced), (0, 0), "{result:?}");
+    assert_eq!(
+        (result.errors, result.synced, result.requeued),
+        (0, 0, 1),
+        "{result:?}"
+    );
+    assert!(
+        result.made_work(),
+        "a requeued fix is work for the job lane"
+    );
     assert_eq!(f.status().await, FindingStatus::Queued);
     assert!(bins.calls_to("gh").is_empty(), "{:?}", bins.calls());
 }
@@ -844,6 +852,8 @@ async fn a_changed_reason_lifts_suppression() {
 
 /// `list_attention` orders by `attention_since`: restamping it on every
 /// sync would send a long-waiting PR to the back of the queue each cycle.
+/// A sync counts as raised only the attention it changed, which is what
+/// wakes the job lane; a PR still flagged for the same reasons is not.
 #[tokio::test]
 async fn attention_since_moves_only_when_the_reason_changes() {
     let f = fixture("sync-attention-since").await;
@@ -854,15 +864,18 @@ async fn attention_since_moves_only_when_the_reason_changes() {
         &bins,
         &pr(&json!({ "reviewDecision": "CHANGES_REQUESTED" })),
     );
-    f.sync().await;
+    let same = f.sync().await;
     assert_eq!(f.pr_state().await.attention_since, Some(42), "unchanged");
+    assert_eq!((same.attention, same.raised), (1, 0), "{same:?}");
+    assert!(!same.made_work(), "{same:?}");
 
     serve_pr(
         &bins,
         &pr(&json!({ "reviewDecision": "CHANGES_REQUESTED", "mergeable": "CONFLICTING" })),
     );
     let before = now_ms();
-    f.sync().await;
+    let changed = f.sync().await;
+    assert_eq!((changed.attention, changed.raised), (1, 1), "{changed:?}");
     let ps = f.pr_state().await;
     assert_eq!(
         ps.needs_attention.as_deref(),
@@ -871,7 +884,8 @@ async fn attention_since_moves_only_when_the_reason_changes() {
     assert!(ps.attention_since.unwrap() >= before, "restamped: {ps:?}");
 
     serve_pr(&bins, &pr(&json!({})));
-    f.sync().await;
+    let cleared = f.sync().await;
+    assert_eq!((cleared.attention, cleared.raised), (0, 0), "{cleared:?}");
     let ps = f.pr_state().await;
     assert_eq!(ps.needs_attention, None);
     assert_eq!(ps.attention_since, None, "cleared");

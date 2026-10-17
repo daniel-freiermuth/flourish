@@ -445,7 +445,7 @@ async fn job_place(pool: &SqlitePool, id: i64) -> (String, i64, Option<i64>, Opt
 
 /// A fresh `kind` job on `finding`, ended as `state`.
 async fn ended_job(
-    scope: &hunter::recovery::CycleScope,
+    scope: &hunter::recovery::CycleScope<'_>,
     kind: FindingJobKind,
     finding: i64,
     state: FinishedState,
@@ -1274,14 +1274,14 @@ async fn a_pr_sync_pass_begins_only_once_the_last_one_ended() {
     let (_dir, path, pool) = fresh_db().await;
     seed_repo_and_findings(&pool).await;
     let store = rw_store(&path).await;
-    let recovered = support::recovered(&store);
+    let admin = support::admin(&store);
 
-    let first = recovered.begin_pr_sync().expect("no pass is live yet");
-    assert!(recovered.begin_pr_sync().is_none());
-    assert!(support::recovered(&store.clone()).begin_pr_sync().is_none());
+    let first = admin.begin_pr_sync().expect("no pass is live yet");
+    assert!(admin.begin_pr_sync().is_none());
+    assert!(support::admin(&store.clone()).begin_pr_sync().is_none());
 
     drop(first);
-    assert!(recovered.begin_pr_sync().is_some());
+    assert!(admin.begin_pr_sync().is_some());
 }
 
 /// A pass reads each finding's PR once: a second read of it in the same

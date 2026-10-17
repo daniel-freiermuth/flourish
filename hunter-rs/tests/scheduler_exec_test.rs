@@ -568,14 +568,14 @@ async fn a_settled_claim_is_not_released_again_under_a_later_claim() {
     seed_repo(&pool).await;
     seed_findings(&pool).await;
     let store = rw_store(&path).await;
-    let recovered = support::recovered(&store);
+    let jobs = support::jobs(&store);
     let work_root = dir.subdir("work_root");
     drop(support::scope(&store).claim_fix(2).await.unwrap().unwrap());
-    let released = recovered.settle_unsettled(&work_root).await.unwrap();
+    let released = jobs.settle_unsettled(&work_root).await.unwrap();
     assert_eq!(released.requeued, 1);
     let later = support::scope(&store).claim_fix(2).await.unwrap().unwrap();
 
-    let settled = recovered.settle_unsettled(&work_root).await.unwrap();
+    let settled = jobs.settle_unsettled(&work_root).await.unwrap();
 
     assert_eq!(settled, Settled::default());
     let status = store.get_finding(2).await.unwrap().unwrap().status;
@@ -724,10 +724,10 @@ async fn a_settled_claim_spares_a_finding_a_running_job_works_on() {
         .await
         .unwrap()
         .job;
-    let recovered = support::recovered(&store);
+    let jobs = support::jobs(&store);
     let work_root = dir.subdir("work_root");
 
-    let spared = recovered.settle_unsettled(&work_root).await.unwrap();
+    let spared = jobs.settle_unsettled(&work_root).await.unwrap();
 
     assert_eq!(
         spared,
@@ -754,7 +754,7 @@ async fn a_settled_claim_spares_a_finding_a_running_job_works_on() {
         })
         .await
         .unwrap();
-    let released = recovered.settle_unsettled(&work_root).await.unwrap();
+    let released = jobs.settle_unsettled(&work_root).await.unwrap();
 
     assert_eq!(
         released,
@@ -800,17 +800,17 @@ async fn a_job_dropped_while_its_tree_is_in_use_stays_owed() {
         .spawn()
         .unwrap();
     drop(job);
-    let recovered = support::recovered(&store);
+    let jobs = support::jobs(&store);
     let state = |store: Store| async move {
         let jobs = store.list_jobs(10).await.unwrap();
         jobs.into_iter().find(|j| j.job.id == id).unwrap().job.state
     };
 
-    let while_working = recovered.settle_unsettled(&work_root).await;
+    let while_working = jobs.settle_unsettled(&work_root).await;
     let state_while_working = state(store.clone()).await;
     worker.kill().unwrap();
     worker.wait().unwrap();
-    let after = recovered.settle_unsettled(&work_root).await.unwrap();
+    let after = jobs.settle_unsettled(&work_root).await.unwrap();
 
     assert_eq!(
         while_working.unwrap(),
@@ -851,7 +851,7 @@ async fn a_job_dropped_unended_is_owed_to_the_next_settle() {
     let id = job.id();
     drop(job);
 
-    let settled = support::recovered(&store)
+    let settled = support::jobs(&store)
         .settle_unsettled(&dir.subdir("work_root"))
         .await
         .unwrap();

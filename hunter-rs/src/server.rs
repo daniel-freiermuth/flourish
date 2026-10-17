@@ -36,26 +36,81 @@ use crate::domain::{
 use crate::store::{FindingFilter, HoldRelease, RepoUpdate, Store, StoreWriteError};
 use crate::transition::{Moved, OperatorVerdict, Transition, VerdictRefused};
 use crate::types::{
-    ActivityStatus, BudgetState, Event, Finding, FindingDetail, FindingOut, HoldOut, JobListEntry,
-    Repo, RepoBrief, RepoHoldOut, RepoOut, RepoStreakOut, RepoWorkOut, Stats, Summary,
+    ActivityStatus, AdminActivity, AdminTask, BudgetState, Event, Finding, FindingDetail,
+    FindingOut, HoldOut, JobListEntry, Repo, RepoBrief, RepoHoldOut, RepoOut, RepoStreakOut,
+    RepoWorkOut, Stats, Summary,
 };
 
-/// Handle to this process's scheduler loop.
-#[derive(Clone)]
+/// Handle to this process's two scheduler lanes: the job lane, which runs
+/// cycles, and the admin lane beside it (`crate::daemon`).
+#[derive(Clone, Default)]
 pub struct SchedulerHandle {
-    /// Set by the loop for the duration of a cycle. Drives `cycle_running`,
-    /// the "working" activity status, and the busy check on manual triggers.
+    /// Set by the job lane for the duration of a cycle. Drives
+    /// `cycle_running`, the "working" activity status, and the busy check
+    /// on manual triggers.
     pub running: Arc<AtomicBool>,
-    /// Prevents new scheduler cycles; an already-running worker is allowed
-    /// to finish and remains visible as running.
+    /// Prevents new passes of either lane; an already-running worker is
+    /// allowed to finish and remains visible as running.
     pub paused: Arc<AtomicBool>,
     /// Promotes every budget decision to the backend's prioritized path.
     /// Pacing limits are bypassed, but provider hard stops remain enforced.
     pub overdrive: Arc<AtomicBool>,
-    /// Interrupts the loop's sleep so the next cycle starts immediately.
-    /// A notify delivered mid-cycle is held as a permit, so a trigger is
-    /// never lost -- it just lands on the following iteration.
+    /// Interrupts the job lane's sleep so the next cycle starts
+    /// immediately. A notify delivered mid-cycle is held as a permit, so a
+    /// trigger is never lost -- it just lands on the following iteration.
     pub wake: Arc<tokio::sync::Notify>,
+    /// The same for the admin lane's next pass.
+    pub admin_wake: Arc<tokio::sync::Notify>,
+    /// The admin lane's current task.
+    pub admin: AdminStatus,
+}
+
+impl SchedulerHandle {
+    /// Wake both lanes: the admin lane syncs, the job lane picks.
+    pub fn wake_both(&self) {
+        self.admin_wake.notify_one();
+        self.wake.notify_one();
+    }
+}
+
+/// What the admin lane is doing right now. Set only by
+/// [`AdminStatus::begin`], whose guard clears it when dropped, so it never
+/// names a task that has ended, however the task returned.
+#[derive(Clone, Default)]
+pub struct AdminStatus(Arc<std::sync::Mutex<Option<AdminActivity>>>);
+
+impl AdminStatus {
+    /// Record `task` as running from now until the guard is dropped.
+    pub fn begin(&self, task: AdminTask) -> AdminTaskGuard {
+        *self.cell() = Some(AdminActivity {
+            task,
+            started_at: crate::util::now_ms(),
+        });
+        AdminTaskGuard(self.clone())
+    }
+
+    /// The task running now, if any.
+    pub fn current(&self) -> Option<AdminActivity> {
+        *self.cell()
+    }
+
+    /// Never held across an await, so a poisoned lock only means a panic
+    /// between two plain assignments: the value is intact.
+    fn cell(&self) -> std::sync::MutexGuard<'_, Option<AdminActivity>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// An admin task in progress ([`AdminStatus::begin`]); dropped, it ends.
+#[must_use = "the task shows as running only while its guard is held"]
+pub struct AdminTaskGuard(AdminStatus);
+
+impl Drop for AdminTaskGuard {
+    fn drop(&mut self) {
+        *self.0.cell() = None;
+    }
 }
 
 #[derive(Clone)]
@@ -365,10 +420,11 @@ async fn summary(State(state): State<AppState>) -> Result<Json<Summary>, ApiErro
     let scheduler_state = store.scheduler_state().await?;
 
     let backend_status_html = state.backend.status_html().await?;
-    // True only while the loop is inside a cycle.
+    // True only while the job lane is inside a cycle.
     let cycle_running = state.scheduler.running.load(Ordering::SeqCst);
     let scheduler_paused = state.scheduler.paused.load(Ordering::SeqCst);
     let scheduler_overdrive = state.scheduler.overdrive.load(Ordering::SeqCst);
+    let admin_activity = state.scheduler.admin.current();
 
     // "What's next" preview (`server.Handler._summary`): only when nothing is
     // running, from the SAME selection the scheduler itself makes, minus its
@@ -420,7 +476,8 @@ async fn summary(State(state): State<AppState>) -> Result<Json<Summary>, ApiErro
             job: Box::new(job.clone()),
         }
     } else if cycle_running {
-        // Priority 2: a cycle is under way but has not created a job row yet.
+        // Priority 2: the job lane is in a cycle with no job row: picking,
+        // or preparing or finishing a job.
         ActivityStatus::Working
     } else if let Some(s) = scheduler_state.as_ref().filter(|s| s.state == "error") {
         ActivityStatus::Error {
@@ -461,6 +518,7 @@ async fn summary(State(state): State<AppState>) -> Result<Json<Summary>, ApiErro
         next_candidate,
         scheduler_state,
         activity_status,
+        admin_activity,
     }))
 }
 
@@ -1079,8 +1137,9 @@ async fn release_repo_hold(
 
 // -- POST /api/cycle (contract §2) --------------------------------------------
 
-/// Trigger a scheduler cycle now (contract §2): 409 if one is already
-/// running, otherwise 202 and the loop starts immediately.
+/// Trigger both lanes now (contract §2): 409 if a cycle is already
+/// running, otherwise 202; the admin lane syncs and the job lane starts
+/// its next cycle.
 ///
 /// The busy check is advisory, as Python's non-blocking lock acquire was:
 /// a trigger that races the loop into its next cycle is held as a notify
@@ -1093,7 +1152,7 @@ async fn cycle(State(state): State<AppState>, headers: HeaderMap) -> Result<Resp
     if state.scheduler.running.load(Ordering::SeqCst) {
         return Ok(error_body(StatusCode::CONFLICT, "busy"));
     }
-    state.scheduler.wake.notify_one();
+    state.scheduler.wake_both();
     Ok((StatusCode::ACCEPTED, Json(json!({ "started": true }))).into_response())
 }
 
@@ -1109,7 +1168,7 @@ async fn set_scheduler_paused(
         .and_then(Value::as_bool)
         .ok_or_else(|| ApiError::BadRequest("paused must be a boolean".to_owned()))?;
     state.scheduler.paused.store(paused, Ordering::SeqCst);
-    state.scheduler.wake.notify_one();
+    state.scheduler.wake_both();
     Ok(Json(json!({ "paused": paused })).into_response())
 }
 
@@ -1661,7 +1720,7 @@ async fn reap_in(
     let store = lane.store().clone();
     // Taken here rather than by the callers, because there are two of
     // them and only one used to hold it: the delete handler did, but the
-    // reaper pass that runs at startup and before every cycle did not.
+    // reaper pass that runs at startup and on every admin-lane pass did not.
     // An append interleaving with that pass recreates the notes file
     // after the reaper has walked past it, and the row is dropped a
     // moment later — leaving a file for a repo that no longer exists and
