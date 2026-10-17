@@ -165,6 +165,20 @@ pub enum StoreWriteError {
     Db(#[from] sqlx::Error),
 }
 
+/// The repos whose `dep_update` is the job lane's: Renovate had no answer
+/// for them since their last `dep_update` run, so the AI scan is due
+/// ([`Store::dep_update_fallbacks`]). Every other repo's `dep_update` is
+/// the admin lane's Renovate scan (`scheduler::dependency_scans`).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DepScanFallbacks(HashSet<i64>);
+
+impl DepScanFallbacks {
+    /// Whether `repo_id`'s AI `dep_update` scan is due.
+    pub fn pending(&self, repo_id: i64) -> bool {
+        self.0.contains(&repo_id)
+    }
+}
+
 /// Why [`Store::upsert_finding`] wrote no finding.
 #[derive(Debug, thiserror::Error)]
 pub enum FindingInsertError {
@@ -4099,11 +4113,11 @@ impl Store {
     /// Insert a finding unless one with the same (type, fingerprint) already
     /// exists. Returns (id, `was_inserted`).
     ///
-    /// Deliberately *not* `INSERT OR IGNORE`: the lookup and the INSERT are
-    /// separate statements, so two callers racing on the same fingerprint
-    /// would have the second fail the UNIQUE constraint rather than be
-    /// ignored. Only the job lane ingests, one cycle at a time, so no
-    /// second caller exists to open that window.
+    /// Both lanes file findings -- the job lane its workers', the admin lane
+    /// Renovate's -- so two writers can race on one fingerprint. The INSERT
+    /// yields to the UNIQUE index (`ON CONFLICT DO NOTHING`) and the row
+    /// that won is read back, so the loser reports a duplicate rather than
+    /// failing the constraint.
     ///
     /// `found_by_job` is stored only on a genuine insert: a duplicate
     /// belongs to the job that first turned it up, not the latest one to
@@ -4165,7 +4179,8 @@ impl Store {
              modernization_class, current_approach, proposed_approach, standard_section, \
              status, created_at, updated_at, found_by_job) \
              SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27, ?28, ?29, ?30, ?31 \
-             WHERE EXISTS (SELECT 1 FROM repos WHERE id = ?2 AND deleted_at IS NULL)",
+             WHERE EXISTS (SELECT 1 FROM repos WHERE id = ?2 AND deleted_at IS NULL) \
+             ON CONFLICT (type, fingerprint) DO NOTHING",
             finding_type, repo_id, fingerprint, file, symbol, line, bug_class,
             severity, confidence, summary, detail, evidence_plan, introduced_by,
             ecosystem, package, current_version, latest_version, update_type, security_advisory,
@@ -4176,7 +4191,19 @@ impl Store {
         .execute(&self.pool)
         .await?;
         if result.rows_affected() == 0 {
-            return Err(FindingInsertError::RepoDeleted { repo_id });
+            // Another writer filed it since the lookup above, or the repo
+            // is deleted.
+            let raced = sqlx::query_scalar!(
+                r#"SELECT id AS "id!: i64" FROM findings WHERE type = ?1 AND fingerprint = ?2"#,
+                finding_type,
+                fingerprint
+            )
+            .fetch_optional(&self.pool)
+            .await?;
+            return match raced {
+                Some(id) => Ok((id, false)),
+                None => Err(FindingInsertError::RepoDeleted { repo_id }),
+            };
         }
         Ok((result.last_insert_rowid(), true))
     }
@@ -5030,6 +5057,36 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Record that Renovate had no answer for `repo_id` just now, so its
+    /// AI `dep_update` scan is due on the job lane (migration 032).
+    pub async fn request_dep_update_fallback(&self, repo_id: i64) -> sqlx::Result<()> {
+        let now = now_ms();
+        sqlx::query!(
+            "INSERT INTO dep_scan_fallbacks (repo_id, requested_at) VALUES (?1, ?2) \
+             ON CONFLICT (repo_id) DO UPDATE SET requested_at = excluded.requested_at",
+            repo_id,
+            now
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The repos whose AI `dep_update` scan is due: Renovate had no answer
+    /// for them after their last `dep_update` run ([`DepScanFallbacks`]).
+    pub async fn dep_update_fallbacks(&self) -> sqlx::Result<DepScanFallbacks> {
+        let rows = sqlx::query!(
+            r#"SELECT f.repo_id AS "repo_id!: i64"
+               FROM dep_scan_fallbacks f JOIN repos r ON r.id = f.repo_id
+               WHERE f.requested_at > COALESCE(r.last_dep_update_at, 0)"#
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(DepScanFallbacks(
+            rows.into_iter().map(|r| r.repo_id).collect(),
+        ))
     }
 
     /// Every live repo's work item that is failing and not yet held: its

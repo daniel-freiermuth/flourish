@@ -1672,8 +1672,8 @@ async fn renovate_scans_a_tree_at_the_fetched_tip() {
     advance_origin(&f.dir, &f.repo.origin);
     let seen_cwd = f.dir.join("renovate-cwd");
     let seen_ls = f.dir.join("renovate-ls");
-    // Fails after recording, so the scan yields nothing and the AI
-    // fallback runs; what matters here is where Renovate was run.
+    // Fails after recording, so Renovate has no answer; what matters here
+    // is where it was run.
     bins.script(
         "renovate",
         &format!(
@@ -1682,22 +1682,11 @@ async fn renovate_scans_a_tree_at_the_fetched_tip() {
             seen_ls.display()
         ),
     );
-    std::fs::write(
-        f.dir.join("playbooks").join("dep_update.md"),
-        "deps {{REPO_PATH}} -> {{OUT_PATH}}\n",
-    )
-    .unwrap();
     let row = f.store.get_repo_by_id(1).await.unwrap().unwrap();
 
-    hunter::scheduler::run_dep_update(
-        &support::scope(&f.store),
-        f.store.test_lane(),
-        &f.cfg,
-        Attempt::Cold(&row),
-        &ScriptedBackend::noop(),
-    )
-    .await
-    .unwrap();
+    hunter::scheduler::scan_dependencies(f.store.test_lane(), &f.store, &f.cfg, &row)
+        .await
+        .unwrap();
 
     let scan = f.cfg.work_root.join("scan").join("repo-1");
     let cwd = std::fs::read_to_string(&seen_cwd).expect("renovate ran");
@@ -1734,23 +1723,10 @@ async fn renovate_runs_holding_no_clone_and_the_sweep_keeps_its_tree() {
             release.display()
         ),
     );
-    std::fs::write(
-        f.dir.join("playbooks").join("dep_update.md"),
-        "deps {{REPO_PATH}} -> {{OUT_PATH}}\n",
-    )
-    .unwrap();
     let row = f.store.get_repo_by_id(1).await.unwrap().unwrap();
     let scan = f.cfg.work_root.join("scan").join("repo-1");
 
-    let scope = support::scope(&f.store);
-    let backend = ScriptedBackend::noop();
-    let runner = hunter::scheduler::run_dep_update(
-        &scope,
-        f.store.test_lane(),
-        &f.cfg,
-        Attempt::Cold(&row),
-        &backend,
-    );
+    let runner = hunter::scheduler::scan_dependencies(f.store.test_lane(), &f.store, &f.cfg, &row);
     let meanwhile = async {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while !started.exists() {

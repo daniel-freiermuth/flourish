@@ -26,9 +26,11 @@ use support::{GitRepo, ScriptedBackend, TempDir};
 /// Where `test_gap`'s rotation timestamp starts: long ago, and the
 /// stalest of the eligible kinds, so rotation picks it.
 const STALE_TEST_GAP: i64 = 1_000;
-/// `dep_update`'s: stale enough to be eligible, newer than `test_gap`,
-/// so it is the kind that gets the turn once `test_gap` is held.
+/// `dep_update`'s: stale, but it is the admin lane's Renovate scan, not the
+/// job lane's rotation, until Renovate has no answer for the repo.
 const STALE_DEP_UPDATE: i64 = 3_000;
+/// `refactor`'s: stale enough to be eligible, newer than `test_gap`, so it
+/// is the kind that gets the turn once `test_gap` is held.
 const STALE_REFACTOR: i64 = 4_000;
 const STALE_HUNT: i64 = 5_000;
 
@@ -200,7 +202,7 @@ async fn three_failures_hold_test_gap(store: &Store, cfg: &Config, backend: &Scr
     );
     let picked = pick_next(store, cfg, None).await.unwrap();
     assert!(
-        is_repo_pick(picked.as_ref(), 1, RepoJobKind::DepUpdate),
+        is_repo_pick(picked.as_ref(), 1, RepoJobKind::Refactor),
         "a held kind is skipped: the next-stalest kind gets the turn, got {picked:?}"
     );
 }
@@ -241,7 +243,7 @@ async fn a_killed_analysis_attempt_is_retried_then_held() {
         is_repo_pick(
             pick_next(&store, &cfg, None).await.unwrap().as_ref(),
             1,
-            RepoJobKind::DepUpdate
+            RepoJobKind::Refactor
         ),
         "the turn passes on once test_gap is held"
     );
@@ -425,7 +427,7 @@ async fn an_abandoned_analysis_chain_is_counted_and_held_on_the_third() {
         is_repo_pick(
             pick_next(&store, &cfg, None).await.unwrap().as_ref(),
             1,
-            RepoJobKind::DepUpdate
+            RepoJobKind::Refactor
         ),
         "the turn passes on once test_gap is held"
     );

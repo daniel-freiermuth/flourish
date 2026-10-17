@@ -1,10 +1,12 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-//! `run_dep_update` — what the scheduler does with Renovate's answer.
+//! The dependency scan: the admin lane's zero-token Renovate scan
+//! (`scheduler::scan_dependencies`), and the job lane's AI scan
+//! (`run_dep_update`) when Renovate has no answer.
 //!
 //! `dep_scan::scan_repo` distinguishes "every dependency looked up is
 //! current" (`Some(vec![])`) from "Renovate has no answer" (`None`: failed,
-//! or looked nothing up). The runner has to keep that distinction: only
-//! `None` may fall back to the model, because the fallback is a whole AI
+//! or looked nothing up). The scan has to keep that distinction: only
+//! `None` may hand the repo to the model, because that is a whole AI
 //! run — and it must, or a repo Renovate cannot read is never analysed.
 
 mod support;
@@ -13,13 +15,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use hunter::domain::{ForgeName, JobKind, JobState, RepoJobKind};
-use hunter::scheduler::{Attempt, CycleSummary};
+use hunter::scheduler::{Attempt, Candidate, CycleSummary, DependencyScan};
 use support::{FakeBins, GitRepo, ScriptedBackend, TempDir, done, fresh_store, git};
 
-/// One cycle of `run_dep_update` over a real clone, with the installed
-/// Renovate replaced by one printing `renovate_output` and exiting 0.
-/// Returns the summary, whether the model ran, and whether the repo's
-/// dep-update cadence advanced.
+/// One Renovate scan over a real clone, with the installed Renovate
+/// replaced by one printing `renovate_output` and exiting 0. Returns the
+/// summary, whether the model ran, and whether the repo's dep-update
+/// cadence advanced.
 async fn dep_update_cycle(label: &str, renovate_output: &str) -> (CycleSummary, bool, bool) {
     let c = cycle_with(label, renovate_output, None).await;
     (c.result.expect("dep_update cycle"), c.model_ran, c.advanced)
@@ -99,16 +101,16 @@ impl Rig {
         }
     }
 
-    /// One cycle in which Renovate prints `renovate_output` and exits 0.
-    async fn scan(&self, renovate_output: &str) -> anyhow::Result<CycleSummary> {
+    /// One admin-lane scan in which Renovate prints `renovate_output` and
+    /// exits 0.
+    async fn scan_raw(&self, renovate_output: &str) -> anyhow::Result<DependencyScan> {
         let before = self.bins.calls_to("renovate").len();
         self.bins.ok("renovate", renovate_output);
-        let result = hunter::scheduler::run_dep_update(
-            &support::scope(&self.store),
+        let result = hunter::scheduler::scan_dependencies(
             self.store.test_lane(),
+            &self.store,
             &self.cfg,
-            Attempt::Cold(&self.repo),
-            &self.backend,
+            &self.repo,
         )
         .await;
         assert_eq!(
@@ -118,6 +120,14 @@ impl Rig {
             self.bins.calls()
         );
         result
+    }
+
+    /// [`Self::scan_raw`] for a scan Renovate answered: its summary.
+    async fn scan(&self, renovate_output: &str) -> anyhow::Result<CycleSummary> {
+        match self.scan_raw(renovate_output).await? {
+            DependencyScan::Scanned(summary) => Ok(*summary),
+            other => panic!("renovate answered, yet the scan came to {other:?}"),
+        }
     }
 
     /// File an open `dep_update` for `package` in repo `repo_id`.
@@ -279,15 +289,116 @@ async fn up_to_date_repo_does_not_fall_back_to_the_model() {
     );
 }
 
-/// What Renovate 44.96.2 prints for a repo it finds no dependency in.
+/// What Renovate 44.96.2 prints for a repo it finds no dependency in: no
+/// answer. The admin lane runs no model; it requests the AI scan, which
+/// only then is the job lane's to pick, and the AI scan's success answers
+/// the request.
 #[tokio::test]
-async fn repo_renovate_cannot_read_falls_back_to_the_model() {
+async fn a_repo_renovate_cannot_read_is_handed_to_the_job_lanes_ai_scan() {
     let no_deps = r#"{"name":"renovate","level":20,"msg":"packageFiles with updates","config":{}}"#;
+    let rig = Rig::new("depupd-nodeps").await;
+    // Every other kind ran just now, so `dep_update` is the one due.
+    sqlx::query(
+        "UPDATE repos SET last_hunt_at = ?1, last_test_gap_at = ?1, last_refactor_at = ?1, \
+         last_modernization_at = ?1, last_standards_at = ?1",
+    )
+    .bind(hunter::util::now_ms())
+    .execute(&rig.pool)
+    .await
+    .unwrap();
+    let picked = || hunter::scheduler::pick_next(&rig.store, &rig.cfg, None);
+    let is_dep_update = |c: &Option<Candidate>| {
+        matches!(
+            c,
+            Some(Candidate::Repo {
+                kind: RepoJobKind::DepUpdate,
+                ..
+            })
+        )
+    };
+    assert!(
+        picked().await.unwrap().is_none(),
+        "a due dep_update is the admin lane's Renovate scan, not the job lane's"
+    );
 
-    let (summary, model_ran, _) = dep_update_cycle("depupd-nodeps", no_deps).await;
+    let scan = rig.scan_raw(no_deps).await.unwrap();
 
-    assert!(model_ran, "renovate had no answer, so the model must run");
+    assert!(matches!(scan, DependencyScan::Unavailable), "{scan:?}");
+    assert!(
+        !rig.model_ran.load(Ordering::SeqCst),
+        "the admin lane runs no model"
+    );
+    let candidate = picked().await.unwrap();
+    assert!(is_dep_update(&candidate), "{candidate:?}");
+
+    let repo = rig
+        .store
+        .get_repo_by_id(rig.repo.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let summary = hunter::scheduler::run_dep_update(
+        &support::scope(&rig.store),
+        rig.store.test_lane(),
+        &rig.cfg,
+        Attempt::Cold(&repo),
+        &rig.backend,
+    )
+    .await
+    .unwrap();
+
+    assert!(rig.model_ran.load(Ordering::SeqCst), "the AI scan ran");
     assert!(summary.job_id.is_some(), "{summary:?}");
+    // A run recorded after the request answers it, as the AI scan's
+    // success records its own (`set_last_kind_at`); this scripted worker
+    // files no output, so the test records it.
+    rig.store.set_last_dep_update(rig.repo.id).await.unwrap();
+    assert!(
+        picked().await.unwrap().is_none(),
+        "a dep_update run after the request answered it"
+    );
+}
+
+/// The admin lane's pass scans a due repo, and leaves alone one whose AI
+/// scan is due: that one is the job lane's, so the two lanes never scan a
+/// repo's dependencies at once. Once scanned, the repo is not due again.
+#[tokio::test]
+async fn the_dependency_pass_scans_due_repos_and_leaves_the_ai_scans_alone() {
+    let rig = Rig::new("depupd-pass").await;
+    rig.bins.ok("renovate", UPDATE);
+    let (_keep, running_on) = tokio::sync::watch::channel(false);
+    let pass = || hunter::scheduler::dependency_scans(&rig.store, &rig.cfg, &running_on);
+
+    rig.store
+        .request_dep_update_fallback(rig.repo.id)
+        .await
+        .unwrap();
+    assert_eq!(pass().await, hunter::scheduler::DepScans::default());
+    assert!(
+        rig.bins.calls_to("renovate").is_empty(),
+        "{:?}",
+        rig.bins.calls()
+    );
+
+    sqlx::query("DELETE FROM dep_scan_fallbacks")
+        .execute(&rig.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        pass().await,
+        hunter::scheduler::DepScans {
+            scanned: 1,
+            ..Default::default()
+        }
+    );
+    assert_eq!(rig.findings().await.len(), 1, "Renovate's update was filed");
+
+    assert_eq!(
+        pass().await,
+        hunter::scheduler::DepScans::default(),
+        "not due again"
+    );
+    assert_eq!(rig.bins.calls_to("renovate").len(), 1);
 }
 
 /// Renovate's updates become `dep_update` findings, and the cycle summary
@@ -323,13 +434,11 @@ async fn a_repo_deleted_during_its_renovate_scan_files_nothing_and_is_reaped() {
     let rig = Rig::new("depupd-deleted").await;
     let (started, release) = rig.hold_renovate(UPDATE);
 
-    let (scope, lane) = (support::scope(&rig.store), rig.store.test_lane());
-    let scan = hunter::scheduler::run_dep_update(
-        &scope,
-        lane,
+    let scan = hunter::scheduler::scan_dependencies(
+        rig.store.test_lane(),
+        &rig.store,
         &rig.cfg,
-        Attempt::Cold(&rig.repo),
-        &rig.backend,
+        &rig.repo,
     );
     let delete = async {
         wait_for(&started).await;
@@ -339,9 +448,13 @@ async fn a_repo_deleted_during_its_renovate_scan_files_nothing_and_is_reaped() {
             .expect("a repo with no jobs and no findings can be deleted");
         std::fs::write(&release, "").unwrap();
     };
-    let (summary, ()) = tokio::join!(scan, delete);
+    let (scan, ()) = tokio::join!(scan, delete);
 
-    let summary = summary.expect("a repo deleted during its scan is a skip, not an error");
+    let DependencyScan::Scanned(summary) =
+        scan.expect("a repo deleted during its scan is a skip, not an error")
+    else {
+        panic!("the scan did not come to a summary");
+    };
     assert!(
         summary
             .skipped
@@ -364,44 +477,6 @@ async fn a_repo_deleted_during_its_renovate_scan_files_nothing_and_is_reaped() {
         rig.store.deleted_repo_ids().await.unwrap(),
         [] as [i64; 0],
         "the reaper finished the delete"
-    );
-}
-
-/// The job lane says what it is doing outside a worker: while Renovate
-/// runs, the status page's `job_activity` reads `scanning_dependencies`,
-/// and once the cycle is over it reads nothing.
-#[tokio::test]
-async fn a_running_renovate_scan_shows_as_the_job_lanes_phase() {
-    use hunter::types::JobPhase;
-    let rig = Rig::new("depupd-phase").await;
-    let (started, release) = rig.hold_renovate(UPDATE);
-    let status = hunter::activity::JobStatus::default();
-
-    let (scope, lane) = (support::scope(&rig.store), rig.store.test_lane());
-    let scan = hunter::activity::reporting_job_phases(
-        status.clone(),
-        hunter::scheduler::run_dep_update(
-            &scope,
-            lane,
-            &rig.cfg,
-            Attempt::Cold(&rig.repo),
-            &rig.backend,
-        ),
-    );
-    let watch = async {
-        wait_for(&started).await;
-        let seen = status.current().map(|a| a.phase);
-        std::fs::write(&release, "").unwrap();
-        seen
-    };
-    let (summary, seen) = tokio::join!(scan, watch);
-
-    summary.expect("the scan ran");
-    assert_eq!(seen, Some(JobPhase::ScanningDependencies));
-    assert_eq!(
-        status.current(),
-        None,
-        "nothing shows once the cycle is over"
     );
 }
 
