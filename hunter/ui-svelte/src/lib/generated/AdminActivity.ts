@@ -2,7 +2,7 @@
 import type { AdminTask } from "./AdminTask";
 
 /**
- * /`api/summary.admin_activity`: the admin lane's current task, since
- * when (epoch ms).
+ * One entry of /`api/summary.admin_activity`: an admin duty running now,
+ * since when (epoch ms).
  */
 export type AdminActivity = { task: AdminTask, started_at: number, };

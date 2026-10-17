@@ -453,24 +453,24 @@ pub struct Summary {
     pub next_candidate: Option<NextCandidate>,
     pub scheduler_state: Option<SchedulerState>,
     pub activity_status: ActivityStatus,
-    /// What the admin lane is doing right now, beside the job lane; `null`
-    /// between its passes.
-    pub admin_activity: Option<AdminActivity>,
-    /// The job lane's current phase outside its worker -- a fetch, the
-    /// tree, a Renovate scan, publishing, ingesting; `null` otherwise.
+    /// The admin lane's duties running now, beside the job lane and each
+    /// other, by task; empty between their runs.
+    pub admin_activity: Vec<AdminActivity>,
+    /// The job lane's current phase outside its worker -- cloning,
+    /// fetching, the tree, publishing, ingesting; `null` otherwise.
     pub job_activity: Option<JobActivity>,
 }
 
-/// One task of the admin lane (`crate::daemon`), which runs beside the
-/// job lane.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+/// One duty of the admin lane (`crate::daemon`), which runs beside the
+/// job lane and the other duties, each on its own timer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum AdminTask {
     /// Reading every open PR from its forge (`scheduler::sync_prs`).
     PrSync,
     /// Removing the clones of deleted repos (`server::reap_deleted_repos`).
     Reap,
-    /// Fetching every enabled repo's clone ahead of its jobs
+    /// Fetching enabled repos' clones ahead of their jobs
     /// (`scheduler::fetch_ahead`).
     FetchAhead,
     /// The zero-token Renovate dependency scan of every repo whose
@@ -480,8 +480,8 @@ pub enum AdminTask {
     Sweep,
 }
 
-/// /`api/summary.admin_activity`: the admin lane's current task, since
-/// when (epoch ms).
+/// One entry of /`api/summary.admin_activity`: an admin duty running now,
+/// since when (epoch ms).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
 pub struct AdminActivity {
     pub task: AdminTask,

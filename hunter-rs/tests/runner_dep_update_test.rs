@@ -108,7 +108,7 @@ impl Rig {
         self.bins.ok("renovate", renovate_output);
         let result = hunter::scheduler::scan_dependencies(
             self.store.test_lane(),
-            &self.store,
+            &support::admin(&self.store),
             &self.cfg,
             &self.repo,
         )
@@ -359,17 +359,19 @@ async fn a_repo_renovate_cannot_read_is_handed_to_the_job_lanes_ai_scan() {
     );
 }
 
-/// The admin lane's pass scans a due repo, and leaves alone one whose AI
-/// scan is due: that one is the job lane's, so the two lanes never scan a
-/// repo's dependencies at once. Once scanned, the repo is not due again.
+/// The admin lane's dependency duty scans a due repo, and leaves alone one
+/// whose AI scan is due: that one is the job lane's, so the two lanes
+/// never scan a repo's dependencies at once. Once scanned, the repo is not
+/// due again.
 #[tokio::test]
 async fn the_dependency_pass_scans_due_repos_and_leaves_the_ai_scans_alone() {
     let rig = Rig::new("depupd-pass").await;
     rig.bins.ok("renovate", UPDATE);
     let (_keep, running_on) = tokio::sync::watch::channel(false);
-    let pass = || hunter::scheduler::dependency_scans(&rig.store, &rig.cfg, &running_on);
+    let admin = support::admin(&rig.store);
+    let pass = || hunter::scheduler::dependency_scans(&admin, &rig.cfg, &running_on);
 
-    rig.store
+    admin
         .request_dep_update_fallback(rig.repo.id)
         .await
         .unwrap();
@@ -434,12 +436,9 @@ async fn a_repo_deleted_during_its_renovate_scan_files_nothing_and_is_reaped() {
     let rig = Rig::new("depupd-deleted").await;
     let (started, release) = rig.hold_renovate(UPDATE);
 
-    let scan = hunter::scheduler::scan_dependencies(
-        rig.store.test_lane(),
-        &rig.store,
-        &rig.cfg,
-        &rig.repo,
-    );
+    let admin = support::admin(&rig.store);
+    let scan =
+        hunter::scheduler::scan_dependencies(rig.store.test_lane(), &admin, &rig.cfg, &rig.repo);
     let delete = async {
         wait_for(&started).await;
         rig.store
@@ -467,12 +466,8 @@ async fn a_repo_deleted_during_its_renovate_scan_files_nothing_and_is_reaped() {
         rig.findings().await.is_empty(),
         "nothing filed in a deleted repo"
     );
-    hunter::server::reap_deleted_repos(
-        &rig.store,
-        &rig.cfg.work_root,
-        &tokio::sync::Mutex::new(()),
-    )
-    .await;
+    hunter::server::reap_deleted_repos(&admin, &rig.cfg.work_root, &tokio::sync::Mutex::new(()))
+        .await;
     assert_eq!(
         rig.store.deleted_repo_ids().await.unwrap(),
         [] as [i64; 0],

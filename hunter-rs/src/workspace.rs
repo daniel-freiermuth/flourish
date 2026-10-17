@@ -640,8 +640,8 @@ pub struct SweepReport {
 }
 
 /// Reclaim what finished chains, and the layouts before this one, left on
-/// disk. Runs at daemon startup and on every admin-lane pass
-/// (`daemon::admin_pass`), beside whatever job is running.
+/// disk. Runs at daemon startup and as the admin lane's sweep duty
+/// (`daemon::admin_duty`), beside whatever job is running.
 ///
 /// Nothing is removed without first reading from the database that no
 /// `running` job or checkpoint needs it, and no tree a runner leases. A

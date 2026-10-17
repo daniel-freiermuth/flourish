@@ -1227,7 +1227,9 @@ use crate::backend::{Backend, JobClass, Verdict};
 use crate::forge::{self, PrView};
 use crate::ingest::{EntryTypes, IngestResult, ingest_findings, ingest_scan_findings};
 use crate::playbooks;
-use crate::recovery::{CreatedJob, CycleScope, FixClaim, JobAuthority, RecordedJob, RunningJob};
+use crate::recovery::{
+    AdminAuthority, CreatedJob, CycleScope, FixClaim, JobAuthority, RecordedJob, RunningJob,
+};
 use crate::types::RunResult;
 use crate::workspace::{OpenWorkspace, TreeSpec, Workspace};
 use serde::{Deserialize, Serialize};
@@ -1709,6 +1711,7 @@ async fn sync_repo(
             network: true,
         }));
     }
+    permit.record_fetch();
     Ok(Ok(()))
 }
 
@@ -1732,14 +1735,23 @@ async fn fetch_held(permit: &ClonePermit<'_>, refs: &[&str]) -> (i32, String) {
 pub struct FetchAhead {
     /// Clones fetched.
     pub fetched: usize,
+    /// Clones left alone: fetched in full more recently than the pass's
+    /// `min_age`, by this pass's previous run or by a job.
+    pub fresh: usize,
     /// Clones whose fetch failed, or that could not be fetched at all.
     pub failed: usize,
 }
 
 /// Fetch every enabled repo's clone ahead of its jobs, so the fetch the
 /// job lane makes before a job ([`sync_to_tip`], an engage's PR head, a
-/// harvest's default branch) finds nothing left to download. Run by the
-/// admin lane (`crate::daemon::admin_pass`), beside whatever job runs.
+/// harvest's default branch) finds little left to download. Run by the
+/// admin lane (`crate::daemon`), beside whatever job runs.
+///
+/// A clone fetched in full less than `min_age` ago, by either lane, is
+/// left alone ([`ClonePermit::fetched_within`]): a fetch holds the clone's
+/// permit through git's housekeeping, and a job starting on that repo
+/// waits for it, so fetching every repo on every run would cost the job
+/// lane for little. The first run after a restart fetches every clone.
 ///
 /// The same [`sync_repo`] as the job lane's, under the same clone permit,
 /// so a fetch here and one there never overlap, and a clone whose origin
@@ -1753,7 +1765,12 @@ pub struct FetchAhead {
 /// range a runner reads after its worker names its own pins or leases.
 ///
 /// Stops at the next repo once `stop` is set.
-pub async fn fetch_ahead(store: &Store, stop: &tokio::sync::watch::Receiver<bool>) -> FetchAhead {
+pub async fn fetch_ahead(
+    admin: &AdminAuthority,
+    min_age: std::time::Duration,
+    stop: &tokio::sync::watch::Receiver<bool>,
+) -> FetchAhead {
+    let store = admin.store();
     let repos = match store.list_repos().await {
         Ok(repos) => repos,
         Err(e) => {
@@ -1777,6 +1794,10 @@ pub async fn fetch_ahead(store: &Store, stop: &tokio::sync::watch::Receiver<bool
                     }
                 };
                 if !permit.clone_dir().exists() {
+                    continue;
+                }
+                if permit.fetched_within(min_age) {
+                    done.fresh += 1;
                     continue;
                 }
                 match sync_repo(store, &permit).await {
@@ -3814,7 +3835,7 @@ pub enum DependencyScan {
     /// summary says.
     Scanned(Box<CycleSummary>),
     /// Renovate had no answer; the AI scan is now due on the job lane
-    /// (`Store::request_dep_update_fallback`).
+    /// (`AdminAuthority::request_dep_update_fallback`).
     Unavailable,
     /// The clone could not be synced: nothing scanned, nothing counted.
     /// The job lane's own fetches keep the repo's `sync` streak.
@@ -3832,11 +3853,12 @@ pub struct DepScans {
     pub failed: usize,
 }
 
-/// The admin lane's dependency pass (`crate::daemon::admin_pass`): the
-/// zero-token Renovate scan of every enabled, cloned repo whose
-/// `dep_update` is due, beside whatever job runs. It spends no tokens, so
-/// it is not the job lane's: a Renovate run takes up to two minutes, and
-/// the job lane used to sit in it.
+/// The admin lane's dependency duty (`crate::daemon`): the zero-token
+/// Renovate scan of every enabled, cloned repo whose `dep_update` is due,
+/// beside whatever job runs. It spends no tokens, so it is not the job
+/// lane's: a Renovate run takes up to two minutes, and the job lane used
+/// to sit in it. It takes the [`AdminAuthority`], which only the admin
+/// lane holds, so the job lane cannot run it beside its own AI scan.
 ///
 /// A repo is skipped while its `dep_update` is held, running, or holds a
 /// checkpoint (a paused AI scan, which the job lane's resume tier owns),
@@ -3846,10 +3868,11 @@ pub struct DepScans {
 ///
 /// Stops at the next repo once `stop` is set.
 pub async fn dependency_scans(
-    store: &Store,
+    admin: &AdminAuthority,
     cfg: &Config,
     stop: &tokio::sync::watch::Receiver<bool>,
 ) -> DepScans {
+    let store = admin.store();
     let due = match dependency_scans_due(store, cfg).await {
         Ok(due) => due,
         Err(e) => {
@@ -3864,7 +3887,7 @@ pub async fn dependency_scans(
                 if *stop.borrow() {
                     break;
                 }
-                match scan_dependencies(lane, store, cfg, repo).await {
+                match scan_dependencies(lane, admin, cfg, repo).await {
                     Ok(DependencyScan::Scanned(summary)) => {
                         if summary.failure.is_some() {
                             done.failed += 1;
@@ -3931,10 +3954,11 @@ async fn dependency_scans_due(store: &Store, cfg: &Config) -> sqlx::Result<Vec<R
 /// result file, the settle): nothing moves, and the next pass retries it.
 pub async fn scan_dependencies(
     lane: &mut Lane,
-    store: &Store,
+    admin: &AdminAuthority,
     cfg: &Config,
     repo: &Repo,
 ) -> anyhow::Result<DependencyScan> {
+    let store = admin.store();
     let permit = lane.lock_clone(repo.id).await?;
     if !permit.clone_dir().exists() {
         return Ok(DependencyScan::NotSynced("not cloned".to_owned()));
@@ -3957,7 +3981,7 @@ pub async fn scan_dependencies(
         }
     };
     let Some(scan) = scan else {
-        store.request_dep_update_fallback(repo.id).await?;
+        admin.request_dep_update_fallback(repo.id).await?;
         let _ = store
             .log_event(
                 "dep_update",

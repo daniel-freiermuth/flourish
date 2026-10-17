@@ -286,9 +286,12 @@ impl JobAuthority {
     }
 }
 
-/// The admin lane's authority: the only way to begin a PR sync pass.
-/// Neither `Clone` nor `Copy`: the admin lane holds it. It creates no job
-/// and claims no fix; those take the [`JobAuthority`].
+/// The admin lane's authority: the only way to begin a PR sync pass, and
+/// what the admin lane's other duties take (`crate::daemon`): the reaper,
+/// fetch-ahead, the Renovate scans and their request for the AI scan, the
+/// sweep. Neither `Clone` nor `Copy`: the admin lane holds it, sharing it
+/// among its duties. It creates no job and claims no fix; those take the
+/// [`JobAuthority`].
 pub struct AdminAuthority {
     store: Store,
 }
@@ -303,6 +306,14 @@ impl AdminAuthority {
     /// store, the one held under its [`DaemonLock`], can sync.
     pub fn begin_pr_sync(&self) -> Option<PrSyncPass> {
         PrSyncPass::begin(self)
+    }
+
+    /// Record that Renovate had no answer for `repo_id` just now, which
+    /// hands the repo's `dep_update` to the job lane's AI scan
+    /// ([`Store::dep_update_fallbacks`]). Only the admin lane's Renovate
+    /// scan decides that, so only its authority records it.
+    pub async fn request_dep_update_fallback(&self, repo_id: i64) -> sqlx::Result<()> {
+        self.store.request_dep_update_fallback(repo_id).await
     }
 }
 

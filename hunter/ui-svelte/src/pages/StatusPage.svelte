@@ -254,14 +254,13 @@
         <div class="row dim">warming up &mdash; no cycle has run yet</div>
       {/if}
 
-      <!-- Admin lane: runs beside the job lane above -->
-      {#if store.summary.admin_activity}
-        {@const aa = store.summary.admin_activity}
+      <!-- Admin lane: its duties run beside the job lane above and each other -->
+      {#each store.summary.admin_activity as aa (aa.task)}
         <div class="row dim">
           <span class="status-icon running">▶</span>
           admin: {ADMIN_TASK_LABEL[aa.task]} ({dur(aa.started_at, null)})
         </div>
-      {/if}
+      {/each}
 
       <!-- Scheduler detail (last log) -->
       {#if store.summary.scheduler_state}

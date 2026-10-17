@@ -1,10 +1,14 @@
 //! What each scheduler lane is doing right now, for the status page.
 //!
-//! A lane's current activity is set only through a guard ([`ActivityGuard`])
-//! that puts back what was there before when it drops, so the status never
-//! names work that has ended, however that work returned, and a phase
-//! begun inside another (a fetch inside a tree's preparation) hands the
-//! status back to the outer one.
+//! The job lane does one thing at a time: its current phase is set only
+//! through a guard ([`ActivityGuard`]) that puts back what was there before
+//! when it drops, so the status never names work that has ended, however
+//! that work returned, and a phase begun inside another (a fetch inside a
+//! tree's preparation) hands the status back to the outer one.
+//!
+//! The admin lane runs its duties side by side (`crate::daemon`), so its
+//! status is the set of duties running now ([`AdminStatus`]): each guard
+//! ([`AdminTaskGuard`]) adds its own entry and removes only that one.
 //!
 //! The job lane reports through a task-local ([`reporting_job_phases`],
 //! [`job_phase`]) rather than through every runner's arguments: the phases
@@ -14,6 +18,7 @@
 //! blocking thread does not inherit the task-local, so phases are set
 //! from the async code around it.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::types::{AdminActivity, AdminTask, JobActivity, JobPhase};
@@ -68,16 +73,61 @@ impl<T: Copy> Drop for ActivityGuard<T> {
     }
 }
 
-/// The admin lane's current task (`crate::daemon::admin_pass`).
-pub type AdminStatus = LaneStatus<AdminActivity>;
+/// The admin lane's duties running now (`crate::daemon`), each from its
+/// [`Self::begin`] until its guard drops.
+#[derive(Clone, Default)]
+pub struct AdminStatus(Arc<AdminRunning>);
+
+#[derive(Default)]
+struct AdminRunning {
+    /// Each live guard's entry, by the id only that guard holds.
+    running: Mutex<Vec<(u64, AdminActivity)>>,
+    next: AtomicU64,
+}
 
 impl AdminStatus {
     /// Record `task` as running from now until the guard is dropped.
-    pub fn begin(&self, task: AdminTask) -> ActivityGuard<AdminActivity> {
-        self.show(AdminActivity {
+    pub fn begin(&self, task: AdminTask) -> AdminTaskGuard {
+        let id = self.0.next.fetch_add(1, Ordering::Relaxed);
+        let activity = AdminActivity {
             task,
             started_at: crate::util::now_ms(),
-        })
+        };
+        self.entries().push((id, activity));
+        AdminTaskGuard {
+            status: self.clone(),
+            id,
+        }
+    }
+
+    /// The duties running now, by task.
+    pub fn current(&self) -> Vec<AdminActivity> {
+        let mut now: Vec<AdminActivity> = self.entries().iter().map(|&(_, a)| a).collect();
+        now.sort_by_key(|a| (a.task, a.started_at));
+        now
+    }
+
+    /// Never held across an await, so a poisoned lock only means a panic
+    /// between two plain pushes or removals: the list is intact.
+    fn entries(&self) -> MutexGuard<'_, Vec<(u64, AdminActivity)>> {
+        self.0
+            .running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// A duty in progress; dropped, it leaves the admin lane's status, and
+/// nothing else does.
+#[must_use = "the duty shows only while its guard is held"]
+pub struct AdminTaskGuard {
+    status: AdminStatus,
+    id: u64,
+}
+
+impl Drop for AdminTaskGuard {
+    fn drop(&mut self) {
+        self.status.entries().retain(|&(id, _)| id != self.id);
     }
 }
 
