@@ -67,7 +67,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use crate::domain::{ClosureClass, FindingStatus, JobState};
 use crate::store::{JobInsertError, JobOutcome, JobStart, PrSyncPass, Store, VerdictAnchor};
 use crate::transition::Moved;
-use crate::types::Job;
+use crate::types::{Finding, Job};
 use crate::workspace::{Workspace, tree_in_use};
 
 const UNRECONCILED: u8 = 0;
@@ -499,12 +499,14 @@ impl CycleScope<'_> {
     }
 
     /// Claim `finding_id` for a fix (`queued` → `fixing`), held by the
-    /// [`FixClaim`] returned. `None` when the finding is no longer `queued`.
+    /// [`FixClaim`] returned, which carries the row as the claim took it
+    /// ([`FixClaim::finding`]). `None` when the finding is no longer
+    /// `queued`.
     pub async fn claim_fix(&self, finding_id: i64) -> sqlx::Result<Option<FixClaim>> {
         let claimed = self.store.claim_fixing(&Owner(()), finding_id).await?;
-        Ok(claimed.then(|| FixClaim {
+        Ok(claimed.map(|finding| FixClaim {
             store: self.store.clone(),
-            finding_id,
+            finding: Box::new(finding),
             claim: NEXT_CLAIM.fetch_add(1, Ordering::Relaxed),
             ended: false,
         }))
@@ -616,7 +618,9 @@ impl RecordedJob {
 #[must_use = "a fix claim is moved on by release, open_pr or conclude; dropped, it is released by the next settle"]
 pub struct FixClaim {
     store: Store,
-    finding_id: i64,
+    /// The row as the claim took it; boxed, so a claim handed back in an
+    /// error stays small.
+    finding: Box<Finding>,
     /// Which claim of the finding this is ([`OwedClaim`]).
     claim: u64,
     ended: bool,
@@ -624,7 +628,16 @@ pub struct FixClaim {
 
 impl FixClaim {
     pub const fn finding_id(&self) -> i64 {
-        self.finding_id
+        self.finding.id
+    }
+
+    /// The finding as the claim took it, read in the claim's own write.
+    /// Until then a `queued` row can still change -- the admin lane's
+    /// Renovate pass rewrites a `queued` dep update's target -- so the row
+    /// the pick read can be older than the one now held. Once `fixing`,
+    /// nothing rewrites it: the fix works from this row.
+    pub fn finding(&self) -> &Finding {
+        &self.finding
     }
 
     /// Put the finding back to `queued` if it is still `fixing`; `false`
@@ -633,7 +646,7 @@ impl FixClaim {
     pub async fn release(mut self) -> sqlx::Result<bool> {
         let released = self
             .store
-            .release_fixing(&Owner(()), self.finding_id)
+            .release_fixing(&Owner(()), self.finding.id)
             .await?;
         self.ended = true;
         Ok(released)
@@ -646,7 +659,7 @@ impl FixClaim {
     pub async fn open_pr(mut self, pr_url: &str) -> Result<Moved, (Self, sqlx::Error)> {
         match self
             .store
-            .open_pr_from_fixing(&Owner(()), self.finding_id, pr_url)
+            .open_pr_from_fixing(&Owner(()), self.finding.id, pr_url)
             .await
         {
             Ok(moved) => {
@@ -671,7 +684,7 @@ impl FixClaim {
     ) -> Result<Moved, (Self, sqlx::Error)> {
         match self
             .store
-            .conclude_fixing(&Owner(()), self.finding_id, class, reason, anchor)
+            .conclude_fixing(&Owner(()), self.finding.id, class, reason, anchor)
             .await
         {
             Ok(moved) => {
@@ -697,7 +710,7 @@ impl Drop for FixClaim {
             lock(&self.store.recovery().unsettled)
                 .claims
                 .insert(OwedClaim {
-                    finding_id: self.finding_id,
+                    finding_id: self.finding.id,
                     claim: self.claim,
                 });
         }

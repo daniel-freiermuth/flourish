@@ -1255,6 +1255,15 @@ impl Store {
     /// SELECT all 39 columns FROM findings WHERE id = ? (embedded row in
     /// verdict/recheck/unqueue/override success bodies).
     pub async fn get_finding(&self, id: i64) -> sqlx::Result<Option<Finding>> {
+        Self::read_finding(&self.pool, id).await
+    }
+
+    /// [`Self::get_finding`], on `executor`: the pool, or a transaction
+    /// that reads the row it has just written.
+    async fn read_finding<'e>(
+        executor: impl sqlx::Executor<'e, Database = sqlx::Sqlite>,
+        id: i64,
+    ) -> sqlx::Result<Option<Finding>> {
         sqlx::query_as!(
             Finding,
             r#"
@@ -1272,7 +1281,7 @@ impl Store {
             "#,
             id
         )
-        .fetch_optional(&self.pool)
+        .fetch_optional(executor)
         .await
     }
 
@@ -5308,9 +5317,8 @@ impl Store {
         Ok(())
     }
 
-    /// The guarded UPDATE behind a fix claim's take and release
-    /// ([`CycleScope::claim_fix`](crate::recovery::CycleScope::claim_fix),
-    /// [`FixClaim::release`](crate::recovery::FixClaim::release)).
+    /// The guarded UPDATE behind a fix claim's release
+    /// ([`FixClaim::release`](crate::recovery::FixClaim::release)).
     async fn move_if_at(
         &self,
         finding_id: i64,
@@ -5330,13 +5338,41 @@ impl Store {
         Ok(claimed.rows_affected() > 0)
     }
 
-    /// Claim `finding_id` for a fix (`queued` → `fixing`); `false` when it
-    /// is no longer `queued`. Takes an [`Owner`], which only
-    /// `crate::recovery` makes, inside [`CycleScope::claim_fix`](crate::recovery::CycleScope::claim_fix):
+    /// Claim `finding_id` for a fix (`queued` → `fixing`) and read the row
+    /// as the claim took it, in one transaction; `None` when it is no
+    /// longer `queued`. Takes an [`Owner`], which only `crate::recovery`
+    /// makes, inside [`CycleScope::claim_fix`](crate::recovery::CycleScope::claim_fix):
     /// every claim is a [`FixClaim`](crate::recovery::FixClaim) that releases it.
-    pub(crate) async fn claim_fixing(&self, _owner: &Owner, finding_id: i64) -> sqlx::Result<bool> {
-        self.move_if_at(finding_id, FindingStatus::Queued, FindingStatus::Fixing)
-            .await
+    ///
+    /// The row is read here, not at the pick, because a `queued` row can
+    /// still change between the two: the admin lane's Renovate pass
+    /// rewrites a `queued` dep update's target ([`Self::refresh_dep_update`]).
+    /// Once `fixing`, nothing rewrites it, so the fix works from this row
+    /// throughout.
+    pub(crate) async fn claim_fixing(
+        &self,
+        _owner: &Owner,
+        finding_id: i64,
+    ) -> sqlx::Result<Option<Finding>> {
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
+        let (queued, fixing, now) = (FindingStatus::Queued, FindingStatus::Fixing, now_ms());
+        let claimed = sqlx::query!(
+            "UPDATE findings SET status = ?1, updated_at = ?2 WHERE id = ?3 AND status = ?4",
+            fixing,
+            now,
+            finding_id,
+            queued
+        )
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+        if !claimed {
+            return Ok(None);
+        }
+        let row = Self::read_finding(&mut *tx, finding_id).await?;
+        tx.commit().await?;
+        Ok(row)
     }
 
     /// Release a fix claim (`fixing` → `queued`) if the finding is still

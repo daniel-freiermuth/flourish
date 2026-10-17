@@ -2063,3 +2063,65 @@ async fn a_blocked_fix_keeps_its_one_shot_override() {
         Some(hunter::domain::BudgetOverride::Once)
     );
 }
+
+/// The admin lane's Renovate pass can rewrite a `queued` dep update's
+/// target after the job lane picked it and before the fix claims it --
+/// the window holds the budget gate. The worker is asked for the target
+/// the claimed row names, not the one the pick read: built from the
+/// pick, the fix would ship the old upgrade under a finding that names
+/// the new one, and the next scan would find the dependency still behind.
+#[tokio::test]
+async fn a_fix_works_from_the_row_it_claimed_not_the_row_it_picked() {
+    let f = fixture("fix-claimed-row").await;
+    let dep = |latest: &str| FindingInsert {
+        fingerprint: "fp-dep-serde".to_owned(),
+        file: "Cargo.toml".to_owned(),
+        severity: hunter::domain::Severity::Low,
+        confidence: 0.9,
+        summary: format!("serde 1.0.0 -> {latest}"),
+        ecosystem: Some("cargo".to_owned()),
+        package: Some("serde".to_owned()),
+        current_version: Some("1.0.0".to_owned()),
+        latest_version: Some(latest.to_owned()),
+        update_type: Some("minor".to_owned()),
+        ..Default::default()
+    };
+    let repo_id = f.store.get_finding(f.fid).await.unwrap().unwrap().repo_id;
+    let (fid, _) = f
+        .store
+        .upsert_finding(repo_id, &dep("1.5.0"), "dep_update", None)
+        .await
+        .unwrap();
+    f.store
+        .set_finding_status(fid, hunter::domain::FindingStatus::Queued)
+        .await
+        .unwrap();
+    std::fs::write(
+        f.cfg.root.join("playbooks").join("apply_improvement.md"),
+        "apply {{FINDING_JSON}}\n",
+    )
+    .unwrap();
+    let picked = f.store.get_finding(fid).await.unwrap().unwrap();
+    let store = f.store.clone();
+    let worker = ScriptedBackend::noop().on_decide(move || {
+        let store = store.clone();
+        async move {
+            assert!(store.refresh_dep_update(fid, &dep("2.0.0")).await.unwrap());
+        }
+    });
+
+    hunter::scheduler::run_fix(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Cold(&picked),
+        &worker,
+    )
+    .await
+    .unwrap();
+
+    let runs = worker.runs();
+    assert_eq!(runs.len(), 1);
+    assert!(runs[0].prompt.contains("2.0.0"), "{}", runs[0].prompt);
+    assert!(!runs[0].prompt.contains("1.5.0"), "{}", runs[0].prompt);
+}
