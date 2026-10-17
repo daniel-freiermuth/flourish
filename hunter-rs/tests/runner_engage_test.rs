@@ -731,15 +731,10 @@ async fn an_override_raised_while_the_engage_ran_is_kept() {
     });
 
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-    let summary = hunter::scheduler::run_engage(
-        &support::scope(&f.store),
-        &f.cfg,
-        &finding,
-        &backend,
-        None,
-    )
-    .await
-    .unwrap();
+    let summary =
+        hunter::scheduler::run_engage(&support::scope(&f.store), &f.cfg, &finding, &backend, None)
+            .await
+            .unwrap();
 
     assert_eq!(summary.outcome.as_deref(), Some("withdrawn"), "{summary:?}");
     let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
