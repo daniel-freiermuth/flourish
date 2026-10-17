@@ -590,7 +590,7 @@ Fixed strings; git's or the worker's words go into the detail.
 
 **The network's failures count nothing (#95, layer 2).** Before a clone or fetch failure, a runner error, or a worker that failed without metered work is counted, the repo's hosts are probed again (`Backend::first_unreachable(&work_hosts(..))`). If one is unreachable, nothing is counted, the checkpoint stays, and the cycle ends as `offline_denial`. `origin mismatch`, `branch not found` and `repo not cloned` are local and always count.
 
-**Renovate (`dep_update` without a job).** A scan with invalid entries is the failure `invalid entries` and has no checkpoint. Renovate being unavailable is not a failure: the AI job it falls back to is counted like any other. A store error while settling the scan stays a cycle error.
+**Renovate (`dep_update` without a job).** The zero-token Renovate scan runs on the admin lane (`scheduler::dependency_scans`), for every enabled, cloned repo whose `dep_update` is due and is not held, running or checkpointed. A scan with invalid entries is the failure `invalid entries` and has no checkpoint. Renovate having no answer is not a failure: it records a request for the AI scan (`dep_scan_fallbacks`, migration 032), and the job lane's rotation offers the repo's `dep_update` only while that request is newer than its `last_dep_update_at`, so the two lanes never scan one repo's dependencies at once. The AI job is counted like any other, and its success answers the request. A store error while settling the scan is logged as an `error` event, and the next admin pass retries the scan. A clone that cannot be synced is skipped and counted nowhere: the job lane's own fetches keep the `sync` streak.
 
 ### 17.4 Holds and releases
 

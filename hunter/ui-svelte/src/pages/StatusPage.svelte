@@ -97,6 +97,7 @@
     pr_sync: "syncing open PRs",
     reap: "removing deleted repos' clones",
     fetch_ahead: "fetching repos ahead of their jobs",
+    dependency_scan: "scanning dependencies with Renovate",
     sweep: "sweeping finished workspaces",
   };
   const JOB_PHASE_LABEL: Record<JobPhase, string> = {
@@ -104,7 +105,6 @@
     cloning: "cloning the repo",
     fetching: "fetching the repo",
     preparing_tree: "preparing the job's worktree",
-    scanning_dependencies: "scanning dependencies with Renovate",
     publishing: "publishing to the PR",
     ingesting: "filing findings",
   };

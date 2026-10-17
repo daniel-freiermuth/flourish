@@ -474,6 +474,9 @@ pub enum AdminTask {
     /// Fetching every enabled repo's clone ahead of its jobs
     /// (`scheduler::fetch_ahead`).
     FetchAhead,
+    /// The zero-token Renovate dependency scan of every repo whose
+    /// `dep_update` is due (`scheduler::dependency_scans`).
+    DependencyScan,
     /// Releasing finished chains' trees (`workspace::sweep`).
     Sweep,
 }
@@ -500,8 +503,6 @@ pub enum JobPhase {
     Fetching,
     /// Adding the job's worktree.
     PreparingTree,
-    /// The zero-token Renovate dependency scan.
-    ScanningDependencies,
     /// Pushing and opening or answering a PR, or withdrawing one.
     Publishing,
     /// Filing a worker's findings.

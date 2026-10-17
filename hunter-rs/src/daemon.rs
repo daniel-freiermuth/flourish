@@ -35,7 +35,7 @@ use crate::backend::Backend;
 use crate::config::Config;
 use crate::domain::JobState;
 use crate::recovery::AdminAuthority;
-use crate::scheduler::{CycleSummary, FetchAhead, SyncResult};
+use crate::scheduler::{CycleSummary, DepScans, FetchAhead, SyncResult};
 use crate::server::{AppState, router};
 use crate::store::Store;
 use crate::types::AdminTask;
@@ -93,12 +93,26 @@ pub struct AdminPass {
     pub sync: Option<SyncResult>,
     /// The fetch-ahead's counts; `None` when the pass stopped before it.
     pub fetched: Option<FetchAhead>,
+    /// The dependency scans' counts; `None` when the pass stopped before
+    /// them.
+    pub dependencies: Option<DepScans>,
+}
+
+impl AdminPass {
+    /// Whether this pass gave the job lane work it did not have: a PR's
+    /// end or flag ([`SyncResult::made_work`]), or a repo whose AI
+    /// dependency scan is now due.
+    pub fn made_work(&self) -> bool {
+        self.sync.as_ref().is_some_and(SyncResult::made_work)
+            || self.dependencies.is_some_and(|d| d.fallbacks > 0)
+    }
 }
 
 /// One pass of the admin lane: sync every open PR, remove what deleted
-/// repos left, fetch every enabled clone ahead of its jobs, sweep the
-/// workspaces. Each task shows on the status page while it runs
-/// (`status`). None of it creates a job; that takes the job lane's
+/// repos left, fetch every enabled clone ahead of its jobs, run the
+/// zero-token Renovate scan of every repo whose dependencies are due,
+/// sweep the workspaces. Each task shows on the status page while it
+/// runs (`status`). None of it creates a job; that takes the job lane's
 /// authority, which this does not have.
 ///
 /// Once `shutdown` is set the pass stops at the next step, and the sync at
@@ -131,6 +145,13 @@ pub async fn admin_pass(
     {
         let _task = status.begin(AdminTask::FetchAhead);
         pass.fetched = Some(crate::scheduler::fetch_ahead(store, shutdown).await);
+    }
+    if stopping() {
+        return pass;
+    }
+    {
+        let _task = status.begin(AdminTask::DependencyScan);
+        pass.dependencies = Some(crate::scheduler::dependency_scans(store, cfg, shutdown).await);
     }
     if stopping() {
         return pass;
@@ -195,7 +216,7 @@ async fn run_admin_lane(lane: AdminLane, mut shutdown: watch::Receiver<bool>) {
             &shutdown,
         )
         .await;
-        if pass.sync.as_ref().is_some_and(SyncResult::made_work) {
+        if pass.made_work() {
             lane.job_wake.notify_one();
         }
         tokio::select! {

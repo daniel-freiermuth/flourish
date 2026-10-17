@@ -4,4 +4,4 @@
  * One task of the admin lane (`crate::daemon`), which runs beside the
  * job lane.
  */
-export type AdminTask = "pr_sync" | "reap" | "fetch_ahead" | "sweep";
+export type AdminTask = "pr_sync" | "reap" | "fetch_ahead" | "dependency_scan" | "sweep";
