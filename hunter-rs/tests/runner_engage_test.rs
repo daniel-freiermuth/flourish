@@ -2316,6 +2316,71 @@ async fn a_reply_only_engage_marks_the_attention_addressed() {
     );
 }
 
+/// The admin lane fetches the clone while a worker runs, so the PR
+/// branch's remote-tracking ref can move under it. Here a reviewer
+/// force-pushes a rewritten branch mid-run and the clone fetches it: the
+/// worker, which only replies, made no commits, so nothing is pushed -- not
+/// the branch's old head, which the lease would refuse -- and the reply is
+/// posted.
+#[tokio::test]
+async fn a_reply_only_engage_pushes_nothing_when_its_branch_moved_meanwhile() {
+    let f = fixture("engage-reply-branch-moved").await;
+    let bins = FakeBins::acquire("engage-reply-branch-moved");
+    bins.ok("gh", PR_VIEW_JSON);
+    let origin = push_to(&f, None).await;
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let clone = PathBuf::from(
+        f.store
+            .get_repo_by_id(finding.repo_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .path,
+    );
+    let reviewer = TempDir::new("engage-reply-branch-moved-reviewer");
+    let checkout = reviewer.join("checkout");
+    let (origin_w, checkout_w, reviewer_w) =
+        (origin.clone(), checkout.clone(), reviewer.path().to_owned());
+    let backend = ScriptedBackend::new(move |tree| {
+        support::git(
+            &reviewer_w,
+            &[
+                "clone",
+                "-b",
+                BRANCH,
+                origin_w.to_string_lossy().as_ref(),
+                checkout_w.to_string_lossy().as_ref(),
+            ],
+        );
+        support::git(
+            &checkout_w,
+            &["commit", "--amend", "-m", "rebased by a reviewer"],
+        );
+        support::git(&checkout_w, &["push", "--force", "origin", BRANCH]);
+        support::git(&clone, &["fetch", "origin"]);
+        std::fs::write(tree.join("PR-REPLY.md"), "thanks, answered inline").unwrap();
+        support::done()
+    });
+
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Cold(&finding),
+        &backend,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
+    assert!(bins.called_with("gh", "comment"), "{:?}", bins.calls());
+    assert_eq!(
+        support::git(&origin, &["rev-parse", BRANCH]),
+        support::git(&checkout, &["rev-parse", "HEAD"]),
+        "the reviewer's rewrite stays the branch's head"
+    );
+}
+
 // -- what counts as new feedback after an engage ------------------------------
 
 /// Script `gh` as the PR now reads: open, nothing else wrong with it, and

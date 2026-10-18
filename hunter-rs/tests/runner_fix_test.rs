@@ -1651,6 +1651,44 @@ async fn a_description_without_commits_ships_nothing() {
     assert!(!bins.called_with("gh", "create"), "{:?}", bins.calls());
 }
 
+/// The admin lane fetches the clone while a worker runs, so the default
+/// branch's remote-tracking ref can move under it. Here upstream rewrites
+/// its default branch mid-run and the clone fetches it: the worker made no
+/// commits, so nothing ships -- not the dropped upstream commits, which
+/// `origin/<default>..HEAD` would now name as the worker's.
+#[tokio::test]
+async fn a_fix_ships_nothing_when_its_default_branch_was_rewritten_meanwhile() {
+    let bins = support::FakeBins::acquire("fix-default-rewritten");
+    bins.ok("gh", "https://github.com/acme/widget/pull/43");
+    let f = fixture("fix-default-rewritten").await;
+    route_push(&f, None);
+    let origin = git(&f.repo_dir, &["remote", "get-url", "origin"]);
+    let origin = origin.trim().to_owned();
+    let clone = f.repo_dir.clone();
+    let upstream = TempDir::new("fix-default-rewritten-upstream");
+    let checkout = upstream.join("checkout");
+    let upstream_dir = upstream.path().to_owned();
+    let worker = ScriptedBackend::new(move |tree| {
+        let co = checkout.to_string_lossy();
+        git(&upstream_dir, &["clone", "-q", &origin, &co]);
+        git(&checkout, &["checkout", "-q", "--orphan", "rewritten"]);
+        git(&checkout, &["commit", "-qm", "history rewritten upstream"]);
+        git(&checkout, &["push", "-q", "--force", "origin", "HEAD:main"]);
+        git(&clone, &["fetch", "-q", "origin"]);
+        std::fs::write(tree.join("PR-DESCRIPTION.md"), "nothing changed").unwrap();
+        support::done()
+    });
+
+    let summary = fix(&f, &worker).await;
+
+    assert_eq!(
+        summary.failure.as_deref(),
+        Some("no commits"),
+        "{summary:?}"
+    );
+    assert!(!bins.called_with("gh", "create"), "{:?}", bins.calls());
+}
+
 /// Send `run_fix`'s push, which targets the forge's SSH URL, to `target`:
 /// the clone's `origin` when `None`, as the shipping tests above do.
 fn route_push(f: &Fixture, target: Option<&str>) {
