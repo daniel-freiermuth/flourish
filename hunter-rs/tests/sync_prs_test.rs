@@ -102,8 +102,8 @@ impl Fixture {
         let first = self.store.record_open_pr(self.fid, &first).await.unwrap();
         drop(pass);
         assert!(matches!(first, OpenPrRecorded::Recorded(_)), "{first:?}");
-        let answered = self
-            .store
+        let answered = support::scope(&self.store)
+            .store()
             .mark_pr_engaged(
                 self.fid,
                 &EngageAnswer::fixture(
@@ -138,8 +138,8 @@ impl Fixture {
             "a sync recorded problems on a head"
         );
         let pr = pr_ref(PR_URL);
-        let answered = self
-            .store
+        let answered = support::scope(&self.store)
+            .store()
             .mark_pr_engaged(self.fid, &EngageAnswer::without_push(&pr, None, &ps))
             .await
             .unwrap();

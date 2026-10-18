@@ -21,6 +21,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::Write;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
 use sqlx::SqlitePool;
@@ -35,8 +36,7 @@ use crate::domain::{
     RepoWorkKind, Severity,
 };
 use crate::recovery::{
-    DaemonLock, JobAuthority, Owner, RecordedJob, Recovered, Recovery, StrandedClaim, StrandedJob,
-    Unreconciled,
+    DaemonLock, Owner, RecordedJob, Recovery, StrandedClaim, StrandedJob, Unreconciled,
 };
 use crate::transition::{
     Moved, PrEnded, PrEnding, PrRef, Record, ReleaseVerdict, Sources, Transition, Unclaimed,
@@ -905,6 +905,7 @@ async fn write_release_verdict(
         from,
         verdict,
         reason: text,
+        release: ReleaseEdge(()),
     };
     if let Moved::Conflict { now } = Store::apply_transition(tx, finding_id, &release).await? {
         // `from` was read in this transaction, so this is a store fault.
@@ -1058,22 +1059,9 @@ impl Store {
         Ok(recorded)
     }
 
-    /// Set `last_standards_at` to now.
-    pub async fn set_last_standards_at(&self, repo_id: i64) -> sqlx::Result<()> {
-        let now = now_ms();
-        sqlx::query!(
-            "UPDATE repos SET last_standards_at = ?1 WHERE id = ?2",
-            now,
-            repo_id
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
     /// Advance a rotation-kind's `last_{kind}_at` timestamp.
     /// Uses per-kind compile-time checked queries (no `QueryBuilder`).
-    pub async fn set_last_kind_at(&self, repo_id: i64, kind: RepoJobKind) -> sqlx::Result<()> {
+    async fn set_last_kind_at(&self, repo_id: i64, kind: RepoJobKind) -> sqlx::Result<()> {
         let now = now_ms();
         match kind {
             RepoJobKind::Hunt => {
@@ -1158,7 +1146,7 @@ impl Store {
     /// the binary carries its own schema, so deploying a new binary
     /// automatically migrates the DB.
     ///
-    /// The handle has no startup token: [`Recovered`], and so any job,
+    /// The handle has no startup token: [`Recovered`](crate::recovery::Recovered), and so any job,
     /// is out of its reach. The daemon connects through
     /// [`Self::connect_exclusive`] instead.
     pub async fn connect(db_path: &Path) -> anyhow::Result<Self> {
@@ -1422,7 +1410,7 @@ impl Store {
     /// End `finding_id`'s PR `pr` ([`PrEnding`]): the finding's move and
     /// the end in `pr_state`, in one write, only while the finding is still
     /// `pr_open` with that PR (`pr_state::end`).
-    pub async fn end_pr(
+    async fn end_pr(
         &self,
         finding_id: i64,
         pr: &PrRef,
@@ -1438,12 +1426,7 @@ impl Store {
     /// withdrawal made, the sync having recorded it first: the worker's
     /// `reason` replaces the sync's. `true` when it was that closure
     /// (`pr_state::adopt_closure`).
-    pub async fn adopt_closure(
-        &self,
-        finding_id: i64,
-        pr: &PrRef,
-        reason: &str,
-    ) -> sqlx::Result<bool> {
+    async fn adopt_closure(&self, finding_id: i64, pr: &PrRef, reason: &str) -> sqlx::Result<bool> {
         let mut tx = ImmediateTx::begin(&self.pool).await?;
         let adopted = pr_state::adopt_closure(&mut tx, finding_id, pr, reason).await?;
         tx.commit().await?;
@@ -1721,7 +1704,7 @@ impl Store {
     /// re-checked at, so the next scan does not re-check it again, and
     /// replace its condition when the scan restated it. Nothing moves once
     /// the finding is no longer suppressed.
-    pub async fn reconfirm_anchor(
+    async fn reconfirm_anchor(
         &self,
         finding_id: i64,
         sha: &str,
@@ -2041,8 +2024,8 @@ impl Store {
     /// disk -- the reaper only finds leftovers through it -- so dropping it
     /// first would orphan them for good. It does not free the id:
     /// `repos.id` is AUTOINCREMENT (migration 009), so SQLite never reissues
-    /// it.
-    pub async fn forget_deleted_repo(&self, id: i64) -> sqlx::Result<()> {
+    /// it. Only the admin lane's reaper calls it ([`AdminStore`]).
+    async fn forget_deleted_repo(&self, id: i64) -> sqlx::Result<()> {
         sqlx::query!(
             "DELETE FROM repos WHERE id = ?1 AND deleted_at IS NOT NULL",
             id
@@ -2809,7 +2792,7 @@ impl Store {
     /// could not be published while the network was down (#95), which the
     /// next cycle continues to publish instead of redoing the work. Without
     /// a transcript the pointer is left as it is.
-    pub async fn keep_attempt_as_checkpoint(&self, job_id: i64) -> sqlx::Result<()> {
+    async fn keep_attempt_as_checkpoint(&self, job_id: i64) -> sqlx::Result<()> {
         let resumable = sqlx::query_scalar!(
             r#"SELECT session_file IS NOT NULL AS "resumable!: bool" FROM jobs WHERE id = ?1"#,
             job_id
@@ -3582,7 +3565,7 @@ impl Store {
 
     /// Record the commit a cold job's working tree was created at. See
     /// migration 015; resumed attempts get theirs from [`CycleScope::create_job`](crate::recovery::CycleScope::create_job).
-    pub async fn set_pinned_sha(&self, job_id: i64, sha: &str) -> sqlx::Result<()> {
+    async fn set_pinned_sha(&self, job_id: i64, sha: &str) -> sqlx::Result<()> {
         sqlx::query!("UPDATE jobs SET pinned_sha = ?1 WHERE id = ?2", sha, job_id)
             .execute(&self.pool)
             .await?;
@@ -3612,7 +3595,7 @@ impl Store {
 
     /// Record the newest PR feedback a cold engage attempt's worker was
     /// shown. Resumes inherit it ([`CycleScope::create_job`](crate::recovery::CycleScope::create_job)) instead.
-    pub async fn set_seen_activity(&self, job_id: i64, seen: SeenActivity) -> sqlx::Result<()> {
+    async fn set_seen_activity(&self, job_id: i64, seen: SeenActivity) -> sqlx::Result<()> {
         let at_ms = seen.0;
         sqlx::query!(
             "UPDATE jobs SET seen_activity_at = ?1 WHERE id = ?2",
@@ -3847,7 +3830,7 @@ impl Store {
     /// Downgrade an already-recorded job to failed (e.g. post-run push
     /// failure). Takes the [`RecordedJob`] its outcome was recorded as, so
     /// it cannot end a job that is still `running`.
-    pub async fn fail_job(&self, job: &RecordedJob, notes: &str) -> sqlx::Result<()> {
+    async fn fail_job(&self, job: &RecordedJob, notes: &str) -> sqlx::Result<()> {
         let job_id = job.id();
         let failed = JobState::Failed;
         sqlx::query!(
@@ -3862,7 +3845,7 @@ impl Store {
     }
 
     /// UPDATE repos SET `last_hunt_sha` = ?, `last_hunt_at` = now WHERE id = ?.
-    pub async fn set_last_hunt(&self, repo_id: i64, sha: &str) -> sqlx::Result<()> {
+    async fn set_last_hunt(&self, repo_id: i64, sha: &str) -> sqlx::Result<()> {
         let now = now_ms();
         sqlx::query!(
             "UPDATE repos SET last_hunt_sha = ?1, last_hunt_at = ?2 WHERE id = ?3",
@@ -3876,7 +3859,7 @@ impl Store {
     }
 
     /// UPDATE repos SET `last_full_hunt_at` = now WHERE id = ?.
-    pub async fn set_last_full_hunt(&self, repo_id: i64) -> sqlx::Result<()> {
+    async fn set_last_full_hunt(&self, repo_id: i64) -> sqlx::Result<()> {
         let now = now_ms();
         sqlx::query!(
             "UPDATE repos SET last_full_hunt_at = ?1 WHERE id = ?2",
@@ -3919,7 +3902,7 @@ impl Store {
     /// Record that a hunt has started to answer `request` (a
     /// `full_hunt_requested_at` value), so that request no longer jumps
     /// the rotation.
-    pub async fn mark_full_hunt_attempted(&self, repo_id: i64, request: i64) -> sqlx::Result<()> {
+    async fn mark_full_hunt_attempted(&self, repo_id: i64, request: i64) -> sqlx::Result<()> {
         sqlx::query!(
             "UPDATE repos SET full_hunt_request_attempted = ?1 WHERE id = ?2",
             request,
@@ -3934,7 +3917,7 @@ impl Store {
     /// chain that `job_id` belongs to, which has just finished — but only
     /// if it is the request that chain accepted. One made since asked for
     /// a pass over a tree this chain had already pinned, and stays pending.
-    pub async fn settle_full_hunt_request(&self, repo_id: i64, job_id: i64) -> sqlx::Result<()> {
+    async fn settle_full_hunt_request(&self, repo_id: i64, job_id: i64) -> sqlx::Result<()> {
         sqlx::query!(
             "UPDATE repos SET full_hunt_requested_at = NULL \
              WHERE id = ?1 \
@@ -3951,7 +3934,7 @@ impl Store {
     /// Record that hunt job `job_id` starts a chain over the repo's
     /// complete history, answering `request` if one was pending; every
     /// resume of the chain inherits both.
-    pub async fn mark_full_history(&self, job_id: i64, request: Option<i64>) -> sqlx::Result<()> {
+    async fn mark_full_history(&self, job_id: i64, request: Option<i64>) -> sqlx::Result<()> {
         sqlx::query!(
             "UPDATE jobs SET full_history = 1, full_hunt_request = ?1 WHERE id = ?2",
             request,
@@ -4580,7 +4563,7 @@ impl Store {
     /// one transaction, while the finding is still `pr_open` with the PR
     /// answered ([`AnswerRecorded`]). Writes the answered columns only
     /// (`crate::attention`); the watermark only ever rises.
-    pub async fn mark_pr_engaged(
+    async fn mark_pr_engaged(
         &self,
         finding_id: i64,
         answer: &EngageAnswer<'_>,
@@ -4592,7 +4575,7 @@ impl Store {
     }
 
     /// Mark a merged PR as harvested.
-    pub async fn mark_pr_harvested(&self, finding_id: i64, harvested_at: i64) -> sqlx::Result<()> {
+    async fn mark_pr_harvested(&self, finding_id: i64, harvested_at: i64) -> sqlx::Result<()> {
         pr_state::stamp_harvested(&self.pool, finding_id, harvested_at).await
     }
 
@@ -4616,7 +4599,7 @@ impl Store {
     /// the PR was reviewed. Returns whether the classification applied.
     /// The verdict's `anchor` (or the removal of an earlier one) lands with
     /// the classification, never without it.
-    pub async fn record_closed_harvest(
+    async fn record_closed_harvest(
         &self,
         finding_id: i64,
         class: ClosureClass,
@@ -4629,6 +4612,7 @@ impl Store {
             class,
             reason,
             anchor,
+            job: JobEdge(PhantomData),
         };
         let classified =
             Self::apply_transition(&mut tx, finding_id, &classify).await? == Moved::Applied;
@@ -4638,7 +4622,7 @@ impl Store {
     }
 
     /// Self-heal a missing `pr_number`; fill-only (`pr_state::fill_pr_number`).
-    pub async fn fill_pr_number(&self, finding_id: i64, pr_number: i64) -> sqlx::Result<()> {
+    async fn fill_pr_number(&self, finding_id: i64, pr_number: i64) -> sqlx::Result<()> {
         pr_state::fill_pr_number(&self.pool, finding_id, pr_number).await
     }
 
@@ -4797,11 +4781,7 @@ impl Store {
     /// End `finding_id`'s `kind` streak: the work concluded without
     /// leaving its tier, as an engage does (leaving the tier ends it on its
     /// own, migration 024's trigger).
-    pub async fn clear_work_streak(
-        &self,
-        finding_id: i64,
-        kind: FindingJobKind,
-    ) -> sqlx::Result<()> {
+    async fn clear_work_streak(&self, finding_id: i64, kind: FindingJobKind) -> sqlx::Result<()> {
         sqlx::query!(
             "UPDATE finding_work SET streak = 0, last_failure = NULL \
              WHERE finding_id = ?1 AND kind = ?2",
@@ -5118,7 +5098,7 @@ impl Store {
     /// finding's. The checkpoint is left alone: an attempt that ran has
     /// moved it in `complete_job` already, and a failure without a new
     /// attempt did no work that could replace it.
-    pub async fn record_repo_failure(
+    async fn record_repo_failure(
         &self,
         repo_id: i64,
         kind: RepoWorkKind,
@@ -5230,7 +5210,7 @@ impl Store {
     /// the streak ends, and the checkpoint becomes `job` if a worker ran in
     /// it, else stays what it was. `false` when nothing was held: the repo
     /// is gone, or the work item is already held.
-    pub async fn hold_repo_work(
+    async fn hold_repo_work(
         &self,
         repo_id: i64,
         kind: RepoWorkKind,
@@ -5553,19 +5533,75 @@ impl Store {
 #[derive(Debug, Clone, Copy)]
 pub struct ScanEdge(());
 
+/// What only the job lane can make ([`JobStore::edge`]): the finding
+/// transitions a job's outcome makes carry one (a recheck's verdict,
+/// [`Transition::RecheckConfirmed`], [`Transition::RecheckStale`] and
+/// [`Transition::RecheckInvalid`], and a harvest's
+/// [`Transition::Classified`]), so neither the admin lane nor a handler
+/// can build one. It borrows the [`JobStore`] that made it, so it cannot
+/// outlive its cycle: kept in a struct or moved into a spawned task, it
+/// does not compile.
+#[derive(Debug, Clone, Copy)]
+pub struct JobEdge<'a>(PhantomData<&'a JobStore>);
+
+/// What only a PR sync pass can make
+/// ([`PrSyncPass::edge`](pr_state::PrSyncPass::edge)): the transition the
+/// sync makes on what it reads ([`Transition::PrMissing`]) carries one, so
+/// only the admin lane's sync can build it. It borrows the pass that made
+/// it, so it cannot outlive that pass.
+#[derive(Debug, Clone, Copy)]
+pub struct SyncEdge<'a>(PhantomData<&'a pr_state::PrSyncPass>);
+
+/// What only an operator's release of a hold can make, inside
+/// [`Store::release_hold`]'s transaction: [`Transition::HoldReleased`]
+/// carries one, so [`Store::transition`] cannot be handed a release. It
+/// would otherwise move a finding out of any unclaimed status -- a
+/// `rechecking` one under its running recheck, or a `pr_open` one past
+/// the sync and the engage -- with nothing checking a hold.
+#[derive(Debug, Clone, Copy)]
+pub struct ReleaseEdge(());
+
 /// The store as the job lane writes it: everything a [`Store`] does,
-/// through `Deref`, and the writes only the job lane makes. Those end a
-/// chain's checkpoint and count or hold a finding's work, which only the
-/// lane's own selection and runners may decide.
+/// through `Deref`, and the writes only the job lane makes. Those are the
+/// writes about the lane's own work: its jobs' rows, a chain's
+/// checkpoint, a work item's streak and hold, the rotation's timestamps
+/// and watermarks, the engage and harvest groups of `pr_state`, and the
+/// finding moves a job's outcome makes ([`JobEdge`]).
 ///
-/// Made only from the [`JobAuthority`] (by its
-/// [`CycleScope`](crate::recovery::CycleScope)), so an admin duty or a
-/// handler, holding a plain [`Store`], has none of these writes to call.
+/// Made only inside `crate::recovery`, from the [`JobAuthority`](crate::recovery::JobAuthority) (by its
+/// [`CycleScope`](crate::recovery::CycleScope)): the constructor takes an
+/// [`Owner`], which nothing outside that module can build. So an admin
+/// duty or a handler, holding a plain [`Store`] or an [`AdminStore`], has
+/// none of these writes to call, and no code elsewhere in the crate can
+/// mint one. What stays on [`Store`] is what every holder writes (events,
+/// ingest) and the operator's writes.
 pub struct JobStore(Store);
 
 impl JobStore {
-    pub(crate) fn of(_jobs: &JobAuthority, store: Store) -> Self {
+    pub(crate) const fn of(_owner: &Owner, store: Store) -> Self {
         Self(store)
+    }
+
+    /// The proof a job-lane finding transition carries ([`JobEdge`]).
+    pub const fn edge(&self) -> JobEdge<'_> {
+        JobEdge(PhantomData)
+    }
+
+    /// Record an engage's withdrawal of `finding_id`'s PR `pr`: the
+    /// finding goes `closed` with `reason`, and `pr_state` records the
+    /// closure, as the PR sync's end does ([`PrSyncPass::end_pr`]). Only
+    /// a closure: a merge is only ever the sync's to see.
+    ///
+    /// [`PrSyncPass::end_pr`]: pr_state::PrSyncPass::end_pr
+    pub async fn end_withdrawn_pr(
+        &self,
+        finding_id: i64,
+        pr: &PrRef,
+        reason: &str,
+    ) -> sqlx::Result<PrEnded> {
+        self.0
+            .end_pr(finding_id, pr, PrEnding::Closed { reason })
+            .await
     }
 
     /// Give up `finding_id`'s `kind` checkpoint at `job_id`, with its
@@ -5627,6 +5663,142 @@ impl JobStore {
     pub async fn repo_work_succeeded(&self, repo_id: i64, kind: RepoWorkKind) -> sqlx::Result<()> {
         self.0.repo_work_succeeded(repo_id, kind).await
     }
+
+    /// Advance a rotation-kind's `last_{kind}_at` timestamp. See the private `Store` method of the same name.
+    pub async fn set_last_kind_at(&self, repo_id: i64, kind: RepoJobKind) -> sqlx::Result<()> {
+        self.0.set_last_kind_at(repo_id, kind).await
+    }
+
+    /// Take over the PR sync's record of the closure an engage's withdrawal made, the sync having recorded it first. See the private `Store` method of the same name.
+    pub async fn adopt_closure(
+        &self,
+        finding_id: i64,
+        pr: &PrRef,
+        reason: &str,
+    ) -> sqlx::Result<bool> {
+        self.0.adopt_closure(finding_id, pr, reason).await
+    }
+
+    /// A scan re-checked an anchored verdict whose code had changed and found it still holds. See the private `Store` method of the same name.
+    pub async fn reconfirm_anchor(
+        &self,
+        finding_id: i64,
+        sha: &str,
+        holds_while: Option<&str>,
+    ) -> sqlx::Result<()> {
+        self.0.reconfirm_anchor(finding_id, sha, holds_while).await
+    }
+
+    /// Make the finished attempt `job_id` its work item's checkpoint, when it has a transcript to continue. See the private `Store` method of the same name.
+    pub async fn keep_attempt_as_checkpoint(&self, job_id: i64) -> sqlx::Result<()> {
+        self.0.keep_attempt_as_checkpoint(job_id).await
+    }
+
+    /// Record the commit a cold job's working tree was created at. See the private `Store` method of the same name.
+    pub async fn set_pinned_sha(&self, job_id: i64, sha: &str) -> sqlx::Result<()> {
+        self.0.set_pinned_sha(job_id, sha).await
+    }
+
+    /// Record the newest PR feedback a cold engage attempt's worker was shown. See the private `Store` method of the same name.
+    pub async fn set_seen_activity(&self, job_id: i64, seen: SeenActivity) -> sqlx::Result<()> {
+        self.0.set_seen_activity(job_id, seen).await
+    }
+
+    /// Downgrade an already-recorded job to failed. See the private `Store` method of the same name.
+    pub async fn fail_job(&self, job: &RecordedJob, notes: &str) -> sqlx::Result<()> {
+        self.0.fail_job(job, notes).await
+    }
+
+    /// Record `sha` as the repo's last hunted commit, at now. See the private `Store` method of the same name.
+    pub async fn set_last_hunt(&self, repo_id: i64, sha: &str) -> sqlx::Result<()> {
+        self.0.set_last_hunt(repo_id, sha).await
+    }
+
+    /// Record a full hunt of the repo, at now. See the private `Store` method of the same name.
+    pub async fn set_last_full_hunt(&self, repo_id: i64) -> sqlx::Result<()> {
+        self.0.set_last_full_hunt(repo_id).await
+    }
+
+    /// Record that a hunt has started to answer `request` (a `full_hunt_requested_at` value), so that request no longer jumps the rotation. See the private `Store` method of the same name.
+    pub async fn mark_full_hunt_attempted(&self, repo_id: i64, request: i64) -> sqlx::Result<()> {
+        self.0.mark_full_hunt_attempted(repo_id, request).await
+    }
+
+    /// Settle the pending full re-hunt request with the full-history hunt chain that `job_id` belongs to, which has just finished — but only if it is the request that chain accepted. See the private `Store` method of the same name.
+    pub async fn settle_full_hunt_request(&self, repo_id: i64, job_id: i64) -> sqlx::Result<()> {
+        self.0.settle_full_hunt_request(repo_id, job_id).await
+    }
+
+    /// Record that hunt job `job_id` starts a chain over the repo's complete history, answering `request` if one was pending; every resume of the chain inherits both. See the private `Store` method of the same name.
+    pub async fn mark_full_history(&self, job_id: i64, request: Option<i64>) -> sqlx::Result<()> {
+        self.0.mark_full_history(job_id, request).await
+    }
+
+    /// Record an engage's answer and settle the PR's attention from it, in one transaction, while the finding is still `pr_open` with the PR answered ([`AnswerRecorded`]). See the private `Store` method of the same name.
+    pub async fn mark_pr_engaged(
+        &self,
+        finding_id: i64,
+        answer: &EngageAnswer<'_>,
+    ) -> sqlx::Result<AnswerRecorded> {
+        self.0.mark_pr_engaged(finding_id, answer).await
+    }
+
+    /// Mark a merged PR as harvested. See the private `Store` method of the same name.
+    pub async fn mark_pr_harvested(&self, finding_id: i64, harvested_at: i64) -> sqlx::Result<()> {
+        self.0.mark_pr_harvested(finding_id, harvested_at).await
+    }
+
+    /// Record a closed PR's harvest. See the private `Store` method of the same name.
+    pub async fn record_closed_harvest(
+        &self,
+        finding_id: i64,
+        class: ClosureClass,
+        reason: &str,
+        anchor: Option<&VerdictAnchor>,
+        harvested_at: i64,
+    ) -> sqlx::Result<bool> {
+        self.0
+            .record_closed_harvest(finding_id, class, reason, anchor, harvested_at)
+            .await
+    }
+
+    /// Self-heal a missing `pr_number`; fill-only (`pr_state::fill_pr_number`). See the private `Store` method of the same name.
+    pub async fn fill_pr_number(&self, finding_id: i64, pr_number: i64) -> sqlx::Result<()> {
+        self.0.fill_pr_number(finding_id, pr_number).await
+    }
+
+    /// End `finding_id`'s `kind` streak. See the private `Store` method of the same name.
+    pub async fn clear_work_streak(
+        &self,
+        finding_id: i64,
+        kind: FindingJobKind,
+    ) -> sqlx::Result<()> {
+        self.0.clear_work_streak(finding_id, kind).await
+    }
+
+    /// Count one failure of `repo_id`'s `kind` work under `key` and return the streak it makes, as [`Self::record_work_failure`] does for a finding's. See the private `Store` method of the same name.
+    pub async fn record_repo_failure(
+        &self,
+        repo_id: i64,
+        kind: RepoWorkKind,
+        key: &str,
+    ) -> sqlx::Result<i64> {
+        self.0.record_repo_failure(repo_id, kind, key).await
+    }
+
+    /// Hold `repo_id`'s `kind` work for the operator, in one transaction with its `hold` event, as [`Self::hold_work`] does for a finding's. See the private `Store` method of the same name.
+    pub async fn hold_repo_work(
+        &self,
+        repo_id: i64,
+        kind: RepoWorkKind,
+        reason: HoldReason,
+        detail: &str,
+        job: Option<i64>,
+    ) -> sqlx::Result<bool> {
+        self.0
+            .hold_repo_work(repo_id, kind, reason, detail, job)
+            .await
+    }
 }
 
 impl std::ops::Deref for JobStore {
@@ -5640,15 +5812,20 @@ impl std::ops::Deref for JobStore {
 /// The store as the admin lane writes it: everything a [`Store`] does,
 /// through `Deref`, and the writes only the admin lane's Renovate scan
 /// makes. Only that scan decides what Renovate proposes, retires or hands
-/// over, and when the job lane's AI scan is wanted instead.
+/// over, and when the job lane's AI scan is wanted instead. The repo's
+/// `dep_update` work item is the one piece of work both lanes do (Renovate
+/// here, the AI scan on the job lane), so its streak and hold are the only
+/// work-item writes here, and only for that kind.
 ///
-/// Made only with the startup proof ([`Recovered`]), by
-/// [`Recovered::into_lanes`] for the [`AdminAuthority`], which only the
+/// Made only with the startup proof ([`Recovered`](crate::recovery::Recovered)), by
+/// [`Recovered::into_lanes`](crate::recovery::Recovered::into_lanes) for the [`AdminAuthority`](crate::recovery::AdminAuthority), which only the
 /// admin lane holds.
 pub struct AdminStore(Store);
 
 impl AdminStore {
-    pub(crate) fn of(_recovered: &Recovered, store: Store) -> Self {
+    /// Made only inside `crate::recovery` ([`Owner`]), for the
+    /// [`AdminAuthority`](crate::recovery::AdminAuthority).
+    pub(crate) const fn of(_owner: &Owner, store: Store) -> Self {
         Self(store)
     }
 
@@ -5686,6 +5863,35 @@ impl AdminStore {
     /// job or a checkpoint): then `false`, and nothing is written.
     pub async fn renovate_succeeded(&self, repo_id: i64) -> sqlx::Result<bool> {
         self.0.renovate_succeeded(repo_id).await
+    }
+
+    /// Count one failed Renovate scan of `repo_id` under `key` in its
+    /// `dep_update` streak and return the streak it makes, as
+    /// [`JobStore::record_repo_failure`] does for the job lane's work.
+    pub async fn record_renovate_failure(&self, repo_id: i64, key: &str) -> sqlx::Result<i64> {
+        self.0
+            .record_repo_failure(repo_id, RepoWorkKind::DepUpdate, key)
+            .await
+    }
+
+    /// Hold `repo_id`'s `dep_update` work for the operator after repeated
+    /// Renovate failures, as [`JobStore::hold_repo_work`] does; a scan has
+    /// no job, so nothing becomes its checkpoint.
+    pub async fn hold_renovate(
+        &self,
+        repo_id: i64,
+        reason: HoldReason,
+        detail: &str,
+    ) -> sqlx::Result<bool> {
+        self.0
+            .hold_repo_work(repo_id, RepoWorkKind::DepUpdate, reason, detail, None)
+            .await
+    }
+
+    /// Drop `repo_id`'s flagged row once the reaper has removed its clone
+    /// and notes; see the private `Store` method of the same name.
+    pub async fn forget_deleted_repo(&self, repo_id: i64) -> sqlx::Result<()> {
+        self.0.forget_deleted_repo(repo_id).await
     }
 }
 

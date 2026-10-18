@@ -83,7 +83,7 @@ impl FindingStatus {
     /// Statuses at which a finding asks the operator for a verdict: `new`
     /// (triage), `note` (act on it after all) and `closed` (classify a
     /// closed PR; a harvest still running keeps the operator's verdict,
-    /// see `Store::record_closed_harvest`). Everywhere else a job or the
+    /// see `JobStore::record_closed_harvest`). Everywhere else a job or the
     /// forge owns the finding, and a verdict would race it, so
     /// `/api/verdict` refuses. Work held for the operator is released
     /// through `/api/hold/release`, not by a verdict.

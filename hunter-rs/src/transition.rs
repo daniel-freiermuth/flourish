@@ -21,7 +21,9 @@
 
 use crate::domain::{ClosureClass, FindingStatus};
 use crate::forge::Forge;
-use crate::store::{FindingAnalysisUpdate, FindingInsert, ScanEdge, VerdictAnchor};
+use crate::store::{
+    FindingAnalysisUpdate, FindingInsert, JobEdge, ReleaseEdge, ScanEdge, SyncEdge, VerdictAnchor,
+};
 
 /// A finding status no fix claim holds: every [`FindingStatus`] but
 /// `fixing`, which only a [`crate::recovery::FixClaim`]'s holder moves a
@@ -162,20 +164,28 @@ pub enum Transition<'a> {
     Verdict(OperatorVerdict<'a>),
     /// The operator released a hold with a verdict. `from` is the status
     /// read with the hold, in the transaction that writes the verdict.
+    /// Made only inside that transaction ([`ReleaseEdge`]).
     HoldReleased {
         from: Unclaimed,
         verdict: ReleaseVerdict,
         reason: &'a str,
+        release: ReleaseEdge,
     },
     /// A recheck confirmed the finding; it goes back to triage, with the
-    /// recheck's revised analysis.
-    RecheckConfirmed { analysis: &'a FindingAnalysisUpdate },
-    /// A recheck found the code moved on, taking the bug with it.
-    RecheckStale { reason: &'a str },
-    /// A recheck found the finding wrong, anchored to what it judged.
+    /// recheck's revised analysis. The job lane's ([`JobEdge`]).
+    RecheckConfirmed {
+        analysis: &'a FindingAnalysisUpdate,
+        job: JobEdge<'a>,
+    },
+    /// A recheck found the code moved on, taking the bug with it. The job
+    /// lane's ([`JobEdge`]).
+    RecheckStale { reason: &'a str, job: JobEdge<'a> },
+    /// A recheck found the finding wrong, anchored to what it judged. The
+    /// job lane's ([`JobEdge`]).
     RecheckInvalid {
         reason: &'a str,
         anchor: Option<&'a VerdictAnchor>,
+        job: JobEdge<'a>,
     },
     /// A scan filed a suppressed finding again and its verdict had lapsed
     /// ([`crate::suppression::reopen_if_changed`]): back to triage with the
@@ -198,13 +208,15 @@ pub enum Transition<'a> {
     /// Made only beside [`Self::HandedOver`].
     TakesOver { from_id: i64, scan: ScanEdge },
     /// A `pr_open` row without a PR URL (a fix that failed before its PR,
-    /// from before fix claims): retried.
-    PrMissing,
-    /// A closed PR's harvest classified why it closed.
+    /// from before fix claims): retried. The PR sync's ([`SyncEdge`]).
+    PrMissing(SyncEdge<'a>),
+    /// A closed PR's harvest classified why it closed. The job lane's
+    /// ([`JobEdge`]); made inside the harvest's own write.
     Classified {
         class: ClosureClass,
         reason: &'a str,
         anchor: Option<&'a VerdictAnchor>,
+        job: JobEdge<'a>,
     },
 }
 
@@ -243,7 +255,9 @@ impl PrRef {
 }
 
 /// A finding's PR ended: `pr_open` → `merged` or `closed`, with `pr_state`
-/// recording the end in the same write ([`Store::end_pr`]).
+/// recording the end in the same write. Only the PR sync records either
+/// ([`PrSyncPass::end_pr`]), and only an engage's withdrawal records a
+/// closure besides ([`JobStore::end_withdrawn_pr`]).
 ///
 /// Not a [`Transition`]: a transition is guarded by status alone, and
 /// `pr_open` cannot tell the PR its writer read from the one the finding
@@ -254,7 +268,8 @@ impl PrRef {
 /// ([`PrEnded::OtherPr`] otherwise), as an observation and an answer do
 /// (`crate::attention`).
 ///
-/// [`Store::end_pr`]: crate::store::Store::end_pr
+/// [`PrSyncPass::end_pr`]: crate::store::PrSyncPass::end_pr
+/// [`JobStore::end_withdrawn_pr`]: crate::store::JobStore::end_withdrawn_pr
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrEnding<'a> {
     /// The PR sync saw the PR merged.
@@ -266,9 +281,9 @@ pub enum PrEnding<'a> {
 
 /// The verdict reason the PR sync records for a PR it saw closed without
 /// merging: a closure nobody has classified yet. An engage that withdrew
-/// the same PR takes such a closure over ([`Store::adopt_closure`]).
+/// the same PR takes such a closure over ([`JobStore::adopt_closure`]).
 ///
-/// [`Store::adopt_closure`]: crate::store::Store::adopt_closure
+/// [`JobStore::adopt_closure`]: crate::store::JobStore::adopt_closure
 pub const PR_CLOSED_AWAITING_HARVEST: &str = "PR closed without merge; awaiting harvest";
 
 impl<'a> PrEnding<'a> {
@@ -380,7 +395,7 @@ impl<'a> Transition<'a> {
             Self::Reopened { .. } => Either(S::Rejected, S::Wontfix),
             Self::Reproposed(_) => One(S::Superseded),
             Self::TakesOver { .. } => Either(S::New, S::Queued),
-            Self::PrMissing => One(S::PrOpen),
+            Self::PrMissing(_) => One(S::PrOpen),
             Self::Classified { .. } => One(S::Closed),
         }
     }
@@ -404,15 +419,15 @@ impl<'a> Transition<'a> {
                 S::Superseded
             }
             Self::RecheckInvalid { .. } => S::Rejected,
-            Self::PrMissing | Self::TakesOver { .. } => S::Queued,
+            Self::PrMissing(_) | Self::TakesOver { .. } => S::Queued,
             Self::Classified { class, .. } => (*class).into(),
         }
     }
 
     pub(crate) fn record(&self) -> Record<'a> {
         match *self {
-            Self::RecheckRequested | Self::Unqueued | Self::PrMissing => Record::StatusOnly,
-            Self::RecheckConfirmed { analysis } => Record::Analysis(analysis),
+            Self::RecheckRequested | Self::Unqueued | Self::PrMissing(_) => Record::StatusOnly,
+            Self::RecheckConfirmed { analysis, .. } => Record::Analysis(analysis),
             Self::Reopened { scan } => Record::Rescan(scan),
             Self::TakesOver { from_id, .. } => Record::InheritOverride { from_id },
             // An operator's verdict has no tree to anchor to, and one given
@@ -427,18 +442,17 @@ impl<'a> Transition<'a> {
                 anchor: None,
             },
             Self::HoldReleased { reason, .. }
-            | Self::RecheckStale { reason }
+            | Self::RecheckStale { reason, .. }
             | Self::Unproposed { reason, .. }
             | Self::HandedOver { reason, .. } => Record::Verdict {
                 reason: Some(reason),
                 anchor: None,
             },
-            Self::RecheckInvalid { reason, anchor } | Self::Classified { reason, anchor, .. } => {
-                Record::Verdict {
-                    reason: Some(reason),
-                    anchor,
-                }
-            }
+            Self::RecheckInvalid { reason, anchor, .. }
+            | Self::Classified { reason, anchor, .. } => Record::Verdict {
+                reason: Some(reason),
+                anchor,
+            },
         }
     }
 }

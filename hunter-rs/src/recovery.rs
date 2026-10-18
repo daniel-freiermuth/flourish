@@ -232,7 +232,7 @@ impl Recovered {
     /// Hand the proof to the daemon's two lanes, each its own part of it.
     pub fn into_lanes(self) -> (JobAuthority, AdminAuthority) {
         let admin = AdminAuthority {
-            store: AdminStore::of(&self, self.store.clone()),
+            store: AdminStore::of(&Owner(()), self.store.clone()),
         };
         (
             JobAuthority {
@@ -274,7 +274,7 @@ impl JobAuthority {
     /// settled or dropped, so no second scope opens beside it.
     pub fn scope(&mut self) -> CycleScope<'_> {
         CycleScope {
-            store: JobStore::of(self, self.store.clone()),
+            store: JobStore::of(&Owner(()), self.store.clone()),
             _jobs: PhantomData,
         }
     }
@@ -285,7 +285,7 @@ impl JobAuthority {
     #[cfg(feature = "test-support")]
     pub fn into_test_scope(self) -> CycleScope<'static> {
         CycleScope {
-            store: JobStore::of(&self, self.store.clone()),
+            store: JobStore::of(&Owner(()), self.store.clone()),
             _jobs: PhantomData,
         }
     }
@@ -296,7 +296,7 @@ impl JobAuthority {
 /// fetch-ahead, the Renovate scans, the sweep. The store writes that only
 /// the Renovate scan may make take it too: retiring what Renovate no
 /// longer proposes, handing queued updates over, and requesting the AI
-/// scan (`Store::request_dep_update_fallback`). Neither `Clone` nor
+/// scan (`AdminStore::request_dep_update_fallback`). Neither `Clone` nor
 /// `Copy`: the admin lane holds it, sharing it among its duties. It
 /// creates no job and claims no fix; those take the [`JobAuthority`].
 pub struct AdminAuthority {
@@ -613,7 +613,7 @@ impl Drop for RunningJob {
 }
 
 /// A job whose outcome is recorded ([`RunningJob::complete`]): proof for
-/// the one write that revises it afterwards (`Store::fail_job`), which so
+/// the one write that revises it afterwards (`JobStore::fail_job`), which so
 /// can never end a job that is still `running`.
 #[derive(Debug, Clone, Copy)]
 pub struct RecordedJob {

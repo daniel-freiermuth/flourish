@@ -609,7 +609,8 @@ async fn a_dependency_scan_leaves_the_job_lanes_sync_streak_alone() {
     use hunter::domain::RepoWorkKind;
     let rig = Rig::new("depupd-sync-streak").await;
     for _ in 0..2 {
-        rig.store
+        support::scope(&rig.store)
+            .store()
             .record_repo_failure(rig.repo.id, RepoWorkKind::Sync, "fetch failed")
             .await
             .unwrap();
@@ -843,6 +844,48 @@ async fn a_failed_refresh_fails_the_cycle() {
         rig.status_of("widget:dep:other-1.x@1.0.0").await,
         "new",
         "nothing is retired on an answer that was not recorded"
+    );
+}
+
+/// Renovate scans that keep failing the same way hold the repo's
+/// `dep_update` work for the operator, as the job lane's failures hold
+/// theirs: the third identical `invalid entries` scan is held, not
+/// retried every pass forever.
+#[tokio::test]
+async fn renovate_scans_that_keep_failing_hold_the_repos_dep_update() {
+    let rig = Rig::new("depupd-held-renovate").await;
+    rig.scan(&left_pad("1.2.0", Some("1.3.0"))).await.unwrap();
+    sqlx::query("UPDATE repos SET last_dep_update_at = NULL")
+        .execute(&rig.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER no_refresh BEFORE UPDATE OF latest_version ON findings \
+         BEGIN SELECT RAISE(ABORT, 'refused'); END",
+    )
+    .execute(&rig.pool)
+    .await
+    .unwrap();
+
+    let mut outcomes = Vec::new();
+    for _ in 0..3 {
+        let s = rig.scan(&left_pad("1.2.0", Some("1.4.0"))).await.unwrap();
+        outcomes.push(s.outcome);
+    }
+
+    assert_eq!(
+        outcomes,
+        [
+            Some("retry".into()),
+            Some("retry".into()),
+            Some("held".into())
+        ]
+    );
+    let held = rig.store.held_work().await.unwrap();
+    assert!(held.repo(rig.repo.id, hunter::domain::RepoJobKind::DepUpdate));
+    assert!(
+        !held.repo(rig.repo.id, hunter::domain::RepoJobKind::Hunt),
+        "only the dep_update work is held"
     );
 }
 

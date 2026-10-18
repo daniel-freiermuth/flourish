@@ -34,7 +34,7 @@ use crate::domain::{
     BudgetOverride, ClosureClass, FindingJobKind, FindingStatus, FindingType, ForgeName,
     ReleaseAction, RepoWorkKind, Severity,
 };
-use crate::store::{FindingFilter, HoldRelease, RepoUpdate, Store, StoreWriteError};
+use crate::store::{AdminStore, FindingFilter, HoldRelease, RepoUpdate, Store, StoreWriteError};
 use crate::transition::{Moved, OperatorVerdict, Transition, VerdictRefused};
 use crate::types::{
     ActivityStatus, BudgetState, Event, Finding, FindingDetail, FindingOut, HoldOut, JobListEntry,
@@ -1676,25 +1676,25 @@ async fn add_repo(
 /// Only [`reap_deleted_repos`], the admin lane's, removes a clone: a
 /// handler wakes that duty instead.
 async fn reap_repo(
-    store: &Store,
+    store: &AdminStore,
     repos_dir: &Path,
     rid: i64,
     notes_lock: &tokio::sync::Mutex<()>,
 ) -> std::io::Result<()> {
     store
-        .lane(async |lane| reap_in(lane, repos_dir, rid, notes_lock).await)
+        .lane(async |lane| reap_in(store, lane, repos_dir, rid, notes_lock).await)
         .await
         .map_err(std::io::Error::other)?
 }
 
 /// [`reap_repo`] in its lane.
 async fn reap_in(
+    store: &AdminStore,
     lane: &mut Lane,
     repos_dir: &Path,
     rid: i64,
     notes_lock: &tokio::sync::Mutex<()>,
 ) -> std::io::Result<()> {
-    let store = lane.store().clone();
     // Taken here rather than by the callers, because there are two of
     // them and only one used to hold it: the delete handler did, but the
     // reaper that runs at startup and as an admin-lane duty did not.

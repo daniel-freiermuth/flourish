@@ -199,7 +199,11 @@ async fn delete_repo_refusal_message_is_byte_exact_and_clean_delete_works() {
         vec![2],
         "an invisible repo is still holding its id until its files are gone"
     );
-    store.forget_deleted_repo(2).await.unwrap();
+    support::admin(&store)
+        .store()
+        .forget_deleted_repo(2)
+        .await
+        .unwrap();
     assert_eq!(store.deleted_repo_ids().await.unwrap(), [] as [i64; 0]);
 }
 
@@ -266,7 +270,11 @@ async fn create_job_refuses_a_soft_deleted_repo_and_leaves_it_reapable() {
     // And the deletion can still finish: no job row is holding repo 2's
     // id, so the reaper's DELETE goes through instead of hitting the FK.
     assert_eq!(store.deleted_repo_ids().await.unwrap(), vec![2]);
-    store.forget_deleted_repo(2).await.unwrap();
+    support::admin(&store)
+        .store()
+        .forget_deleted_repo(2)
+        .await
+        .unwrap();
     assert_eq!(store.deleted_repo_ids().await.unwrap(), [] as [i64; 0]);
     let still_there = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM repos WHERE id = 2")
         .fetch_one(&pool)
@@ -1516,7 +1524,8 @@ async fn an_engage_answer_landing_mid_sync_survives_the_sync() {
     let in_flight = read_at(&pass, 2000, with_feedback).await;
     let seen = store.get_pr_state(1).await.unwrap().unwrap();
     let pr = pr_7();
-    let answered = store
+    let answered = support::scope(&store)
+        .store()
         .mark_pr_engaged(
             1,
             &EngageAnswer::without_push(&pr, Some(SeenActivity::fixture(100)), &seen),
@@ -1552,7 +1561,7 @@ async fn an_engage_answer_landing_mid_sync_survives_the_sync() {
 async fn an_open_observation_landing_after_a_withdrawal_leaves_the_closure() {
     use hunter::attention::OpenPrRecorded;
     use hunter::forge::Mergeable;
-    use hunter::transition::{PrEnded, PrEnding};
+    use hunter::transition::PrEnded;
     let (_dir, path, pool) = fresh_db().await;
     seed_repo_and_findings(&pool).await;
     open_pr_for_finding_1(&pool).await;
@@ -1567,11 +1576,12 @@ async fn an_open_observation_landing_after_a_withdrawal_leaves_the_closure() {
     let pass = pr_sync(&store);
     let in_flight = read_at(&pass, 2000, observed(Mergeable::Mergeable)).await;
 
-    let withdrawn = PrEnding::Closed {
-        reason: "withdrawn by engage worker",
-    };
     assert_eq!(
-        store.end_pr(1, &pr_7(), withdrawn).await.unwrap(),
+        support::scope(&store)
+            .store()
+            .end_withdrawn_pr(1, &pr_7(), "withdrawn by engage worker")
+            .await
+            .unwrap(),
         PrEnded::Applied
     );
 
@@ -1604,7 +1614,7 @@ async fn an_open_observation_landing_after_a_withdrawal_leaves_the_closure() {
 async fn an_observation_of_an_ended_pr_never_lands_on_the_next_one() {
     use hunter::attention::{ObservedOpenPr, OpenPrRecorded};
     use hunter::forge::Mergeable;
-    use hunter::transition::{PrEnded, PrEnding};
+    use hunter::transition::PrEnded;
     const NEXT_PR: &str = "https://github.com/o/r/pull/8";
     let (_dir, path, pool) = fresh_db().await;
     seed_repo_and_findings(&pool).await;
@@ -1613,11 +1623,12 @@ async fn an_observation_of_an_ended_pr_never_lands_on_the_next_one() {
     // Sync has begun reading PR 7; the engage withdraws it first.
     let pass = pr_sync(&store);
     let in_flight = read_at(&pass, 1000, observed(Mergeable::Conflicting)).await;
-    let withdrawn = PrEnding::Closed {
-        reason: "withdrawn by engage worker",
-    };
     assert_eq!(
-        store.end_pr(1, &pr_7(), withdrawn).await.unwrap(),
+        support::scope(&store)
+            .store()
+            .end_withdrawn_pr(1, &pr_7(), "withdrawn by engage worker")
+            .await
+            .unwrap(),
         PrEnded::Applied
     );
     // Its harvest, a fresh fix and that fix's PR, abridged.
@@ -1690,6 +1701,7 @@ async fn an_end_of_an_ended_pr_never_lands_on_the_next_one() {
         OpenPrRecorded::Recorded(_)
     ));
     drop(pass);
+    let pass = pr_sync(&store);
 
     for ending in [
         PrEnding::Merged,
@@ -1698,7 +1710,7 @@ async fn an_end_of_an_ended_pr_never_lands_on_the_next_one() {
         },
     ] {
         assert_eq!(
-            store.end_pr(1, &pr_7(), ending).await.unwrap(),
+            pass.end_pr(1, &pr_7(), ending).await.unwrap(),
             PrEnded::OtherPr,
             "{ending:?}"
         );
@@ -1713,8 +1725,7 @@ async fn an_end_of_an_ended_pr_never_lands_on_the_next_one() {
 
     // PR 8's own end lands.
     assert_eq!(
-        store
-            .end_pr(1, &pr_ref(NEXT_PR), PrEnding::Merged)
+        pass.end_pr(1, &pr_ref(NEXT_PR), PrEnding::Merged)
             .await
             .unwrap(),
         PrEnded::Applied
@@ -1762,11 +1773,15 @@ async fn an_answer_to_an_ended_pr_never_lands_on_the_next_one() {
         reason: "closed on the forge",
     };
     assert_eq!(
-        store.end_pr(1, &pr_7(), closed).await.unwrap(),
+        pr_sync(&store).end_pr(1, &pr_7(), closed).await.unwrap(),
         PrEnded::Applied
     );
     assert_eq!(
-        store.mark_pr_engaged(1, &answer).await.unwrap(),
+        support::scope(&store)
+            .store()
+            .mark_pr_engaged(1, &answer)
+            .await
+            .unwrap(),
         AnswerRecorded::NotPrOpen {
             now: Some(FindingStatus::Closed)
         }
@@ -1800,7 +1815,11 @@ async fn an_answer_to_an_ended_pr_never_lands_on_the_next_one() {
     let before = store.get_pr_state(1).await.unwrap().unwrap();
 
     assert_eq!(
-        store.mark_pr_engaged(1, &answer).await.unwrap(),
+        support::scope(&store)
+            .store()
+            .mark_pr_engaged(1, &answer)
+            .await
+            .unwrap(),
         AnswerRecorded::OtherPr
     );
     let ps = store.get_pr_state(1).await.unwrap().unwrap();
@@ -1863,7 +1882,8 @@ async fn a_push_s_answer_waits_for_a_read_begun_after_the_push() {
     .await;
 
     let pr = pr_7();
-    let answered = store
+    let answered = support::scope(&store)
+        .store()
         .mark_pr_engaged(
             1,
             &EngageAnswer::pushed(&pr, Some(SeenActivity::fixture(0))),
@@ -1927,7 +1947,8 @@ async fn an_answer_without_a_push_leaves_an_in_flight_read_counting() {
     .await;
     let started_on = store.get_pr_state(1).await.unwrap().unwrap();
     let pr = pr_7();
-    let answered = store
+    let answered = support::scope(&store)
+        .store()
         .mark_pr_engaged(
             1,
             &EngageAnswer::without_push(&pr, Some(SeenActivity::fixture(0)), &started_on),
@@ -1980,7 +2001,8 @@ async fn record_closed_harvest_keeps_the_finding_pending_when_the_stamp_fails() 
     .await
     .unwrap();
 
-    let err = store
+    let err = support::scope(&store)
+        .store()
         .record_closed_harvest(
             1,
             hunter::domain::ClosureClass::Superseded,
@@ -2017,7 +2039,8 @@ async fn record_closed_harvest_keeps_the_finding_pending_when_the_stamp_fails() 
         .execute(&pool)
         .await
         .unwrap();
-    let classified = store
+    let classified = support::scope(&store)
+        .store()
         .record_closed_harvest(
             1,
             hunter::domain::ClosureClass::Superseded,
@@ -2056,7 +2079,8 @@ async fn record_closed_harvest_keeps_a_verdict_a_human_set_meanwhile() {
         .await
         .unwrap();
 
-    let classified = store
+    let classified = support::scope(&store)
+        .store()
         .record_closed_harvest(
             1,
             hunter::domain::ClosureClass::Superseded,
@@ -2168,7 +2192,11 @@ impl PrUpsert {
             }
             Self::MarkClosed => store.mark_pr_closed(1, pr_number, 6000).await.unwrap(),
             Self::MarkMerged => store.mark_pr_merged(1, pr_number, 6000).await.unwrap(),
-            Self::FillNumber => store.fill_pr_number(1, pr_number).await.unwrap(),
+            Self::FillNumber => support::scope(store)
+                .store()
+                .fill_pr_number(1, pr_number)
+                .await
+                .unwrap(),
         }
     }
 }
@@ -2240,7 +2268,11 @@ async fn the_self_heal_never_replaces_a_recorded_pr_number() {
     seed_harvested_pr(&pool, Some(5)).await;
     let store = rw_store(&path).await;
 
-    store.fill_pr_number(1, 6).await.unwrap();
+    support::scope(&store)
+        .store()
+        .fill_pr_number(1, 6)
+        .await
+        .unwrap();
 
     let ps = store.get_pr_state(1).await.unwrap().unwrap();
     assert_eq!(ps.pr_number, Some(5));
@@ -2815,7 +2847,11 @@ async fn harvesting_a_pr_drops_its_harvest_checkpoint() {
     .await
     .unwrap();
 
-    store.mark_pr_harvested(1, 5000).await.unwrap();
+    support::scope(&store)
+        .store()
+        .mark_pr_harvested(1, 5000)
+        .await
+        .unwrap();
 
     assert_eq!(
         store
@@ -3673,31 +3709,31 @@ async fn repo_holds_are_held_once_released_and_go_with_their_repo() {
     seed_repo(&pool).await;
     insert_suspended_job(&pool, 10, (1, "hunt"), Some("/s/10/session.jsonl")).await;
     let store = rw_store(&path).await;
+    let jobs = support::scope(&store);
+    let jobs = jobs.store();
 
     assert!(
-        store
-            .hold_repo_work(1, RepoWorkKind::Hunt, HoldReason::GaveUp, "chain", Some(10))
+        jobs.hold_repo_work(1, RepoWorkKind::Hunt, HoldReason::GaveUp, "chain", Some(10))
             .await
             .unwrap()
     );
     assert!(
-        !store
+        !jobs
             .hold_repo_work(1, RepoWorkKind::Hunt, HoldReason::Stuck, "again", None)
             .await
             .unwrap(),
         "at most one active hold per repo and kind"
     );
     assert!(
-        store
-            .hold_repo_work(
-                1,
-                RepoWorkKind::Sync,
-                HoldReason::Stuck,
-                "fetch failed",
-                None
-            )
-            .await
-            .unwrap()
+        jobs.hold_repo_work(
+            1,
+            RepoWorkKind::Sync,
+            HoldReason::Stuck,
+            "fetch failed",
+            None
+        )
+        .await
+        .unwrap()
     );
     let held = store.held_work().await.unwrap();
     assert!(held.repo(1, RepoJobKind::Hunt));

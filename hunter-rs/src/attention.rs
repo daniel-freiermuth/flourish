@@ -18,13 +18,14 @@
 //!   PR are ever out at once. They are ordered against an engage's pushes:
 //!   a read takes the row's `push_count` when it begins, and the
 //!   observation keeps it ([`Inputs::predates_push`]). A PR's end is
-//!   recorded with its finding's move in `Store::end_pr`, by sync
-//!   (merged, closed on the forge) or by an engage withdrawing the PR,
+//!   recorded with its finding's move, by sync (merged, closed on the
+//!   forge, `PrSyncPass::end_pr`) or by an engage withdrawing the PR
+//!   (`JobStore::end_withdrawn_pr`),
 //!   and, like an observation, only while the finding is still `pr_open`
 //!   with that PR (`PrEnded::OtherPr` otherwise).
-//!   One more writer: `Store::fill_pr_number`, which fills in a
+//!   One more writer: `JobStore::fill_pr_number`, which fills in a
 //!   `pr_number` that is NULL and never overwrites one.
-//! * **Answered**, written by engage (`Store::mark_pr_engaged`, and the
+//! * **Answered**, written by engage (`JobStore::mark_pr_engaged`, and the
 //!   operator's dismiss of a held engage, which counts as a no-op engage):
 //!   `last_engaged_activity_at`, `addressed_fingerprint`,
 //!   `addressed_head_sha`, `push_count`. An engage's answer names the PR

@@ -1097,7 +1097,8 @@ async fn upgrading_keeps_every_hold_and_adds_the_repo_subject() {
 
     // And a repo's work can now be held, once per kind.
     assert!(
-        store
+        support::scope(&store)
+            .store()
             .hold_repo_work(
                 1,
                 RepoWorkKind::Sync,
@@ -1109,7 +1110,8 @@ async fn upgrading_keeps_every_hold_and_adds_the_repo_subject() {
             .unwrap()
     );
     assert!(
-        !store
+        !support::scope(&store)
+            .store()
             .hold_repo_work(1, RepoWorkKind::Sync, HoldReason::Stuck, "again", None)
             .await
             .unwrap()

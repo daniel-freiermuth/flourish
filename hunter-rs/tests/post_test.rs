@@ -2759,13 +2759,15 @@ async fn held_repo_state() -> TestState {
     let store = &state.store;
     for kind in [RepoWorkKind::Sync, RepoWorkKind::Hunt] {
         assert!(
-            store
+            support::scope(store)
+                .store()
                 .hold_repo_work(1, kind, HoldReason::Stuck, "git fetch origin failed", None)
                 .await
                 .unwrap()
         );
     }
-    store
+    support::scope(store)
+        .store()
         .record_repo_failure(1, RepoWorkKind::TestGap, "runner error")
         .await
         .unwrap();

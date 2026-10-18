@@ -198,7 +198,11 @@ async fn a_closed_unharvested_pr_is_picked_once() {
         other => panic!("expected the closed PR's harvest, got {other:?}"),
     }
 
-    f.store.mark_pr_harvested(f.fid, 2).await.unwrap();
+    support::scope(&f.store)
+        .store()
+        .mark_pr_harvested(f.fid, 2)
+        .await
+        .unwrap();
     let after = pick_next(&support::scope(&f.store), &f.cfg, None)
         .await
         .unwrap();
