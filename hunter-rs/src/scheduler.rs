@@ -19,8 +19,8 @@ use crate::domain::{
     HoldReason, JobKind, JobState, RepoJobKind, RepoWorkKind, Severity,
 };
 use crate::store::{
-    FindingFilter, JobInsertError, JobOutcome, JobPlace, JobStart, JobStore, PrSyncPass,
-    SeenActivity, Store, StoreWriteError,
+    AdminStore, FindingFilter, JobInsertError, JobOutcome, JobPlace, JobStart, JobStore,
+    PrSyncPass, SeenActivity, Store, StoreWriteError,
 };
 use crate::transition::{
     Moved, PR_CLOSED_AWAITING_HARVEST, PrEnded, PrEnding, PrRef, Transition, Unclaimed,
@@ -1847,9 +1847,10 @@ pub async fn fetch_ahead(
     })
 }
 /// Sync `repo`'s clone ([`sync_repo`]) and resolve the tip of its default
-/// branch: everything every kind of the repo needs before it can start.
-/// Success ends the `sync` work item's streak.
-async fn sync_to_tip(
+/// branch, recording nothing about the outcome: what the admin lane's
+/// dependency scan needs, which keeps no streak of its own and must not
+/// end the job lane's.
+async fn fetch_to_tip(
     store: &Store,
     permit: &ClonePermit<'_>,
     repo: &Repo,
@@ -1863,18 +1864,29 @@ async fn sync_to_tip(
         .await
         .ok()
         .flatten();
-    let Some(tip) = tip else {
-        return Ok(Err(SyncFailure {
-            key: BRANCH_NOT_FOUND,
-            detail: format!("origin/{} does not resolve", repo.default_branch),
-            network: false,
-        }));
-    };
-    log_write_failure(
-        store.repo_work_succeeded(repo.id, RepoWorkKind::Sync).await,
-        format_args!("repo {}: ending the sync streak", repo.id),
-    );
-    Ok(Ok(tip))
+    Ok(tip.ok_or_else(|| SyncFailure {
+        key: BRANCH_NOT_FOUND,
+        detail: format!("origin/{} does not resolve", repo.default_branch),
+        network: false,
+    }))
+}
+
+/// [`fetch_to_tip`] for the job lane, before any kind of the repo starts:
+/// success ends the `sync` work item's streak, which only the job lane
+/// keeps (it takes the [`JobStore`]).
+async fn sync_to_tip(
+    store: &JobStore,
+    permit: &ClonePermit<'_>,
+    repo: &Repo,
+) -> sqlx::Result<Result<String, SyncFailure>> {
+    let tip = fetch_to_tip(store, permit, repo).await?;
+    if tip.is_ok() {
+        log_write_failure(
+            store.repo_work_succeeded(repo.id, RepoWorkKind::Sync).await,
+            format_args!("repo {}: ending the sync streak", repo.id),
+        );
+    }
+    Ok(tip)
 }
 
 /// A repo's `kind` work that could not start because the repo could not be
@@ -2397,7 +2409,7 @@ async fn count_unmade_repo_tree(
 }
 
 /// `repo`'s `kind` work succeeded: its streak ends.
-async fn repo_succeeded(store: &Store, repo: &Repo, kind: RepoJobKind) {
+async fn repo_succeeded(store: &JobStore, repo: &Repo, kind: RepoJobKind) {
     log_write_failure(
         store.repo_work_succeeded(repo.id, kind.into()).await,
         format_args!("repo {}: ending the {kind} streak", repo.id),
@@ -3868,6 +3880,10 @@ pub enum DependencyScan {
     /// The clone could not be synced: nothing scanned, nothing counted.
     /// The job lane's own fetches keep the repo's `sync` streak.
     NotSynced(String),
+    /// No longer the admin lane's once its clone's permit was taken: the job
+    /// lane took the repo's `dep_update` meanwhile, an operator held it, or
+    /// the repo was disabled or deleted. Nothing scanned.
+    Taken,
 }
 
 /// What one [`dependency_scans`] pass did.
@@ -3924,6 +3940,7 @@ pub async fn dependency_scans(
                         }
                     }
                     Ok(DependencyScan::Unavailable) => done.fallbacks += 1,
+                    Ok(DependencyScan::Taken) => {}
                     Ok(DependencyScan::NotSynced(why)) => {
                         tracing::info!("dependency scan {}: not synced: {why}", repo.name);
                     }
@@ -3951,27 +3968,74 @@ pub async fn dependency_scans(
 
 /// The repos [`dependency_scans`] scans now, by its rules.
 async fn dependency_scans_due(store: &Store, cfg: &Config) -> sqlx::Result<Vec<Repo>> {
-    let held = store.held_work().await?;
-    let running = store.running_places().await?;
-    let fallbacks = store.dep_update_fallbacks().await?;
-    let interval_ms = (cfg.scan_interval_days * 86_400_000.0) as i64;
-    let now = now_ms();
+    let gate = DepScanGate::load(store, cfg).await?;
     let mut due = Vec::new();
     for repo in store.list_repos().await? {
-        let kind = RepoJobKind::DepUpdate;
-        let skip = repo.enabled == 0
-            || held.repo(repo.id, kind)
-            || running.contains(&JobPlace::of(kind.into(), repo.id, None))
-            || fallbacks.pending(repo.id)
-            || repo
-                .last_dep_update_at
-                .is_some_and(|last| last != 0 && now - last < interval_ms)
-            || !Path::new(&repo.path).exists();
-        if !skip && store.repo_checkpoint_job(repo.id, kind).await?.is_none() {
+        if gate.admits(store, &repo).await? {
             due.push(repo);
         }
     }
     Ok(due)
+}
+
+/// What a Renovate scan of a repo waits on, read once: the repo is
+/// enabled and cloned, its `dep_update` is not held, running, waiting for
+/// its AI scan, or paused at a checkpoint -- the last three are the job
+/// lane's -- and, for a pass to pick it, due by its interval.
+struct DepScanGate {
+    held: crate::store::HeldWork,
+    running: HashSet<JobPlace>,
+    fallbacks: crate::store::DepScanFallbacks,
+    interval_ms: i64,
+    now: i64,
+}
+
+impl DepScanGate {
+    async fn load(store: &Store, cfg: &Config) -> sqlx::Result<Self> {
+        Ok(Self {
+            held: store.held_work().await?,
+            running: store.running_places().await?,
+            fallbacks: store.dep_update_fallbacks().await?,
+            interval_ms: (cfg.scan_interval_days * 86_400_000.0) as i64,
+            now: now_ms(),
+        })
+    }
+
+    /// A pass scans `repo` now: it is the admin lane's ([`Self::open`]) and
+    /// its last run is an interval ago.
+    async fn admits(&self, store: &Store, repo: &Repo) -> sqlx::Result<bool> {
+        let ran_lately = repo
+            .last_dep_update_at
+            .is_some_and(|last| last != 0 && self.now - last < self.interval_ms);
+        Ok(!ran_lately && self.open(store, repo).await?)
+    }
+
+    /// `repo`'s dependency scan is the admin lane's to run: nothing of the
+    /// job lane's or the operator's stands on it.
+    async fn open(&self, store: &Store, repo: &Repo) -> sqlx::Result<bool> {
+        let kind = RepoJobKind::DepUpdate;
+        let closed = repo.enabled == 0
+            || self.held.repo(repo.id, kind)
+            || self
+                .running
+                .contains(&JobPlace::of(kind.into(), repo.id, None))
+            || self.fallbacks.pending(repo.id)
+            || !Path::new(&repo.path).exists();
+        Ok(!closed && store.repo_checkpoint_job(repo.id, kind).await?.is_none())
+    }
+}
+
+/// Whether `repo`'s dependency scan is still the admin lane's to run, read
+/// afresh ([`DepScanGate::open`]): a pass reads every repo's gate once at
+/// its start, then scans one repo after another, up to two minutes each.
+async fn still_open(store: &Store, cfg: &Config, repo_id: i64) -> sqlx::Result<bool> {
+    let Some(repo) = store.get_repo_by_id(repo_id).await? else {
+        return Ok(false);
+    };
+    DepScanGate::load(store, cfg)
+        .await?
+        .open(store, &repo)
+        .await
 }
 
 /// One repo's Renovate scan, as [`dependency_scans`] runs it: sync the
@@ -3988,10 +4052,18 @@ pub async fn scan_dependencies(
 ) -> anyhow::Result<DependencyScan> {
     let store = admin.store();
     let permit = lane.lock_clone(repo.id).await?;
+    // The pass read what is due before any of its scans; the job lane may
+    // have taken this repo's `dep_update` since. Read again now, under the
+    // permit its own fetch also takes. What the scan finds is still only
+    // recorded as the work's run if the job lane has not taken it by then
+    // ([`renovate_outcome`]).
+    if !still_open(store, cfg, repo.id).await? {
+        return Ok(DependencyScan::Taken);
+    }
     if !permit.clone_dir().exists() {
         return Ok(DependencyScan::NotSynced("not cloned".to_owned()));
     }
-    if let Err(failure) = sync_to_tip(store, &permit, repo).await? {
+    if let Err(failure) = fetch_to_tip(store, &permit, repo).await? {
         return Ok(DependencyScan::NotSynced(failure.detail));
     }
     // The scan tree is made at the fetched tip in the fetch's hold, which
@@ -4100,10 +4172,12 @@ fn deleted_during_scan(repo: &Repo) -> CycleSummary {
 }
 
 /// What a Renovate scan amounts to for the repo's `dep_update` work: one
-/// that settled is its outcome, and only then does its timestamp move. One
+/// that settled is its outcome, and only then does its timestamp move --
+/// unless the job lane's AI scan has taken the work meanwhile, whose run
+/// and checkpoint are its own ([`AdminStore::renovate_succeeded`]). One
 /// with invalid entries filed its valid ones and failed; it has no job, so
 /// nothing to continue from.
-async fn renovate_outcome(store: &Store, repo: &Repo, counts: IngestResult) -> CycleSummary {
+async fn renovate_outcome(store: &AdminStore, repo: &Repo, counts: IngestResult) -> CycleSummary {
     let mut summary = CycleSummary {
         kind: Some(RepoJobKind::DepUpdate.into()),
         repo: Some(repo.name.clone()),
@@ -4111,11 +4185,17 @@ async fn renovate_outcome(store: &Store, repo: &Repo, counts: IngestResult) -> C
         ..Default::default()
     };
     if counts.invalid == 0 {
-        log_write_failure(
-            store.set_last_dep_update(repo.id).await,
-            format_args!("repo {}: recording last dep_update run", repo.id),
-        );
-        repo_succeeded(store, repo, RepoJobKind::DepUpdate).await;
+        match store.renovate_succeeded(repo.id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                let note = "its dep_update work is the job lane's now; not recorded as its run";
+                let _ = store
+                    .log_event("dep_update", &format!("{}: {note}", repo.name), None, None)
+                    .await;
+                summary.skipped = Some(note.to_owned());
+            }
+            Err(e) => tracing::warn!("repo {}: recording the renovate run: {e}", repo.id),
+        }
     } else {
         let detail = format!("renovate scan: {} invalid entries", counts.invalid);
         let held = record_repo_failure(
