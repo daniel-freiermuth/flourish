@@ -353,7 +353,12 @@ async fn a_repo_renovate_cannot_read_is_handed_to_the_job_lanes_ai_scan() {
     // A run recorded after the request answers it, as the AI scan's
     // success records its own (`set_last_kind_at`); this scripted worker
     // files no output, so the test records it.
-    rig.store.set_last_dep_update(rig.repo.id).await.unwrap();
+    sqlx::query("UPDATE repos SET last_dep_update_at = ?1 WHERE id = ?2")
+        .bind(hunter::util::now_ms())
+        .bind(rig.repo.id)
+        .execute(&rig.pool)
+        .await
+        .unwrap();
     assert!(
         picked().await.unwrap().is_none(),
         "a dep_update run after the request answered it"
@@ -475,6 +480,150 @@ async fn a_repo_deleted_during_its_renovate_scan_files_nothing_and_is_reaped() {
         [] as [i64; 0],
         "the reaper finished the delete"
     );
+}
+
+/// A paused AI `dep_update` scan of the rig's repo: a suspended job with a
+/// transcript, which the repo's `dep_update` work item points at.
+async fn pause_ai_scan(rig: &Rig) -> i64 {
+    let session = rig.cfg.work_root.join("ai-scan.jsonl");
+    std::fs::write(&session, "").unwrap();
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO jobs (kind, repo_id, state, session_file, killed_reason, started_at, \
+                           finished_at) \
+         VALUES ('dep_update', ?1, 'suspended', ?2, 'cap', 1000, 2000) RETURNING id",
+    )
+    .bind(rig.repo.id)
+    .bind(session.to_string_lossy().into_owned())
+    .fetch_one(&rig.pool)
+    .await
+    .unwrap();
+    support::point_repo_checkpoint(&rig.pool, rig.repo.id, "dep_update", Some(id)).await;
+    id
+}
+
+/// The repo's `dep_update` checkpoint and `last_dep_update_at`.
+async fn dep_update_state(rig: &Rig) -> (Option<i64>, Option<i64>) {
+    sqlx::query_as(
+        "SELECT (SELECT checkpoint_job_id FROM repo_work \
+                 WHERE repo_id = r.id AND kind = 'dep_update'), \
+                r.last_dep_update_at \
+         FROM repos r WHERE r.id = ?1",
+    )
+    .bind(rig.repo.id)
+    .fetch_one(&rig.pool)
+    .await
+    .unwrap()
+}
+
+/// A pass reads what is due once, then scans one repo after another. A
+/// repo whose `dep_update` the job lane paused since is no longer the
+/// admin lane's: its scan stops before Renovate runs.
+#[tokio::test]
+async fn a_scan_of_a_repo_the_job_lane_took_since_the_pass_began_runs_nothing() {
+    let rig = Rig::new("depupd-taken").await;
+    rig.bins.ok("renovate", UPDATE);
+    let checkpoint = pause_ai_scan(&rig).await;
+
+    let scan = hunter::scheduler::scan_dependencies(
+        rig.store.test_lane(),
+        &support::admin(&rig.store),
+        &rig.cfg,
+        &rig.repo,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(scan, DependencyScan::Taken), "{scan:?}");
+    assert!(
+        rig.bins.calls_to("renovate").is_empty(),
+        "{:?}",
+        rig.bins.calls()
+    );
+    assert_eq!(dep_update_state(&rig).await, (Some(checkpoint), None));
+}
+
+/// The job lane can pause an AI scan of the repo while Renovate runs. The
+/// Renovate result is still filed, but it is not the work's run: the
+/// paused chain keeps its checkpoint for the resume tier, and the run is
+/// not recorded. Recorded, it would mark the work done and throw the
+/// paused chain away.
+#[tokio::test]
+async fn a_renovate_result_leaves_an_ai_scan_paused_meanwhile_alone() {
+    let rig = Rig::new("depupd-paused-meanwhile").await;
+    let (started, release) = rig.hold_renovate(UPDATE);
+    let admin = support::admin(&rig.store);
+    let scan =
+        hunter::scheduler::scan_dependencies(rig.store.test_lane(), &admin, &rig.cfg, &rig.repo);
+    let pause = async {
+        wait_for(&started).await;
+        let id = pause_ai_scan(&rig).await;
+        std::fs::write(&release, "").unwrap();
+        id
+    };
+    let (scan, checkpoint) = tokio::join!(scan, pause);
+
+    let DependencyScan::Scanned(summary) = scan.unwrap() else {
+        panic!("renovate answered, so the scan came to a summary");
+    };
+    assert!(summary.skipped.is_some(), "{summary:?}");
+    assert_eq!(rig.findings().await.len(), 1, "Renovate's update was filed");
+    assert_eq!(dep_update_state(&rig).await, (Some(checkpoint), None));
+}
+
+/// The same while an AI scan of the repo runs: its run is its own to
+/// record, not a Renovate result's that landed beside it.
+#[tokio::test]
+async fn a_renovate_result_is_not_recorded_while_an_ai_scan_runs() {
+    let rig = Rig::new("depupd-running-meanwhile").await;
+    let (started, release) = rig.hold_renovate(UPDATE);
+    let admin = support::admin(&rig.store);
+    let scan =
+        hunter::scheduler::scan_dependencies(rig.store.test_lane(), &admin, &rig.cfg, &rig.repo);
+    let start = async {
+        wait_for(&started).await;
+        sqlx::query(
+            "INSERT INTO jobs (kind, repo_id, state, started_at) \
+             VALUES ('dep_update', ?1, 'running', 1000)",
+        )
+        .bind(rig.repo.id)
+        .execute(&rig.pool)
+        .await
+        .unwrap();
+        std::fs::write(&release, "").unwrap();
+    };
+    let (scan, ()) = tokio::join!(scan, start);
+
+    let DependencyScan::Scanned(summary) = scan.unwrap() else {
+        panic!("renovate answered, so the scan came to a summary");
+    };
+    assert!(summary.skipped.is_some(), "{summary:?}");
+    assert_eq!(dep_update_state(&rig).await, (None, None));
+}
+
+/// The `sync` streak is the job lane's: it counts the job lane's failed
+/// fetches, and only the job lane's own fetch ends it. A dependency scan
+/// fetching the same clone on the admin lane leaves it as it was, or a
+/// fetch that keeps failing for the job lane would never reach its hold.
+#[tokio::test]
+async fn a_dependency_scan_leaves_the_job_lanes_sync_streak_alone() {
+    use hunter::domain::RepoWorkKind;
+    let rig = Rig::new("depupd-sync-streak").await;
+    for _ in 0..2 {
+        rig.store
+            .record_repo_failure(rig.repo.id, RepoWorkKind::Sync, "fetch failed")
+            .await
+            .unwrap();
+    }
+
+    rig.scan(UPDATE).await.unwrap();
+
+    let streak = rig
+        .store
+        .repo_work_streak(rig.repo.id, RepoWorkKind::Sync)
+        .await
+        .unwrap();
+    assert_eq!(streak.streak, 2);
+    assert_eq!(streak.last_failure.as_deref(), Some("fetch failed"));
 }
 
 /// One Renovate update of `left-pad`, as the scan reports it.

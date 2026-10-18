@@ -1012,17 +1012,50 @@ impl Store {
 
     // ── repo timestamp helpers (scheduler) ────────────────────────────
 
-    /// Set `last_dep_update_at` to now.
-    pub async fn set_last_dep_update(&self, repo_id: i64) -> sqlx::Result<()> {
+    /// A Renovate scan of `repo_id` settled: record the run
+    /// (`last_dep_update_at`) and end the `dep_update` streak, in one
+    /// transaction and only while the job lane does not own that work --
+    /// no `dep_update` job of the repo is running and none has left a
+    /// checkpoint. `false` when it does, and nothing is written: the AI
+    /// scan's run and its paused chain are its own to record and to end,
+    /// and a Renovate result landing beside them must not mark the work
+    /// done or clear the checkpoint. Only [`AdminStore`] exposes this.
+    async fn renovate_succeeded(&self, repo_id: i64) -> sqlx::Result<bool> {
         let now = now_ms();
-        sqlx::query!(
-            "UPDATE repos SET last_dep_update_at = ?1 WHERE id = ?2",
+        let kind = RepoWorkKind::DepUpdate;
+        let job_kind = JobKind::Repo(RepoJobKind::DepUpdate);
+        let running = JobState::Running;
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
+        let recorded = sqlx::query!(
+            "UPDATE repos SET last_dep_update_at = ?1 \
+             WHERE id = ?2 AND deleted_at IS NULL \
+               AND NOT EXISTS (SELECT 1 FROM jobs \
+                               WHERE repo_id = ?2 AND kind = ?3 AND state = ?4) \
+               AND NOT EXISTS (SELECT 1 FROM repo_work \
+                               WHERE repo_id = ?2 AND kind = ?5 \
+                                 AND checkpoint_job_id IS NOT NULL)",
             now,
-            repo_id
+            repo_id,
+            job_kind,
+            running,
+            kind
         )
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+        if recorded {
+            sqlx::query!(
+                "UPDATE repo_work SET streak = 0, last_failure = NULL \
+                 WHERE repo_id = ?1 AND kind = ?2",
+                repo_id,
+                kind
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(recorded)
     }
 
     /// Set `last_standards_at` to now.
@@ -5108,8 +5141,10 @@ impl Store {
     }
 
     /// `repo_id`'s `kind` work succeeded (§6.3): its streak ends and its
-    /// checkpoint is cleared.
-    pub async fn repo_work_succeeded(&self, repo_id: i64, kind: RepoWorkKind) -> sqlx::Result<()> {
+    /// checkpoint is cleared. The job lane's alone, through [`JobStore`]:
+    /// the admin lane's fetches and scans never end a streak the job lane
+    /// counts, nor clear a checkpoint its resume tier owns.
+    async fn repo_work_succeeded(&self, repo_id: i64, kind: RepoWorkKind) -> sqlx::Result<()> {
         sqlx::query!(
             "UPDATE repo_work SET streak = 0, last_failure = NULL, checkpoint_job_id = NULL \
              WHERE repo_id = ?1 AND kind = ?2",
@@ -5586,6 +5621,12 @@ impl JobStore {
             .hold_work(finding_id, kind, reason, detail, job)
             .await
     }
+
+    /// `repo_id`'s `kind` work succeeded (§6.3): its streak ends and its
+    /// checkpoint is cleared.
+    pub async fn repo_work_succeeded(&self, repo_id: i64, kind: RepoWorkKind) -> sqlx::Result<()> {
+        self.0.repo_work_succeeded(repo_id, kind).await
+    }
 }
 
 impl std::ops::Deref for JobStore {
@@ -5638,6 +5679,13 @@ impl AdminStore {
     /// no answer (migration 032).
     pub async fn request_dep_update_fallback(&self, repo_id: i64) -> sqlx::Result<()> {
         self.0.request_dep_update_fallback(repo_id).await
+    }
+
+    /// Record a settled Renovate scan of `repo_id` as its `dep_update`
+    /// run, unless the job lane's AI scan owns that work now (a running
+    /// job or a checkpoint): then `false`, and nothing is written.
+    pub async fn renovate_succeeded(&self, repo_id: i64) -> sqlx::Result<bool> {
+        self.0.renovate_succeeded(repo_id).await
     }
 }
 
