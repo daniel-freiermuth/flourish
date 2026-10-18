@@ -834,6 +834,7 @@ async fn fetch_ahead_brings_every_enabled_clone_up_to_its_origin() {
         hunter::scheduler::FetchAhead {
             fetched: 1,
             fresh: 0,
+            held: 0,
             failed: 0
         }
     );
@@ -844,7 +845,7 @@ async fn fetch_ahead_brings_every_enabled_clone_up_to_its_origin() {
     );
 }
 
-/// Fetch-ahead leaves a clone fetched in full less than its `min_age` ago
+/// Fetch-ahead leaves a clone fetched less than its `min_age` ago
 /// alone, and fetches it again once that has passed: a fetch holds the
 /// clone, which a job starting on the repo waits for, so fetching every
 /// clone on every run would cost the job lane for nothing.
@@ -883,4 +884,227 @@ async fn fetch_ahead_leaves_a_recently_fetched_clone_alone() {
     let stale = fetch(Duration::ZERO).await;
     assert_eq!((stale.fetched, stale.fresh), (1, 0), "{stale:?}");
     assert_eq!(support::git(clone, &["rev-parse", "origin/main"]), upstream);
+}
+
+/// A clone whose fetch failed is left alone for `min_age` too: a remote
+/// that is down would otherwise hold the clone's permit through another
+/// fetch timeout on every run, and a job starting on that repo would wait
+/// for each one.
+#[tokio::test]
+async fn fetch_ahead_backs_off_a_clone_whose_fetch_failed() {
+    let (dir, store, _cfg, _fid) = fixture("lanes-fetch-failed").await;
+    let alpha = store.get_repo_by_id(1).await.unwrap().unwrap();
+    let origin = std::path::PathBuf::from(&alpha.url);
+    let moved = dir.path().join("origin-away");
+    let (_keep, running_on) = tokio::sync::watch::channel(false);
+    let admin = support::admin(&store);
+    let fetch = |min_age| hunter::scheduler::fetch_ahead(&admin, min_age, &running_on);
+    let hour = Duration::from_hours(1);
+
+    std::fs::rename(&origin, &moved).unwrap();
+    let down = fetch(hour).await;
+    assert_eq!((down.fetched, down.failed), (0, 1), "{down:?}");
+
+    std::fs::rename(&moved, &origin).unwrap();
+    let next = fetch(hour).await;
+    assert_eq!(
+        (next.fetched, next.fresh, next.failed),
+        (0, 1, 0),
+        "a failed clone was fetched again within min_age: {next:?}"
+    );
+    assert_eq!(fetch(Duration::ZERO).await.fetched, 1, "retried once due");
+}
+
+/// A repo whose `sync` work is held waits for the operator: fetch-ahead
+/// leaves its clone alone and takes no permit for it.
+#[tokio::test]
+async fn fetch_ahead_skips_a_repo_whose_sync_is_held() {
+    let (_dir, store, _cfg, _fid) = fixture("lanes-fetch-held").await;
+    support::scope(&store)
+        .store()
+        .hold_repo_work(
+            1,
+            hunter::domain::RepoWorkKind::Sync,
+            hunter::domain::HoldReason::Stuck,
+            "fetch failed",
+            None,
+        )
+        .await
+        .unwrap();
+    let (_keep, running_on) = tokio::sync::watch::channel(false);
+    let admin = support::admin(&store);
+    let done = hunter::scheduler::fetch_ahead(&admin, Duration::ZERO, &running_on).await;
+    assert_eq!((done.fetched, done.held), (0, 1), "{done:?}");
+}
+
+/// Push a commit to `url`, a local origin, from a clone of it under
+/// `dir`: the sha a fetch would now bring.
+fn advance_origin(dir: &TempDir, url: &str) -> String {
+    let pusher = dir.path().join("pusher");
+    if !pusher.exists() {
+        support::git(dir.path(), &["clone", "-q", url, &pusher.to_string_lossy()]);
+    }
+    support::git(
+        &pusher,
+        &["commit", "--allow-empty", "-qm", "upstream moved"],
+    );
+    support::git(&pusher, &["push", "-q", "origin", "HEAD:main"]);
+    support::git(&pusher, &["rev-parse", "HEAD"])
+}
+
+/// A job the job lane starts right after an admin duty fetched its clone
+/// takes that fetch as its own: it does not make the same round trip
+/// again, holding the clone, after having waited for the first one. Here
+/// `alpha`'s `test_gap` runs after fetch-ahead, and its origin has moved
+/// in between.
+#[tokio::test]
+async fn a_job_right_after_an_admin_fetch_does_not_fetch_again() {
+    let (dir, store, cfg, _fid) = fixture("lanes-fetch-reuse").await;
+    let alpha = store.get_repo_by_id(1).await.unwrap().unwrap();
+    let clone = std::path::Path::new(&alpha.path);
+    let (_keep, running_on) = tokio::sync::watch::channel(false);
+    let ahead =
+        hunter::scheduler::fetch_ahead(&support::admin(&store), Duration::ZERO, &running_on).await;
+    let fetched = support::git(clone, &["rev-parse", "origin/main"]);
+    let upstream = advance_origin(&dir, &alpha.url);
+
+    let backend = ScriptedBackend::new(|_| support::done());
+    let summary =
+        hunter::scheduler::run_cycle(&mut support::jobs(&store), &cfg, &backend, None).await;
+
+    assert_eq!(ahead.fetched, 1, "{ahead:?}");
+    assert!(summary.job_id.is_some(), "fixture: no job ran: {summary:?}");
+    assert_ne!(fetched, upstream);
+    assert_eq!(
+        support::git(clone, &["rev-parse", "origin/main"]),
+        fetched,
+        "the job fetched again"
+    );
+}
+
+/// An admin fetch that failed stands in for nothing on the job lane: the
+/// job fetches itself, and so keeps the repo's `sync` streak honest.
+#[tokio::test]
+async fn a_job_after_a_failed_admin_fetch_fetches_itself() {
+    let (dir, store, cfg, _fid) = fixture("lanes-fetch-reuse-failed").await;
+    let alpha = store.get_repo_by_id(1).await.unwrap().unwrap();
+    let clone = std::path::Path::new(&alpha.path);
+    let origin = std::path::PathBuf::from(&alpha.url);
+    let away = dir.path().join("origin-away");
+    let (_keep, running_on) = tokio::sync::watch::channel(false);
+    std::fs::rename(&origin, &away).unwrap();
+    let ahead =
+        hunter::scheduler::fetch_ahead(&support::admin(&store), Duration::ZERO, &running_on).await;
+    std::fs::rename(&away, &origin).unwrap();
+    let upstream = advance_origin(&dir, &alpha.url);
+
+    let backend = ScriptedBackend::new(|_| support::done());
+    let summary =
+        hunter::scheduler::run_cycle(&mut support::jobs(&store), &cfg, &backend, None).await;
+
+    assert_eq!(ahead.failed, 1, "{ahead:?}");
+    assert!(summary.job_id.is_some(), "fixture: no job ran: {summary:?}");
+    assert_eq!(support::git(clone, &["rev-parse", "origin/main"]), upstream);
+}
+
+/// The pack files in `clone`'s object store.
+fn packs(clone: &std::path::Path) -> usize {
+    std::fs::read_dir(clone.join(".git/objects/pack")).map_or(0, |dir| {
+        dir.flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "pack"))
+            .count()
+    })
+}
+
+/// An admin fetch runs none of git's housekeeping: a repack of a large
+/// clone would hold the permit a job starting on the repo waits for. The
+/// job lane's own fetches run it. Here the clone's housekeeping is due (a
+/// threshold of one, thousands of loose objects), and fetch-ahead leaves
+/// its packs as they were.
+#[tokio::test]
+async fn an_admin_fetch_leaves_housekeeping_to_the_job_lane() {
+    let (dir, store, _cfg, _fid) = fixture("lanes-fetch-no-gc").await;
+    let alpha = store.get_repo_by_id(1).await.unwrap().unwrap();
+    let clone = std::path::Path::new(&alpha.path);
+    support::git(clone, &["config", "gc.auto", "1"]);
+    let loose = dir.subdir("loose");
+    let paths: Vec<String> = (0..3000)
+        .map(|i| {
+            let p = loose.join(i.to_string());
+            std::fs::write(&p, format!("loose {i}\n")).unwrap();
+            p.to_string_lossy().into_owned()
+        })
+        .collect();
+    let mut hashed = std::process::Command::new("git")
+        .args(["-C", &alpha.path, "hash-object", "-w", "--stdin-paths"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(hashed.stdin.as_mut().unwrap(), paths.join("\n").as_bytes()).unwrap();
+    drop(hashed.stdin.take());
+    assert!(hashed.wait().unwrap().success());
+    let before = packs(clone);
+    advance_origin(&dir, &alpha.url);
+
+    let (_keep, running_on) = tokio::sync::watch::channel(false);
+    let ahead =
+        hunter::scheduler::fetch_ahead(&support::admin(&store), Duration::ZERO, &running_on).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    assert_eq!(ahead.fetched, 1, "{ahead:?}");
+    assert_eq!(packs(clone), before, "the admin fetch ran housekeeping");
+}
+
+/// The dependency scan takes a fetch-ahead fetch of its clone within the
+/// fetch-ahead interval as its own: it does not fetch the clone again,
+/// holding the permit, before Renovate runs.
+#[tokio::test]
+async fn a_dependency_scan_does_not_refetch_a_clone_fetched_lately() {
+    let bins = FakeBins::acquire("lanes-scan-fresh");
+    bins.fail("renovate", 1, "no answer");
+    let (dir, store, cfg, _fid) = fixture_with("lanes-scan-fresh", true).await;
+    let alpha = store.get_repo_by_id(1).await.unwrap().unwrap();
+    let clone = std::path::Path::new(&alpha.path);
+    let admin = support::admin(&store);
+    let (_keep, running_on) = tokio::sync::watch::channel(false);
+    let ahead = hunter::scheduler::fetch_ahead(&admin, Duration::ZERO, &running_on).await;
+    let fetched = support::git(clone, &["rev-parse", "origin/main"]);
+    advance_origin(&dir, &alpha.url);
+
+    let scans = hunter::scheduler::dependency_scans(&admin, &cfg, &running_on).await;
+
+    assert_eq!(ahead.fetched, 1, "{ahead:?}");
+    assert_eq!(scans.fallbacks, 1, "{scans:?}");
+    assert_eq!(bins.calls_to("renovate").len(), 1);
+    assert_eq!(
+        support::git(clone, &["rev-parse", "origin/main"]),
+        fetched,
+        "the scan fetched the clone again"
+    );
+}
+
+/// A clone whose fetch just failed is not fetched again by the dependency
+/// scan until the fetch-ahead interval has passed: it is skipped, and
+/// nothing is recorded or requested for it. Each pass would otherwise
+/// hold the clone's permit through another fetch timeout.
+#[tokio::test]
+async fn a_dependency_scan_skips_a_clone_whose_fetch_just_failed() {
+    let bins = FakeBins::acquire("lanes-scan-failed");
+    bins.fail("renovate", 1, "no answer");
+    let (dir, store, cfg, _fid) = fixture_with("lanes-scan-failed", true).await;
+    let alpha = store.get_repo_by_id(1).await.unwrap().unwrap();
+    let origin = std::path::PathBuf::from(&alpha.url);
+    let away = dir.path().join("origin-away");
+    let admin = support::admin(&store);
+    let (_keep, running_on) = tokio::sync::watch::channel(false);
+    std::fs::rename(&origin, &away).unwrap();
+    let ahead = hunter::scheduler::fetch_ahead(&admin, Duration::ZERO, &running_on).await;
+    std::fs::rename(&away, &origin).unwrap();
+
+    let scans = hunter::scheduler::dependency_scans(&admin, &cfg, &running_on).await;
+
+    assert_eq!(ahead.failed, 1, "{ahead:?}");
+    assert_eq!(scans, hunter::scheduler::DepScans::default());
+    assert!(bins.calls_to("renovate").is_empty(), "Renovate ran");
 }

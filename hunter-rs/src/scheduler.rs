@@ -12,7 +12,7 @@ use std::path::Path;
 use anyhow::Context as _;
 
 use crate::attention::{AnswerRecorded, EngageAnswer, ObservedOpenPr, OpenPrRecorded};
-use crate::clones::{ClonePermit, Force, Lane, Unheld};
+use crate::clones::{ClonePermit, FetchOutcome, FetchedBy, Force, Lane, LastFetch, Unheld};
 use crate::config::Config;
 use crate::domain::{
     BudgetOverride, ClosureClass, FindingJobKind, FindingStatus, FindingType, FinishedState,
@@ -1666,6 +1666,62 @@ const ORIGIN_MISMATCH: &str = "origin mismatch";
 const BRANCH_NOT_FOUND: &str = "branch not found";
 const REPO_NOT_CLONED: &str = "repo not cloned";
 
+/// How long a job-lane fetch may run, and its housekeeping after it.
+const JOB_FETCH_TIMEOUT_S: u64 = 600;
+/// How long an admin-lane fetch may run. It holds the clone's permit, and
+/// a job starting on the repo waits for that, so it is far shorter than
+/// the job lane's own, and runs no housekeeping.
+pub const ADMIN_FETCH_TIMEOUT_S: u64 = 120;
+/// An admin-lane full fetch that succeeded this recently is the job
+/// lane's fetch too: a job that waited for an admin duty's fetch of its
+/// clone does not make the same round trip again. Only an admin fetch: a
+/// job right after another job on the same repo fetches what was pushed
+/// in between, as it always did.
+pub const JOB_FETCH_REUSE: std::time::Duration = std::time::Duration::from_mins(1);
+
+/// Whose full fetch [`sync_repo`] makes, which bounds how long it holds
+/// the clone's permit and what earlier fetch stands in for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fetcher {
+    /// The job lane, before its job: [`JOB_FETCH_TIMEOUT_S`] and git's
+    /// housekeeping after it, unless an admin fetch succeeded within
+    /// [`JOB_FETCH_REUSE`].
+    Job,
+    /// An admin duty: [`ADMIN_FETCH_TIMEOUT_S`] and no housekeeping. A
+    /// fetch within `recent`, by either lane, stands in for this one: one
+    /// that succeeded is used as it is, and one that failed fails this one
+    /// too, so a remote that is down is not asked again, holding the
+    /// permit, on every run.
+    Admin { recent: std::time::Duration },
+}
+
+impl Fetcher {
+    const fn timeout_s(self) -> u64 {
+        match self {
+            Self::Job => JOB_FETCH_TIMEOUT_S,
+            Self::Admin { .. } => ADMIN_FETCH_TIMEOUT_S,
+        }
+    }
+
+    const fn lane(self) -> FetchedBy {
+        match self {
+            Self::Job => FetchedBy::JobLane,
+            Self::Admin { .. } => FetchedBy::AdminLane,
+        }
+    }
+
+    /// How the earlier fetch that stands in for this one ended, if one does.
+    fn stand_in(self, permit: &ClonePermit<'_>) -> Option<FetchOutcome> {
+        match self {
+            Self::Job => permit
+                .last_fetch_within(JOB_FETCH_REUSE)
+                .filter(|f| f.by == FetchedBy::AdminLane && f.outcome == FetchOutcome::Succeeded)
+                .map(|f| f.outcome),
+            Self::Admin { recent } => permit.last_fetch_within(recent).map(|f| f.outcome),
+        }
+    }
+}
+
 /// Clone the repo if it is not cloned yet, then fetch, under its clone's
 /// permit (`crate::clones`); each command holds the permit on its blocking
 /// thread, so one outliving its dropped future still holds the clone.
@@ -1683,6 +1739,7 @@ const REPO_NOT_CLONED: &str = "repo not cloned";
 async fn sync_repo(
     store: &Store,
     permit: &ClonePermit<'_>,
+    fetcher: Fetcher,
 ) -> sqlx::Result<Result<(), SyncFailure>> {
     let repo_url = &store.origin_url(permit).await?;
     let rpath = permit.clone_dir();
@@ -1734,7 +1791,29 @@ async fn sync_repo(
             }));
         }
     }
-    let (rc, out) = fetch_held(permit, &[]).await;
+    match fetcher.stand_in(permit) {
+        Some(FetchOutcome::Succeeded) => return Ok(Ok(())),
+        Some(FetchOutcome::Failed) => {
+            return Ok(Err(SyncFailure {
+                key: FETCH_FAILED,
+                detail: "git fetch origin failed lately; not retried yet".to_owned(),
+                network: true,
+            }));
+        }
+        None => {}
+    }
+    let (rc, out) = fetch_held(permit, &[], fetcher).await;
+    // Failed or not: an admin duty backs off a clone whose remote is down
+    // as it does one just fetched, instead of holding the permit through
+    // another fetch timeout on every run.
+    permit.record_fetch(LastFetch {
+        by: fetcher.lane(),
+        outcome: if rc == 0 {
+            FetchOutcome::Succeeded
+        } else {
+            FetchOutcome::Failed
+        },
+    });
     if rc != 0 {
         return Ok(Err(SyncFailure {
             key: FETCH_FAILED,
@@ -1742,20 +1821,20 @@ async fn sync_repo(
             network: true,
         }));
     }
-    permit.record_fetch();
     Ok(Ok(()))
 }
 
 /// [`crate::workspace::fetch`] of `refs` on a blocking thread that holds
-/// `permit` until the fetch and its housekeeping end. The only way the
-/// daemon fetches into a clone.
-async fn fetch_held(permit: &ClonePermit<'_>, refs: &[&str]) -> (i32, String) {
+/// `permit` until the fetch, and for the job lane its housekeeping, end,
+/// bounded by `fetcher`'s timeout. The only way the daemon fetches into a
+/// clone.
+async fn fetch_held(permit: &ClonePermit<'_>, refs: &[&str], fetcher: Fetcher) -> (i32, String) {
     let _phase = crate::activity::job_phase(JobPhase::Fetching);
     let refs: Vec<String> = refs.iter().map(|&r| r.to_owned()).collect();
     permit
         .blocking(move |hold| {
             let refs: Vec<&str> = refs.iter().map(String::as_str).collect();
-            crate::workspace::fetch(hold, &refs, 600)
+            crate::workspace::fetch(hold, &refs, fetcher.timeout_s(), fetcher == Fetcher::Job)
         })
         .await
         .unwrap_or((127, "spawn error".to_owned()))
@@ -1766,9 +1845,12 @@ async fn fetch_held(permit: &ClonePermit<'_>, refs: &[&str]) -> (i32, String) {
 pub struct FetchAhead {
     /// Clones fetched.
     pub fetched: usize,
-    /// Clones left alone: fetched in full more recently than the pass's
-    /// `min_age`, by this pass's previous run or by a job.
+    /// Clones left alone: their last fetch, by this pass's previous run or
+    /// by a job, ended less than the pass's `min_age` ago, failed or not.
     pub fresh: usize,
+    /// Clones left alone because the repo's `sync` work is held: the
+    /// operator has to look at the repo first.
+    pub held: usize,
     /// Clones whose fetch failed, or that could not be fetched at all.
     pub failed: usize,
 }
@@ -1778,11 +1860,16 @@ pub struct FetchAhead {
 /// harvest's default branch) finds little left to download. Run by the
 /// admin lane (`crate::daemon`), beside whatever job runs.
 ///
-/// A clone fetched in full less than `min_age` ago, by either lane, is
-/// left alone ([`ClonePermit::fetched_within`]): a fetch holds the clone's
-/// permit through git's housekeeping, and a job starting on that repo
-/// waits for it, so fetching every repo on every run would cost the job
-/// lane for little. The first run after a restart fetches every clone.
+/// A clone whose last fetch, by either lane, ended less than `min_age`
+/// ago is left alone ([`ClonePermit::last_fetch_within`]): a fetch holds
+/// the clone's permit, and a job starting on that repo waits for it, so
+/// fetching every repo on every run would cost the job lane for little. A
+/// failed fetch counts too: a remote that is down would otherwise hold the
+/// permit for a fetch timeout on every run. A repo whose `sync` work is
+/// held is skipped outright. The first run after a restart fetches every
+/// clone. A fetch here is the admin lane's ([`Fetcher::Admin`]): bounded
+/// by [`ADMIN_FETCH_TIMEOUT_S`], with git's housekeeping left to the job
+/// lane's own fetches, so a job waits at most that long for the clone.
 ///
 /// The same [`sync_repo`] as the job lane's, under the same clone permit,
 /// so a fetch here and one there never overlap, and a clone whose origin
@@ -1802,9 +1889,9 @@ pub async fn fetch_ahead(
     stop: &tokio::sync::watch::Receiver<bool>,
 ) -> FetchAhead {
     let store = admin.store();
-    let repos = match store.list_repos().await {
-        Ok(repos) => repos,
-        Err(e) => {
+    let (repos, held) = match (store.list_repos().await, store.held_work().await) {
+        (Ok(repos), Ok(held)) => (repos, held),
+        (Err(e), _) | (_, Err(e)) => {
             tracing::warn!("fetch-ahead: listing repos: {e}");
             return FetchAhead::default();
         }
@@ -1815,6 +1902,10 @@ pub async fn fetch_ahead(
             for repo in repos.iter().filter(|r| r.enabled != 0) {
                 if *stop.borrow() {
                     break;
+                }
+                if held.repo_sync(repo.id) {
+                    done.held += 1;
+                    continue;
                 }
                 let permit = match lane.lock_clone(repo.id).await {
                     Ok(permit) => permit,
@@ -1827,11 +1918,11 @@ pub async fn fetch_ahead(
                 if !permit.clone_dir().exists() {
                     continue;
                 }
-                if permit.fetched_within(min_age) {
+                if permit.last_fetch_within(min_age).is_some() {
                     done.fresh += 1;
                     continue;
                 }
-                match sync_repo(store, &permit).await {
+                match sync_repo(store, &permit, Fetcher::Admin { recent: min_age }).await {
                     Ok(Ok(())) => done.fetched += 1,
                     Ok(Err(failure)) => {
                         done.failed += 1;
@@ -1851,16 +1942,17 @@ pub async fn fetch_ahead(
         FetchAhead::default()
     })
 }
-/// Sync `repo`'s clone ([`sync_repo`]) and resolve the tip of its default
-/// branch, recording nothing about the outcome: what the admin lane's
-/// dependency scan needs, which keeps no streak of its own and must not
-/// end the job lane's.
+/// Sync `repo`'s clone ([`sync_repo`], as `fetcher`) and resolve the tip of
+/// its default branch, recording nothing about the outcome: what the admin
+/// lane's dependency scan needs, which keeps no streak of its own and must
+/// not end the job lane's.
 async fn fetch_to_tip(
     store: &Store,
     permit: &ClonePermit<'_>,
     repo: &Repo,
+    fetcher: Fetcher,
 ) -> sqlx::Result<Result<String, SyncFailure>> {
-    if let Err(failure) = sync_repo(store, permit).await? {
+    if let Err(failure) = sync_repo(store, permit, fetcher).await? {
         return Ok(Err(failure));
     }
     let rev = format!("origin/{}", repo.default_branch);
@@ -1884,7 +1976,7 @@ async fn sync_to_tip(
     permit: &ClonePermit<'_>,
     repo: &Repo,
 ) -> sqlx::Result<Result<String, SyncFailure>> {
-    let tip = fetch_to_tip(store, permit, repo).await?;
+    let tip = fetch_to_tip(store, permit, repo, Fetcher::Job).await?;
     if tip.is_ok() {
         log_write_failure(
             store.repo_work_succeeded(repo.id, RepoWorkKind::Sync).await,
@@ -3130,7 +3222,7 @@ pub async fn run_recheck(
     // Never on a resume: a resumed chain continues in its own tree, and
     // nothing is fetched for it.
     if resume.is_none()
-        && let Err(failure) = sync_repo(store, &permit).await?
+        && let Err(failure) = sync_repo(store, &permit, Fetcher::Job).await?
     {
         let _ = store
             .log_event(
@@ -4122,7 +4214,14 @@ pub async fn scan_dependencies(
     if !permit.clone_dir().exists() {
         return Ok(DependencyScan::NotSynced("not cloned".to_owned()));
     }
-    if let Err(failure) = fetch_to_tip(store, &permit, repo).await? {
+    // A fetch-ahead fetch of the clone within its interval stands in for
+    // this one, whether it succeeded or not: a clone fetched minutes ago
+    // is not fetched again, and a remote that just failed is not asked
+    // again, holding the permit, on every pass.
+    let fetcher = Fetcher::Admin {
+        recent: crate::daemon::FETCH_AHEAD_MIN_AGE,
+    };
+    if let Err(failure) = fetch_to_tip(store, &permit, repo, fetcher).await? {
         return Ok(DependencyScan::NotSynced(failure.detail));
     }
     // The scan tree is made at the fetched tip in the fetch's hold, which
@@ -5955,7 +6054,7 @@ async fn fetch_pr_head<'l>(
     let permit = lane.lock_clone(repo.id).await?;
     if let Attempt::Cold(finding) = attempt {
         let fid = finding.id;
-        let (rc, out) = fetch_held(&permit, &[head_ref]).await;
+        let (rc, out) = fetch_held(&permit, &[head_ref], Fetcher::Job).await;
         if rc != 0 {
             let tail = crate::util::tail(&out, 300);
             let _ = store
@@ -7606,7 +7705,7 @@ pub async fn run_harvest(
     // recorded (`jobs.base_sha`).
     let base = if fresh {
         let db = repo.default_branch.as_str();
-        let (rc, out) = fetch_held(&permit, &[db]).await;
+        let (rc, out) = fetch_held(&permit, &[db], Fetcher::Job).await;
         if rc != 0 {
             let tail = crate::util::tail(&out, 300);
             let what = format!("fetch {}", repo.default_branch);

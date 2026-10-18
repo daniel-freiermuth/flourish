@@ -95,9 +95,9 @@ exclude_re = [
     # `OverdriveBackend` only changes `decide`; every other method forwards
     # to the provider backend verbatim. `decide` is not excluded.
     "<impl Backend for OverdriveBackend>::(keep_fresh|status_html|run) ",
-    # `fetched_within`'s `<` against `<=` differs only when a clone's
+    # `last_fetch_within`'s `<` against `<=` differs only when a clone's
     # fetch ended exactly `age` ago to the nanosecond, which no run can
     # hit: `Instant::elapsed` has moved on by the time it is read. The
     # other mutants of the comparison are caught (`lanes_test`).
-    "replace < with <= in ClonePermit<'_>::fetched_within",
+    "replace < with <= in ClonePermit<'_>::last_fetch_within",
 ]

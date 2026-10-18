@@ -44,8 +44,9 @@
 //!   clone -- or for the one it holds, which would wait for itself -- does
 //!   not compile. Two futures of one lane (`join!`, `select!`) cannot both
 //!   take permits either. The only exception is the sweep's
-//!   [`Lane::lock_every`], one permit per repo row, taken in id order by
-//!   this module; since nothing else holds two, no wait can be circular.
+//!   [`Lane::try_lock_every`], one permit per repo row, each taken only if
+//!   free: it never waits while holding one, so no wait can be circular,
+//!   and no job waits behind it for longer than its own step.
 //! - A permit can never be `'static`, whatever the store's lifetime:
 //!   `tokio::spawn` and `spawn_blocking` refuse it, so it stays in the lane
 //!   that took it.
@@ -77,9 +78,31 @@ struct Registry {
     /// Live leases, by what they keep: a chain's tree, or a repo's scan
     /// tree.
     leases: Mutex<HashMap<Leased, usize>>,
-    /// When each clone's last full fetch (`git fetch origin`) ended, as
-    /// recorded under its permit ([`ClonePermit::record_fetch`]).
-    fetched: Mutex<HashMap<i64, Instant>>,
+    /// When each clone's last full fetch (`git fetch origin`) ended, by
+    /// which lane and how, as recorded under its permit
+    /// ([`ClonePermit::record_fetch`]).
+    fetched: Mutex<HashMap<i64, (Instant, LastFetch)>>,
+}
+
+/// A clone's last full fetch ([`ClonePermit::last_fetch_within`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LastFetch {
+    pub by: FetchedBy,
+    pub outcome: FetchOutcome,
+}
+
+/// Which lane made a fetch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchedBy {
+    JobLane,
+    AdminLane,
+}
+
+/// How a fetch ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchOutcome {
+    Succeeded,
+    Failed,
 }
 
 /// What a [`TreeLease`] keeps.
@@ -222,21 +245,27 @@ impl Lane {
         acquire(&self.store, clone.clone()).await
     }
 
-    /// Every clone's permit -- every repo row's, deleted or not, in id
-    /// order -- for a change to a clone that only git can name. The only
-    /// way a lane holds more than one; nothing else does, so the fixed
-    /// order is all it takes for no wait to be circular.
-    pub(crate) async fn lock_every(&mut self) -> sqlx::Result<EveryClone<'_>> {
+    /// Every clone's permit -- every repo row's, deleted or not -- for a
+    /// change to a clone that only git can name, if every one is free now;
+    /// `None`, holding none, if any is taken. The only way a lane holds
+    /// more than one, and it never waits while holding: waiting for one
+    /// clone while holding the others would keep a job on any of those
+    /// waiting behind an admin duty's fetch of an unrelated repo. The
+    /// caller tries again on its next run.
+    pub(crate) async fn try_lock_every(&mut self) -> sqlx::Result<Option<EveryClone<'_>>> {
         let mut held = Vec::new();
         for repo_id in self.store.clone_ids().await? {
             match self.store.clone_ref(repo_id).await {
-                Ok(clone) => held.push(acquire(&self.store, clone).await),
+                Ok(clone) => match try_acquire(&self.store, clone) {
+                    Some(permit) => held.push(permit),
+                    None => return Ok(None),
+                },
                 // Gone since it was listed: its clone went with it.
                 Err(CloneLockError::NoRepo(_)) => {}
                 Err(CloneLockError::Db(e)) => return Err(e),
             }
         }
-        Ok(EveryClone { held })
+        Ok(Some(EveryClone { held }))
     }
 }
 
@@ -250,16 +279,33 @@ impl Lane {
 /// admin duty finishes with the clone. Off the job lane nothing is
 /// reported; a free lock is taken before the status page could show it.
 async fn acquire<'l>(store: &Store, clone: CloneRef) -> ClonePermit<'l> {
-    let clones = store.clones().clone();
-    let slot = lock(&clones.0.locks)
-        .entry(clone.repo_id())
-        .or_default()
-        .clone();
+    let (clones, slot) = slot_of(store, &clone);
     let guard = {
         let _waiting = Waiting::new(&slot.waiting);
         let _phase = crate::activity::job_phase(crate::types::JobPhase::WaitingForClone);
         slot.mutex.clone().lock_owned().await
     };
+    permit_of(clones, clone, guard)
+}
+
+/// `clone`'s permit if its lock is free now, without waiting. Private for
+/// the reason [`acquire`] is.
+fn try_acquire<'l>(store: &Store, clone: CloneRef) -> Option<ClonePermit<'l>> {
+    let (clones, slot) = slot_of(store, &clone);
+    let guard = slot.mutex.clone().try_lock_owned().ok()?;
+    Some(permit_of(clones, clone, guard))
+}
+
+fn slot_of(store: &Store, clone: &CloneRef) -> (Clones, Arc<Slot>) {
+    let clones = store.clones().clone();
+    let slot = lock(&clones.0.locks)
+        .entry(clone.repo_id())
+        .or_default()
+        .clone();
+    (clones, slot)
+}
+
+fn permit_of<'l>(clones: Clones, clone: CloneRef, guard: OwnedMutexGuard<()>) -> ClonePermit<'l> {
     ClonePermit {
         hold: CloneHold(Arc::new(Held {
             clone,
@@ -397,18 +443,20 @@ impl ClonePermit<'_> {
         Ok(self.clones.take(Leased::Scan(repo_id)))
     }
 
-    /// Record that a full fetch of this clone ended just now. Under the
-    /// permit, so no other fetch of the clone ran between it and this.
-    pub(crate) fn record_fetch(&self) {
-        lock(&self.clones.0.fetched).insert(self.repo_id(), Instant::now());
+    /// Record that a full fetch of this clone ended just now, by whom and
+    /// how. Under the permit, so no other fetch of the clone ran between
+    /// it and this.
+    pub(crate) fn record_fetch(&self, last: LastFetch) {
+        lock(&self.clones.0.fetched).insert(self.repo_id(), (Instant::now(), last));
     }
 
-    /// Whether this clone's last full fetch in this process ended less
-    /// than `age` ago, whoever made it. `false` after a restart.
-    pub fn fetched_within(&self, age: Duration) -> bool {
+    /// This clone's last full fetch in this process, if it ended less than
+    /// `age` ago. `None` after a restart.
+    pub fn last_fetch_within(&self, age: Duration) -> Option<LastFetch> {
         lock(&self.clones.0.fetched)
             .get(&self.repo_id())
-            .is_some_and(|at| at.elapsed() < age)
+            .filter(|(at, _)| at.elapsed() < age)
+            .map(|&(_, last)| last)
     }
 }
 
