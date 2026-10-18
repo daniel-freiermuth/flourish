@@ -15,7 +15,7 @@ use std::marker::PhantomData;
 use std::sync::atomic::Ordering;
 use std::sync::{Mutex, PoisonError};
 
-use super::{ImmediateTx, Store};
+use super::{ImmediateTx, Store, SyncEdge};
 use crate::attention::{
     self, AnswerRecorded, AttentionChange, EngageAnswer, ObservedOpenPr, OpenPrRecorded,
 };
@@ -84,6 +84,28 @@ impl PrSyncPass {
     /// The store this pass syncs.
     pub const fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// The proof the sync's own finding transition carries
+    /// ([`SyncEdge`]).
+    pub const fn edge(&self) -> SyncEdge<'_> {
+        SyncEdge(std::marker::PhantomData)
+    }
+
+    /// End `finding_id`'s PR `pr` as this pass saw it end, merged or
+    /// closed ([`PrEnding`]): the finding's move and the end in
+    /// `pr_state`, in one write, only while the finding is still
+    /// `pr_open` with that PR ([`end`]). An engage's withdrawal is the
+    /// job lane's ([`JobStore::end_withdrawn_pr`]).
+    ///
+    /// [`JobStore::end_withdrawn_pr`]: super::JobStore::end_withdrawn_pr
+    pub async fn end_pr(
+        &self,
+        finding_id: i64,
+        pr: &PrRef,
+        ending: PrEnding<'_>,
+    ) -> sqlx::Result<PrEnded> {
+        self.store.end_pr(finding_id, pr, ending).await
     }
 
     /// Begin a forge read of `finding_id`'s open PR `pr`: the [`PrRead`]

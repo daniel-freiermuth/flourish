@@ -909,7 +909,8 @@ async fn two_repos_for_selection(label: &str, alpha_cloned: bool) -> (TempDir, S
 
 async fn hold(store: &Store, rid: i64, kind: RepoWorkKind) {
     assert!(
-        store
+        support::scope(store)
+            .store()
             .hold_repo_work(rid, kind, HoldReason::Stuck, "kept failing", None)
             .await
             .unwrap()
@@ -1078,8 +1079,13 @@ async fn a_hunt_with_no_new_commits_ends_its_streak() {
     )
     .trim()
     .to_owned();
-    store.set_last_hunt(1, &tip).await.unwrap();
-    store
+    support::scope(&store)
+        .store()
+        .set_last_hunt(1, &tip)
+        .await
+        .unwrap();
+    support::scope(&store)
+        .store()
         .record_repo_failure(1, RepoWorkKind::Hunt, "no findings file")
         .await
         .unwrap();

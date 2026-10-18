@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use crate::clones::Unheld;
 use crate::domain::FindingStatus;
 use crate::playbooks::{Changed, Suppression};
-use crate::store::{FindingInsert, Store, VerdictAnchor};
+use crate::store::{FindingInsert, JobStore, Store, VerdictAnchor};
 use crate::transition::{Moved, Transition};
 use crate::types::{Finding, Repo};
 
@@ -284,7 +284,7 @@ struct Reconfirmed {
 /// reconfirms nothing either, and says so: otherwise every CHANGED entry
 /// would be re-checked again next scan with no trace of why.
 pub async fn apply_reconfirmations(
-    store: &Store,
+    store: &JobStore,
     repo: &Repo,
     types: &[&str],
     out_path: &Path,

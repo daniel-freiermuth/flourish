@@ -619,7 +619,11 @@ async fn a_downgrade_fails_the_recorded_job_and_no_other() {
         recorded.push(job.complete(&outcome).await.unwrap());
     }
 
-    store.fail_job(&recorded[1], "push failed").await.unwrap();
+    support::scope(&store)
+        .store()
+        .fail_job(&recorded[1], "push failed")
+        .await
+        .unwrap();
 
     let jobs = store.list_jobs(10).await.unwrap();
     let row = |id: i64| {
@@ -1020,8 +1024,10 @@ async fn a_transition_applies_only_from_its_source_status() {
         .set_finding_verdict(2, PrOpen, "operator's reason")
         .await
         .unwrap();
+    let jobs = support::scope(&store);
     let stale = Transition::RecheckStale {
         reason: "recheck: code moved",
+        job: jobs.store().edge(),
     };
     let moved = store.transition(2, &stale).await.unwrap();
     assert_eq!(moved, Moved::Conflict { now: Some(PrOpen) });

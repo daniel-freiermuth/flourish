@@ -739,8 +739,8 @@ async fn pushed_commits_land_on_the_branch_and_clear_the_addressed_state() {
     // observable.
     let ps = f.pr_row().await;
     let pr = support::pr_ref(PR_URL);
-    let answered = f
-        .store
+    let answered = support::scope(&f.store)
+        .store()
         .mark_pr_engaged(f.fid, &EngageAnswer::without_push(&pr, None, &ps))
         .await
         .unwrap();

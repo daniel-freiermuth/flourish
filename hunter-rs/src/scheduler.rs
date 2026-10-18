@@ -927,9 +927,9 @@ async fn count_given_up_repo_chain(
 ) {
     let detail = format!("{CHAIN_GAVE_UP}: {why}");
     record_repo_failure(
-        scope.store(),
+        RepoStreak::Job(scope.store(), kind.into()),
         (repo_id, name),
-        (kind.into(), Some(job)),
+        Some(job),
         CHAIN_GAVE_UP,
         &detail,
         HoldReason::GaveUp,
@@ -1896,7 +1896,7 @@ async fn sync_to_tip(
 /// the cycle ends denied for the host (#95). Otherwise the error ends the
 /// cycle as it always did.
 async fn repo_sync_failed(
-    store: &Store,
+    store: &JobStore,
     (cfg, backend): (&Config, &dyn Backend),
     repo: &Repo,
     kind: RepoJobKind,
@@ -1908,9 +1908,9 @@ async fn repo_sync_failed(
         return Ok(offline_denial(store, kind.into(), None, None, host).await);
     }
     record_repo_failure(
-        store,
+        RepoStreak::Job(store, RepoWorkKind::Sync),
         (repo.id, &repo.name),
-        (RepoWorkKind::Sync, None),
+        None,
         failure.key,
         &failure.detail,
         HoldReason::Stuck,
@@ -1919,28 +1919,81 @@ async fn repo_sync_failed(
     Err(anyhow::anyhow!("{}", failure.detail))
 }
 
-/// Count one failure of `repo`'s `kind` work under `key`, `detail`
-/// describing it, in the work item's streak, as [`record_harvest_failure`]
-/// does for a finding's. The [`MAX_CONSECUTIVE_SAME_FAILURE`]th identical
-/// failure holds the work for the operator as `at_limit`
-/// ([`Store::hold_repo_work`]), with `job` as its checkpoint if a worker
-/// ran in it. A failure does not move `last_<kind>_at`, so the work is
-/// retried as soon as the rotation reaches it again (WORK-MODEL.md §17).
+/// Whose count a repo work failure is, and so which work item it is: the
+/// job lane's, of any kind ([`JobStore::record_repo_failure`]), or the
+/// admin lane's Renovate scan, which is always the repo's `dep_update`
+/// ([`AdminStore::record_renovate_failure`]).
+enum RepoStreak<'s> {
+    Job(&'s JobStore, RepoWorkKind),
+    Renovate(&'s AdminStore),
+}
+
+impl RepoStreak<'_> {
+    fn store(&self) -> &Store {
+        match self {
+            Self::Job(store, _) => store,
+            Self::Renovate(store) => store,
+        }
+    }
+
+    const fn kind(&self) -> RepoWorkKind {
+        match self {
+            Self::Job(_, kind) => *kind,
+            Self::Renovate(_) => RepoWorkKind::DepUpdate,
+        }
+    }
+
+    async fn count(&self, repo_id: i64, key: &str) -> sqlx::Result<i64> {
+        match self {
+            Self::Job(store, kind) => store.record_repo_failure(repo_id, *kind, key).await,
+            Self::Renovate(store) => store.record_renovate_failure(repo_id, key).await,
+        }
+    }
+
+    /// A Renovate scan has no job, so `job` is the job lane's alone.
+    async fn hold(
+        &self,
+        repo_id: i64,
+        reason: HoldReason,
+        detail: &str,
+        job: Option<i64>,
+    ) -> sqlx::Result<bool> {
+        match self {
+            Self::Job(store, kind) => {
+                store
+                    .hold_repo_work(repo_id, *kind, reason, detail, job)
+                    .await
+            }
+            Self::Renovate(store) => store.hold_renovate(repo_id, reason, detail).await,
+        }
+    }
+}
+
+/// Count one failure of `repo`'s work under `key`, `detail` describing
+/// it, in the work item's streak, as [`record_harvest_failure`] does for
+/// a finding's. The [`MAX_CONSECUTIVE_SAME_FAILURE`]th identical failure
+/// holds the work for the operator as `at_limit`
+/// ([`JobStore::hold_repo_work`]), with `job` as its checkpoint if a
+/// worker ran in it. A failure does not move `last_<kind>_at`, so the work
+/// is retried as soon as the rotation reaches it again (WORK-MODEL.md
+/// §17).
 ///
 /// True when the work is now held. A count or a hold that could not be
 /// recorded is reported as such and ends nothing.
 async fn record_repo_failure(
-    store: &Store,
+    counter: RepoStreak<'_>,
     (repo_id, repo): (i64, &str),
-    (kind, job): (RepoWorkKind, Option<i64>),
+    job: Option<i64>,
     key: &str,
     detail: &str,
     at_limit: HoldReason,
 ) -> bool {
+    let store = counter.store();
+    let kind = counter.kind();
     let log = |message: String| async move {
         let _ = store.log_event("error", &message, job, None).await;
     };
-    let streak = match store.record_repo_failure(repo_id, kind, key).await {
+    let streak = match counter.count(repo_id, key).await {
         Ok(streak) => streak,
         Err(e) => {
             log(format!(
@@ -1954,10 +2007,7 @@ async fn record_repo_failure(
         log(format!("{kind} {repo}: {detail}, will retry")).await;
         return false;
     }
-    match store
-        .hold_repo_work(repo_id, kind, at_limit, detail, job)
-        .await
-    {
+    match counter.hold(repo_id, at_limit, detail, job).await {
         Ok(true) => {
             log(format!(
                 "{kind} {repo}: held after {streak} identical failures ({detail})"
@@ -2085,7 +2135,7 @@ async fn budget_gate(
 /// removed whatever it made. `Ok(Ok(..))` hands the job back for its
 /// runner to end.
 async fn open_workspace(
-    store: &Store,
+    store: &JobStore,
     cfg: &Config,
     (permit, repo): (ClonePermit<'_>, &Repo),
     created: CreatedJob,
@@ -2268,21 +2318,22 @@ async fn log_not_moved(
         .await;
 }
 
-/// End `pr` for the PR sync ([`Store::end_pr`]), recording it in
+/// End `pr` for the PR sync ([`PrSyncPass::end_pr`]), recording it in
 /// `pr_state` with the finding's move: a failed write is an `error` event
 /// and a sync error, and leaves the finding `pr_open` with its `pr_state`
 /// unchanged, so the next sync retries both. A conflict, or a finding that
 /// has shipped another PR since sync listed it, is logged as a `kind`
 /// event and left to whatever moved it; `true` only when the end was made.
 async fn sync_pr_end(
-    store: &Store,
+    pass: &PrSyncPass,
     fid: i64,
     kind: &str,
     pr: &PrRef,
     ending: PrEnding<'_>,
     summary: &mut SyncResult,
 ) -> bool {
-    match store.end_pr(fid, pr, ending).await {
+    let store = pass.store();
+    match pass.end_pr(fid, pr, ending).await {
         Ok(PrEnded::Applied) => true,
         Ok(PrEnded::Conflict { now }) => {
             log_not_moved(store, fid, None, kind, (ending.from(), ending.to()), now).await;
@@ -2367,16 +2418,16 @@ fn repo_attempt(
 /// Count a hunt's or scan's failed attempt `job` on its work item, and say
 /// so in the cycle's summary: held at the limit, else retried.
 async fn count_repo_attempt(
-    store: &Store,
+    store: &JobStore,
     repo: &Repo,
     (kind, job): (RepoJobKind, i64),
     (key, detail): (&str, &str),
     summary: &mut CycleSummary,
 ) {
     let held = record_repo_failure(
-        store,
+        RepoStreak::Job(store, kind.into()),
         (repo.id, &repo.name),
-        (kind.into(), Some(job)),
+        Some(job),
         key,
         detail,
         HoldReason::Stuck,
@@ -2391,7 +2442,7 @@ async fn count_repo_attempt(
 /// fixed [`TREE_NOT_MADE`], git's reason as the detail, as for every
 /// finding kind (WORK-MODEL.md §7, G9).
 async fn count_unmade_repo_tree(
-    store: &Store,
+    store: &JobStore,
     repo: &Repo,
     (kind, job): (RepoJobKind, i64),
     mut summary: CycleSummary,
@@ -3362,6 +3413,7 @@ pub async fn run_recheck(
             (
                 Transition::RecheckConfirmed {
                     analysis: &analysis,
+                    job: store.edge(),
                 },
                 "confirmed",
             )
@@ -3375,6 +3427,7 @@ pub async fn run_recheck(
             (
                 Transition::RecheckStale {
                     reason: &verdict_reason,
+                    job: store.edge(),
                 },
                 "stale",
             )
@@ -3392,6 +3445,7 @@ pub async fn run_recheck(
                 Transition::RecheckInvalid {
                     reason: &verdict_reason,
                     anchor: anchor.as_ref(),
+                    job: store.edge(),
                 },
                 "invalid",
             )
@@ -4199,9 +4253,9 @@ async fn renovate_outcome(store: &AdminStore, repo: &Repo, counts: IngestResult)
     } else {
         let detail = format!("renovate scan: {} invalid entries", counts.invalid);
         let held = record_repo_failure(
-            store,
+            RepoStreak::Renovate(store),
             (repo.id, &repo.name),
-            (RepoWorkKind::DepUpdate, None),
+            None,
             INVALID_ENTRIES,
             &detail,
             HoldReason::Stuck,
@@ -4943,9 +4997,9 @@ async fn runner_failed(
         WorkOf::Finding(kind, fid) => (kind, fid),
         WorkOf::Repo(kind, repo) => {
             record_repo_failure(
-                store,
+                RepoStreak::Job(store, kind.into()),
                 (repo.id, &repo.name),
-                (kind.into(), Some(job)),
+                Some(job),
                 RUNNER_ERROR,
                 &detail,
                 HoldReason::Stuck,
@@ -5621,7 +5675,7 @@ async fn sync_one_pr(pass: &PrSyncPass, cfg: &Config, f: &Finding) -> SyncResult
                 finding_id = fid,
                 "pr_open finding has no pr_url — requeueing"
             );
-            if make_transition(store, fid, None, "fix", &Transition::PrMissing).await {
+            if make_transition(store, fid, None, "fix", &Transition::PrMissing(pass.edge())).await {
                 summary.requeued += 1;
                 let _ = store.log_event(
                         "fix", &format!("#{fid} requeued: pr_open with no pr_url (prior fix failed before PR creation)"),
@@ -5715,7 +5769,7 @@ async fn sync_one_pr(pass: &PrSyncPass, cfg: &Config, f: &Finding) -> SyncResult
             // The finding's move and the PR's record are one write: a
             // failed write leaves both for the next sync, and a
             // conflict leaves the finding to what moved it.
-            if !sync_pr_end(store, fid, "ship", &read_pr, PrEnding::Merged, &mut summary).await {
+            if !sync_pr_end(pass, fid, "ship", &read_pr, PrEnding::Merged, &mut summary).await {
                 return summary;
             }
             let _ = store
@@ -5735,7 +5789,7 @@ async fn sync_one_pr(pass: &PrSyncPass, cfg: &Config, f: &Finding) -> SyncResult
             let closed = PrEnding::Closed {
                 reason: PR_CLOSED_AWAITING_HARVEST,
             };
-            if !sync_pr_end(store, fid, "verdict", &read_pr, closed, &mut summary).await {
+            if !sync_pr_end(pass, fid, "verdict", &read_pr, closed, &mut summary).await {
                 return summary;
             }
             let _ = store
@@ -5823,7 +5877,7 @@ async fn sync_one_pr(pass: &PrSyncPass, cfg: &Config, f: &Finding) -> SyncResult
 /// them first. Reads only; the clone is changed later, by
 /// [`fetch_pr_head`].
 async fn engage_target(
-    store: &Store,
+    store: &JobStore,
     finding: &Finding,
 ) -> anyhow::Result<(Repo, crate::store::RecordedPrState, String, PrRef)> {
     let fid = finding.id;
@@ -5923,7 +5977,7 @@ async fn fetch_pr_head<'l>(
 /// sync of the finding's PR rewrites it, and until then its head is not
 /// this PR's.
 async fn check_row_is_of(
-    store: &Store,
+    store: &JobStore,
     fid: i64,
     ps: &crate::types::PrState,
     pr: &PrRef,
@@ -6262,7 +6316,7 @@ async fn start_engage(
 /// reads the PR (`pr`), and its playbook shows the worker exactly that
 /// view; a resume inherits what its chain was shown.
 async fn engage_seen_activity(
-    store: &Store,
+    store: &JobStore,
     job: i64,
     pr: Option<&PrView>,
 ) -> Option<SeenActivity> {
@@ -6370,11 +6424,17 @@ async fn withdraw_pr(
 /// The PR sync, on the admin lane, may see the PR closed and record it
 /// between the engage's close on the forge and this write. That is this
 /// withdrawal's closure, so the engage takes it over
-/// ([`Store::adopt_closure`]): its reason replaces the sync's, and it
+/// ([`JobStore::adopt_closure`]): its reason replaces the sync's, and it
 /// continues into its harvest as if its own write had landed.
-async fn set_withdrawn_closed(store: &Store, fid: i64, job: i64, pr: &PrRef, reason: &str) -> bool {
+async fn set_withdrawn_closed(
+    store: &JobStore,
+    fid: i64,
+    job: i64,
+    pr: &PrRef,
+    reason: &str,
+) -> bool {
     let pr_number = pr.number();
-    let now = match store.end_pr(fid, pr, PrEnding::Closed { reason }).await {
+    let now = match store.end_withdrawn_pr(fid, pr, reason).await {
         Ok(PrEnded::Applied) => return true,
         Ok(PrEnded::Conflict {
             now: Some(FindingStatus::Closed),
@@ -6642,7 +6702,7 @@ async fn record_engage(
 /// which settle voids if they have moved since. Not recorded when the PR
 /// ended while the worker ran, which is logged.
 async fn record_engage_answer(
-    store: &Store,
+    store: &JobStore,
     fid: i64,
     start: &EngageStart,
     answer: EngageAnswer<'_>,
@@ -6766,7 +6826,7 @@ async fn record_engage_failure(
 /// `PR-REPLY.md`, `WITHDRAW.md`) is kept and the next cycle continues it to
 /// publish. `None` when every host is reachable: a real publish failure.
 async fn unpublished_offline(
-    store: &Store,
+    store: &JobStore,
     (cfg, backend): (&Config, &dyn Backend),
     fid: i64,
     start: &EngageStart,
