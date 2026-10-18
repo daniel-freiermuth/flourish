@@ -126,8 +126,9 @@ const USAGE_PROBE_TICK_S: u64 = 60;
 const UI_DRAIN: Duration = Duration::from_secs(5);
 /// How often each admin duty runs when nothing wakes it sooner.
 pub const ADMIN_INTERVAL: Duration = Duration::from_mins(5);
-/// How long fetch-ahead leaves a clone alone after its last full fetch,
-/// whichever lane made it ([`crate::scheduler::fetch_ahead`]).
+/// How long fetch-ahead leaves a clone alone after its last fetch,
+/// whichever lane made it and whether it succeeded or not
+/// ([`crate::scheduler::fetch_ahead`]).
 pub const FETCH_AHEAD_MIN_AGE: Duration = Duration::from_mins(30);
 
 /// The admin lane's duties, each its own task ([`spawn_admin_lane`]).

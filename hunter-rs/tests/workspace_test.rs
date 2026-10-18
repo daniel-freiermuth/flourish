@@ -796,7 +796,7 @@ async fn a_fetch_finishes_the_clones_housekeeping_before_it_returns() {
 
     let (rc, out) = permit(&f)
         .await
-        .blocking(|hold| workspace::fetch(hold, &[], 60))
+        .blocking(|hold| workspace::fetch(hold, &[], 60, true))
         .await
         .unwrap();
 
@@ -925,7 +925,7 @@ async fn a_fetch_works_in_a_clone_whose_config_is_locked() {
 
     let (rc, out) = permit(&f)
         .await
-        .blocking(|hold| workspace::fetch(hold, &[], 60))
+        .blocking(|hold| workspace::fetch(hold, &[], 60, true))
         .await
         .unwrap();
 
@@ -1353,6 +1353,60 @@ async fn a_sweep_that_keeps_every_legacy_tree_holds_no_clone_while_it_waits() {
     let report = sweep.await.unwrap().unwrap();
     assert!(in_use.is_dir(), "the checkpoint's legacy tree is kept");
     assert_eq!(report.legacy_trees_kept, 1);
+}
+
+/// A legacy tree to remove needs every clone's permit, and the sweep runs
+/// beside admin duties that hold one for a fetch: it takes them only if
+/// every one is free, and otherwise leaves the tree for the next sweep.
+/// Waiting for a held clone while keeping the others would keep a job on
+/// any of those waiting behind a fetch of an unrelated repo.
+#[tokio::test]
+async fn a_sweep_never_holds_one_clone_while_waiting_for_another() {
+    let f = fixture("ws-legacy-busy", "main").await;
+    sqlx::query(
+        "INSERT INTO repos (id, name, url, path, forge, default_branch, enabled, added_at) \
+         VALUES (2, 'beta', 'https://example.com/beta.git', ?1, 'github', 'main', 1, 1000)",
+    )
+    .bind(
+        f.dir
+            .subdir("repos")
+            .join("repo-2")
+            .to_string_lossy()
+            .to_string(),
+    )
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    let leftover = f.cfg.work_root.join("wt").join("f57");
+    std::fs::create_dir_all(leftover.join("src")).unwrap();
+    let sweep = |store: hunter::store::Store, root: std::path::PathBuf| async move {
+        workspace::sweep(&support::admin(&store), &root, hunter::util::now_ms()).await
+    };
+
+    let held = f.store.test_lane().lock_clone(2).await.unwrap();
+    let first = tokio::spawn(sweep(f.store.clone(), f.cfg.work_root.clone()));
+    // Its per-clone pass waits for repo 2 holding nothing; before that,
+    // the legacy step must not have waited for repo 2 holding repo 1.
+    support::until_waiting(&f.store, 2, 1).await;
+    let other = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        f.store.test_lane().lock_clone(1),
+    )
+    .await;
+    assert!(
+        other.is_ok_and(|p| p.is_ok()),
+        "repo 1's clone was held while the sweep waited for repo 2's"
+    );
+    drop(held);
+    let report = first.await.unwrap().unwrap();
+    assert!(leftover.is_dir(), "removed while a clone was busy");
+    assert_eq!(report.legacy_trees_removed, 0);
+
+    let report = sweep(f.store.clone(), f.cfg.work_root.clone())
+        .await
+        .unwrap();
+    assert!(!leftover.exists(), "the next sweep removes it");
+    assert_eq!(report.legacy_trees_removed, 1);
 }
 
 // -- invariant 6: a tree that cannot be made ---------------------------------

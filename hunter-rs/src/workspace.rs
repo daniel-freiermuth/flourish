@@ -184,9 +184,9 @@ fn missing_worktrees(porcelain: &str) -> impl Iterator<Item = &str> {
         .filter(|p| !Path::new(p).exists())
 }
 
-/// `git fetch origin <refs>` into the held clone, then the housekeeping
-/// git would have run after it, both on the caller's blocking thread and
-/// so both inside the hold.
+/// `git fetch origin <refs>` into the held clone, then, with
+/// `housekeeping`, the housekeeping git would have run after it, both on
+/// the caller's blocking thread and so both inside the hold.
 ///
 /// Git ends a fetch -- and a commit, which workers make in their trees of
 /// this clone -- by starting `git maintenance run --auto --detach`: a
@@ -198,7 +198,10 @@ fn missing_worktrees(porcelain: &str) -> impl Iterator<Item = &str> {
 /// with automatic maintenance off for that one command
 /// (`-c maintenance.auto=false`, which its children inherit), and runs the
 /// housekeeping here instead, attached. `--auto` keeps git's own
-/// thresholds: most fetches find nothing worth doing.
+/// thresholds: most fetches find nothing worth doing. Without
+/// `housekeeping` none runs at all, detached or not: the admin lane's
+/// fetches leave it to the job lane's, so a repack of a large clone does
+/// not hold the permit a job is waiting for.
 ///
 /// Per command, not written to the clone's config: a fetch must not fail
 /// because the config cannot be rewritten (a stale `config.lock` left by a
@@ -206,11 +209,11 @@ fn missing_worktrees(porcelain: &str) -> impl Iterator<Item = &str> {
 /// checkout, whose config is not ours to change. Worker commits, which
 /// pass no such flag, are covered in the daemon's own clones by their
 /// config ([`quiet_clones`], [`CloneHold::clone_from`]).
-pub fn fetch(hold: &CloneHold, refs: &[&str], timeout_s: u64) -> (i32, String) {
+pub fn fetch(hold: &CloneHold, refs: &[&str], timeout_s: u64, housekeeping: bool) -> (i32, String) {
     let mut args = vec!["-c", "maintenance.auto=false", "fetch", "origin"];
     args.extend_from_slice(refs);
     let fetched = hold.git(&args, timeout_s);
-    if fetched.0 == 0 {
+    if fetched.0 == 0 && housekeeping {
         let (rc, out) = hold.git(
             &[
                 "-c",
@@ -759,7 +762,8 @@ async fn sweep_chains(
 
 /// Step (b) of [`sweep`]. Every clone's permit is taken only when there is
 /// a tree to remove, not for one a live job keeps: a pass that removes
-/// nothing waits for no runner.
+/// nothing waits for no runner. Taken only if every one is free
+/// ([`Lane::try_lock_every`]); otherwise the step waits for the next sweep.
 async fn sweep_legacy_trees(
     lane: &mut Lane,
     work_root: &Path,
@@ -799,7 +803,10 @@ async fn sweep_legacy_trees(
     if removable.is_empty() {
         return Ok(());
     }
-    let every = lane.lock_every().await?;
+    let Some(every) = lane.try_lock_every().await? else {
+        tracing::debug!("sweep: a clone is busy; legacy trees wait for the next sweep");
+        return Ok(());
+    };
     for entry in removable {
         let path = entry.clone();
         every
@@ -866,8 +873,9 @@ async fn sweep_legacy_sessions(
 
 /// Steps (d) and (e) of [`sweep`], one clone at a time under its permit.
 /// A scan tree of a repo no longer listed is removed with every clone
-/// held, as its clone is only known to git. A scan tree a running scan
-/// leases is kept: the lease is taken under the same permit.
+/// held, as its clone is only known to git, and only once every clone is
+/// free ([`Lane::try_lock_every`]). A scan tree a running scan leases is
+/// kept: the lease is taken under the same permit.
 async fn prune_clones_and_scans(lane: &mut Lane, work_root: &Path) -> anyhow::Result<()> {
     let store = lane.store().clone();
     let mut scans: BTreeSet<PathBuf> = child_dirs(&scan_root(work_root)).into_iter().collect();
@@ -896,7 +904,10 @@ async fn prune_clones_and_scans(lane: &mut Lane, work_root: &Path) -> anyhow::Re
         scan_tree_repo(scan).is_none_or(|repo_id| !store.clones().scan_leased(repo_id))
     });
     if !scans.is_empty() {
-        let every = lane.lock_every().await?;
+        let Some(every) = lane.try_lock_every().await? else {
+            tracing::debug!("sweep: a clone is busy; orphan scan trees wait for the next sweep");
+            return Ok(());
+        };
         every
             .blocking(move |held| {
                 for scan in &scans {
