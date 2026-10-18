@@ -4809,7 +4809,7 @@ async fn conclude_fix(
     }
 
     let ShipFailure { failure, at_forge } =
-        match ship_pr(&start.repo, &start.branch, worktree, state).await {
+        match ship_pr(&start.repo, &start.branch, &start.pinned, worktree, state).await {
             Ok((pr_url, recovered)) => return Ok(FixOutcome::Shipped { pr_url, recovered }),
             Err(failure) => failure,
         };
@@ -5128,24 +5128,23 @@ impl ShipFailure {
 async fn ship_pr(
     repo: &Repo,
     branch: &str,
+    pinned: &str,
     worktree: &Path,
     state: JobState,
 ) -> Result<(String, bool), ShipFailure> {
     let _phase = crate::activity::job_phase(JobPhase::Publishing);
     let db = repo.default_branch.clone();
     let wt = worktree.to_owned();
-    let db2 = db.clone();
-    let (rc, commits) = tokio::task::spawn_blocking(move || {
-        let commits = |range: &str| Unheld::Commits { range }.run(&wt, 30);
-        let (rc, out) = commits(&format!("origin/{db2}..HEAD"));
-        if rc != 0 {
-            commits(&format!("{db2}..HEAD"))
-        } else {
-            (rc, out)
-        }
-    })
-    .await
-    .unwrap_or((127, String::new()));
+    // The worker's own commits: those on top of the commit its tree was
+    // created at. Not `origin/<default>..HEAD`: that ref moves under a
+    // running worker (fetch-ahead, a dependency scan's fetch), and after a
+    // rewrite of the default branch it would name the dropped upstream
+    // commits as the worker's and ship them as a PR.
+    let range = format!("{pinned}..HEAD");
+    let (rc, commits) =
+        tokio::task::spawn_blocking(move || Unheld::Commits { range: &range }.run(&wt, 30))
+            .await
+            .unwrap_or((127, String::new()));
     let commits = commits.trim();
     let pr_desc = worktree.join("PR-DESCRIPTION.md");
     if rc != 0 || commits.is_empty() || !pr_desc.exists() {
@@ -6527,7 +6526,12 @@ async fn push_then_reply(
     let (repo, worktree, head_ref) = (&start.repo, &start.ws.tree, &start.head_ref);
     let fg = forge::forge_for(repo.forge);
     let wt = worktree.clone();
-    let range = format!("origin/{head_ref}..HEAD");
+    // The worker's own commits: those on top of the commit its tree was
+    // created at. Not `origin/<head_ref>..HEAD`: that ref moves under a
+    // running worker (fetch-ahead, a dependency scan's fetch), and after a
+    // rebase or force-push of the PR branch it would name the branch's old
+    // commits as the worker's, and push them into a lease that refuses.
+    let range = format!("{}..HEAD", start.pinned);
     let (rc, commits) =
         tokio::task::spawn_blocking(move || Unheld::Commits { range: &range }.run(&wt, 30))
             .await
