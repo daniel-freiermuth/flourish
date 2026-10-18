@@ -119,8 +119,8 @@ async fn every_duty_once(
 }
 
 /// While the job lane's worker runs, the admin duties sync the open PR to
-/// its merge, sweep, and return; the job is still running when they do,
-/// and finishes once its worker does.
+/// its merge, scan the job's repo's dependencies, sweep, and return; the
+/// job is still running when they do, and finishes once its worker does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_admin_duties_run_while_a_job_runs() {
     let bins = FakeBins::acquire("lanes");
@@ -128,7 +128,10 @@ async fn the_admin_duties_run_while_a_job_runs() {
         "gh",
         r#"{"state":"MERGED","mergedAt":"2026-01-02T03:04:05Z","mergeable":"UNKNOWN","reviewDecision":"","comments":[],"reviews":[],"statusCheckRollup":[],"updatedAt":"2026-01-02T03:04:05Z","headRefName":"fix/some-bug","headRefOid":"deadbeef"}"#,
     );
-    let (_dir, store, cfg, fid) = fixture("lanes").await;
+    // `alpha`'s dependency scan is due, so the Renovate duty works on the
+    // repo the job runs on rather than returning at once.
+    bins.fail("renovate", 1, "no answer");
+    let (_dir, store, cfg, fid) = fixture_with("lanes", true).await;
     let started = Arc::new(AtomicBool::new(false));
     let release = Arc::new(AtomicBool::new(false));
     let (worker_started, worker_release) = (started.clone(), release.clone());
@@ -180,6 +183,11 @@ async fn the_admin_duties_run_while_a_job_runs() {
     assert_eq!(finding.status, FindingStatus::Merged);
     assert_eq!(status.current(), [], "no duty shows once its run is over");
     assert_eq!(prsync_events(&store).await, 1, "the merge is in the log");
+    assert_eq!(
+        bins.calls_to("renovate").len(),
+        1,
+        "the dependency duty scanned the running job's repo"
+    );
     assert_eq!(
         store.current_job().await.unwrap().map(|j| j.id),
         Some(running.id),

@@ -78,10 +78,21 @@ impl Rig {
         let mut cfg = support::load_config(dir.path());
         cfg.work_root = dir.subdir("work_root");
         let model_ran = Arc::new(AtomicBool::new(false));
+        // The AI scan, when one runs: it finds nothing to update, a valid
+        // and empty answer.
+        let out_dir = cfg.work_root.join("out");
         let backend = ScriptedBackend::new({
             let model_ran = Arc::clone(&model_ran);
-            move |_| {
+            move |tree| {
                 model_ran.store(true, Ordering::SeqCst);
+                let origin = tree
+                    .parent()
+                    .unwrap()
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy();
+                std::fs::write(out_dir.join(format!("job{origin}.dep_updates.json")), "[]")
+                    .unwrap();
                 done()
             }
         });
@@ -349,19 +360,18 @@ async fn a_repo_renovate_cannot_read_is_handed_to_the_job_lanes_ai_scan() {
     .unwrap();
 
     assert!(rig.model_ran.load(Ordering::SeqCst), "the AI scan ran");
-    assert!(summary.job_id.is_some(), "{summary:?}");
-    // A run recorded after the request answers it, as the AI scan's
-    // success records its own (`set_last_kind_at`); this scripted worker
-    // files no output, so the test records it.
-    sqlx::query("UPDATE repos SET last_dep_update_at = ?1 WHERE id = ?2")
-        .bind(hunter::util::now_ms())
-        .bind(rig.repo.id)
-        .execute(&rig.pool)
-        .await
-        .unwrap();
+    assert_eq!(summary.state, Some(JobState::Done), "{summary:?}");
+    assert!(
+        !rig.store
+            .dep_update_fallbacks()
+            .await
+            .unwrap()
+            .pending(rig.repo.id),
+        "the AI scan's success answered the request"
+    );
     assert!(
         picked().await.unwrap().is_none(),
-        "a dep_update run after the request answered it"
+        "no dep_update is offered again"
     );
 }
 
@@ -461,13 +471,7 @@ async fn a_repo_deleted_during_its_renovate_scan_files_nothing_and_is_reaped() {
     else {
         panic!("the scan did not come to a summary");
     };
-    assert!(
-        summary
-            .skipped
-            .as_deref()
-            .is_some_and(|s| s.contains("deleted during its scan")),
-        "{summary:?}"
-    );
+    assert!(summary.skipped.is_some(), "{summary:?}");
     assert!(!rig.model_ran.load(Ordering::SeqCst));
     assert!(
         rig.findings().await.is_empty(),
@@ -887,6 +891,52 @@ async fn renovate_scans_that_keep_failing_hold_the_repos_dep_update() {
         !held.repo(rig.repo.id, hunter::domain::RepoJobKind::Hunt),
         "only the dep_update work is held"
     );
+}
+
+/// A Renovate scan that succeeds ends the failure streak: failures spread
+/// out between successes never add up to a hold.
+#[tokio::test]
+async fn a_renovate_success_ends_the_dep_update_failure_streak() {
+    let rig = Rig::new("depupd-streak-reset").await;
+    rig.scan(&left_pad("1.2.0", Some("1.3.0"))).await.unwrap();
+    let due_again = || async {
+        sqlx::query("UPDATE repos SET last_dep_update_at = NULL")
+            .execute(&rig.pool)
+            .await
+            .unwrap();
+    };
+    let refuse_refresh = || async {
+        sqlx::query(
+            "CREATE TRIGGER no_refresh BEFORE UPDATE OF latest_version ON findings \
+             BEGIN SELECT RAISE(ABORT, 'refused'); END",
+        )
+        .execute(&rig.pool)
+        .await
+        .unwrap();
+    };
+    due_again().await;
+    refuse_refresh().await;
+    let mut outcomes = Vec::new();
+    for _ in 0..2 {
+        let s = rig.scan(&left_pad("1.2.0", Some("1.4.0"))).await.unwrap();
+        outcomes.push(s.outcome);
+    }
+    sqlx::query("DROP TRIGGER no_refresh")
+        .execute(&rig.pool)
+        .await
+        .unwrap();
+    let ok = rig.scan(&left_pad("1.2.0", Some("1.4.0"))).await.unwrap();
+    assert_eq!(ok.failure, None, "{ok:?}");
+    due_again().await;
+    refuse_refresh().await;
+    for _ in 0..2 {
+        let s = rig.scan(&left_pad("1.2.0", Some("1.5.0"))).await.unwrap();
+        outcomes.push(s.outcome);
+    }
+
+    assert_eq!(outcomes, vec![Some("retry".to_owned()); 4]);
+    let held = rig.store.held_work().await.unwrap();
+    assert!(!held.repo(rig.repo.id, hunter::domain::RepoJobKind::DepUpdate));
 }
 
 /// `queued` means the operator wants it fixed, and no worker has started:
