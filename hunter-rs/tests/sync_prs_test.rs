@@ -241,9 +241,11 @@ fn now_ms() -> i64 {
 /// `PR_SYNC_CONCURRENCY` at once: each `gh pr view` is a forge round trip,
 /// and a serial pass cost their sum. Every PR is still synced once.
 ///
-/// The fake `gh` marks itself live in `live/` for half a second and
-/// records how many reads were live when it started. Serial reads would
-/// each see only themselves.
+/// The fake `gh` marks itself live in `live/` and started in `started/`,
+/// then holds until the bound's worth of reads are live at once (or every
+/// read has started), bounded, and records how many were live. So a pass
+/// within the bound always shows the bound, with no timing to win; a
+/// serial one shows 1 after the hold runs out.
 #[tokio::test]
 async fn a_pass_reads_its_open_prs_side_by_side_within_the_bound() {
     const PRS: i64 = 7;
@@ -272,19 +274,27 @@ async fn a_pass_reads_its_open_prs_side_by_side_within_the_bound() {
             .unwrap();
     }
     let live = f.cfg.work_root.join("live");
+    let started = f.cfg.work_root.join("started");
     let seen = f.cfg.work_root.join("seen");
-    std::fs::create_dir_all(&live).unwrap();
-    std::fs::create_dir_all(&seen).unwrap();
+    for dir in [&live, &started, &seen] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
     bins.script(
         "gh",
         &format!(
-            "touch '{live}/'$$\n\
+            "touch '{live}/'$$ '{started}/'$$\n\
+             i=0\n\
+             while [ \"$(ls '{live}' | wc -l)\" -lt {bound} ] \
+                   && [ \"$(ls '{started}' | wc -l)\" -lt {PRS} ] && [ $i -lt 250 ]; do\n\
+               sleep 0.02; i=$((i+1))\n\
+             done\n\
              ls '{live}' | wc -l > '{seen}/'$$\n\
-             sleep 0.5\n\
              rm -f '{live}/'$$\n\
              cat <<'__PR_EOF__'\n{view}\n__PR_EOF__\nexit 0",
             live = live.display(),
+            started = started.display(),
             seen = seen.display(),
+            bound = hunter::scheduler::PR_SYNC_CONCURRENCY,
             view = pr(&json!({})),
         ),
     );
@@ -309,10 +319,10 @@ async fn a_pass_reads_its_open_prs_side_by_side_within_the_bound() {
         "one read per PR"
     );
     let most = overlaps.iter().copied().max().unwrap();
-    assert!(most >= 2, "the reads ran one at a time: {overlaps:?}");
-    assert!(
-        most <= hunter::scheduler::PR_SYNC_CONCURRENCY,
-        "more than the bound at once: {overlaps:?}"
+    assert_eq!(
+        most,
+        hunter::scheduler::PR_SYNC_CONCURRENCY,
+        "the bound's worth of reads at once, never more: {overlaps:?}"
     );
 }
 
