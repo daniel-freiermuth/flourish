@@ -333,6 +333,85 @@ async fn a_running_daemon_syncs_open_prs_on_its_admin_lane_even_paused() {
         .expect("run_daemon returned an error");
 }
 
+/// The job lane does not wait for the PR sync: while the first pass is
+/// still reading its PR, the lane has already run a cycle (only the loop
+/// writes `scheduler_state`). Only engages wait for that pass, held back
+/// from the pick; the repo here is disabled and its PR unflagged, so the
+/// cycle finds nothing and reports idle.
+#[tokio::test]
+async fn the_job_lane_runs_cycles_while_the_first_pr_sync_runs() {
+    let bins = FakeBins::acquire("daemon-wait-sync");
+    bins.script("omp", "exit 0");
+    let root = TempDir::new("daemon-wait-sync-root");
+    let release = root.join("release-gh");
+    // Bounded: a failing assertion below must not leave `gh` waiting.
+    bins.script(
+        "gh",
+        &format!(
+            "for _ in $(seq 1 400); do [ -f '{}' ] && break; sleep 0.05; done\n\
+             echo '{{\"state\":\"OPEN\",\"mergeable\":\"MERGEABLE\",\"reviewDecision\":\"\",\"comments\":[],\"reviews\":[],\"statusCheckRollup\":[],\"updatedAt\":\"2026-01-02T03:04:05Z\",\"headRefName\":\"fix/some-bug\",\"headRefOid\":\"deadbeef\"}}'",
+            release.display()
+        ),
+    );
+    let _home = bins.env("HOME", root.path());
+    let port = free_port();
+    std::fs::write(
+        root.join("config.json"),
+        format!(r#"{{"ompBin": "omp", "serve": {{"port": {port}}}}}"#),
+    )
+    .unwrap();
+    let cfg = support::load_config(root.path());
+    std::fs::create_dir_all(cfg.db_path.parent().unwrap()).unwrap();
+    let store = hunter::store::Store::connect(&cfg.db_path).await.unwrap();
+    let cookie = support::auth_cookie(&store).await;
+    let fid = seed_open_pr(&store, &root.join("repos")).await;
+    let rid = store.get_finding(fid).await.unwrap().unwrap().repo_id;
+    store
+        .update_repo(
+            rid,
+            &hunter::store::RepoUpdate {
+                enabled: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let daemon = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("daemon runtime")
+            .block_on(hunter::daemon::run_daemon(cfg))
+    });
+
+    let summary = wait_for_summary(port, &daemon, &cookie, "the job lane to run a cycle", |s| {
+        !s["scheduler_state"].is_null()
+    })
+    .await;
+    let syncing = summary["admin_activity"]
+        .as_array()
+        .is_some_and(|a| a.iter().any(|t| t["task"] == "pr_sync"));
+    std::fs::write(&release, "").unwrap();
+    assert!(
+        syncing,
+        "fixture: the first PR sync ended before the cycle, so this proves nothing: {summary}"
+    );
+    assert_eq!(summary["scheduler_state"]["state"], "idle", "{summary}");
+
+    nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGTERM)
+        .expect("send SIGTERM to this test process");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !daemon.is_finished() {
+        assert!(Instant::now() < deadline, "the daemon never stopped");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    daemon
+        .join()
+        .expect("run_daemon thread panicked")
+        .expect("run_daemon returned an error");
+}
+
 /// `serve.host` is what the daemon binds, not a hard-coded loopback.
 ///
 /// Proven without touching a real interface: Linux routes all of

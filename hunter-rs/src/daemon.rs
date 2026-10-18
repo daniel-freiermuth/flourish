@@ -29,9 +29,10 @@
 //! clone changes only under its permit, and a tree a runner still uses is
 //! leased. The lanes meet through the database: a duty that made work
 //! wakes the job lane, which picks from what the duty recorded. Where the
-//! database may be behind the forge, the job lane waits for a PR sync
-//! pass ([`PrSyncPasses`]): before its first pick, and after a cycle that
-//! met a PR the forge has ended and the database has not.
+//! database may be behind the forge, the engages it would pick from that
+//! wait for a PR sync pass ([`EngageWaits`]): every engage until the first
+//! pass since startup, and an engage that met a PR the forge has ended and
+//! the database has not. The job lane itself never waits for the sync.
 //!
 //! # Where the work queue is, and why there is no queue type
 //!
@@ -260,30 +261,43 @@ async fn sync_open_prs(
 }
 
 /// The PR sync passes the admin lane has begun and finished, so the job
-/// lane can wait until the forge's state of every open PR is recorded
-/// before it picks from it: once at startup, when the database may be
-/// hours behind the forge, and after a cycle that found a PR already
-/// ended there ([`CycleSummary::awaits_pr_sync`]). Picked from a
-/// `pr_open` row the sync has not yet caught up with, an engage would
-/// run a whole worker session on a merged PR.
+/// lane can tell when the forge's state of every open PR has been
+/// recorded since a given moment ([`EngageWaits`]): since startup, when
+/// the database may be hours behind the forge, and since a cycle that
+/// found a PR already ended there ([`CycleSummary::awaits_pr_sync`]).
+/// Picked from a `pr_open` row the sync has not yet caught up with, an
+/// engage would only find the PR ended and pick again.
 #[derive(Clone, Default)]
 pub struct PrSyncPasses(Arc<watch::Sender<SyncCount>>);
 
-#[derive(Clone, Copy, Default)]
-struct SyncCount {
-    begun: u64,
-    finished: u64,
-    /// Whether the pass that finished last read every open PR
-    /// ([`SyncResult::complete`]).
-    last_complete: bool,
+/// What the PR sync duty's passes have done so far. Its runs are one
+/// after another, so pass `n` is the `n`th begun.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SyncCount {
+    /// Passes begun.
+    pub begun: u64,
+    /// Passes finished, complete or not.
+    pub finished: u64,
+    /// The number of the last pass that finished having read every open
+    /// PR ([`SyncResult::complete`]); 0 while none has.
+    pub last_complete: u64,
+}
+
+impl SyncCount {
+    /// Whether a pass begun after `begun` passes had begun has finished
+    /// having read every open PR.
+    pub const fn complete_since(&self, begun: u64) -> bool {
+        self.last_complete > begun
+    }
 }
 
 /// A PR sync pass in progress: counted finished when dropped, so a pass
-/// that panics still releases a job lane waiting for it. Complete only
-/// once [`Self::completed`] says so; a pass that panicked or stopped for
-/// shutdown before reading every PR is not.
+/// that panics is counted too. Complete only once [`Self::completed`]
+/// says so; a pass that panicked or stopped for shutdown before reading
+/// every PR is not.
 struct SyncPassCount<'a> {
     passes: &'a PrSyncPasses,
+    number: u64,
     complete: bool,
 }
 
@@ -296,50 +310,100 @@ impl SyncPassCount<'_> {
 
 impl Drop for SyncPassCount<'_> {
     fn drop(&mut self) {
-        let complete = self.complete;
+        let (number, complete) = (self.number, self.complete);
         self.passes.0.send_modify(|c| {
             c.finished += 1;
-            c.last_complete = complete;
+            if complete {
+                c.last_complete = c.last_complete.max(number);
+            }
         });
     }
 }
 
 impl PrSyncPasses {
     fn begin(&self) -> SyncPassCount<'_> {
-        self.0.send_modify(|c| c.begun += 1);
+        let mut number = 0;
+        self.0.send_modify(|c| {
+            c.begun += 1;
+            number = c.begun;
+        });
         SyncPassCount {
             passes: self,
+            number,
             complete: false,
         }
     }
 
-    /// Wait until a first pass has finished, or for shutdown.
-    pub async fn first(&self, shutdown: &watch::Receiver<bool>) {
-        self.finished_after(0, shutdown).await;
+    /// The counts now.
+    pub fn now(&self) -> SyncCount {
+        *self.0.borrow()
     }
 
-    /// Wake the PR sync (`wake`) and wait until a pass begun after this
-    /// call has finished, or for shutdown: whether such a pass finished
-    /// having read every open PR. A pass already running when this is
-    /// called may have read a PR before it ended, so it does not count;
-    /// nor does one that panicked or stopped for shutdown before reaching
-    /// every PR, since it may never have read the one waited for.
-    pub async fn next(&self, wake: &Notify, shutdown: &watch::Receiver<bool>) -> bool {
-        let begun = self.0.borrow().begun;
-        wake.notify_one();
-        self.finished_after(begun, shutdown).await
-    }
-
-    /// Whether a pass past the first `passes` finished before shutdown,
-    /// having read every open PR.
-    async fn finished_after(&self, passes: u64, shutdown: &watch::Receiver<bool>) -> bool {
+    /// Wait until more than `seen` passes have finished, however they
+    /// ended.
+    pub async fn finished_after(&self, seen: u64) {
         let mut counts = self.0.subscribe();
-        let mut shutdown = shutdown.clone();
-        tokio::select! {
-            biased;
-            c = counts.wait_for(|c| c.finished > passes) => c.is_ok_and(|c| c.last_complete),
-            _ = shutdown.wait_for(|stop| *stop) => false,
+        let _ = counts.wait_for(|c| c.finished > seen).await;
+    }
+}
+
+/// The engages the job lane holds back until the PR sync has caught up
+/// with the forge ([`crate::scheduler::EngageHoldback`]), and the cycles
+/// that found an ended PR, each waiting for a complete pass begun after it.
+///
+/// Only the engage waits. The job lane goes on picking every other tier,
+/// so a slow forge delays no hunt, fix or harvest: the sync is the admin
+/// lane's, and nothing but an engage picks work from a PR state the sync
+/// has yet to record.
+#[derive(Default)]
+pub struct EngageWaits {
+    /// Each cycle that found its engage's PR ended on the forge, with the
+    /// number of passes begun when it ended.
+    ended: Vec<(CycleSummary, u64)>,
+}
+
+impl EngageWaits {
+    /// Record a cycle that found its engage's PR ended on the forge
+    /// ([`CycleSummary::awaits_pr_sync`]); others are ignored. Its engage is
+    /// held back until a complete pass begun after now: a pass already
+    /// running may have read the PR before it ended.
+    pub fn ended(&mut self, summary: &CycleSummary, passes: &PrSyncPasses) {
+        if summary.awaits_pr_sync && summary.finding_id.is_some() {
+            self.ended.push((summary.clone(), passes.now().begun));
         }
+    }
+
+    /// Whether any engage waits for a PR sync pass.
+    pub fn waiting(&self, passes: &PrSyncPasses) -> bool {
+        !self.ended.is_empty() || passes.now().finished == 0
+    }
+
+    /// Before a cycle: the engages it may not pick, and the cycles whose
+    /// wait a complete pass has ended since, for the job lane to count
+    /// ([`crate::scheduler::count_unrecorded_pr_end`]). Every engage is held
+    /// back until a first pass has finished since startup, complete or
+    /// not: a sync that cannot list its PRs must not stop every engage for
+    /// good, and an engage still checks its PR on the forge before its job.
+    /// An engage that found its PR ended waits for a complete pass, which
+    /// is what tells whether the sync could record the end.
+    pub fn settle(
+        &mut self,
+        passes: &PrSyncPasses,
+    ) -> (crate::scheduler::EngageHoldback, Vec<CycleSummary>) {
+        let now = passes.now();
+        let (done, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.ended)
+            .into_iter()
+            .partition(|(_, begun)| now.complete_since(*begun));
+        self.ended = waiting;
+        let holdback = crate::scheduler::EngageHoldback {
+            all: now.finished == 0,
+            findings: self
+                .ended
+                .iter()
+                .filter_map(|(s, _)| s.finding_id)
+                .collect(),
+        };
+        (holdback, done.into_iter().map(|(s, _)| s).collect())
     }
 }
 
@@ -782,10 +846,10 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         &shutdown_rx,
     );
 
-    // Job lane. Not before the first PR sync: what the forge did while
-    // the daemon was down -- a merge, a close -- is not in the database
-    // until that pass records it.
-    pr_sync_passes.first(&shutdown_rx).await;
+    // Job lane. It never waits for the PR sync: only the engages whose PR
+    // the sync has not caught up with wait, held back from the pick
+    // ([`EngageWaits`]), and the lane goes on with every other tier.
+    let mut engage_waits = EngageWaits::default();
     let mut stop = *shutdown_rx.borrow();
     while !stop {
         // Not atomic with the `cycle_running.store(true)` below, on
@@ -812,24 +876,27 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
             continue;
         }
 
+        // What the cycle may not pick, and the ended PRs a complete pass
+        // has looked at since: a pass that read every open PR and still
+        // could not record an end counts against that engage, so a sync
+        // that keeps failing on one PR holds the engage for the operator.
+        let (holdback, looked_at) = engage_waits.settle(&pr_sync_passes);
+        for summary in &looked_at {
+            crate::scheduler::count_unrecorded_pr_end(&jobs.scope(), summary).await;
+        }
+        jobs.hold_back_engages(holdback);
+        let passes_seen = pr_sync_passes.now().finished;
+
         cycle_running.store(true, Ordering::SeqCst);
         let summary = crate::scheduler::run_cycle(&mut jobs, &cfg, &*backend, None).await;
         cycle_running.store(false, Ordering::SeqCst);
 
         // The cycle met a PR the forge has ended and the database has not:
-        // picking again before a sync records it would pick the same work.
-        // A pass that read every open PR and still could not record it
-        // counts against the engage, so a sync that keeps failing on one PR
-        // holds that engage instead of keeping the lane on it. Woken by
-        // shutdown instead, or by a pass that panicked or stopped for
-        // shutdown before reading every PR, nothing says the PR was read,
-        // so there is nothing to count.
-        if summary.awaits_pr_sync
-            && pr_sync_passes
-                .next(&scheduler.pr_sync_wake, &shutdown_rx)
-                .await
-        {
-            crate::scheduler::count_unrecorded_pr_end(&jobs.scope(), &summary).await;
+        // its engage waits for a sync pass begun after now, which this
+        // asks for, and the next cycle picks something else.
+        if summary.awaits_pr_sync {
+            engage_waits.ended(&summary, &pr_sync_passes);
+            scheduler.pr_sync_wake.notify_one();
         }
         let sleep_s = compute_sleep_s(&store, &summary).await;
         let (state_label, detail) = describe_cycle(&summary);
@@ -841,11 +908,22 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         let summary_head: String = summary_str.chars().take(200).collect();
         tracing::info!("cycle: {summary_head} -> sleep {sleep_s:.0}s");
 
-        // Sleep, wake on shutdown or notify
+        // Sleep, wake on shutdown or notify, and while an engage waits for
+        // a PR sync, when a pass ends: it may have released the engage.
+        let pass_ended = async {
+            if engage_waits.waiting(&pr_sync_passes) {
+                pr_sync_passes.finished_after(passes_seen).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
         tokio::select! {
             () = tokio::time::sleep(std::time::Duration::from_secs_f64(sleep_s)) => {},
             () = wake.notified() => {
                 tracing::debug!("job lane woken by notify");
+            },
+            () = pass_ended => {
+                tracing::debug!("job lane woken by the end of a PR sync pass");
             },
             _ = shutdown_rx.changed() => {},
         }

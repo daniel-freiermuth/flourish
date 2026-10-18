@@ -101,7 +101,7 @@
     sweep: "sweeping finished workspaces",
   };
   const JOB_PHASE_LABEL: Record<JobPhase, string> = {
-    waiting_for_clone: "waiting for an admin duty to release the repo",
+    waiting_for_clone: "waiting for the repo's clone",
     cloning: "cloning the repo",
     fetching: "fetching the repo",
     preparing_tree: "preparing the job's worktree",
@@ -129,7 +129,7 @@
             disabled={schedulerBusy}
             onclick={toggleScheduler}
             aria-label={store.summary.scheduler_paused ? "Resume jobs" : "Pause jobs"}
-            title="Pauses new jobs. PR sync and workspace cleanup keep running."
+            title="Pauses new jobs. PR sync, repo reaping, fetch-ahead, Renovate scans and workspace cleanup keep running."
           >
             <span class="scheduler-icon">{store.summary.scheduler_paused ? "▶" : "⏸"}</span>
             <span>{store.summary.scheduler_paused ? "Resume jobs" : "Pause jobs"}</span>

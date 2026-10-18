@@ -357,6 +357,63 @@ async fn pick_next_attention_beats_queued_fix_and_orders_by_attention_since() {
     assert!(matches!(c, hunter::scheduler::Candidate::Finding { .. }));
 }
 
+/// An engage the job lane holds back (its PR's end awaits a sync, or no
+/// sync has run since startup) is passed over, and the pick moves to the
+/// next engage or down to the queued fix: only that engage waits, not the
+/// lane. The preview, which has no cycle, holds back nothing.
+#[tokio::test]
+async fn pick_next_passes_over_held_back_engages() {
+    use hunter::scheduler::EngageHoldback;
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo(&pool, 1, "alpha", 1, "/nonexistent/alpha").await;
+    seed_finding(&pool, 5, 1, "queued", "queued bug").await;
+    seed_finding(&pool, 7, 1, "pr_open", "older attention").await;
+    seed_finding(&pool, 8, 1, "pr_open", "newer attention").await;
+    for (fid, since) in [(7_i64, 1000_i64), (8, 2000)] {
+        sqlx::query(
+            "INSERT INTO pr_state \
+             (finding_id, pr_number, state, needs_attention, attention_since, synced_at) \
+             VALUES (?1, 1, 'OPEN', 'review_comments', ?2, 5000)",
+        )
+        .bind(fid)
+        .bind(since)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let store = open_store(pool, &path).await;
+    let cfg = test_config(3600.0);
+    let pick = async |holdback: EngageHoldback| {
+        let mut jobs = support::jobs(&store);
+        jobs.hold_back_engages(holdback);
+        let scope = jobs.scope();
+        let c = pick_next(&scope, &cfg, None).await.unwrap().unwrap();
+        (c.job_kind(), c.target_id())
+    };
+
+    let one = pick(EngageHoldback {
+        all: false,
+        findings: [7].into(),
+    })
+    .await;
+    let every = pick(EngageHoldback {
+        all: true,
+        ..EngageHoldback::default()
+    })
+    .await;
+    let preview = hunter::scheduler::preview_next(&store, &cfg)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(one, (FindingJobKind::Engage.into(), 8));
+    assert_eq!(every, (FindingJobKind::Fix.into(), 5));
+    assert_eq!(
+        (preview.job_kind(), preview.target_id()),
+        (FindingJobKind::Engage.into(), 7)
+    );
+}
+
 #[tokio::test]
 async fn pick_next_budget_override_jumps_the_queue() {
     let (_dir, path, pool) = fresh_db().await;

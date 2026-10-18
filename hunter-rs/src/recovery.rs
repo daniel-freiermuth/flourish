@@ -238,6 +238,7 @@ impl Recovered {
             JobAuthority {
                 store: self.store,
                 status: crate::activity::JobStatus::default(),
+                holdback: crate::scheduler::EngageHoldback::default(),
             },
             admin,
         )
@@ -253,6 +254,9 @@ pub struct JobAuthority {
     /// Where the lane's cycles report their phases
     /// (`crate::activity::job_phase`); nowhere until [`Self::report_to`].
     status: crate::activity::JobStatus,
+    /// The engages the lane's cycles may not pick yet
+    /// ([`Self::hold_back_engages`]).
+    holdback: crate::scheduler::EngageHoldback,
 }
 
 impl JobAuthority {
@@ -270,11 +274,19 @@ impl JobAuthority {
         self.status.clone()
     }
 
+    /// Hold back `holdback`'s engages from the cycles opened from now on,
+    /// until the next call: the PR sync has not yet caught up with what
+    /// the forge shows for them (`crate::daemon::EngageWaits`).
+    pub fn hold_back_engages(&mut self, holdback: crate::scheduler::EngageHoldback) {
+        self.holdback = holdback;
+    }
+
     /// Open the cycle's scope. It borrows this authority until it is
     /// settled or dropped, so no second scope opens beside it.
     pub fn scope(&mut self) -> CycleScope<'_> {
         CycleScope {
             store: JobStore::of(&Owner(()), self.store.clone()),
+            holdback: self.holdback.clone(),
             _jobs: PhantomData,
         }
     }
@@ -286,6 +298,7 @@ impl JobAuthority {
     pub fn into_test_scope(self) -> CycleScope<'static> {
         CycleScope {
             store: JobStore::of(&Owner(()), self.store.clone()),
+            holdback: crate::scheduler::EngageHoldback::default(),
             _jobs: PhantomData,
         }
     }
@@ -464,6 +477,8 @@ pub struct Owner(());
 /// a runner holding one can still create its job.
 pub struct CycleScope<'a> {
     store: JobStore,
+    /// The engages this cycle may not pick ([`JobAuthority::hold_back_engages`]).
+    holdback: crate::scheduler::EngageHoldback,
     _jobs: PhantomData<&'a mut JobAuthority>,
 }
 
@@ -471,6 +486,11 @@ impl CycleScope<'_> {
     /// The store with the writes only the job lane makes ([`JobStore`]).
     pub const fn store(&self) -> &JobStore {
         &self.store
+    }
+
+    /// The engages this cycle may not pick yet: `pick_next` skips them.
+    pub const fn engage_holdback(&self) -> &crate::scheduler::EngageHoldback {
+        &self.holdback
     }
 
     /// Create a job, owned by the [`RunningJob`] returned. The INSERT and
