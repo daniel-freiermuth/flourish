@@ -305,6 +305,11 @@ async fn list_engage(store: &Store) -> sqlx::Result<(Vec<Finding>, BTreeSet<i64>
 /// Selection — replicates `scheduler.pick_next`'s priority order and
 /// per-kind eligibility conditions.
 ///
+/// This is the job lane's dispatcher: the work queue it serves is the
+/// database's work items, read afresh at every pick, not an in-memory
+/// queue (see `crate::daemon`'s module docs for why, and for when a queue
+/// type becomes worth building).
+///
 /// Priority (`scheduler.pick_next`): a budget-overridden finding (any
 /// category) jumps the queue -> flagged PR (oldest-outstanding reason
 /// first) -> oldest merged or closed PR pending its harvest

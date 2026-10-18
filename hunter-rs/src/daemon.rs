@@ -32,6 +32,71 @@
 //! database may be behind the forge, the job lane waits for a PR sync
 //! pass ([`PrSyncPasses`]): before its first pick, and after a cycle that
 //! met a PR the forge has ended and the database has not.
+//!
+//! # Where the work queue is, and why there is no queue type
+//!
+//! There is no in-memory queue of work items, and no pool of workers that
+//! drains one. The scheduler does without them for now; the end of this
+//! section says when one becomes worth building. The queue is the
+//! database: a work item is a finding × a kind, active while the finding
+//! is in that kind's tier, with its streak, hold and checkpoint
+//! (WORK-MODEL.md §6), or a repo's scan, due by its `last_*_at`. What to
+//! do next is read from those rows each time:
+//!
+//! - The job lane's dispatcher is [`crate::scheduler::pick_next`], one
+//!   priority ladder over every token-spending work item. One job runs at
+//!   a time, and the types make it so: a cycle borrows the one
+//!   `&mut JobAuthority`. That bound fits while tokens are the scarce
+//!   resource; several workers need the changes listed below.
+//! - Each admin duty reads its own due set (the `pr_open` findings, the
+//!   flagged repos, the clones not fetched lately, the repos whose
+//!   dependencies are due, the finished trees) at every run and works
+//!   through it. A duty is its own worker; between runs it sleeps until
+//!   its timer or its wake.
+//! - The lanes hand work to each other through the same rows: a duty that
+//!   made work wakes the job lane ([`DutyRun::made_work`]), which then
+//!   picks it. When Renovate has no answer, the admin lane hands the
+//!   repo's dependency scan to the job lane's AI scan as a row
+//!   (`dep_scan_fallbacks`), not as a message.
+//!
+//! So the state survives a crash or a restart without a queue to rebuild,
+//! and the guards that keep two writers apart (guarded transitions, one
+//! running job per place, clone permits, tree leases) sit on those rows,
+//! where every reader sees them.
+//!
+//! Two limits of the current design, and why they stand:
+//!
+//! - **A duty's pass is serial inside the duty.** The Renovate duty scans
+//!   its due repos one after another, fetch-ahead fetches one clone after
+//!   another. A slow scan delays only the scans after it. The duties do
+//!   not wait for each other, and none of them waits for a job. (Before
+//!   the duties were split, the whole admin lane was one serial pass with
+//!   a 5-minute sleep, so a Renovate scan held up PR sync. That is the
+//!   problem [`spawn_admin_lane`] fixes; do not reintroduce a shared
+//!   pass.)
+//! - **The job lane still does a job's preparation and wrap-up itself.**
+//!   The fetch, the clone, the worktree, ingest, push and PR creation run
+//!   inside its cycle, around the worker. They spend no tokens, but each
+//!   has to finish before the next job starts. Fetch-ahead keeps the
+//!   fetch short. Whether the rest is worth moving to the admin lane is
+//!   to be measured first: the job lane reports each of these phases
+//!   (`job_activity`, [`crate::types::JobPhase`]).
+//!
+//! A queue of typed work items with a pool of job workers becomes worth
+//! building when either of these is wanted:
+//!
+//! - **Several job workers.** Then the budget's grant and its reservation
+//!   must become one step, because today two workers could both pass the
+//!   gate against the same headroom. Each chain also needs its own build
+//!   cache, because the clone's shared `target/` serializes builds
+//!   ([`crate::workspace::Workspace::build_cache`]). The UI needs every
+//!   running job, not one. The database already refuses two running jobs
+//!   on one place (migration 031), so two workers cannot corrupt state.
+//!   They would only waste a pick.
+//! - **Preparation and wrap-up off the job lane.** Then a job becomes
+//!   three steps handed between the lanes: prepare, run, conclude. The
+//!   hand-offs would have to be persisted, for example a fix ready to
+//!   ship, so that a crash between steps loses nothing.
 
 use std::future::Future;
 use std::path::Path;
@@ -303,6 +368,11 @@ pub struct AdminLane {
 /// paused daemon still records merges, closes and review comments and
 /// sweeps finished trees. The tasks end at shutdown, once their run in
 /// progress has ([`admin_duty`]).
+///
+/// One task per duty, never one shared pass: a pass ran PR sync, reaping,
+/// fetch-ahead, the Renovate scans and the sweep in turn, so a merge or a
+/// review comment waited for every Renovate scan due. See the module docs
+/// for why the lanes have no queue type.
 pub fn spawn_admin_lane(lane: AdminLane, shutdown: &watch::Receiver<bool>) -> Vec<JoinHandle<()>> {
     let lane = Arc::new(lane);
     ADMIN_DUTIES

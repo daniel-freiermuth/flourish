@@ -96,6 +96,9 @@ impl Workspace {
     /// own `target/` is already gitignored and warm from before trees were
     /// per-chain. Sharing it is safe because the job lane runs one job at
     /// a time (`recovery::JobAuthority`) and cargo locks the directory anyway.
+    /// With several job workers, builds of one repo would wait on each
+    /// other here: a cache per chain is part of that change (`crate::daemon`
+    /// module docs).
     pub fn build_cache(&self) -> PathBuf {
         self.clone.join("target")
     }
