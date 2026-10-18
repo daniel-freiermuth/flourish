@@ -3815,12 +3815,12 @@ fn gh_merged(bins: &FakeBins) {
 }
 
 /// The engage tier is the top one, and after a cycle that found its PR
-/// ended on the forge the job lane waits for a PR sync pass and picks
-/// again. If that pass cannot record the end (its view or its write keeps
-/// failing for this one PR), the same engage is picked at once, views the
-/// PR, waits for another pass, and so on for good, with no tier below it
-/// ever running. Each such round counts against the engage, so the limit
-/// holds it for the operator and the selection moves on.
+/// ended on the forge the job lane holds that engage back until a PR sync
+/// pass has read every open PR. If that pass cannot record the end (its
+/// view or its write keeps failing for this one PR), the engage would
+/// then be picked again, view the PR, wait for another pass, and so on
+/// for good. Each such round counts against the engage, so the limit
+/// holds it for the operator.
 #[tokio::test]
 async fn an_ended_pr_the_sync_cannot_record_holds_its_engage() {
     let f = fixture("engage-ended-unrecorded").await;

@@ -445,9 +445,10 @@ async fn summary(State(state): State<AppState>) -> Result<Json<Summary>, ApiErro
         ActivityStatus::Running {
             job: Box::new(job.clone()),
         }
-    } else if cycle_running {
-        // Priority 2: the job lane is in a cycle with no job row: picking,
-        // or preparing or finishing a job.
+    } else if cycle_running || job_activity.is_some() {
+        // Priority 2: the job lane is in a cycle with no job row (picking,
+        // or preparing or finishing a job), or waits outside one for a PR
+        // sync pass; which, `job_activity` says.
         ActivityStatus::Working
     } else if let Some(s) = scheduler_state.as_ref().filter(|s| s.state == "error") {
         ActivityStatus::Error {

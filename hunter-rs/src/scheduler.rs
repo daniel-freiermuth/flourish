@@ -302,6 +302,46 @@ async fn list_engage(store: &Store) -> sqlx::Result<(Vec<Finding>, BTreeSet<i64>
     Ok((rows.into_iter().map(|(_, f)| f).collect(), flagged))
 }
 
+/// Engages the job lane may not pick yet, because the PR sync has not
+/// caught up with what the forge shows for them: every engage until the
+/// first pass since startup has finished (`all`), and each engage that
+/// found its PR ended on the forge until a complete pass begun after that
+/// (`findings`, [`CycleSummary::awaits_pr_sync`]). Set by the daemon
+/// before each cycle (`crate::recovery::JobAuthority::hold_back_engages`).
+///
+/// Only the engage tier waits for the sync, fresh or resumed. No other
+/// tier picks work from a PR's state the sync has yet to record: a
+/// harvest is offered only once the sync recorded the PR's end, and the
+/// other kinds read no PR. So the lane keeps working through every other
+/// tier while the PR sync runs, however slow the forge is. Holding the
+/// engage back only saves a cycle: an engage picked from a stale
+/// `pr_open` row would still find its PR ended before any job row
+/// (`engage_view`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EngageHoldback {
+    /// Every engage: no PR sync pass has finished since startup.
+    pub all: bool,
+    /// The findings whose engage found the PR ended on the forge, waiting
+    /// for a complete pass begun after that.
+    pub findings: BTreeSet<i64>,
+}
+
+impl EngageHoldback {
+    /// Whether finding `fid`'s engage is held back.
+    pub fn holds(&self, fid: i64) -> bool {
+        self.all || self.findings.contains(&fid)
+    }
+}
+
+/// Whether `mode`'s cycle holds back finding `fid`'s engage
+/// ([`EngageHoldback`]). The preview has no cycle and holds back nothing.
+fn engage_held_back(mode: Pick<'_>, fid: i64) -> bool {
+    match mode {
+        Pick::Run(scope) => scope.engage_holdback().holds(fid),
+        Pick::Preview => false,
+    }
+}
+
 /// Selection — replicates `scheduler.pick_next`'s priority order and
 /// per-kind eligibility conditions.
 ///
@@ -411,6 +451,8 @@ async fn select(
     let not_held = |kind: FindingJobKind| move |f: &Finding| !held_ref.finding(f.id, kind);
     rechecking.retain(not_held(FindingJobKind::Recheck));
     attention.retain(not_held(FindingJobKind::Engage));
+    // Engages whose PR the sync has not caught up with yet wait for it.
+    attention.retain(|f| !engage_held_back(mode, f.id));
     pending_harvest.retain(not_held(FindingJobKind::Harvest));
     queued.retain(not_held(FindingJobKind::Fix));
     // A place a job is running on takes no second attempt: the insert
@@ -821,6 +863,9 @@ async fn pick_resume(
             continue;
         }
         let is_held = match (job.kind, job.finding_id) {
+            (JobKind::Finding(FindingJobKind::Engage), Some(fid)) => {
+                held.finding(fid, FindingJobKind::Engage) || engage_held_back(mode, fid)
+            }
             (JobKind::Finding(kind), Some(fid)) => held.finding(fid, kind),
             (JobKind::Repo(kind), _) => held.repo(job.repo_id, kind),
             (JobKind::Finding(_), None) => false,
@@ -1361,9 +1406,10 @@ pub struct CycleSummary {
     pub idle: Option<String>,
     /// The cycle found the forge ahead of the database -- a PR the
     /// database still has open is merged or closed -- and recorded
-    /// nothing, since that is the PR sync's to record. The job lane waits
-    /// for a fresh sync pass before it picks again
-    /// ([`crate::daemon::PrSyncPasses::next`]).
+    /// nothing, since that is the PR sync's to record. The job lane holds
+    /// the finding's engage back until a sync pass begun after it has read
+    /// every open PR, and picks other work meanwhile
+    /// ([`crate::daemon::EngageWaits`]).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub awaits_pr_sync: bool,
 }

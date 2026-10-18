@@ -2962,6 +2962,34 @@ async fn a_paused_engage_continues_while_its_pr_is_open_whatever_the_flag() {
     assert_eq!(plan.kind(), JobKind::from(FindingJobKind::Engage));
 }
 
+/// A paused engage the job lane holds back waits too: neither its tier
+/// nor the resume tier below it continues it. Nothing else is due, so
+/// the resume tier is reached, and what is picked is not the engage.
+#[tokio::test]
+async fn a_held_back_engage_is_not_resumed_by_any_tier() {
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo(&pool, &dir).await;
+    let cfg = test_config(dir.path());
+    seed_quiet_finding(&pool, 5).await;
+    let session = seed_session_in(&dir, 20, CTX);
+    seed_finding_suspension(&pool, 20, "engage", 5, &session).await;
+    let store = rw_store(&path).await;
+    let mut jobs = support::jobs(&store);
+    jobs.hold_back_engages(hunter::scheduler::EngageHoldback {
+        all: false,
+        findings: [5].into(),
+    });
+    let scope = jobs.scope();
+
+    let c = pick_next(&scope, &cfg, None).await.unwrap();
+
+    assert!(
+        c.as_ref()
+            .is_none_or(|c| c.job_kind() != FindingJobKind::Engage.into()),
+        "{c:?}"
+    );
+}
+
 /// The flag still gates a fresh start: a flagless PR whose engage
 /// checkpoint can no longer be continued (its tree is gone) has nothing to
 /// do, and the selection moves on rather than starting an engage nobody

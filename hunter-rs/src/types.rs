@@ -489,13 +489,14 @@ pub struct AdminActivity {
     pub started_at: i64,
 }
 
-/// A phase of a job-lane cycle outside its worker, reported by the
-/// helpers that do it (`crate::activity::job_phase`).
+/// A phase of the job lane outside its worker, reported by the helpers
+/// that do it (`crate::activity::job_phase`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum JobPhase {
-    /// Waiting for a repo's clone that an admin duty holds (fetch-ahead,
-    /// a dependency scan, the sweep): reported only while the wait lasts.
+    /// Waiting for a repo's clone that something else holds (an admin
+    /// duty, such as fetch-ahead, a dependency scan or the sweep, or a
+    /// handler's repo URL update): reported only while the wait lasts.
     WaitingForClone,
     /// Cloning a repo for its first job.
     Cloning,

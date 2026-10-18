@@ -136,10 +136,9 @@ pub type JobStatus = LaneStatus<JobActivity>;
 
 impl JobStatus {
     /// Record `phase` as running from now until the guard is dropped.
-    /// Crate-private: the job lane's phases are set only through
-    /// [`job_phase`], inside the cycle `run_cycle` runs under
-    /// [`reporting_job_phases`], so no handler or admin duty can show a
-    /// job phase while no cycle runs.
+    /// Crate-private: the job lane's phases are set inside the cycle
+    /// `run_cycle` runs under [`reporting_job_phases`] ([`job_phase`]), so
+    /// no handler or admin duty can show a job phase.
     pub(crate) fn begin(&self, phase: JobPhase) -> ActivityGuard<JobActivity> {
         self.show(JobActivity {
             phase,
