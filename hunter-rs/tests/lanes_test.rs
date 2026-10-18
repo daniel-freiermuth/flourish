@@ -707,47 +707,64 @@ fn a_duty_made_work_only_through_a_sync_or_a_scan_fallback() {
 }
 
 /// A run that made work wakes the job lane; one that made none leaves it
-/// asleep.
+/// asleep. The supervisor decides on the wake once the run has returned,
+/// before it waits for its next tick, so once the run has signalled and
+/// the duty has stopped, a wake it made is a permit already held.
 #[tokio::test]
 async fn a_duty_wakes_the_job_lane_only_after_a_run_that_made_work() {
+    use futures_util::FutureExt as _;
     let dir = TempDir::new("lanes-wake");
     let (_db, store) = support::fresh_store(&dir, "lanes-wake").await;
-    let job_wake = Arc::new(tokio::sync::Notify::new());
-    let supervise = |made: bool| {
-        let (stop, stopping) = tokio::sync::watch::channel(false);
-        let run = move || async move {
-            DutyRun::Scanned(hunter::scheduler::DepScans {
-                fallbacks: usize::from(made),
-                ..Default::default()
-            })
-        };
-        let duty = tokio::spawn(hunter::daemon::supervise_duty(
+    let woke = |made: bool| {
+        let (store, job_wake, ran) = (
             store.clone(),
-            AdminTask::DependencyScan,
-            DutyTimer {
-                interval: BOUND,
-                wake: None,
-            },
-            Arc::clone(&job_wake),
-            stopping,
-            run,
-        ));
-        (stop, duty)
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        async move {
+            let (stop, stopping) = tokio::sync::watch::channel(false);
+            let run = {
+                let ran = Arc::clone(&ran);
+                move || {
+                    let ran = Arc::clone(&ran);
+                    async move {
+                        ran.notify_one();
+                        DutyRun::Scanned(hunter::scheduler::DepScans {
+                            fallbacks: usize::from(made),
+                            ..Default::default()
+                        })
+                    }
+                }
+            };
+            let duty = tokio::spawn(hunter::daemon::supervise_duty(
+                store,
+                AdminTask::DependencyScan,
+                DutyTimer {
+                    interval: BOUND,
+                    wake: None,
+                },
+                Arc::clone(&job_wake),
+                stopping,
+                run,
+            ));
+            tokio::time::timeout(BOUND, ran.notified())
+                .await
+                .expect("the duty never ran");
+            stop.send_replace(true);
+            tokio::time::timeout(BOUND, duty)
+                .await
+                .expect("the duty did not stop")
+                .unwrap();
+            job_wake.notified().now_or_never().is_some()
+        }
     };
-    let short = Duration::from_millis(300);
 
-    let (stop, duty) = supervise(false);
-    let woken = tokio::time::timeout(short, job_wake.notified()).await;
-    stop.send_replace(true);
-    duty.await.unwrap();
-    assert!(woken.is_err(), "a run that made no work woke the job lane");
-
-    let (stop, duty) = supervise(true);
-    let woken = tokio::time::timeout(BOUND, job_wake.notified()).await;
-    stop.send_replace(true);
-    duty.await.unwrap();
     assert!(
-        woken.is_ok(),
+        !woke(false).await,
+        "a run that made no work woke the job lane"
+    );
+    assert!(
+        woke(true).await,
         "a run that made work left the job lane asleep"
     );
 }
