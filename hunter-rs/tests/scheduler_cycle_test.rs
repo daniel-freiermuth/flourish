@@ -5,16 +5,23 @@
 //! keeps running. Both leave an event, which is how the UI tells an idle
 //! daemon from a crashing one. And a cycle leaves no job of its own
 //! `running`, whichever way its runner returned.
+//!
+//! The PR sync that opens every cycle runs only while some finding has an
+//! open PR, and whatever it did is reported on the summary the cycle ends
+//! with. The daemon shortens its sleep to the PR-sync interval whenever a
+//! summary carries a sync (`daemon.rs`), so a sync dropped from a summary
+//! leaves review feedback waiting a full idle sleep, and a sync reported
+//! with no PR open keeps an idle daemon polling for nothing.
 
 mod support;
 
 use hunter::backend::NullBackend;
 use hunter::config::Config;
-use hunter::domain::JobState;
+use hunter::domain::{FindingStatus, JobState, Severity};
 use hunter::scheduler::run_cycle;
-use hunter::store::Store;
+use hunter::store::{FindingInsert, Store};
 use hunter::util::now_ms;
-use support::{GitRepo, ScriptedBackend, TempDir};
+use support::{FakeBins, GitRepo, ScriptedBackend, TempDir};
 
 /// A writable store on an empty schema, and a config whose disk gate
 /// cannot deny (a real statvfs of the test machine's disk would make the
@@ -266,4 +273,159 @@ async fn a_failed_settle_is_the_cycles_error_and_is_retried_before_the_next() {
         "{first:?}"
     );
     assert_eq!(store.current_job().await.unwrap().map(|j| j.id), None);
+}
+
+/// `sync_prs`'s view of a PR nobody has touched.
+const PR_OPEN_JSON: &str = r#"{"state":"OPEN","mergeable":"MERGEABLE","reviewDecision":"","comments":[],"reviews":[],"statusCheckRollup":[],"updatedAt":"2026-01-02T03:04:05Z","headRefName":"fix/some-bug","headRefOid":"deadbeef"}"#;
+
+/// A GitHub repo with a real clone whose `test_gap` is the only kind due,
+/// so an `enabled` repo dispatches it and a disabled one leaves the cycle
+/// idle, and one finding on it. The URL is GitHub's so `sync_prs` can
+/// resolve a PR on it; the clone's origin is that URL, redirected by git
+/// to the local bare repo, so a fetch never leaves the machine.
+async fn with_finding(label: &str, enabled: bool) -> (TempDir, Store, Config, i64) {
+    const URL: &str = "https://github.com/acme/widget";
+    let dir = TempDir::new(label);
+    let (path, pool) = support::fresh_pool(&dir, "cycle").await;
+    let repo = GitRepo::with_branch(&dir, "feature");
+    let clone = dir.path().join("repo-1");
+    std::fs::rename(&repo.work, &clone).unwrap();
+    let origin = repo.origin.to_string_lossy().to_string();
+    support::git(&clone, &["remote", "set-url", "origin", URL]);
+    support::git(&clone, &["config", &format!("url.{origin}.insteadOf"), URL]);
+    let future = now_ms() + 999_999;
+    sqlx::query(
+        "INSERT INTO repos \
+         (id, name, url, path, forge, default_branch, enabled, added_at, \
+          last_hunt_at, last_test_gap_at, last_dep_update_at, last_refactor_at, \
+          last_modernization_at, last_standards_at) \
+         VALUES (1, 'alpha', ?1, ?2, 'github', 'main', ?3, 1000, ?4, 1000, ?4, ?4, ?4, ?4)",
+    )
+    .bind(URL)
+    .bind(clone.to_string_lossy().to_string())
+    .bind(i64::from(enabled))
+    .bind(future)
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    std::fs::write(
+        dir.subdir("playbooks").join("test_gap.md"),
+        "test gaps in {{REPO_NAME}} -> {{OUT_PATH}}\n",
+    )
+    .unwrap();
+    let mut cfg = support::load_config(dir.path());
+    cfg.work_root = dir.subdir("work_root");
+    cfg.min_free_disk_bytes = 0;
+    let store = Store::connect(&path).await.unwrap();
+    let (fid, _) = store
+        .upsert_finding(
+            1,
+            &FindingInsert {
+                fingerprint: "fp-cycle-pr".to_owned(),
+                file: "src/lib.rs".to_owned(),
+                severity: Severity::Medium,
+                confidence: 0.9,
+                summary: "a bug with a PR".to_owned(),
+                ..Default::default()
+            },
+            "bug",
+            None,
+        )
+        .await
+        .unwrap();
+    (dir, store, cfg, fid)
+}
+
+/// A finding whose PR has already merged is not an open PR: the cycle
+/// asks the forge nothing and reports no sync.
+#[tokio::test]
+async fn a_cycle_with_no_open_pr_runs_no_pr_sync() {
+    let bins = FakeBins::acquire("cycle-no-pr");
+    bins.ok("gh", PR_OPEN_JSON);
+    let (_dir, store, cfg, fid) = with_finding("cycle-no-pr", false).await;
+    store
+        .set_finding_pr_open(fid, "https://github.com/acme/widget/pull/7")
+        .await
+        .unwrap();
+    store
+        .set_finding_status(fid, FindingStatus::Merged)
+        .await
+        .unwrap();
+
+    let summary = run_cycle(&support::recovered(&store), &cfg, &NullBackend, None).await;
+
+    assert!(summary.idle.is_some(), "{summary:?}");
+    assert!(summary.sync.is_none(), "no PR is open: {summary:?}");
+    assert!(
+        bins.calls_to("gh").is_empty(),
+        "the forge was asked: {:?}",
+        bins.calls()
+    );
+}
+
+/// An open PR is synced even when there is no job to run, and the idle
+/// summary says so.
+#[tokio::test]
+async fn an_idle_cycle_reports_its_pr_sync() {
+    let bins = FakeBins::acquire("cycle-idle-pr");
+    bins.ok("gh", PR_OPEN_JSON);
+    let (_dir, store, cfg, fid) = with_finding("cycle-idle-pr", false).await;
+    store
+        .set_finding_pr_open(fid, "https://github.com/acme/widget/pull/7")
+        .await
+        .unwrap();
+
+    let summary = run_cycle(&support::recovered(&store), &cfg, &NullBackend, None).await;
+
+    assert_eq!(
+        summary.idle.as_deref(),
+        Some("no queued findings, no enabled repos"),
+        "{summary:?}"
+    );
+    assert_eq!(summary.job_id, None, "{summary:?}");
+    let sync = summary.sync.as_ref().expect("the sync is reported");
+    assert_eq!((sync.synced, sync.errors), (1, 0), "{summary:?}");
+    assert!(!bins.calls_to("gh").is_empty(), "the PR was looked at");
+}
+
+/// A cycle that runs a job reports the sync that preceded it, on the
+/// summary and in the cycle's event line.
+#[tokio::test]
+async fn a_dispatched_cycle_reports_its_pr_sync() {
+    let bins = FakeBins::acquire("cycle-job-pr");
+    bins.ok("gh", PR_OPEN_JSON);
+    let (_dir, store, cfg, fid) = with_finding("cycle-job-pr", true).await;
+    store
+        .set_finding_pr_open(fid, "https://github.com/acme/widget/pull/7")
+        .await
+        .unwrap();
+
+    let summary = run_cycle(
+        &support::recovered(&store),
+        &cfg,
+        &ScriptedBackend::noop(),
+        None,
+    )
+    .await;
+
+    assert_eq!(
+        summary.kind.map(hunter::domain::JobKind::as_str),
+        Some("test_gap"),
+        "{summary:?}"
+    );
+    assert!(summary.job_id.is_some(), "{summary:?}");
+    let sync = summary.sync.as_ref().expect("the sync is reported");
+    assert_eq!((sync.synced, sync.errors), (1, 0), "{summary:?}");
+    let event = store
+        .last_cycle_event()
+        .await
+        .unwrap()
+        .expect("cycle event");
+    assert!(
+        event.message.starts_with("kind=test_gap, repo=alpha")
+            && event.message.ends_with("; prsync 1s/0m/0c/0a/0e"),
+        "{}",
+        event.message
+    );
 }
