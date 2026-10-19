@@ -1020,7 +1020,7 @@ async fn count_given_up_chain(
                 store,
                 &mut summary,
                 fid,
-                job,
+                Some(job),
                 failure,
                 &detail,
                 HoldReason::GaveUp,
@@ -3109,24 +3109,24 @@ pub async fn run_hunt(
 /// given up). The [`MAX_CONSECUTIVE_SAME_FAILURE`]th identical failure holds
 /// the recheck for the operator as `at_limit` ([`Store::hold_work`]) —
 /// `stuck`, or `gave_up` when the give-up ceiling's failure completed the
-/// streak — with `job` as its checkpoint if a worker ran in it. The finding
+/// streak — with `job` as its checkpoint if a worker ran in it; `None`
+/// for one that failed before its job existed. The finding
 /// stays `rechecking`: sent back to `new` it looked exactly like a finding
 /// nobody had rechecked.
 async fn handle_recheck_failure(
     store: &JobStore,
     summary: &mut CycleSummary,
     fid: i64,
-    job: i64,
+    job: Option<i64>,
     failure: &str,
     detail: &str,
     at_limit: HoldReason,
     override_mode: Option<BudgetOverride>,
 ) -> CycleSummary {
     let log = |message: String| async move {
-        let _ = store
-            .log_event("recheck", &message, Some(job), Some(fid))
-            .await;
+        let _ = store.log_event("recheck", &message, job, Some(fid)).await;
     };
+    let attempt = job.map_or_else(String::new, |job| format!("job {job} "));
     summary.outcome = Some("requeued".into());
     match store
         .record_work_failure(fid, FindingJobKind::Recheck, failure)
@@ -3134,21 +3134,21 @@ async fn handle_recheck_failure(
     {
         Ok(None) => {
             log(format!(
-                "#{fid}: job {job} {detail} -- not counted: it is no longer rechecking"
+                "#{fid}: {attempt}{detail} -- not counted: it is no longer rechecking"
             ))
             .await;
         }
         Err(e) => {
             log(format!(
-                "#{fid}: job {job} {detail} -- will retry (not counted: {e})"
+                "#{fid}: {attempt}{detail} -- will retry (not counted: {e})"
             ))
             .await;
         }
         Ok(Some(streak)) if streak < MAX_CONSECUTIVE_SAME_FAILURE => {
-            log(format!("#{fid}: job {job} {detail} -- will retry")).await;
+            log(format!("#{fid}: {attempt}{detail} -- will retry")).await;
         }
         Ok(Some(streak)) => match store
-            .hold_work(fid, FindingJobKind::Recheck, at_limit, detail, Some(job))
+            .hold_work(fid, FindingJobKind::Recheck, at_limit, detail, job)
             .await
         {
             Ok(true) => {
@@ -3270,6 +3270,18 @@ pub async fn run_recheck(
     if resume.is_none()
         && let Err(failure) = sync_repo(store, &permit, Fetcher::Job).await?
     {
+        if failure.network
+            && let Some(host) = unreachable_now(cfg, &repo.url, backend).await
+        {
+            return Ok(offline_denial(
+                store,
+                FindingJobKind::Recheck.into(),
+                Some(fid),
+                None,
+                host,
+            )
+            .await);
+        }
         let _ = store
             .log_event(
                 "error",
@@ -3278,6 +3290,22 @@ pub async fn run_recheck(
                 Some(fid),
             )
             .await;
+        // Counted under the sync's fixed key, as a failed recheck: an
+        // uncounted one stayed `rechecking`, and the recheck tier, which
+        // outranks fixes, resumes and the repo rotation, took it again every
+        // cycle. The repo's own `sync` hold would not stop that tier. No
+        // worker ran, so a one-shot override is not spent.
+        handle_recheck_failure(
+            store,
+            &mut CycleSummary::default(),
+            fid,
+            None,
+            failure.key,
+            &failure.detail,
+            HoldReason::Stuck,
+            None,
+        )
+        .await;
         anyhow::bail!("{}", failure.detail);
     }
 
@@ -3343,7 +3371,7 @@ pub async fn run_recheck(
                 store,
                 &mut failed,
                 fid,
-                job,
+                Some(job),
                 TREE_NOT_MADE,
                 &note,
                 HoldReason::Stuck,
@@ -3493,7 +3521,7 @@ pub async fn run_recheck(
             store,
             &mut summary,
             fid,
-            job,
+            Some(job),
             &failure,
             &failure,
             HoldReason::Stuck,
@@ -3510,7 +3538,7 @@ pub async fn run_recheck(
             store,
             &mut summary,
             fid,
-            job,
+            Some(job),
             "missing verdict field",
             "missing verdict field",
             HoldReason::Stuck,
@@ -3600,7 +3628,7 @@ pub async fn run_recheck(
                 store,
                 &mut summary,
                 fid,
-                job,
+                Some(job),
                 &failure,
                 &failure,
                 HoldReason::Stuck,
@@ -5164,7 +5192,7 @@ async fn runner_failed(
                 store,
                 &mut summary,
                 fid,
-                job,
+                Some(job),
                 RUNNER_ERROR,
                 &detail,
                 HoldReason::Stuck,
