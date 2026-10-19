@@ -3785,6 +3785,19 @@ esac"#,
     .expect("a PR the forge has ended is a skip, not the cycle's error");
 
     assert!(summary.awaits_pr_sync, "{summary:?}");
+    assert_eq!(
+        (
+            summary.kind,
+            summary.repo.as_deref(),
+            summary.skipped.is_some()
+        ),
+        (
+            Some(hunter::domain::FindingJobKind::Engage.into()),
+            Some("widget"),
+            true
+        ),
+        "a skip that names the kind and repo it skipped: {summary:?}"
+    );
     assert!(backend.runs().is_empty());
     assert!(
         f.store.jobs_by_finding(f.fid).await.unwrap().is_empty(),

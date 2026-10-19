@@ -253,7 +253,8 @@ async fn sync_open_prs(
         "prsync {}s/{}m/{}c/{}a/{}r/{}q/{}e",
         s.synced, s.merged, s.closed, s.attention, s.raised, s.requeued, s.errors
     );
-    tracing::debug!("{line}");
+    // `complete` is false only for a pass cut short by shutdown.
+    tracing::debug!(complete = s.complete, "{line}");
     if s.made_work() {
         let _ = admin.store().log_event("prsync", &line, None, None).await;
     }

@@ -421,6 +421,49 @@ async fn a_woken_reaper_removes_a_deleted_repo_at_once() {
     );
 }
 
+/// A cycle reports its phases to the status the job lane was given
+/// (`JobAuthority::report_to`), the one the status page reads: here, its
+/// wait for a clone an admin duty holds, which ends with the wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cycle_reports_its_wait_for_a_held_clone_to_the_job_lanes_status() {
+    let (_dir, store, cfg, _fid) = fixture("lanes-phase").await;
+    let status = hunter::activity::JobStatus::default();
+    let held = store.test_lane().lock_clone(1).await.unwrap();
+    let mut jobs = support::jobs(&store);
+    jobs.report_to(status.clone());
+    let cycle = tokio::spawn(async move {
+        hunter::scheduler::run_cycle(
+            &mut jobs,
+            &cfg,
+            &ScriptedBackend::new(|_| support::done()),
+            None,
+        )
+        .await
+    });
+
+    let shown = tokio::time::timeout(BOUND, async {
+        loop {
+            if let Some(activity) = status.current() {
+                return activity.phase;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    drop(held);
+    let summary = tokio::time::timeout(BOUND, cycle)
+        .await
+        .expect("the cycle never finished")
+        .unwrap();
+
+    assert_eq!(
+        shown.expect("the cycle's wait never showed"),
+        hunter::types::JobPhase::WaitingForClone
+    );
+    assert!(summary.job_id.is_some(), "fixture: no job ran: {summary:?}");
+    assert_eq!(status.current(), None, "a phase outlived its cycle");
+}
+
 /// Every engage is held back until the first PR sync since startup has
 /// finished: a PR merged while the daemon was down is recorded before any
 /// engage is picked from the `pr_open` row the database still has. Only
@@ -434,12 +477,14 @@ async fn engages_are_held_back_until_the_first_sync_has_recorded_what_the_forge_
     let passes = hunter::daemon::PrSyncPasses::default();
     let mut waits = hunter::daemon::EngageWaits::default();
     let (before, _) = waits.settle(&passes);
+    let waiting_before = waits.waiting(&passes);
     let (_scheduler, stop, _stopping, duties) = start_admin_lane(&store, &cfg, &passes);
 
     tokio::time::timeout(BOUND, passes.finished_after(0))
         .await
         .expect("the first PR sync never finished");
     let (after, looked_at) = waits.settle(&passes);
+    let waiting_after = waits.waiting(&passes);
     let status = store.get_finding(fid).await.unwrap().unwrap().status;
 
     stop_admin_lane(&stop, duties).await;
@@ -448,6 +493,11 @@ async fn engages_are_held_back_until_the_first_sync_has_recorded_what_the_forge_
         "an engage could be picked before the first sync"
     );
     assert!(before.holds(fid));
+    assert!(
+        waiting_before,
+        "the job lane would not wake for the first sync"
+    );
+    assert!(!waiting_after, "the job lane still waits for a sync");
     assert_eq!(after, hunter::scheduler::EngageHoldback::default());
     assert!(looked_at.is_empty());
     assert_eq!(status, FindingStatus::Merged);
@@ -490,7 +540,16 @@ async fn an_ended_prs_engage_is_held_back_until_a_sync_begun_after_it() {
     let mut waits = hunter::daemon::EngageWaits::default();
     waits.ended(&ended_pr_cycle(fid), &passes);
     waits.ended(&hunter::scheduler::CycleSummary::default(), &passes);
+    // A cycle on another finding that met no ended PR holds nothing back.
+    waits.ended(
+        &hunter::scheduler::CycleSummary {
+            finding_id: Some(fid + 1),
+            ..Default::default()
+        },
+        &passes,
+    );
     let (held, early) = waits.settle(&passes);
+    let waiting = waits.waiting(&passes);
     let seen = passes.now().finished;
     scheduler.pr_sync_wake.notify_one();
     tokio::time::timeout(BOUND, passes.finished_after(seen))
@@ -503,6 +562,7 @@ async fn an_ended_prs_engage_is_held_back_until_a_sync_begun_after_it() {
     assert_eq!(before, FindingStatus::PrOpen);
     assert!(!held.all);
     assert_eq!(held.findings, std::collections::BTreeSet::from([fid]));
+    assert!(waiting, "the job lane would not wake when the sync ends");
     assert!(
         early.is_empty(),
         "released by a pass that was over before it"

@@ -100,4 +100,15 @@ exclude_re = [
     # hit: `Instant::elapsed` has moved on by the time it is read. The
     # other mutants of the comparison are caught (`lanes_test`).
     "replace < with <= in ClonePermit<'_>::last_fetch_within",
+    # `DepScanGate::admits`' `<` against `<=` differs only when a repo's
+    # last scan ended exactly an interval ago to the millisecond of the
+    # pass's `now_ms()`, which a test cannot set: the pass reads the clock
+    # itself. The other mutants of the check are caught
+    # (`runner_dep_update_test`).
+    "replace < with <= in DepScanGate::admits",
+    # `Fetcher::timeout_s` returning 1 differs only for a fetch that takes
+    # over a second, which no test's local origin does; a test that made
+    # one slow on purpose would pin a wall-clock race. Returning 0 (every
+    # fetch timed out at once) is caught.
+    "replace Fetcher::timeout_s -> u64 with 1$",
 ]
