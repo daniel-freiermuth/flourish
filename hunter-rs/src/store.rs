@@ -3187,12 +3187,13 @@ impl Store {
     /// holds its branch checked out, and git refuses to check one branch
     /// out in two worktrees.
     ///
-    /// A resumed attempt copies `pinned_sha`, `base_sha` and
-    /// `seen_activity_at` from the attempt it continues, here in the
-    /// INSERT, so every link of a chain names the commit its shared tree
-    /// was created at, the default-branch commit a harvest chain judges
-    /// against, and the newest PR feedback an engage chain's worker was
-    /// shown. `base_sha`, when given, is the commit a harvest resolved for
+    /// A resumed attempt copies `pinned_sha`, `base_sha`,
+    /// `seen_activity_at` and the `started_on_*` pair from the attempt it
+    /// continues, here in the INSERT, so every link of a chain names the
+    /// commit its shared tree was created at, the default-branch commit a
+    /// harvest chain judges against, the newest PR feedback an engage
+    /// chain's worker was shown, and the problems it started from.
+    /// `base_sha`, when given, is the commit a harvest resolved for
     /// itself; it is written by the same INSERT, so no harvest row exists
     /// without it for a resume to inherit as NULL.
     ///
@@ -3456,12 +3457,15 @@ impl Store {
         let result = sqlx::query!(
             "INSERT INTO jobs \
              (kind, repo_id, finding_id, cap_tokens, state, started_at, estimated_tokens, \
-              resumed_from, pinned_sha, base_sha, seen_activity_at, full_history, \
+              resumed_from, pinned_sha, base_sha, seen_activity_at, \
+              started_on_fingerprint, started_on_head_sha, full_history, \
               full_hunt_request) \
              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, \
                     (SELECT p.pinned_sha FROM jobs p WHERE p.id = ?8), \
                     COALESCE(?9, (SELECT p.base_sha FROM jobs p WHERE p.id = ?8)), \
                     (SELECT p.seen_activity_at FROM jobs p WHERE p.id = ?8), \
+                    (SELECT p.started_on_fingerprint FROM jobs p WHERE p.id = ?8), \
+                    (SELECT p.started_on_head_sha FROM jobs p WHERE p.id = ?8), \
                     COALESCE((SELECT p.full_history FROM jobs p WHERE p.id = ?8), 0), \
                     (SELECT p.full_hunt_request FROM jobs p WHERE p.id = ?8) \
              WHERE EXISTS (SELECT 1 FROM repos WHERE id = ?2 AND deleted_at IS NULL)",
@@ -3618,6 +3622,38 @@ impl Store {
                 .map(SeenActivity),
         )
     }
+
+    /// Record the problems and head a cold engage attempt started from, as
+    /// `ps` records them. Resumes inherit them ([`CycleScope::create_job`](crate::recovery::CycleScope::create_job)) instead.
+    async fn set_started_on(&self, job_id: i64, ps: &RecordedPrState) -> sqlx::Result<()> {
+        sqlx::query!(
+            "UPDATE jobs SET started_on_fingerprint = ?1, started_on_head_sha = ?2 WHERE id = ?3",
+            ps.attention_fingerprint,
+            ps.head_sha,
+            job_id
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Whether `ps` records the problems, on the head, that `job_id`'s
+    /// engage chain started from ([`Self::set_started_on`]). False for a
+    /// chain that recorded none, or no head.
+    pub async fn started_on(&self, job_id: i64, ps: &RecordedPrState) -> sqlx::Result<bool> {
+        Ok(sqlx::query_scalar!(
+            r#"SELECT started_on_fingerprint = ?2 AND started_on_head_sha = ?3 AS "same?: bool"
+               FROM jobs WHERE id = ?1"#,
+            job_id,
+            ps.attention_fingerprint,
+            ps.head_sha
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten()
+        .unwrap_or(false))
+    }
+
     /// Whether the chain rooted at `origin_id` still needs its working
     /// tree, and how long ago it last did anything.
     ///
@@ -5702,6 +5738,11 @@ impl JobStore {
     /// Record the newest PR feedback a cold engage attempt's worker was shown. See the private `Store` method of the same name.
     pub async fn set_seen_activity(&self, job_id: i64, seen: SeenActivity) -> sqlx::Result<()> {
         self.0.set_seen_activity(job_id, seen).await
+    }
+
+    /// Record the problems and head a cold engage attempt started from. See the private `Store` method of the same name.
+    pub async fn set_started_on(&self, job_id: i64, ps: &RecordedPrState) -> sqlx::Result<()> {
+        self.0.set_started_on(job_id, ps).await
     }
 
     /// Downgrade an already-recorded job to failed. See the private `Store` method of the same name.
