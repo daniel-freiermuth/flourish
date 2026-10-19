@@ -6207,6 +6207,10 @@ struct EngageStart {
     /// by a cold attempt, inherited by a resume (which is only told to
     /// carry on). None for a chain started before this was recorded.
     seen_activity: Option<SeenActivity>,
+    /// Whether `ps` records the problems, on the head, the chain started
+    /// from: always for a cold attempt; for a resume, only while no sync
+    /// has recorded others since, which its worker was never shown.
+    shown_ps: bool,
 }
 
 /// The PR as the forge shows it, for a fresh engage's playbook. A failed
@@ -6441,6 +6445,7 @@ async fn start_engage(
         }
     };
     let seen_activity = engage_seen_activity(store, job, pr.as_ref()).await;
+    let shown_ps = engage_shown_ps(store, job, &ps, resume.is_none()).await;
     Ok(Ok((
         EngageStart {
             repo,
@@ -6453,6 +6458,7 @@ async fn start_engage(
             pinned,
             cap,
             seen_activity,
+            shown_ps,
         },
         running,
     )))
@@ -6474,6 +6480,25 @@ async fn engage_seen_activity(
     // chain started with: a re-raised comment, never a hidden one.
     let _ = store.set_seen_activity(job, seen).await;
     Some(seen)
+}
+
+/// Whether job `job`'s worker was shown the problems `ps` records. A cold
+/// attempt starts from `ps`, and records it; a resume, which is only told
+/// to carry on in the tree made at its chain's first head, was shown only
+/// what its chain started from.
+async fn engage_shown_ps(
+    store: &JobStore,
+    job: i64,
+    ps: &crate::store::RecordedPrState,
+    cold: bool,
+) -> bool {
+    if !cold {
+        return store.started_on(job, ps).await.unwrap_or(false);
+    }
+    // Unrecorded, a resume of this chain declines nothing: a re-raised
+    // problem, never a hidden one.
+    let _ = store.set_started_on(job, ps).await;
+    true
 }
 
 /// The worker asked to withdraw the PR (`WITHDRAW.md`): close it on the
@@ -6809,8 +6834,10 @@ async fn record_engage(
         Ok(replied) => {
             let answer = if pushed {
                 EngageAnswer::pushed(&start.pr_ref, start.seen_activity)
-            } else {
+            } else if start.shown_ps {
                 EngageAnswer::without_push(&start.pr_ref, start.seen_activity, &start.ps)
+            } else {
+                EngageAnswer::without_push_unshown(&start.pr_ref, start.seen_activity)
             };
             record_engage_answer(store, fid, start, answer).await;
             let did: Vec<&str> = [("pushed", pushed), ("replied", replied)]
