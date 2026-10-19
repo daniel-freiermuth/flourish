@@ -76,7 +76,9 @@ impl CheckConclusion {
     pub fn parse(s: &str) -> Self {
         match s.to_ascii_uppercase().as_str() {
             "SUCCESS" => Self::Success,
-            "FAILURE" => Self::Failure,
+            // A legacy status's `ERROR` and a check run that never started
+            // (`STARTUP_FAILURE`, e.g. an invalid workflow) are red CI too.
+            "FAILURE" | "ERROR" | "STARTUP_FAILURE" => Self::Failure,
             "TIMED_OUT" => Self::TimedOut,
             "CANCELLED" => Self::Cancelled,
             "NEUTRAL" => Self::Neutral,
