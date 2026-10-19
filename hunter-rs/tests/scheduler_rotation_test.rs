@@ -610,7 +610,9 @@ async fn a_clean_scan_moves_its_timestamp_and_ends_the_streak() {
 }
 
 /// A backend that cannot start the worker closes its job, which is not
-/// left `running`, and is counted as `runner error`.
+/// left `running`, and is counted as `runner error`. The error reaches the
+/// operator as it was raised, cause and all, though the runner has marked
+/// it counted.
 #[tokio::test]
 async fn a_runner_error_closes_the_job_and_is_counted() {
     let (_dir, path, cfg) = fixture("rotation-runner-error").await;
@@ -624,7 +626,21 @@ async fn a_runner_error_closes_the_job_and_is_counted() {
     )
     .await;
 
-    assert!(summary.error.is_some(), "{summary:?}");
+    assert_eq!(
+        summary.error.as_deref(),
+        Some("test: the backend failed before the worker ran"),
+        "{summary:?}"
+    );
+    let events = store.recent_events(10).await.unwrap();
+    let crash = events
+        .iter()
+        .find(|e| e.message.starts_with("cycle crashed: "))
+        .expect("a cycle crashed event");
+    assert!(
+        crash.message.contains("test: the blocking task panicked"),
+        "the cause must be logged too: {}",
+        crash.message
+    );
     let jobs = store.list_jobs(10).await.unwrap();
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].job.state, JobState::Failed, "{:?}", jobs[0]);
@@ -760,6 +776,29 @@ async fn an_abandoned_hunt_chain_is_held_on_the_third() {
     let held = hold_alpha_then_beta(&store, &cfg, &backend, RepoWorkKind::Hunt).await;
 
     assert_eq!(held.reason, HoldReason::GaveUp);
+}
+
+/// A hunt that errors before its worker runs, here on a playbook typo the
+/// prompt cannot be rendered past, is counted like any other failure: three
+/// in a row hold the hunt, and the turn passes on instead of the same hunt
+/// being picked again every cycle.
+#[tokio::test]
+async fn a_hunt_that_errors_before_its_worker_is_held_and_passes_the_turn_on() {
+    let (dir, store, cfg) = two_hunts_due("rotation-hunt-error").await;
+    std::fs::write(
+        dir.join("playbooks").join("hunt.md"),
+        "hunt {{REPO_PATH}} {{NO_SUCH_SLOT}}\n",
+    )
+    .unwrap();
+    let backend = ScriptedBackend::noop();
+
+    let held = hold_alpha_then_beta(&store, &cfg, &backend, RepoWorkKind::Hunt).await;
+
+    assert!(
+        backend.runs().is_empty(),
+        "no worker may have been launched"
+    );
+    assert!(held.detail.contains("NO_SUCH_SLOT"), "{held:?}");
 }
 
 /// A hunt whose fetch fails never gets as far as a job. The failure is the

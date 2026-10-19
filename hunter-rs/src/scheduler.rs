@@ -2059,7 +2059,7 @@ async fn repo_sync_failed(
         HoldReason::Stuck,
     )
     .await;
-    Err(anyhow::anyhow!("{}", failure.detail))
+    Err(counted(anyhow::anyhow!("{}", failure.detail)))
 }
 
 /// Whose count a repo work failure is, and so which work item it is: the
@@ -2175,6 +2175,38 @@ async fn record_repo_failure(
             false
         }
     }
+}
+
+/// The failure a repo's hunt or scan records when its runner returns an
+/// error that no step of it counted: a suppression list that cannot be
+/// read, a playbook that cannot be rendered, a store read or write that
+/// fails (WORK-MODEL.md §17.3). Fixed, with the error as
+/// the detail, so the same error every cycle is identical however it is
+/// worded and the work is held instead of being picked again forever.
+const CYCLE_ERROR: &str = "cycle error";
+
+/// An error whose failure its runner has counted on a repo work item
+/// already ([`repo_sync_failed`], [`runner_failed`]). The cycle does not
+/// count it again as [`CYCLE_ERROR`], which would reset the streak it
+/// just extended. Reads exactly as the error it wraps.
+#[derive(Debug)]
+struct Counted(anyhow::Error);
+
+impl std::fmt::Display for Counted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for Counted {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
+    }
+}
+
+/// Mark `err` as already counted on its repo work item ([`Counted`]).
+fn counted(err: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(Counted(err))
 }
 
 /// Budget gate: check with backend, return the grant or a denied summary.
@@ -2985,7 +3017,7 @@ pub async fn run_hunt(
             let ran = (WorkOf::Repo(RepoJobKind::Hunt, repo), running);
             let denied = runner_failed(store, (cfg, backend, &repo.url), ran, &e).await;
             close_workspace(lane, ws).await;
-            return denied.ok_or(e);
+            return denied.ok_or_else(|| counted(e));
         }
     };
     let ran = (WorkOf::Repo(RepoJobKind::Hunt, repo), running);
@@ -3889,7 +3921,7 @@ async fn run_analysis_job<K: AnalysisKind>(
             let ran = (WorkOf::Repo(kind, repo), running);
             let denied = runner_failed(store, (cfg, backend, &repo.url), ran, &e).await;
             close_workspace(lane, ws).await;
-            return denied.ok_or(e);
+            return denied.ok_or_else(|| counted(e));
         }
     };
     let ran = (WorkOf::Repo(kind, repo), running);
@@ -8744,8 +8776,29 @@ async fn run_cycle_inner(
     // A failure is counted on its work item and leaves the timestamp
     // alone, so the work is retried as soon as the rotation reaches it and
     // is held after three identical failures (WORK-MODEL.md §17), where it
-    // used to be bumped here and wait out its interval each time.
-    let result = dispatch(scope, lane, cfg, backend, &candidate).await?;
+    // used to be bumped here and wait out its interval each time. An error
+    // its runner did not count is counted here, as `cycle error`: left
+    // uncounted, the work would stay the stalest in the rotation and be
+    // picked again every cycle, starving every other repo's.
+    let result = match dispatch(scope, lane, cfg, backend, &candidate).await {
+        Ok(result) => result,
+        Err(e) => {
+            if let JobKind::Repo(kind) = candidate.job_kind()
+                && e.downcast_ref::<Counted>().is_none()
+            {
+                record_repo_failure(
+                    RepoStreak::Job(store, kind.into()),
+                    (candidate.repo_id(), candidate.label().unwrap_or_default()),
+                    None,
+                    CYCLE_ERROR,
+                    &format!("{CYCLE_ERROR}: {e:#}"),
+                    HoldReason::Stuck,
+                )
+                .await;
+            }
+            return Err(e);
+        }
+    };
 
     // Build log line
     let mut parts: Vec<String> = Vec::new();
