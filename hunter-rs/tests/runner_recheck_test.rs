@@ -695,6 +695,80 @@ async fn a_recheck_whose_backend_keeps_failing_is_held() {
     assert_eq!(running, 0, "no job is left running");
 }
 
+/// A fresh recheck whose clone cannot be synced (here: its origin is gone)
+/// is a failed recheck (WORK-MODEL.md §7): counted under the sync's fixed
+/// key, not git's words, and held at the limit. Uncounted, the finding
+/// stayed `rechecking`, and the recheck tier, which outranks fixes,
+/// resumes and the repo rotation, took it again every cycle.
+#[tokio::test]
+async fn a_recheck_whose_clone_cannot_sync_is_held() {
+    let f = fixture("recheck-sync-fails", FindingStatus::Rechecking).await;
+    let repo = f.store.list_repos().await.unwrap().remove(0);
+    std::fs::remove_dir_all(&repo.url).unwrap();
+    let never_runs = ScriptedBackend::new(|_| panic!("no worker without a synced clone"));
+    for attempt in 1..=3 {
+        let finding = f.finding().await;
+        let err = run_recheck(
+            &support::scope(&f.store),
+            f.store.test_lane(),
+            &f.cfg,
+            Attempt::Cold(&finding),
+            &never_runs,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("git fetch origin failed"), "{err}");
+        if attempt < 3 {
+            let streak = f.streak().await;
+            assert_eq!(streak.streak, attempt);
+            assert_eq!(streak.last_failure.as_deref(), Some("fetch failed"));
+        }
+    }
+    let hold = support::hold_of(&f.store, f.fid, FindingJobKind::Recheck)
+        .await
+        .expect("held at the limit");
+    assert_eq!(hold.reason, hunter::domain::HoldReason::Stuck);
+    assert!(
+        hold.detail.starts_with("git fetch origin failed"),
+        "{hold:?}"
+    );
+    assert_eq!(hold.checkpoint_job_id, None);
+    assert_eq!(f.job_count().await, 0);
+    assert_eq!(f.finding().await.status, FindingStatus::Rechecking);
+    assert!(
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
+            .await
+            .unwrap()
+            .is_none_or(|c| c.job_kind() != FindingJobKind::Recheck.into()),
+        "the recheck tier skips held work"
+    );
+}
+
+/// A sync that fails while a host the recheck needs is unreachable is the
+/// network's failure (#95): nothing is counted, and the cycle ends denied
+/// for the host.
+#[tokio::test]
+async fn a_failing_sync_while_a_host_is_unreachable_counts_nothing() {
+    let provider = support::PROVIDER_HOST;
+    let mut f = fixture("recheck-sync-offline", FindingStatus::Rechecking).await;
+    f.cfg.network_gate = true;
+    let repo = f.store.list_repos().await.unwrap().remove(0);
+    std::fs::remove_dir_all(&repo.url).unwrap();
+    let never_runs = ScriptedBackend::new(|_| panic!("no worker without a synced clone"))
+        .needing(&[provider])
+        .offline(&[provider]);
+
+    let summary = f.recheck(&never_runs).await;
+
+    assert_eq!(
+        summary.unreachable.as_deref(),
+        Some(provider),
+        "{summary:?}"
+    );
+    assert_eq!(f.streak().await, WorkStreak::default());
+    assert_eq!(f.job_count().await, 0);
+}
+
 /// A recheck that cannot reach a verdict without a human writes
 /// `BLOCKED.md` (WORK-MODEL.md §9.1): the recheck is held as a missing
 /// prerequisite with the report as its detail and this attempt as its
