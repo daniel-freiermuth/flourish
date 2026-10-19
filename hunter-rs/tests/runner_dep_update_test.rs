@@ -420,6 +420,37 @@ async fn the_dependency_pass_scans_due_repos_and_leaves_the_ai_scans_alone() {
     assert_eq!(rig.bins.calls_to("renovate").len(), 1);
 }
 
+/// A pass scans a repo whose last scan is older than the scan interval and
+/// leaves one scanned within it alone.
+#[tokio::test]
+async fn the_dependency_pass_waits_out_the_scan_interval() {
+    const DAY_MS: i64 = 86_400_000;
+    let rig = Rig::new("depupd-interval").await;
+    rig.bins.ok("renovate", UPDATE);
+    let (_keep, running_on) = tokio::sync::watch::channel(false);
+    let admin = support::admin(&rig.store);
+    let mut cfg = rig.cfg.clone();
+    cfg.scan_interval_days = 7.0;
+    let scanned_ago = |ago_ms: i64| {
+        sqlx::query("UPDATE repos SET last_dep_update_at = ?1 WHERE id = ?2")
+            .bind(hunter::util::now_ms() - ago_ms)
+            .bind(rig.repo.id)
+            .execute(&rig.pool)
+    };
+
+    scanned_ago(3 * DAY_MS).await.unwrap();
+    let within = hunter::scheduler::dependency_scans(&admin, &cfg, &running_on).await;
+    scanned_ago(7 * DAY_MS + 60_000).await.unwrap();
+    let past = hunter::scheduler::dependency_scans(&admin, &cfg, &running_on).await;
+
+    assert_eq!(
+        within,
+        hunter::scheduler::DepScans::default(),
+        "scanned within its interval"
+    );
+    assert_eq!(past.scanned, 1, "{past:?}");
+}
+
 /// Renovate's updates become `dep_update` findings, and the cycle summary
 /// (the daemon's per-cycle log line and the manual-trigger response) says
 /// which job ran for which repo and what it ingested.
@@ -472,6 +503,11 @@ async fn a_repo_deleted_during_its_renovate_scan_files_nothing_and_is_reaped() {
         panic!("the scan did not come to a summary");
     };
     assert!(summary.skipped.is_some(), "{summary:?}");
+    assert_eq!(
+        (summary.kind, summary.repo.as_deref()),
+        (Some(JobKind::Repo(RepoJobKind::DepUpdate)), Some("widget")),
+        "the skip names what it skipped"
+    );
     assert!(!rig.model_ran.load(Ordering::SeqCst));
     assert!(
         rig.findings().await.is_empty(),
@@ -891,6 +927,64 @@ async fn renovate_scans_that_keep_failing_hold_the_repos_dep_update() {
         !held.repo(rig.repo.id, hunter::domain::RepoJobKind::Hunt),
         "only the dep_update work is held"
     );
+
+    // A pass leaves the held repo to the operator.
+    let (_keep, running_on) = tokio::sync::watch::channel(false);
+    let pass =
+        hunter::scheduler::dependency_scans(&support::admin(&rig.store), &rig.cfg, &running_on)
+            .await;
+    assert_eq!(
+        pass,
+        hunter::scheduler::DepScans::default(),
+        "a held scan ran again"
+    );
+    assert_eq!(rig.bins.calls_to("renovate").len(), 4);
+}
+
+/// A pass counts as failed both a scan whose outcome it recorded as a
+/// failure (here, a refresh the database refused) and one that could not
+/// record its outcome at all (here, a result file it could not write).
+#[tokio::test]
+async fn the_dependency_pass_counts_failed_scans() {
+    use std::os::unix::fs::PermissionsExt;
+    let rig = Rig::new("depupd-pass-failed").await;
+    rig.scan(&left_pad("1.2.0", Some("1.3.0"))).await.unwrap();
+    let due_again = || async {
+        sqlx::query("UPDATE repos SET last_dep_update_at = NULL")
+            .execute(&rig.pool)
+            .await
+            .unwrap();
+    };
+    let (_keep, running_on) = tokio::sync::watch::channel(false);
+    let admin = support::admin(&rig.store);
+    let pass = || hunter::scheduler::dependency_scans(&admin, &rig.cfg, &running_on);
+
+    due_again().await;
+    sqlx::query(
+        "CREATE TRIGGER no_refresh BEFORE UPDATE OF latest_version ON findings \
+         BEGIN SELECT RAISE(ABORT, 'refused'); END",
+    )
+    .execute(&rig.pool)
+    .await
+    .unwrap();
+    rig.bins.ok("renovate", &left_pad("1.2.0", Some("1.4.0")));
+    let refused = pass().await;
+
+    due_again().await;
+    let result = rig
+        .cfg
+        .work_root
+        .join("out")
+        .join(format!("dep_scan_{}.json", rig.repo.id));
+    std::fs::set_permissions(&result, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let unwritable = pass().await;
+
+    let failed = hunter::scheduler::DepScans {
+        failed: 1,
+        ..Default::default()
+    };
+    assert_eq!(refused, failed, "a scan whose refresh was refused");
+    assert_eq!(unwritable, failed, "a scan that could not write its result");
 }
 
 /// A Renovate scan that succeeds ends the failure streak: failures spread

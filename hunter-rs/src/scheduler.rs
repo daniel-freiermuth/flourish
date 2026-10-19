@@ -1969,16 +1969,16 @@ pub async fn fetch_ahead(
                     continue;
                 }
                 match sync_repo(store, &permit, Fetcher::Admin { recent: min_age }).await {
-                    Ok(Ok(())) => done.fetched += 1,
+                    Ok(Ok(())) => {
+                        done.fetched += 1;
+                        continue;
+                    }
                     Ok(Err(failure)) => {
-                        done.failed += 1;
                         tracing::info!("fetch-ahead {}: {}", repo.name, failure.detail);
                     }
-                    Err(e) => {
-                        done.failed += 1;
-                        tracing::warn!("fetch-ahead {}: {e}", repo.name);
-                    }
+                    Err(e) => tracing::warn!("fetch-ahead {}: {e}", repo.name),
                 }
+                done.failed += 1;
             }
             done
         })
@@ -5796,9 +5796,6 @@ pub async fn sync_prs(pass: &PrSyncPass, cfg: &Config) -> SyncResult {
         summary = summary.add(&one);
     }
     summary.complete = todo.len() == 0;
-    if !summary.complete {
-        tracing::info!("PR sync stopped for shutdown");
-    }
     summary
 }
 

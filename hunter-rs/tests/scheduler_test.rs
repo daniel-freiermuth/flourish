@@ -9,6 +9,7 @@ mod support;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -710,9 +711,13 @@ async fn pick_next_unknown_force_repo_is_an_error() {
 
 /// `/api/summary` over a queued fix finding (id 5) and no running job,
 /// with the daemon's backend wiring: `NullBackend` behind the overdrive
-/// switch. `last_cycle` is the (state, detail) the daemon recorded for
-/// its last cycle, if any.
-async fn summary_over_queued_fix(overdrive: bool, last_cycle: Option<(&str, &str)>) -> Value {
+/// switch, which `scheduler` holds with the lanes' other flags.
+/// `last_cycle` is the (state, detail) the daemon recorded for its last
+/// cycle, if any.
+async fn summary_over_queued_fix(
+    scheduler: hunter::server::SchedulerHandle,
+    last_cycle: Option<(&str, &str)>,
+) -> Value {
     let (dir, path, pool) = fresh_db().await;
     seed_repo(&pool, 1, "alpha", 1, "/nonexistent/alpha").await;
     seed_finding(&pool, 5, 1, "queued", "queued bug").await;
@@ -731,19 +736,15 @@ async fn summary_over_queued_fix(overdrive: bool, last_cycle: Option<(&str, &str
 
     let mut config = test_config(3600.0);
     config.ui_dir = dir.subdir("ui");
-    let overdrive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(overdrive));
     let state = AppState {
         store: Arc::new(store),
         config: Arc::new(config),
         backend: Arc::new(hunter::backend::OverdriveBackend::new(
             Arc::new(hunter::backend::NullBackend),
-            overdrive.clone(),
+            scheduler.overdrive.clone(),
         )),
         repo_notes: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-        scheduler: hunter::server::SchedulerHandle {
-            overdrive,
-            ..hunter::server::SchedulerHandle::default()
-        },
+        scheduler,
     };
 
     let cookie = support::TEST_COOKIE;
@@ -766,7 +767,7 @@ async fn summary_over_queued_fix(overdrive: bool, last_cycle: Option<(&str, &str
 
 #[tokio::test]
 async fn summary_paused_on_denied_candidate() {
-    let v = summary_over_queued_fix(false, None).await;
+    let v = summary_over_queued_fix(hunter::server::SchedulerHandle::default(), None).await;
     assert!(v["current_job"].is_null());
     assert_eq!(v["cycle_running"], Value::Bool(false));
 
@@ -791,7 +792,9 @@ async fn summary_paused_on_denied_candidate() {
 
 #[tokio::test]
 async fn summary_overdrive_prioritizes_candidate_but_keeps_hard_denial() {
-    let v = summary_over_queued_fix(true, None).await;
+    let scheduler = hunter::server::SchedulerHandle::default();
+    scheduler.overdrive.store(true, Ordering::SeqCst);
+    let v = summary_over_queued_fix(scheduler, None).await;
     assert_eq!(v["scheduler_overdrive"], Value::Bool(true));
 
     // Overdrive routes the plain (un-overridden) candidate through the
@@ -805,12 +808,28 @@ async fn summary_overdrive_prioritizes_candidate_but_keeps_hard_denial() {
     assert_eq!(v["activity_status"]["kind"], "paused");
 }
 
+/// A cycle in progress with no job row yet (picking, preparing, waiting
+/// for a clone) shows as working, ahead of the candidate preview: "paused"
+/// would say the lane is waiting on the budget while it is busy.
+#[tokio::test]
+async fn summary_working_while_a_cycle_runs_without_a_job() {
+    let scheduler = hunter::server::SchedulerHandle::default();
+    scheduler.running.store(true, Ordering::SeqCst);
+    let v = summary_over_queued_fix(scheduler, None).await;
+    assert_eq!(v["cycle_running"], Value::Bool(true));
+    assert_eq!(v["activity_status"]["kind"], "working");
+}
+
 /// A cycle the network gate denied shows as offline, naming the host,
 /// ahead of the candidate preview: "paused" here would blame the budget
 /// for what is a missing network.
 #[tokio::test]
 async fn summary_offline_after_a_cycle_denied_for_an_unreachable_host() {
-    let v = summary_over_queued_fix(false, Some(("offline", "github.com unreachable"))).await;
+    let v = summary_over_queued_fix(
+        hunter::server::SchedulerHandle::default(),
+        Some(("offline", "github.com unreachable")),
+    )
+    .await;
     assert_eq!(
         v["activity_status"],
         serde_json::json!({ "kind": "offline", "detail": "github.com unreachable" })
