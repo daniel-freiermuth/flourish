@@ -3213,12 +3213,7 @@ async fn handle_recheck_failure(
             }
         },
     }
-    if override_mode == Some(BudgetOverride::Once) {
-        log_write_failure(
-            store.spend_once_override(fid).await,
-            format_args!("#{fid}: clearing one-shot budget override"),
-        );
-    }
+    clear_once_override(store, fid, override_mode).await;
     summary.clone()
 }
 
@@ -3523,12 +3518,7 @@ pub async fn run_recheck(
             .await;
         summary.outcome = Some("suspended".into());
         summary.worktree = Some(ws.tree.to_string_lossy().into_owned());
-        if override_mode == Some(BudgetOverride::Once) {
-            log_write_failure(
-                store.spend_once_override(fid).await,
-                format_args!("#{fid}: clearing one-shot budget override"),
-            );
-        }
+        clear_once_override(store, fid, override_mode).await;
         close_workspace(lane, ws).await;
         return Ok(summary);
     }
@@ -3695,12 +3685,7 @@ pub async fn run_recheck(
     }
     // A verdict ends the recheck: its tree is no checkpoint.
     close_workspace(lane, ws).await;
-    if override_mode == Some(BudgetOverride::Once) {
-        log_write_failure(
-            store.spend_once_override(fid).await,
-            format_args!("#{fid}: clearing one-shot budget override"),
-        );
-    }
+    clear_once_override(store, fid, override_mode).await;
     Ok(summary)
 }
 
@@ -5691,12 +5676,7 @@ async fn record_fix_outcome(
             return Ok(());
         }
     };
-    if finding.budget_override == Some(BudgetOverride::Once) {
-        log_write_failure(
-            store.spend_once_override(fid).await,
-            format_args!("#{fid}: clearing one-shot budget override"),
-        );
-    }
+    clear_once_override(store, fid, finding.budget_override).await;
     if let Some(claim) = unreleased {
         release_claim(claim).await;
     }
@@ -6398,7 +6378,7 @@ async fn engage_view(
                     Some(fid),
                 )
                 .await;
-            spend_once_override(store, finding).await;
+            clear_once_override(store, finding.id, finding.budget_override).await;
             Ok(Err(CycleSummary {
                 kind: Some(FindingJobKind::Engage.into()),
                 repo: Some(repo.name.clone()),
@@ -7008,12 +6988,7 @@ async fn record_engage(
             summary.outcome = Some("engaged".into());
         }
     }
-    if finding.budget_override == Some(BudgetOverride::Once) {
-        log_write_failure(
-            store.spend_once_override(fid).await,
-            format_args!("#{fid}: clearing one-shot budget override"),
-        );
-    }
+    clear_once_override(store, fid, finding.budget_override).await;
 }
 
 /// Record what a published engage answered (`crate::attention`): the
@@ -7317,7 +7292,7 @@ pub async fn run_engage(
         // with it, so it spends a `once` override here, before the handoff
         // reloads the finding: left set, the closed PR's harvest would run
         // prioritized and jump the queue on it.
-        spend_once_override(store, finding).await;
+        clear_once_override(store, finding.id, finding.budget_override).await;
         withdraw_pr(store, (cfg, backend), fid, &start, &reason, &mut summary).await
     } else if let Some(report) = blocked_report(&start.ws.tree)? {
         if let Err(e) = engage_blocked(store, fid, &start, &report, &mut summary).await {
@@ -7403,14 +7378,13 @@ async fn engage_unpublished(
             Some(fid),
         )
         .await;
-    spend_once_override(store, finding).await;
+    clear_once_override(store, finding.id, finding.budget_override).await;
     summary.outcome = Some("not published: PR ended".into());
 }
 
-/// Spend `finding`'s one-shot budget override, if it has one.
-async fn spend_once_override(store: &JobStore, finding: &Finding) {
-    if finding.budget_override == Some(BudgetOverride::Once) {
-        let fid = finding.id;
+/// Spend finding `fid`'s one-shot budget override, if `mode` is one.
+async fn clear_once_override(store: &JobStore, fid: i64, mode: Option<BudgetOverride>) {
+    if mode == Some(BudgetOverride::Once) {
         log_write_failure(
             store.spend_once_override(fid).await,
             format_args!("#{fid}: clearing one-shot budget override"),
@@ -8198,12 +8172,7 @@ pub async fn run_harvest(
             .await;
         summary.outcome = Some("suspended".into());
         summary.worktree = Some(worktree.to_string_lossy().into_owned());
-        if override_mode == Some(BudgetOverride::Once) {
-            log_write_failure(
-                store.spend_once_override(fid).await,
-                format_args!("#{fid}: clearing one-shot budget override"),
-            );
-        }
+        clear_once_override(store, fid, override_mode).await;
         return Ok(summary);
     }
     if let Some(failure) = &failure
@@ -8232,12 +8201,7 @@ pub async fn run_harvest(
         let detail = &failure.detail;
         summary.outcome = Some(if held { "held" } else { "retry" }.into());
         summary.failure = Some(detail.clone());
-        if override_mode == Some(BudgetOverride::Once) {
-            log_write_failure(
-                store.spend_once_override(fid).await,
-                format_args!("#{fid}: clearing one-shot budget override"),
-            );
-        }
+        clear_once_override(store, fid, override_mode).await;
         return Ok(summary);
     }
 
@@ -8297,12 +8261,7 @@ pub async fn run_harvest(
                     .await;
                 summary.outcome = Some("retry".into());
                 summary.failure = Some(format!("recording the classification failed: {e}"));
-                if override_mode == Some(BudgetOverride::Once) {
-                    log_write_failure(
-                        store.spend_once_override(fid).await,
-                        format_args!("#{fid}: clearing one-shot budget override"),
-                    );
-                }
+                clear_once_override(store, fid, override_mode).await;
                 return Ok(summary);
             }
             Ok(true) => {
@@ -8343,12 +8302,7 @@ pub async fn run_harvest(
         )
         .await;
     summary.outcome = Some("harvested".into());
-    if override_mode == Some(BudgetOverride::Once) {
-        log_write_failure(
-            store.spend_once_override(fid).await,
-            format_args!("#{fid}: clearing one-shot budget override"),
-        );
-    }
+    clear_once_override(store, fid, override_mode).await;
     Ok(summary)
 }
 
