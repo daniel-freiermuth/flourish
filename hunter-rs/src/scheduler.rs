@@ -4619,10 +4619,18 @@ async fn start_fix(
         }
     };
     let job = created.job.id();
-    // The branch is per finding, so a superseded fix chain of this finding
-    // holds it checked out; `open_workspace` releases that chain's tree
-    // before adding this one.
+    // The branch is per finding, so an earlier fix chain of this finding
+    // whose tree is still there holds it checked out. `open_workspace`
+    // releases a chain this job superseded; one the selection gave up in
+    // this same cycle was superseded by nothing, so it is released here.
+    // Both before this tree is added.
     let permit = lane.lock_clone(repo.id).await?;
+    if resume.is_none()
+        && let Err(e) = release_ended_fix_trees(store, cfg, &permit, &repo, fid, job).await
+    {
+        release_claim(claim).await;
+        return Err(e);
+    }
     let opened = open_workspace(
         store,
         cfg,
@@ -4660,6 +4668,37 @@ async fn start_fix(
         running,
         claim,
     )))
+}
+
+/// Release the tree of every earlier fix chain of finding `fid` (the new
+/// job `job` aside) that is still on disk and no longer live
+/// ([`crate::workspace::release_if_idle`] leaves a live one alone).
+///
+/// Selection gives a fix chain up and starts the work fresh in the same
+/// cycle ([`finding_pick`]). Giving up dropped the chain's checkpoint, so
+/// the fresh job supersedes nothing and its tree would be added while the
+/// given-up chain's still has the finding's branch checked out, which git
+/// refuses. A workspace is keyed by its chain's first job, so only a
+/// chain's origin has a tree to find.
+async fn release_ended_fix_trees(
+    store: &Store,
+    cfg: &Config,
+    permit: &ClonePermit<'_>,
+    repo: &Repo,
+    fid: i64,
+    job: i64,
+) -> anyhow::Result<()> {
+    for old in store.jobs_by_finding(fid).await? {
+        if old.id == job || old.kind != JobKind::Finding(FindingJobKind::Fix) {
+            continue;
+        }
+        let ws = Workspace::for_chain(&cfg.work_root, Path::new(&repo.path), old.id);
+        if ws.tree.is_dir() {
+            let chain = chain_of(store, old.id).await?;
+            crate::workspace::release_if_idle(store, permit, &cfg.work_root, &chain).await?;
+        }
+    }
+    Ok(())
 }
 
 /// The file a worker of any kind writes when it cannot go on without

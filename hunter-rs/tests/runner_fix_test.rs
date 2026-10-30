@@ -241,8 +241,7 @@ async fn a_fix_started_where_its_chain_was_given_up_gets_a_tree() {
     // is at the attempt ceiling.
     for cycle in 0..4 {
         let summary =
-            hunter::scheduler::run_cycle(&mut support::jobs(&f.store), &f.cfg, &capped, None)
-                .await;
+            hunter::scheduler::run_cycle(&mut support::jobs(&f.store), &f.cfg, &capped, None).await;
         assert_eq!(
             summary.outcome.as_deref(),
             Some("suspended"),
@@ -264,8 +263,15 @@ async fn a_fix_started_where_its_chain_was_given_up_gets_a_tree() {
         "the fresh fix got its tree and ran: {summary:?}"
     );
     assert_eq!(backend.runs().len(), 1);
-    assert_ne!(backend.runs()[0].tree, chain_tree, "a fresh chain's own tree");
-    assert!(!chain_tree.exists(), "the given-up chain's tree is released");
+    assert_ne!(
+        backend.runs()[0].tree,
+        chain_tree,
+        "a fresh chain's own tree"
+    );
+    assert!(
+        !chain_tree.exists(),
+        "the given-up chain's tree is released"
+    );
 }
 
 /// A fix whose tree can never be created -- here the repo names a

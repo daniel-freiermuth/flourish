@@ -365,8 +365,8 @@ fn add_tree(permit: &CloneHold, tree: &Path, spec: &TreeSpec) -> Result<String, 
             // branch named ... already exists" on every later attempt -- a
             // retry loop no amount of waiting resolves (observed
             // 2026-09-15, broken only by a restart). The branch belongs to
-            // this finding, and any chain still using it was superseded
-            // and had its tree released before this one was created, so
+            // this finding, and any chain still using it was superseded or
+            // given up and had its tree released before this one was made, so
             // reclaiming the name is safe: a finding whose branch reached a
             // PR is `pr_open` and never re-enters `fix`. A tree half-made
             // by the failed attempt is removed first, or the retry's add
