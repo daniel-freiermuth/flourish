@@ -14,7 +14,9 @@ RestartSec=30
 # (10s here) turned every stop during a cycle into a SIGKILL -- the exact
 # mid-cycle death that handling SIGTERM is meant to avoid. Orphaned rows
 # are repaired by reconcile_and_log on the next start either way; this
-# just stops us relying on that.
+# just stops us relying on that. A fix's pre-PR review runs several
+# workers in one cycle, each under the fix cap, and checks for the stop
+# before starting each, so a stop still waits for one run at most.
 TimeoutStopSec=3000
 
 # systemd's default KillMode=control-group SIGTERMs every process in the
