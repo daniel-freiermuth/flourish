@@ -117,6 +117,35 @@ new ──recheck──> new / superseded / rejected
   way: superseded / duplicate / obsolete → `superseded`, wrong →
   `rejected`, unwanted → `wontfix`; a decline that classifies nothing
   goes back to `new` for triage.
+- **Pre-PR review** — before a finished fix ships, still inside its fix
+  job, a fresh reviewer session (`playbooks/review.md`) told to distrust
+  the change reads the whole branch diff and writes its issues outside
+  the tree. Every issue it raises (blocking or not; `blocking` ranks
+  them) goes back to the fixer's own session
+  (`playbooks/review_followup.md`), which fixes each one with commits or
+  rebuts it with evidence in a `## Review` section of
+  `PR-DESCRIPTION.md` (or declines or writes `BLOCKED.md` after all);
+  then the whole branch is reviewed again, until a review raises no
+  issue or `review.maxRounds` reviews have run. The reviewer reads the
+  `## Review` section and does not raise a rebutted issue again without
+  new code evidence. Defects outside the change's scope are reported as
+  `follow-up`s: never answered and never keeping the loop going, they are
+  collected across rounds and ship in a "## Follow-ups from review"
+  section of the PR body. When issues are left after the last round (or
+  the grant is spent before the fixer can answer them, or its answer
+  fails without doing work while the forge is reachable; offline, the
+  attempt is kept and retried), a blocking one
+  holds the fix for you like a `BLOCKED.md`, with the remaining issues as
+  the hold's report; `continue` resumes the fixer on them and the review
+  runs again. Non-blocking ones ship in an "Unresolved review issues"
+  section of the PR body; a review that fails (a reviewer that ended early or left
+  no valid output without writing an issue) ships the fix with a note
+  saying so. Whatever a reviewer changes in the tree is undone, and
+  issues it had written still count. A fixer that did not finish ships
+  nothing while the review is on. Every run is metered into the one fix
+  job, under its one budget grant. Details: `hunter-rs/WORK-MODEL.md`
+  §5.7. Before the push, a multi-commit fix is curated into a few logical
+  commits of the same tree (`review.curate`).
 - **Held work** is not a status. When a worker writes `BLOCKED.md`
   (a verification prerequisite, dependency, or human decision is
   missing; every finding kind's playbook says when: a recheck that cannot
@@ -585,7 +614,10 @@ Each analysis/action kind follows the same shape: build a prompt from a
 `playbooks/*.md` template, run it through the backend under a
 budget-decided cap, then either ingest structured output (`findings.json`,
 `FOLLOW-UPS.json`) or interpret marker files the worker wrote
-(`NOT-A-BUG.md`, `PR-DESCRIPTION.md`, `WITHDRAW.md`, ...).
+(`NOT-A-BUG.md`, `PR-DESCRIPTION.md`, `WITHDRAW.md`, ...). The pre-PR
+reviewer is the one worker that writes nothing in its tree: its issues go
+to `review-<job>-<round>.json` beside the tree, in the chain's workspace
+root, and its transcript to `review-<job>-<round>/` there.
 
 ## Data model
 
@@ -643,7 +675,17 @@ quota source for one installation.
 - `budget.deny5hAbove` / `staleAfterS` — see § Budget policy.
 - `models` — fuzzy names, anything omp's `--model` flag accepts. `default`
   applies to all workers; `smol` is for lightweight helper tasks; `hunt`/
-  `fix` override per job family; `null` inherits `default`.
+  `fix` override per job family; `null` inherits `default`. The pre-PR
+  reviewer runs with the `fix` model.
+- `review.maxRounds` (default 7) — how many times a finished fix is
+  reviewed before it ships (§ Finding lifecycle); `0` ships unreviewed.
+- `review.curate` (default true) — once a review ends in a ship with more
+  than one commit, the fixer rewrites them into a few logical commits of
+  the same tree (`playbooks/curate.md`); a rewrite that changes the tree
+  or fails is thrown away and the original commits ship.
+  Each reviewer and each answer gets its own `fix.maxWallS`; the loop as
+  a whole is bounded by the rounds and the token grant, and a stopping
+  daemon starts none of its runs.
 - `backend.llmProvider` selects the OMP quota source: `anthropic` (default),
   `openai-codex`, or `github-copilot`. It must match the provider selected
   by `models`. The Copilot template uses provider-qualified model names
