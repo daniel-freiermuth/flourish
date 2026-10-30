@@ -1493,22 +1493,64 @@ impl Store {
                     > 0
             }
             Record::Rescan(row) => {
+                let file = &row.file;
                 let symbol = row.symbol.as_deref();
                 let detail = row.detail.as_deref();
                 let evidence_plan = row.evidence_plan.as_deref();
+                let introduced_by = row.introduced_by.as_deref();
+                let ecosystem = row.ecosystem.as_deref();
+                let package = row.package.as_deref();
+                let current_version = row.current_version.as_deref();
+                let latest_version = row.latest_version.as_deref();
+                let update_type = row.update_type.as_deref();
+                let security_advisory = row.security_advisory.as_deref();
+                let missing_tests = row.missing_tests.as_deref();
+                let test_file = row.test_file.as_deref();
+                let smell_type = row.smell_type.as_deref();
+                let suggested_refactor = row.suggested_refactor.as_deref();
+                let modernization_class = row.modernization_class.as_deref();
+                let current_approach = row.current_approach.as_deref();
+                let proposed_approach = row.proposed_approach.as_deref();
+                let standard_section = row.standard_section.as_deref();
+                // Every column the scan filed, not only its description: a
+                // fingerprint does not name every field that goes stale (a
+                // dep_update's target, a modernization's file and approach).
                 let set = sqlx::query!(
-                    "UPDATE findings SET status = ?1, verdict_reason = NULL, symbol = ?2, \
-                     line = ?3, severity = ?4, confidence = ?5, summary = ?6, detail = ?7, \
-                     evidence_plan = ?8, updated_at = ?9 \
-                     WHERE id = ?10 AND status IN (?11, ?12)",
+                    "UPDATE findings SET status = ?1, verdict_reason = NULL, file = ?2, \
+                     symbol = ?3, line = ?4, bug_class = ?5, severity = ?6, confidence = ?7, \
+                     summary = ?8, detail = ?9, evidence_plan = ?10, introduced_by = ?11, \
+                     ecosystem = ?12, package = ?13, current_version = ?14, \
+                     latest_version = ?15, update_type = ?16, security_advisory = ?17, \
+                     missing_tests = ?18, test_file = ?19, smell_type = ?20, \
+                     suggested_refactor = ?21, modernization_class = ?22, \
+                     current_approach = ?23, proposed_approach = ?24, standard_section = ?25, \
+                     updated_at = ?26 \
+                     WHERE id = ?27 AND status IN (?28, ?29)",
                     to,
+                    file,
                     symbol,
                     row.line,
+                    row.bug_class,
                     row.severity,
                     row.confidence,
                     row.summary,
                     detail,
                     evidence_plan,
+                    introduced_by,
+                    ecosystem,
+                    package,
+                    current_version,
+                    latest_version,
+                    update_type,
+                    security_advisory,
+                    missing_tests,
+                    test_file,
+                    smell_type,
+                    suggested_refactor,
+                    modernization_class,
+                    current_approach,
+                    proposed_approach,
+                    standard_section,
                     now,
                     finding_id,
                     from_a,
