@@ -1313,9 +1313,10 @@ fn gitlab_view_fails_when_an_author_has_no_id() {
 /// GitLab: a member at Developer (30) or above may steer the MR, a
 /// Reporter (20) and a non-member (404) may not, and a configured bot
 /// is let through as a bot. Membership is looked up by user id. A
-/// `DiffNote` keeps its place in the diff: the new line, or on a removed
-/// line, which has no new line, the old one in the old file, marked
-/// removed.
+/// `DiffNote` keeps its place in the diff: the new line (also on an
+/// unchanged line of a renamed file, which numbers both sides), or on a
+/// removed line, which has no new line, the old one in the old file,
+/// marked removed.
 #[test]
 fn gitlab_views_keep_only_developers_and_configured_bots() {
     let bins = FakeBins::acquire("forge-gl-screen");
@@ -1324,6 +1325,7 @@ fn gitlab_views_keep_only_developers_and_configured_bots() {
  {"body":"bot says","created_at":"2026-01-05T00:00:00Z","author":{"id":9,"username":"review-bot"}},
  {"body":"outsider says","created_at":"2026-01-04T00:00:00Z","author":{"id":7,"username":"outsider"}},
  {"body":"reporter says","created_at":"2026-01-03T00:00:00Z","author":{"id":6,"username":"reporter"}},
+ {"body":"context says","created_at":"2026-01-02T12:00:00Z","author":{"id":5,"username":"dev"},"type":"DiffNote","position":{"old_path":"src/old.rs","new_path":"src/new.rs","old_line":8,"new_line":9}},
  {"body":"developer says","created_at":"2026-01-02T00:00:00Z","author":{"id":5,"username":"dev"},"type":"DiffNote","position":{"old_path":"src/lib.rs","new_path":"src/lib.rs","old_line":null,"new_line":12}},
  {"body":"maintainer says","created_at":"2026-01-01T00:00:00Z","author":{"id":4,"username":"lead"},"position":null}
 ]"#;
@@ -1350,6 +1352,7 @@ fn gitlab_views_keep_only_developers_and_configured_bots() {
         vec![
             ("lead".to_owned(), Voice::Maintainer),
             ("dev".to_owned(), Voice::Maintainer),
+            ("dev".to_owned(), Voice::Maintainer),
             ("review-bot".to_owned(), Voice::Bot),
             ("lead".to_owned(), Voice::Maintainer),
         ]
@@ -1363,6 +1366,12 @@ fn gitlab_views_keep_only_developers_and_configured_bots() {
             Some(CodeLocation {
                 path: "src/lib.rs".to_owned(),
                 line: Some(12),
+                outdated: false,
+                removed: false,
+            }),
+            Some(CodeLocation {
+                path: "src/new.rs".to_owned(),
+                line: Some(9),
                 outdated: false,
                 removed: false,
             }),
