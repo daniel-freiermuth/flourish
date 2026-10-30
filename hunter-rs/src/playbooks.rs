@@ -470,6 +470,71 @@ pub fn build_apply_modernization_prompt(
     render(&template, &slots)
 }
 
+/// The pre-PR reviewer's prompt (`review.md`): a fresh session that reviews
+/// `<base>..HEAD` in `worktree` against the finding and the author's PR
+/// description, and writes its issues to `out_path`, outside the tree.
+pub fn build_review_prompt(
+    root: &Path,
+    finding: &Finding,
+    worktree: &Path,
+    base: &str,
+    pr_description: &str,
+    out_path: &Path,
+    repo: &Repo,
+    repo_notes: &str,
+) -> Result<String> {
+    let notes = notes_or_default(repo_notes, "(No notes yet)");
+    let template = read_template(root, "review.md")?;
+    let mut slots = HashMap::new();
+    slots.insert("WORKTREE", worktree.display().to_string());
+    slots.insert("BASE", base.to_owned());
+    slots.insert("FINDING_JSON", finding_json(finding));
+    slots.insert("PR_DESCRIPTION", pr_description.to_owned());
+    slots.insert("OUT_PATH", out_path.display().to_string());
+    slots.insert("REPO_NAME", repo.name.clone());
+    slots.insert("REPO_NOTES", notes);
+    render(&template, &slots)
+}
+
+/// What a resumed fixer is told after a review round raised blocking
+/// issues (`review_followup.md`). `issues` is the reviewer's blocking
+/// entries as JSON, verbatim; `decline_file` is the file the fixer's own
+/// playbook declines with (`NOT-A-BUG.md` or `DECLINED.md`).
+pub fn build_review_followup_prompt(
+    root: &Path,
+    worktree: &Path,
+    base: &str,
+    issues: &str,
+    decline_file: &str,
+) -> Result<String> {
+    let template = read_template(root, "review_followup.md")?;
+    let mut slots = HashMap::new();
+    slots.insert("WORKTREE", worktree.display().to_string());
+    slots.insert("BASE", base.to_owned());
+    slots.insert("ISSUES", issues.to_owned());
+    slots.insert("DECLINE_FILE", decline_file.to_owned());
+    render(&template, &slots)
+}
+
+/// The prompt that has the fixer curate its reviewed history (`curate.md`):
+/// rewrite `<base>..HEAD` on `branch` into a few logical commits whose
+/// final tree is still `reviewed`'s.
+pub fn build_curate_prompt(
+    root: &Path,
+    worktree: &Path,
+    base: &str,
+    branch: &str,
+    reviewed: &str,
+) -> Result<String> {
+    let template = read_template(root, "curate.md")?;
+    let mut slots = HashMap::new();
+    slots.insert("WORKTREE", worktree.display().to_string());
+    slots.insert("BASE", base.to_owned());
+    slots.insert("BRANCH", branch.to_owned());
+    slots.insert("REVIEWED", reviewed.to_owned());
+    render(&template, &slots)
+}
+
 pub fn build_engage_prompt(
     root: &Path,
     finding: &Finding,

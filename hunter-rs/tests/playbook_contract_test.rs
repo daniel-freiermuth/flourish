@@ -209,6 +209,42 @@ fn improvement_and_modernization_apply_prompts_render() {
 }
 
 #[test]
+fn review_prompts_render() {
+    let repo = sample_repo();
+    let finding = sample_finding(FindingType::Bug);
+    let prompt = playbooks::build_review_prompt(
+        &root(),
+        &finding,
+        Path::new("/tmp/worktree"),
+        "abc123",
+        "the author's description",
+        &out_path(),
+        &repo,
+        "repo notes",
+    )
+    .expect("review.md must render with the slots build_review_prompt supplies");
+    assert_usable("review", &prompt);
+    let prompt = playbooks::build_review_followup_prompt(
+        &root(),
+        Path::new("/tmp/worktree"),
+        "abc123",
+        "[{\"blocking\": true, \"summary\": \"an issue\"}]",
+        "NOT-A-BUG.md",
+    )
+    .expect("review_followup.md must render with its builder's slots");
+    assert_usable("review_followup", &prompt);
+    let prompt = playbooks::build_curate_prompt(
+        &root(),
+        Path::new("/tmp/worktree"),
+        "abc123",
+        "fix/branch",
+        "def456",
+    )
+    .expect("curate.md must render with its builder's slots");
+    assert_usable("curate", &prompt);
+}
+
+#[test]
 fn recheck_prompt_renders() {
     let repo = sample_repo();
     let finding = sample_finding(FindingType::Bug);
@@ -454,6 +490,9 @@ fn every_playbook_is_covered_by_this_test() {
         "engage",
         "harvest",
         "harvest-closed",
+        "review",
+        "review_followup",
+        "curate",
     ]
     .iter()
     .map(|s| (*s).to_owned())
