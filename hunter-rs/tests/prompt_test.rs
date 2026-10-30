@@ -177,15 +177,15 @@ fn section<'a>(prompt: &'a str, name: &str) -> &'a str {
 
 /// A screened PR thread: one maintainer comment and review, one bot
 /// comment, hunter's own reply posted under the maintainer's login, and
-/// two maintainer comments on lines of the diff, one of them since
-/// outdated.
+/// three maintainer comments on lines of the diff, one of them since
+/// outdated and one on a line the PR removes.
 fn screened_thread() -> PrView {
     let author = |login: &str| {
         Some(GhAuthor {
             login: login.to_owned(),
         })
     };
-    let inline = |body: &str, at: &str, line: i64, outdated: bool| GhComment {
+    let inline = |body: &str, at: &str, line: i64, outdated: bool, removed: bool| GhComment {
         id: String::new(),
         author: author("lead"),
         body: body.to_owned(),
@@ -194,6 +194,7 @@ fn screened_thread() -> PrView {
             path: "src/lib.rs".to_owned(),
             line: Some(line),
             outdated,
+            removed,
         }),
         voice: Voice::Maintainer,
     };
@@ -223,13 +224,15 @@ fn screened_thread() -> PrView {
                 location: None,
                 voice: Voice::Bot,
             },
-            inline("off by one here", "2026-01-04T00:00:00Z", 12, false),
+            inline("off by one here", "2026-01-04T00:00:00Z", 12, false, false),
             inline(
                 "was this unwrap intended?",
                 "2026-01-05T00:00:00Z",
                 40,
                 true,
+                false,
             ),
+            inline("put it back", "2026-01-06T00:00:00Z", 7, false, true),
         ],
         reviews: vec![GhReview {
             id: String::new(),
@@ -249,8 +252,9 @@ fn screened_thread() -> PrView {
 /// PR's discussion. Hunter's own replies stay in the maintainers' thread
 /// they answer, labelled as its own and without the mark that tells them.
 /// A comment on a line of the diff says which line, and says so when that
-/// line is from an earlier commit: without it the worker reads "off by
-/// one here" with no "here".
+/// line is from an earlier commit, or from the base because the PR
+/// removes it: without it the worker reads "off by one here" with no
+/// "here", or reads line 7 of the head for a line that is not there.
 #[test]
 fn pr_prompts_keep_bot_reviews_apart_from_maintainer_feedback() {
     let dir = TempDir::new("prompt-voices");
@@ -337,6 +341,13 @@ fn pr_prompts_keep_bot_reviews_apart_from_maintainer_feedback() {
             maint.contains(
                 "### lead on src/lib.rs:40 (outdated: line as of an earlier commit) at \
                  2026-01-05T00:00:00Z\nwas this unwrap intended?"
+            ),
+            "{name}: {prompt}"
+        );
+        assert!(
+            maint.contains(
+                "### lead on src/lib.rs:7 (removed: line as of the base, gone from the PR's \
+                 head) at 2026-01-06T00:00:00Z\nput it back"
             ),
             "{name}: {prompt}"
         );

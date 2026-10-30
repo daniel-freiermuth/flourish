@@ -1013,8 +1013,9 @@ fn authored(view: &hunter::forge::PrView) -> Vec<(String, Voice)> {
 
 /// An inline comment says where it was left: on GitHub, `line` is the
 /// line in the PR's head, or null once the PR has changed that code, and
-/// then the comment keeps the line it was left on, marked outdated. A
-/// conversation comment has no location.
+/// then the comment keeps the line it was left on, marked outdated. On a
+/// line the PR removes (`side` LEFT) the number is the base's, marked
+/// removed. A conversation comment has no location.
 #[test]
 fn github_engage_view_places_inline_comments() {
     let bins = FakeBins::acquire("forge-gh-inline-location");
@@ -1036,6 +1037,7 @@ fn github_engage_view_places_inline_comments() {
             path: "src/lib.rs".to_owned(),
             line: Some(12),
             outdated: false,
+            removed: false,
         })
     );
     assert_eq!(
@@ -1044,15 +1046,17 @@ fn github_engage_view_places_inline_comments() {
             path: "src/main.rs".to_owned(),
             line: Some(40),
             outdated: true,
+            removed: false,
         }),
         "a comment on a line since changed keeps its original line, marked"
     );
-    assert_ne!(
+    assert_eq!(
         location_of("put it back"),
         Some(CodeLocation {
             path: "src/lib.rs".to_owned(),
             line: Some(7),
             outdated: false,
+            removed: true,
         }),
         "a line the PR removes is numbered in the base: it must not pass for line 7 of the head"
     );
@@ -1309,8 +1313,9 @@ fn gitlab_view_fails_when_an_author_has_no_id() {
 /// GitLab: a member at Developer (30) or above may steer the MR, a
 /// Reporter (20) and a non-member (404) may not, and a configured bot
 /// is let through as a bot. Membership is looked up by user id. A
-/// `DiffNote` keeps its place in the diff: the new line, or the old one
-/// on a removed line, which has no new line.
+/// `DiffNote` keeps its place in the diff: the new line, or on a removed
+/// line, which has no new line, the old one in the old file, marked
+/// removed.
 #[test]
 fn gitlab_views_keep_only_developers_and_configured_bots() {
     let bins = FakeBins::acquire("forge-gl-screen");
@@ -1352,22 +1357,23 @@ fn gitlab_views_keep_only_developers_and_configured_bots() {
     let locations: Vec<Option<CodeLocation>> =
         view.comments.iter().map(|c| c.location.clone()).collect();
     assert_eq!(
-        locations[..3],
+        locations,
         [
             None,
             Some(CodeLocation {
                 path: "src/lib.rs".to_owned(),
                 line: Some(12),
                 outdated: false,
+                removed: false,
             }),
             None,
+            Some(CodeLocation {
+                path: "src/old.rs".to_owned(),
+                line: Some(7),
+                outdated: false,
+                removed: true,
+            }),
         ]
-    );
-    let removed = locations[3].clone().expect("a DiffNote has a location");
-    assert_eq!(
-        (removed.path.as_str(), removed.line),
-        ("src/old.rs", Some(7)),
-        "old_line 7 numbers the line in the old file, src/old.rs"
     );
 }
 
