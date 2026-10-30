@@ -4626,7 +4626,7 @@ async fn start_fix(
     // Both before this tree is added.
     let permit = lane.lock_clone(repo.id).await?;
     if resume.is_none()
-        && let Err(e) = release_ended_fix_trees(store, cfg, &permit, &repo, fid, job).await
+        && let Err(e) = release_ended_fix_trees(store, cfg, &permit, &repo, fid).await
     {
         release_claim(claim).await;
         return Err(e);
@@ -4670,9 +4670,10 @@ async fn start_fix(
     )))
 }
 
-/// Release the tree of every earlier fix chain of finding `fid` (the new
-/// job `job` aside) that is still on disk and no longer live
-/// ([`crate::workspace::release_if_idle`] leaves a live one alone).
+/// Release the tree of every earlier fix chain of finding `fid` that is
+/// still on disk and no longer live ([`crate::workspace::release_if_idle`]
+/// leaves a live one alone). The new job is among the finding's jobs, but
+/// its tree is not added yet and its chain is running, so it is left alone.
 ///
 /// Selection gives a fix chain up and starts the work fresh in the same
 /// cycle ([`finding_pick`]). Giving up dropped the chain's checkpoint, so
@@ -4686,10 +4687,9 @@ async fn release_ended_fix_trees(
     permit: &ClonePermit<'_>,
     repo: &Repo,
     fid: i64,
-    job: i64,
 ) -> anyhow::Result<()> {
     for old in store.jobs_by_finding(fid).await? {
-        if old.id == job || old.kind != JobKind::Finding(FindingJobKind::Fix) {
+        if old.kind != JobKind::Finding(FindingJobKind::Fix) {
             continue;
         }
         let ws = Workspace::for_chain(&cfg.work_root, Path::new(&repo.path), old.id);
