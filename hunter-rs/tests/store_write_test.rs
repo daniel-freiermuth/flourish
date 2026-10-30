@@ -2146,6 +2146,108 @@ async fn a_reopen_leaves_a_finding_that_moved_on() {
     assert_eq!(store.verdict_anchor(1).await.unwrap(), Some(anchor));
 }
 
+/// A reopen replaces the finding's analysis with everything the scan filed,
+/// not just its description. A fingerprint does not name every field that
+/// goes stale: a `dep_update`'s names the installed version, not the
+/// target, and a modernization's names the area, not the file or the
+/// approach. Keeping the old target beside the new summary would hand the
+/// fix worker two contradicting instructions.
+#[tokio::test]
+async fn a_reopen_takes_every_field_the_scan_filed() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo_and_findings(&pool).await;
+    let store = rw_store(&path).await;
+    let filed = |kind: &str, version: &str| hunter::store::FindingInsert {
+        fingerprint: format!("alpha:{kind}:serde@1.0.0"),
+        file: format!("Cargo.toml:{version}"),
+        summary: format!("move to {version}"),
+        bug_class: Some(if version == "2.0.0" {
+            hunter::domain::BugClass::Boundary
+        } else {
+            hunter::domain::BugClass::ErrorPath
+        }),
+        introduced_by: Some(format!("intro-{version}")),
+        ecosystem: Some("cargo".to_owned()),
+        package: Some("serde".to_owned()),
+        current_version: Some("1.0.0".to_owned()),
+        latest_version: Some(version.to_owned()),
+        update_type: Some(format!("major-{version}")),
+        security_advisory: Some(format!("GHSA-{version}")),
+        missing_tests: Some(format!("[\"{version}\"]")),
+        test_file: Some(format!("tests/{version}.rs")),
+        smell_type: Some(format!("smell-{version}")),
+        suggested_refactor: Some(format!("refactor to {version}")),
+        modernization_class: Some(format!("class-{version}")),
+        current_approach: Some(format!("before {version}")),
+        proposed_approach: Some(format!("approach {version}")),
+        standard_section: Some(format!("section {version}")),
+        ..Default::default()
+    };
+    for kind in ["dep_update", "modernization"] {
+        let old = filed(kind, "2.0.0");
+        let (fid, _) = store.upsert_finding(1, &old, kind, None).await.unwrap();
+        let anchor = hunter::store::VerdictAnchor {
+            sha: "abc".to_owned(),
+            files: vec!["Cargo.toml".to_owned()],
+            holds_while: None,
+        };
+        store
+            .set_anchored_verdict(fid, FindingStatus::Rejected, "wrong: fine", Some(&anchor))
+            .await
+            .unwrap();
+
+        let refiled = filed(kind, "3.0.0");
+        let reopen = hunter::transition::Transition::Reopened { scan: &refiled };
+        assert!(matches!(
+            store.transition(fid, &reopen).await.unwrap(),
+            hunter::transition::Moved::Applied
+        ));
+
+        let f = store.get_finding(fid).await.unwrap().unwrap();
+        assert_eq!(f.status, FindingStatus::New, "{kind}");
+        let got = [
+            f.file,
+            Some(f.summary),
+            f.introduced_by,
+            f.ecosystem,
+            f.package,
+            f.current_version,
+            f.latest_version,
+            f.update_type,
+            f.security_advisory,
+            f.missing_tests,
+            f.test_file,
+            f.smell_type,
+            f.suggested_refactor,
+            f.modernization_class,
+            f.current_approach,
+            f.proposed_approach,
+            f.standard_section,
+        ];
+        let want = [
+            Some(refiled.file.clone()),
+            Some(refiled.summary.clone()),
+            refiled.introduced_by.clone(),
+            refiled.ecosystem.clone(),
+            refiled.package.clone(),
+            refiled.current_version.clone(),
+            refiled.latest_version.clone(),
+            refiled.update_type.clone(),
+            refiled.security_advisory.clone(),
+            refiled.missing_tests.clone(),
+            refiled.test_file.clone(),
+            refiled.smell_type.clone(),
+            refiled.suggested_refactor.clone(),
+            refiled.modernization_class.clone(),
+            refiled.current_approach.clone(),
+            refiled.proposed_approach.clone(),
+            refiled.standard_section.clone(),
+        ];
+        assert_eq!(got, want, "{kind}: the reopen kept the old analysis");
+        assert_eq!(f.bug_class, refiled.bug_class, "{kind}");
+    }
+}
+
 /// The `pr_state` upserts, each writing `pr_number` for finding 1.
 #[derive(Debug, Clone, Copy)]
 enum PrUpsert {
