@@ -754,9 +754,15 @@ fn packs(clone: &Path) -> usize {
     })
 }
 
-/// Make `clone`'s housekeeping due: a threshold of one, and thousands of
-/// loose objects. Returns the clone's pack count before any runs.
+/// Make `clone`'s housekeeping due: the gc task enabled, a threshold of
+/// one, and thousands of loose objects. Returns the clone's pack count
+/// before any runs.
+///
+/// As of git 2.56 the default auto-maintenance strategy leaves the gc task
+/// out, so `gc.auto` alone makes nothing due; enabling the task explicitly
+/// overrides the strategy on every git version.
 fn housekeeping_due(f: &Fixture) -> usize {
+    git(&f.clone, &["config", "maintenance.gc.enabled", "true"]);
     git(&f.clone, &["config", "gc.auto", "1"]);
     let loose = f.dir.subdir("loose");
     let paths: Vec<String> = (0..3000)
