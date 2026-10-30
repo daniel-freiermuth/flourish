@@ -270,7 +270,8 @@ fn feedback_blocks(pr: &PrView, voice: Voice, cap: usize) -> String {
 }
 
 /// `path:line`, marked when the line number refers to an earlier commit
-/// of the PR: the code it was left on has since changed.
+/// of the PR: the code it was left on has since changed; and when it
+/// refers to the base: the PR removes the line it was left on.
 fn location_label(loc: &CodeLocation) -> String {
     let mut label = match loc.line {
         Some(line) => format!("{}:{line}", loc.path),
@@ -278,6 +279,9 @@ fn location_label(loc: &CodeLocation) -> String {
     };
     if loc.outdated {
         label.push_str(" (outdated: line as of an earlier commit)");
+    }
+    if loc.removed {
+        label.push_str(" (removed: line as of the base, gone from the PR's head)");
     }
     label
 }
