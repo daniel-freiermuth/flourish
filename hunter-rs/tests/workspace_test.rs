@@ -756,8 +756,17 @@ fn packs(clone: &Path) -> usize {
 
 /// Make `clone`'s housekeeping due: a threshold of one, and thousands of
 /// loose objects. Returns the clone's pack count before any runs.
+///
+/// The threshold is set for both strategies `maintenance run --auto` may
+/// pick: `gc` reads `gc.auto`; `geometric`, the default of current git,
+/// reads `maintenance.geometric-repack.auto` (default 6700, which the
+/// 3000 objects here stay under) and ignores `gc.auto`.
 fn housekeeping_due(f: &Fixture) -> usize {
     git(&f.clone, &["config", "gc.auto", "1"]);
+    git(
+        &f.clone,
+        &["config", "maintenance.geometric-repack.auto", "1"],
+    );
     let loose = f.dir.subdir("loose");
     let paths: Vec<String> = (0..3000)
         .map(|i| {

@@ -947,10 +947,7 @@ fn url_host_path(url: &str) -> Option<(&str, &str)> {
         Some(rest) => rest.split_once('/').map(|(_, p)| p)?,
         // Same bound as `url_host`: no slash before the colon, or it is
         // not the scp form.
-        None => url
-            .split_once(':')
-            .filter(|(a, _)| !a.contains('/'))
-            .map(|(_, p)| p)?,
+        None => scp_split(url).map(|(_, p)| p)?,
     };
     (!path.is_empty()).then_some((host, path))
 }
@@ -1643,6 +1640,35 @@ pub fn forge_for(forge: ForgeName) -> Box<dyn Forge> {
     }
 }
 
+/// Split `host[:port]` at the port colon, keeping a bracketed IPv6
+/// literal (`[fd00::5]:8443`) whole.
+fn split_port(authority: &str) -> (&str, Option<&str>) {
+    if authority.starts_with('[')
+        && let Some(end) = authority.find(']')
+    {
+        let (host, rest) = authority.split_at(end + 1);
+        return (host, rest.strip_prefix(':'));
+    }
+    match authority.split_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (authority, None),
+    }
+}
+
+/// Split an scp-like `[user@]host:path` at the colon after the host,
+/// skipping the colons inside a bracketed IPv6 literal. The host half may
+/// not contain a slash.
+fn scp_split(url: &str) -> Option<(&str, &str)> {
+    let at = url.find('@').map_or(0, |i| i + 1);
+    let colon = if url[at..].starts_with('[') {
+        at + url[at..].find("]:")? + 1
+    } else {
+        url.find(':')?
+    };
+    let (a, p) = (&url[..colon], &url[colon + 1..]);
+    (!a.contains('/')).then_some((a, p))
+}
+
 /// Host of a git remote URL: `https://`, `http://`, `ssh://` and the
 /// scp-like `git@host:path` form, with any `user@` and `:port` stripped.
 ///
@@ -1660,16 +1686,13 @@ pub fn url_host(url: &str) -> Option<&str> {
         // and reading it as host `github.com/x` split this daemon from
         // the Python one, which rejects it — the same POST would store
         // forge=github here and forge=gitlab there.
-        None => url
-            .split_once(':')
-            .map(|(a, _)| a)
-            .filter(|a| !a.contains('/'))?,
+        None => scp_split(url).map(|(a, _)| a)?,
     };
     let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
     // Only scheme URLs can carry a port; in the scp form the colon is
     // already gone with the path.
     let host = if after_scheme.is_some() {
-        host.split_once(':').map_or(host, |(h, _)| h)
+        split_port(host).0
     } else {
         host
     };
@@ -1692,8 +1715,7 @@ pub fn web_host(url: &str) -> Option<String> {
     let port = rest
         .and_then(|rest| rest.split('/').next())
         .map(|authority| authority.rsplit_once('@').map_or(authority, |(_, h)| h))
-        .and_then(|authority| authority.split_once(':'))
-        .map(|(_, port)| port)
+        .and_then(|authority| split_port(authority).1)
         .filter(|port| port.parse::<u16>().is_ok())
         .or(rest.and(default_port));
     Some(port.map_or_else(|| host.to_owned(), |port| format!("{host}:{port}")))

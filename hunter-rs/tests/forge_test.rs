@@ -554,6 +554,12 @@ fn web_host_is_where_the_forge_api_answers() {
             "ssh://git@gitlab.corp.com:2222/g/w.git",
             Some("gitlab.corp.com"),
         ),
+        // An IPv6 literal keeps its brackets; its colons are not a port.
+        ("https://[fd00::5]/g/w.git", Some("[fd00::5]")),
+        ("https://[fd00::5]:8443/g/w", Some("[fd00::5]:8443")),
+        ("http://[::1]/g/w", Some("[::1]:80")),
+        ("ssh://git@[fd00::5]:2222/g/w", Some("[fd00::5]")),
+        ("git@[fd00::5]:g/w.git", Some("[fd00::5]")),
         // A local clone has no forge to reach.
         ("/srv/git/widget", None),
     ] {
