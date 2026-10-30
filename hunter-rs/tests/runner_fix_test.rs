@@ -214,6 +214,60 @@ async fn a_cycle_runs_the_queued_fix() {
     assert_eq!(summary.outcome.as_deref(), Some("rejected"), "{summary:?}");
 }
 
+/// A fix chain the selection gives up hands the work back to the fix tier
+/// in the same cycle, so the fresh fix it starts builds its tree on the
+/// finding's branch while the given-up chain's tree still has that branch
+/// checked out. Nothing superseded the chain (giving up dropped its
+/// checkpoint already), so unless the give-up's tree is released first,
+/// `worktree add -b` fails, the fresh fix is recorded as an unmade tree,
+/// and that failure resets the give-up streak that should hold the work.
+#[tokio::test]
+async fn a_fix_started_where_its_chain_was_given_up_gets_a_tree() {
+    let f = fixture("fix-after-give-up").await;
+    let capped = ScriptedBackend::staged(|tree, _| {
+        let session = tree.parent().unwrap().join("session/session.jsonl");
+        std::fs::write(
+            &session,
+            "{\"message\":{\"role\":\"assistant\",\"usage\":{\"input\":1000,\"output\":100}}}\n",
+        )
+        .unwrap();
+        let mut result = support::done();
+        result.exit_code = None;
+        result.killed_reason = Some("cap".to_owned());
+        result.session_file = Some(session.to_string_lossy().into_owned());
+        result
+    });
+    // A cold attempt and three resumes, each a cap suspension: the chain
+    // is at the attempt ceiling.
+    for cycle in 0..4 {
+        let summary =
+            hunter::scheduler::run_cycle(&mut support::jobs(&f.store), &f.cfg, &capped, None)
+                .await;
+        assert_eq!(
+            summary.outcome.as_deref(),
+            Some("suspended"),
+            "cycle {cycle}: {summary:?}"
+        );
+    }
+    let chain_tree = capped.runs()[0].tree.clone();
+    assert!(chain_tree.is_dir(), "the suspended chain keeps its tree");
+
+    let backend =
+        ScriptedBackend::writing("NOT-A-BUG.md", "Classification: wrong\nmisread the code");
+    let summary =
+        hunter::scheduler::run_cycle(&mut support::jobs(&f.store), &f.cfg, &backend, None).await;
+
+    assert_eq!(summary.finding_id, Some(f.fid), "{summary:?}");
+    assert_eq!(
+        summary.outcome.as_deref(),
+        Some("rejected"),
+        "the fresh fix got its tree and ran: {summary:?}"
+    );
+    assert_eq!(backend.runs().len(), 1);
+    assert_ne!(backend.runs()[0].tree, chain_tree, "a fresh chain's own tree");
+    assert!(!chain_tree.exists(), "the given-up chain's tree is released");
+}
+
 /// A fix whose tree can never be created -- here the repo names a
 /// default branch origin does not have -- is a failed fix attempt like any
 /// other: it stays `queued` for the retry and, after
