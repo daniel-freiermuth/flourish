@@ -1478,7 +1478,13 @@ async fn repoint_clone_origin(permit: &ClonePermit<'_>, old_url: &str, new_url: 
         .unwrap_or((127, "spawn error".to_owned()));
     if rc != 0 {
         tracing::warn!("repo {rid} url changed but its clone origin could not be updated: {out}");
+        return;
     }
+    // The clone's last fetch was of the old remote: left recorded, it
+    // would stand in for the new remote's first fetch, and `origin/*`
+    // would keep the old remote's commits for up to the fetch-ahead
+    // interval.
+    permit.forget_fetch();
 }
 
 // -- POST /api/repos (contract §7) -----------------------------------------------

@@ -450,6 +450,12 @@ impl ClonePermit<'_> {
         lock(&self.clones.0.fetched).insert(self.repo_id(), (Instant::now(), last));
     }
 
+    /// Drop this clone's fetch record: its origin now names another
+    /// remote, and a fetch of the old one stands in for none of the new.
+    pub(crate) fn forget_fetch(&self) {
+        lock(&self.clones.0.fetched).remove(&self.repo_id());
+    }
+
     /// This clone's last full fetch in this process, if it ended less than
     /// `age` ago. `None` after a restart.
     pub fn last_fetch_within(&self, age: Duration) -> Option<LastFetch> {
