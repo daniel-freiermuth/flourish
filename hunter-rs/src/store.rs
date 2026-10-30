@@ -2979,6 +2979,12 @@ impl Store {
     /// `since` limits the aggregate to attempts started after that instant:
     /// the give-up ceiling counts only what the scheduler did after the
     /// operator last released the work (WORK-MODEL.md §8).
+    ///
+    /// An attempt the daemon's own shutdown stopped between two worker
+    /// runs (`killed_reason = 'shutdown'`, a fix's pre-PR review) is not
+    /// counted as an attempt: a stop the daemon chose costs the work no
+    /// try, as a stop during a single run never did. Its spend is real and
+    /// counts like any other, in `total` and `max_single`.
     pub async fn resume_chain_stats(
         &self,
         job_id: i64,
@@ -2997,7 +3003,9 @@ impl Store {
                   AND (j.id = c.resumed_from OR j.resumed_from = c.id)
             )
             SELECT COALESCE(SUM(tokens_new), 0) AS "total!: i64",
-                   COALESCE(SUM(resumed_from IS NULL OR killed_reason = 'cap' OR COALESCE(tokens_new, 0) > 0), 0) AS "attempts!: i64",
+                   COALESCE(SUM(killed_reason IS NOT 'shutdown'
+                                AND (resumed_from IS NULL OR killed_reason = 'cap'
+                                     OR COALESCE(tokens_new, 0) > 0)), 0) AS "attempts!: i64",
                    COALESCE(MAX(tokens_new), 0) AS "max_single!: i64"
             FROM jobs WHERE id IN (SELECT id FROM chain)
               AND (?3 IS NULL OR started_at > ?3)

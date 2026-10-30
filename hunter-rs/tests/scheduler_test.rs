@@ -71,6 +71,8 @@ fn test_config(cache_ttl_s: f64) -> Config {
         hunt_max_findings: 8,
         hunt_rehunt_days: 90,
         fix_max_wall_s: 2700,
+        review_max_rounds: 0,
+        review_curate: false,
         scan_interval_days: 1.0,
         modernization_interval_days: 30,
         standards_interval_days: 30,

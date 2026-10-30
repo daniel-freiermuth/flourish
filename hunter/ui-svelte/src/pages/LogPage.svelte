@@ -46,6 +46,7 @@
       case "cycle":
       case "prsync":
       case "fix":
+      case "review":
       case "engage":
       case "harvest":
       case "recheck":

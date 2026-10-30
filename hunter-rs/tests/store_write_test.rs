@@ -3855,3 +3855,32 @@ async fn a_failure_counts_only_while_the_finding_is_in_the_kinds_tier() {
         assert_eq!(store.work_streak(fid, kind).await.unwrap().streak, 0);
     }
 }
+
+/// An attempt the daemon's shutdown stopped between a fix's review runs
+/// costs the work no try, but what it spent is spent: it counts in the
+/// chain's total and largest attempt, which the resume reservation and the
+/// give-up ceiling's spend arm read.
+#[tokio::test]
+async fn chain_stats_count_a_shutdown_stop_as_spend_not_as_an_attempt() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo_and_findings(&pool).await;
+    sqlx::raw_sql(
+        "INSERT INTO jobs (id, kind, repo_id, finding_id, state, tokens_new, resumed_from, \
+                           killed_reason, started_at) VALUES \
+         (10, 'fix', 1, 2, 'suspended', 100, NULL, 'cap', 1000), \
+         (11, 'fix', 1, 2, 'suspended', 400, 10, 'shutdown', 2000), \
+         (12, 'fix', 1, 2, 'suspended', 300, 11, 'cap', 3000);",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let store = rw_store(&path).await;
+    assert_eq!(
+        store.resume_chain_stats(12, None).await.unwrap(),
+        ResumeChainStats {
+            total: 800,
+            attempts: 2,
+            max_single: 400
+        }
+    );
+}
