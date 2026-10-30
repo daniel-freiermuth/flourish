@@ -137,6 +137,9 @@ pub struct CodeLocation {
     /// The line is in a version of the file the PR has since changed:
     /// the comment may no longer apply where it says.
     pub outdated: bool,
+    /// The line is one the PR removes: `line` numbers it in the PR's base,
+    /// and the head no longer has it.
+    pub removed: bool,
 }
 
 /// Review from GitHub's `pr.reviews` array.
@@ -217,14 +220,19 @@ pub struct GlPosition {
 
 impl GlPosition {
     fn location(&self) -> CodeLocation {
+        // A removed line exists only in the old file, so only old_path
+        // matches the number old_line gives it.
+        let removed = self.new_line.is_none() && self.old_line.is_some();
+        let (path, other) = if removed {
+            (&self.old_path, &self.new_path)
+        } else {
+            (&self.new_path, &self.old_path)
+        };
         CodeLocation {
-            path: self
-                .new_path
-                .clone()
-                .or_else(|| self.old_path.clone())
-                .unwrap_or_default(),
+            path: path.clone().or_else(|| other.clone()).unwrap_or_default(),
             line: self.new_line.or(self.old_line),
             outdated: false,
+            removed,
         }
     }
 }
@@ -248,6 +256,10 @@ struct GhReviewComment {
     line: Option<i64>,
     #[serde(default)]
     original_line: Option<i64>,
+    /// `LEFT` for a line the PR removes, which the line fields number in
+    /// the base.
+    #[serde(default)]
+    side: Option<String>,
 }
 
 impl From<GhReviewComment> for GhComment {
@@ -261,6 +273,7 @@ impl From<GhReviewComment> for GhComment {
                 path: c.path,
                 line: c.line.or(c.original_line),
                 outdated: c.line.is_none() && c.original_line.is_some(),
+                removed: c.side.as_deref() == Some("LEFT"),
             }),
             voice: Voice::default(),
         }
