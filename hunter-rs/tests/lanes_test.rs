@@ -1206,3 +1206,61 @@ async fn a_dependency_scan_skips_a_clone_whose_fetch_just_failed() {
     assert_eq!(scans, hunter::scheduler::DepScans::default());
     assert!(bins.calls_to("renovate").is_empty(), "Renovate ran");
 }
+
+/// A clone's last fetch was of the remote it had then: once a URL update
+/// repoints the clone, that fetch stands in for no fetch of the new
+/// remote. Fetch-ahead, which left the clone alone as fetched lately,
+/// fetches it from the new remote at once, so `origin/main` is the new
+/// remote's tip and not the old one's for up to the fetch-ahead interval.
+#[tokio::test]
+async fn a_url_update_makes_the_next_fetch_ahead_fetch_the_new_remote() {
+    let (dir, store, cfg, _fid) = fixture("lanes-fetch-repoint").await;
+    let alpha = store.get_repo_by_id(1).await.unwrap().unwrap();
+    let clone = std::path::Path::new(&alpha.path);
+    let admin = support::admin(&store);
+    let (_keep, running_on) = tokio::sync::watch::channel(false);
+    let hour = Duration::from_hours(1);
+    let ahead = hunter::scheduler::fetch_ahead(&admin, hour, &running_on).await;
+    let moved = dir.path().join("origin-moved.git");
+    let moved = moved.to_string_lossy();
+    support::git(dir.path(), &["clone", "-q", "--bare", &alpha.url, &moved]);
+    let upstream = advance_origin(&dir, &moved);
+
+    let state = hunter::server::AppState {
+        store: Arc::new(store.clone()),
+        config: Arc::new(cfg),
+        backend: Arc::new(hunter::backend::NullBackend),
+        repo_notes: Arc::new(tokio::sync::Mutex::new(())),
+        scheduler: hunter::server::SchedulerHandle::default(),
+    };
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/repo")
+        .header(
+            axum::http::header::COOKIE,
+            support::auth_cookie(&store).await,
+        )
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({ "id": 1, "url": moved }).to_string(),
+        ))
+        .unwrap();
+    let response = tower::util::ServiceExt::oneshot(hunter::server::router(state), request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert_eq!(
+        support::git(clone, &["config", "remote.origin.url"]).trim(),
+        moved
+    );
+
+    let again = hunter::scheduler::fetch_ahead(&admin, hour, &running_on).await;
+
+    assert_eq!(ahead.fetched, 1, "{ahead:?}");
+    assert_eq!((again.fetched, again.fresh), (1, 0), "{again:?}");
+    assert_eq!(
+        support::git(clone, &["rev-parse", "origin/main"]),
+        upstream,
+        "the clone still has the old remote's tip"
+    );
+}
