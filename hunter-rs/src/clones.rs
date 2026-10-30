@@ -572,8 +572,21 @@ fn run_git(dir: &Path, args: &[&str], timeout_s: u64) -> (i32, String) {
 pub enum Unheld<'a> {
     /// `log <range> --oneline`.
     Commits { range: &'a str },
-    /// `log -1 --format=%s`: the subject of `HEAD`.
-    HeadSubject,
+    /// `log -1 --format=%s <rev>`: the subject of the commit `rev` names.
+    Subject { rev: &'a str },
+    /// `symbolic-ref --quiet HEAD`: the ref `HEAD` points at; rc 1 when
+    /// it is detached.
+    HeadRef,
+    /// `diff --quiet --no-ext-diff <from> <to>`: rc 0 when the two
+    /// commits' trees are identical, 1 when they differ.
+    SameTree { from: &'a str, to: &'a str },
+    /// `merge-base --is-ancestor <ancestor> <rev>`: rc 0 when `rev`
+    /// descends from `ancestor` (or is it), 1 when not.
+    IsAncestor { ancestor: &'a str, rev: &'a str },
+    /// `--no-optional-locks status --porcelain`: the tree's uncommitted
+    /// changes and untracked files, one per line; empty when it is clean.
+    /// Without the flag `status` refreshes and rewrites the tree's index.
+    Status,
     /// `push <force> <url> <refspec>`. It changes the remote only: a push
     /// to a URL updates no remote-tracking ref.
     Push {
@@ -618,7 +631,15 @@ impl Unheld<'_> {
         let mut args: Vec<&str> = Vec::new();
         match *self {
             Self::Commits { range } => args.extend(["log", range, "--oneline"]),
-            Self::HeadSubject => args.extend(["log", "-1", "--format=%s"]),
+            Self::Subject { rev } => args.extend(["log", "-1", "--format=%s", rev]),
+            Self::HeadRef => args.extend(["symbolic-ref", "--quiet", "HEAD"]),
+            Self::SameTree { from, to } => {
+                args.extend(["diff", "--quiet", "--no-ext-diff", from, to]);
+            }
+            Self::IsAncestor { ancestor, rev } => {
+                args.extend(["merge-base", "--is-ancestor", ancestor, rev]);
+            }
+            Self::Status => args.extend(["--no-optional-locks", "status", "--porcelain"]),
             Self::Push {
                 force,
                 url,

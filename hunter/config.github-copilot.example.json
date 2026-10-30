@@ -4,6 +4,7 @@
   "ompBin": "omp",
   "hunt": { "maxWallS": 1800, "maxFindings": 8 },
   "fix": { "maxWallS": 2700 },
+  "review": { "maxRounds": 7, "curate": true },
   "budget": { "staleAfterS": 300 },
   "serve": { "port": 8377 },
   "feedback": { "bots": [] },
