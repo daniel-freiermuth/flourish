@@ -489,7 +489,7 @@ pub struct AdminActivity {
     pub started_at: i64,
 }
 
-/// A phase of the job lane outside its worker, reported by the helpers
+/// A phase of the job lane beside its main worker, reported by the helpers
 /// that do it (`crate::activity::job_phase`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "snake_case")]
@@ -504,6 +504,9 @@ pub enum JobPhase {
     Fetching,
     /// Adding the job's worktree.
     PreparingTree,
+    /// A fresh reviewer reading a finished fix before it ships
+    /// (`scheduler::review_fix`).
+    Reviewing,
     /// Pushing and opening or answering a PR, or withdrawing one.
     Publishing,
     /// Filing a worker's findings.

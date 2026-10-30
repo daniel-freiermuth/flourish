@@ -105,6 +105,7 @@
     cloning: "cloning the repo",
     fetching: "fetching the repo",
     preparing_tree: "preparing the job's worktree",
+    reviewing: "reviewing the fix before it ships",
     publishing: "publishing to the PR",
     ingesting: "filing findings",
   };
