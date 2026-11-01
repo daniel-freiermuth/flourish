@@ -29,6 +29,7 @@ use crate::types::{Finding, Job, JobPhase, Repo};
 use crate::util::now_ms;
 
 mod attempt;
+mod review;
 pub use attempt::{Attempt, Kind, Resumed, kind};
 
 /// Everything a resumed attempt needs and a cold one does not.
@@ -1458,9 +1459,14 @@ const MAX_CONSECUTIVE_SAME_FAILURE: i64 = 3;
 ///
 /// `resume-unavailable` is `Failed` rather than `Killed` because nothing
 /// was spawned — there was no run to kill, the attempt could not start.
+///
+/// `shutdown` is no run's end: it is a fix job the daemon's shutdown
+/// stopped between its worker runs (the pre-PR review,
+/// [`review::review_fix`]), with the fixer's transcript to continue. It is
+/// a pause, as a cap is.
 fn job_state(rr: &RunResult) -> FinishedState {
     match rr.killed_reason.as_deref() {
-        Some("cap") if rr.session_file.is_some() => FinishedState::Suspended,
+        Some("cap" | review::STOPPED) if rr.session_file.is_some() => FinishedState::Suspended,
         Some("wallclock") if rr.session_file.is_some() && rr.tokens_new > 0 => {
             FinishedState::Suspended
         }
@@ -4734,6 +4740,7 @@ fn fix_prompt(
     cfg: &Config,
     resume: Option<&ResumePlan>,
     start: &FixStart,
+    curation_undone: bool,
 ) -> anyhow::Result<String> {
     let finding = &start.finding;
     let worktree = &start.ws.tree;
@@ -4765,6 +4772,14 @@ fn fix_prompt(
         ),
     };
     let prompt = built.map_err(|e| anyhow::anyhow!("{e}"))?;
+    if curation_undone && resume.is_some() {
+        return Ok(review::CURATION_UNDONE_PROMPT.to_owned());
+    }
+    if let Some((HoldReason::Prerequisite, detail)) = resume.and_then(|r| r.after_hold.as_ref())
+        && let Some(held) = review::held_resume_prompt(cfg, start, detail)
+    {
+        return held;
+    }
     Ok(
         if let Some((reason, detail)) = resume.and_then(|r| r.after_hold.as_ref()) {
             match reason {
@@ -4916,24 +4931,31 @@ fn header(line: &str) -> Option<(String, String)> {
     Some((key.to_ascii_lowercase(), value.to_owned()))
 }
 
+/// The report a fix worker declines with: `NOT-A-BUG.md` for a bug,
+/// `DECLINED.md` for any other finding.
+fn decline_report(kind: FindingType) -> &'static str {
+    if kind == FindingType::Bug {
+        "NOT-A-BUG.md"
+    } else {
+        "DECLINED.md"
+    }
+}
+
 /// Read the worker's result and decide the attempt's outcome. Shipping is
-/// part of deciding (a push or a PR that fails is a failed attempt). An
-/// error leaves the claim to the caller, which releases it.
+/// part of deciding (a push or a PR that fails is a failed attempt), with
+/// what the review loop left ([`review::review_fix`]). An error leaves the
+/// claim to the caller, which releases it.
 async fn conclude_fix(
     (cfg, backend): (&Config, &dyn Backend),
     start: &FixStart,
     state: JobState,
+    reviewed: &review::Reviewed,
 ) -> anyhow::Result<FixOutcome> {
     let finding = &start.finding;
     let fid = finding.id;
     let worktree = &start.ws.tree;
-    let decline_name = if finding.kind == FindingType::Bug {
-        "NOT-A-BUG.md"
-    } else {
-        "DECLINED.md"
-    };
-    let decline_file = worktree.join(decline_name);
-    let blocked_file = worktree.join("BLOCKED.md");
+    let decline_file = worktree.join(decline_report(finding.kind));
+    let blocked_file = worktree.join(BLOCKED_REPORT);
     let declined = decline_file.exists();
     let report_file = if declined {
         Some(&decline_file)
@@ -4949,6 +4971,9 @@ async fn conclude_fix(
         Ok(report) => report,
         Err(e) => anyhow::bail!("fix #{fid}: cannot read the worker's report: {e}"),
     };
+    if report.is_some() {
+        review::restart_rounds(start);
+    }
     if declined {
         return Ok(FixOutcome::Declined(parse_decline(
             &report.unwrap_or_default(),
@@ -4958,11 +4983,42 @@ async fn conclude_fix(
         return Ok(FixOutcome::Held { report });
     }
 
-    let ShipFailure { failure, at_forge } =
-        match ship_pr(&start.repo, &start.branch, &start.pinned, worktree, state).await {
-            Ok((pr_url, recovered)) => return Ok(FixOutcome::Shipped { pr_url, recovered }),
-            Err(failure) => failure,
-        };
+    if let Some(host) = &reviewed.offline {
+        return Ok(FixOutcome::Offline { host: host.clone() });
+    }
+    // An attempt the review did not end ships nothing unless its fixer
+    // finished: a paused, failed or killed fixer (a first run that stopped
+    // after describing its fix, or half an answer to a review) has not been
+    // reviewed, and the attempt that finishes it will be. One that finished
+    // without a review left nothing to ship, or its commits could not be
+    // listed: either way nothing unreviewed is pushed.
+    let ending = match &reviewed.ending {
+        Some(ending) => ending.clone(),
+        None if state == JobState::Done => {
+            return Ok(FixOutcome::Failed {
+                failure: review::unshippable(start).await,
+            });
+        }
+        None if state == JobState::Suspended => return Ok(FixOutcome::Suspended),
+        None => {
+            return Ok(FixOutcome::Failed {
+                failure: format!("worker {state}"),
+            });
+        }
+    };
+    let ShipFailure { failure, at_forge } = match ship_pr(
+        &start.repo,
+        &start.branch,
+        &start.pinned,
+        worktree,
+        state,
+        &ending,
+    )
+    .await
+    {
+        Ok((pr_url, recovered)) => return Ok(FixOutcome::Shipped { pr_url, recovered }),
+        Err(failure) => failure,
+    };
     if state == JobState::Suspended {
         // A suspension is a pause, not a failure: counting it toward the
         // streak would turn three pauses of one healthy fix into "stuck".
@@ -5275,22 +5331,31 @@ impl ShipFailure {
 /// Push the fix branch and open its draft PR: `(url, recovered)`, or why
 /// not. Nothing to ship (no commits, no `PR-DESCRIPTION.md`, a worker
 /// that did not finish) is a failure like a push that fails.
+///
+/// What the pre-PR review ended with ([`review::Ending`]) says what
+/// ships: the commit (`HEAD` unless a reviewer moved it), the note that
+/// follows the description in the PR body, and the title (the subject of
+/// the commit the fixer finished on before any review round, so answers
+/// to the review do not retitle the fix; the shipped commit's otherwise).
 async fn ship_pr(
     repo: &Repo,
     branch: &str,
     pinned: &str,
     worktree: &Path,
     state: JobState,
+    ending: &review::Ending,
 ) -> Result<(String, bool), ShipFailure> {
     let _phase = crate::activity::job_phase(JobPhase::Publishing);
     let db = repo.default_branch.clone();
     let wt = worktree.to_owned();
+    let head = ending.head.as_deref();
+    let rev = head.unwrap_or("HEAD").to_owned();
     // The worker's own commits: those on top of the commit its tree was
     // created at. Not `origin/<default>..HEAD`: that ref moves under a
     // running worker (fetch-ahead, a dependency scan's fetch), and after a
     // rewrite of the default branch it would name the dropped upstream
     // commits as the worker's and ship them as a PR.
-    let range = format!("{pinned}..HEAD");
+    let range = format!("{pinned}..{rev}");
     let (rc, commits) =
         tokio::task::spawn_blocking(move || Unheld::Commits { range: &range }.run(&wt, 30))
             .await
@@ -5312,11 +5377,14 @@ async fn ship_pr(
     let f = forge::forge_for(repo.forge);
     let push_url = f.ssh_url(&repo.url);
     let wt = worktree.to_owned();
+    // Always to the branch by name: a symbolic `HEAD` would push whatever
+    // ref the tree has checked out, and nothing at all from a detached one.
+    let refspec = format!("{rev}:refs/heads/{branch}");
     let (prc, pout) = tokio::task::spawn_blocking(move || {
         Unheld::Push {
             force: Force::Always,
             url: &push_url,
-            refspec: "HEAD",
+            refspec: &refspec,
         }
         .run(&wt, 600)
     })
@@ -5332,11 +5400,18 @@ async fn ship_pr(
             repo.url
         )));
     }
-    let body = std::fs::read_to_string(&pr_desc).unwrap_or_default();
-    let wt = worktree.to_owned();
-    let (_trc, title) = tokio::task::spawn_blocking(move || Unheld::HeadSubject.run(&wt, 30))
-        .await
-        .unwrap_or((127, branch.to_owned()));
+    let mut body = std::fs::read_to_string(&pr_desc).unwrap_or_default();
+    if let Some(note) = &ending.note {
+        body = format!("{}\n\n{note}\n", body.trim_end());
+    }
+    let title = if let Some(title) = &ending.title {
+        title.clone()
+    } else {
+        let wt = worktree.to_owned();
+        tokio::task::spawn_blocking(move || Unheld::Subject { rev: &rev }.run(&wt, 30))
+            .await
+            .map_or_else(|_| String::new(), |(_, out)| out)
+    };
     let title = title.trim();
     let title = if title.is_empty() { branch } else { title };
     match f.create_pr(Path::new(&repo.path), branch, &db, title, &body) {
@@ -5586,7 +5661,10 @@ pub async fn run_fix(
     };
     // Any early return from here on drops `running`: the cycle's settle
     // records the abandoned job.
-    let prompt = match fix_prompt(cfg, resume, &start) {
+    // A curation the daemon died in is undone before anything reads the
+    // tree; the resumed fixer is then told it has nothing left to do.
+    let curation_undone = review::recover_curation(lane, store, &start).await;
+    let prompt = match fix_prompt(cfg, resume, &start, curation_undone) {
         Ok(prompt) => prompt,
         Err(e) => {
             release_claim(claim).await;
@@ -5625,8 +5703,13 @@ pub async fn run_fix(
             return Ok(denied);
         }
     };
+    // A finished fix is reviewed before it ships, all within this job: the
+    // reviewer and the fixer's answers run under the same grant, and the
+    // row records what all of them spent.
+    let reviewed = review::review_fix(scope, lane, cfg, backend, &start, rr).await;
+    let rr = &reviewed.rr;
     let state = log_write_failure(
-        record_job(store, running, &rr, model, resume)
+        record_job(store, running, rr, model, resume)
             .await
             .map(|r| r.state()),
         format_args!("job {}: recording outcome", start.job),
@@ -5641,7 +5724,7 @@ pub async fn run_fix(
         tokens_new: Some(rr.tokens_new),
         ..Default::default()
     };
-    let outcome = match conclude_fix((cfg, backend), &start, state).await {
+    let outcome = match conclude_fix((cfg, backend), &start, state, &reviewed).await {
         Ok(outcome) => outcome,
         Err(e) => {
             release_claim(claim).await;

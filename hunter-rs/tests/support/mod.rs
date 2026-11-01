@@ -83,14 +83,20 @@ impl Drop for TempDir {
 // Databases
 // ---------------------------------------------------------------------------
 
-/// `Config::load` over `root`, with the network gate off.
+/// `Config::load` over `root`, with the network gate and the pre-PR
+/// review off.
 ///
 /// No test may reach the network, and the gate would probe the forge of
 /// any repo a cycle picks: the fixtures' `https://github.com/acme/widget`
 /// included. A test of the gate itself turns it back on.
+///
+/// A scripted worker answers every run a job makes, so with the review on
+/// a fix test's worker would be asked to review its own fix too. A test of
+/// the review turns it back on.
 pub fn load_config(root: &Path) -> hunter::config::Config {
     let mut cfg = hunter::config::Config::load(root).expect("load config");
     cfg.network_gate = false;
+    cfg.review_max_rounds = 0;
     cfg
 }
 
@@ -442,14 +448,20 @@ fn set_executable(_path: &Path) {}
 // A backend that simulates a worker
 // ---------------------------------------------------------------------------
 
-type RunFn = Box<dyn Fn(&Path, Option<&Path>) -> RunResult + Send + Sync>;
+type RunFn = Box<dyn Fn(&Run) -> RunResult + Send + Sync>;
 type DecideHook = Box<dyn Fn() -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// What one `run()` of a [`ScriptedBackend`] was handed.
 #[derive(Debug, Clone)]
 pub struct Run {
     pub tree: PathBuf,
+    /// The session directory the run was handed (`Workspace::session`).
+    pub session: PathBuf,
     pub prompt: String,
+    /// The token bound the run was handed.
+    pub cap_tokens: Option<i64>,
+    /// The wall-clock bound the run was handed, in seconds.
+    pub max_wall_s: i64,
     pub resume_from: Option<PathBuf>,
 }
 
@@ -491,6 +503,12 @@ impl ScriptedBackend {
     /// Run the given closure against the worktree and the transcript the
     /// run was asked to continue, if any.
     pub fn staged(run: impl Fn(&Path, Option<&Path>) -> RunResult + Send + Sync + 'static) -> Self {
+        Self::seeing(move |r| run(&r.tree, r.resume_from.as_deref()))
+    }
+
+    /// Run the given closure against everything the run was handed: its
+    /// tree, session directory, prompt, cap and transcript to continue.
+    pub fn seeing(run: impl Fn(&Run) -> RunResult + Send + Sync + 'static) -> Self {
         Self {
             run: Box::new(run),
             cap_tokens: None,
@@ -650,20 +668,24 @@ impl Backend for ScriptedBackend {
         &self,
         ws: &hunter::workspace::Workspace,
         prompt: &str,
-        _cap_tokens: Option<i64>,
-        _max_wall_s: i64,
+        cap_tokens: Option<i64>,
+        max_wall_s: i64,
         _job_class: JobClass,
         resume_from: Option<&Path>,
     ) -> anyhow::Result<RunResult> {
-        self.runs.lock().unwrap().push(Run {
+        let run = Run {
             tree: ws.tree.clone(),
+            session: ws.session.clone(),
             prompt: prompt.to_owned(),
+            cap_tokens,
+            max_wall_s,
             resume_from: resume_from.map(Path::to_path_buf),
-        });
+        };
+        self.runs.lock().unwrap().push(run.clone());
         if self.fails {
             anyhow::bail!("test: the backend failed before the worker ran");
         }
-        Ok((self.run)(&ws.tree, resume_from))
+        Ok((self.run)(&run))
     }
 }
 

@@ -851,6 +851,10 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     // the sync has not caught up with wait, held back from the pick
     // ([`EngageWaits`]), and the lane goes on with every other tier.
     let mut engage_waits = EngageWaits::default();
+    // A cycle finishes the worker run it is in at shutdown; one that would
+    // start another (a fix's pre-PR review) stops instead, so the unit's
+    // stop timeout only ever has to cover one run.
+    jobs.stop_on(shutdown_rx.clone());
     let mut stop = *shutdown_rx.borrow();
     while !stop {
         // Not atomic with the `cycle_running.store(true)` below, on

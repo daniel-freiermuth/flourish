@@ -102,7 +102,32 @@ impl Workspace {
     pub fn build_cache(&self) -> PathBuf {
         self.clone.join("target")
     }
+
+    /// The session directory of fix job `job`'s pre-PR reviewer in round
+    /// `round`, beside `session/` (WORK-MODEL.md §5.7). One per job and
+    /// round, and never removed while the chain lives, so a reviewer
+    /// never continues an old transcript, and the chain's metered spend
+    /// is `session/` plus all of them ([`Self::review_sessions`]).
+    pub fn review_session(&self, job: i64, round: u32) -> PathBuf {
+        self.root.join(format!("{REVIEW_PREFIX}{job}-{round}"))
+    }
+
+    /// Every reviewer session directory of the chain
+    /// ([`Self::review_session`]).
+    pub fn review_sessions(&self) -> Vec<PathBuf> {
+        std::fs::read_dir(&self.root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(REVIEW_PREFIX))
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect()
+    }
 }
+
+/// What every reviewer session directory's name starts with.
+const REVIEW_PREFIX: &str = "review-";
 
 /// `<work_root>/jobs`: the parent of every chain workspace.
 pub fn jobs_root(work_root: &Path) -> PathBuf {

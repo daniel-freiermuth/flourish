@@ -239,6 +239,7 @@ impl Recovered {
                 store: self.store,
                 status: crate::activity::JobStatus::default(),
                 holdback: crate::scheduler::EngageHoldback::default(),
+                stop: None,
             },
             admin,
         )
@@ -257,6 +258,9 @@ pub struct JobAuthority {
     /// The engages the lane's cycles may not pick yet
     /// ([`Self::hold_back_engages`]).
     holdback: crate::scheduler::EngageHoldback,
+    /// The daemon's shutdown latch ([`Self::stop_on`]): what a runner
+    /// with several worker runs asks before starting the next one.
+    stop: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 impl JobAuthority {
@@ -281,12 +285,19 @@ impl JobAuthority {
         self.holdback = holdback;
     }
 
+    /// Let this lane's cycles see `stop`, the daemon's shutdown latch
+    /// ([`CycleScope::stopping`]).
+    pub fn stop_on(&mut self, stop: tokio::sync::watch::Receiver<bool>) {
+        self.stop = Some(stop);
+    }
+
     /// Open the cycle's scope. It borrows this authority until it is
     /// settled or dropped, so no second scope opens beside it.
     pub fn scope(&mut self) -> CycleScope<'_> {
         CycleScope {
             store: JobStore::of(&Owner(()), self.store.clone()),
             holdback: self.holdback.clone(),
+            stop: self.stop.clone(),
             _jobs: PhantomData,
         }
     }
@@ -299,6 +310,7 @@ impl JobAuthority {
         CycleScope {
             store: JobStore::of(&Owner(()), self.store.clone()),
             holdback: crate::scheduler::EngageHoldback::default(),
+            stop: self.stop,
             _jobs: PhantomData,
         }
     }
@@ -479,6 +491,7 @@ pub struct CycleScope<'a> {
     store: JobStore,
     /// The engages this cycle may not pick ([`JobAuthority::hold_back_engages`]).
     holdback: crate::scheduler::EngageHoldback,
+    stop: Option<tokio::sync::watch::Receiver<bool>>,
     _jobs: PhantomData<&'a mut JobAuthority>,
 }
 
@@ -491,6 +504,13 @@ impl CycleScope<'_> {
     /// The engages this cycle may not pick yet: `pick_next` skips them.
     pub const fn engage_holdback(&self) -> &crate::scheduler::EngageHoldback {
         &self.holdback
+    }
+
+    /// Whether the daemon is shutting down. A cycle already running
+    /// finishes the worker run it is in; a runner that would start another
+    /// one (the pre-PR review, `scheduler::review`) stops instead.
+    pub fn stopping(&self) -> bool {
+        self.stop.as_ref().is_some_and(|s| *s.borrow())
     }
 
     /// Create a job, owned by the [`RunningJob`] returned. The INSERT and
@@ -937,19 +957,29 @@ async fn chain_workspace(store: &Store, work_root: &Path, j: &Job) -> anyhow::Re
 /// The chain's session directory is shared by every attempt, so the
 /// ledger there also holds what earlier attempts already recorded --
 /// across kinds, when an engage handed its session to a harvest. That is
-/// subtracted, as the harness meters a resume against its base.
+/// subtracted, as the harness meters a resume against its base. A fix
+/// job's recorded spend also holds its pre-PR reviewers', whose
+/// transcripts are in the chain's review directories
+/// (`Workspace::review_sessions`), so those are metered too: without them
+/// an orphan whose ancestors paid for reviews would count too little, or
+/// nothing, and be killed instead of kept.
 async fn orphan_work(
     store: &Store,
     work_root: &Path,
     j: &Job,
 ) -> anyhow::Result<Option<(String, i64)>> {
+    use crate::backends::omp_scavenge::harness::ledger_dir_usage;
     let ws = chain_workspace(store, work_root, j).await?;
-    let Some((file, tokens, _)) =
-        crate::backends::omp_scavenge::harness::ledger_dir_usage(&ws.session)
-    else {
+    let Some((file, tokens, _)) = ledger_dir_usage(&ws.session) else {
         return Ok(None);
     };
-    let own = tokens - store.ancestor_tokens(j.id).await?;
+    let reviews: i64 = ws
+        .review_sessions()
+        .iter()
+        .filter_map(|dir| ledger_dir_usage(dir))
+        .map(|(_, tokens, _)| tokens)
+        .sum();
+    let own = tokens + reviews - store.ancestor_tokens(j.id).await?;
     if own <= 0 || tree_in_use(&ws.tree) {
         return Ok(None);
     }

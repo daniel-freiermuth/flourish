@@ -83,6 +83,8 @@ fn test_config(root: &Path) -> Config {
         hunt_max_wall_s: 1800,
         hunt_max_findings: 8,
         fix_max_wall_s: 2700,
+        review_max_rounds: 0,
+        review_curate: false,
         hunt_rehunt_days: 90,
         scan_interval_days: 1.0,
         modernization_interval_days: 30,

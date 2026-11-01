@@ -1264,6 +1264,73 @@ async fn reconcile_counts_only_the_orphans_own_work_in_a_handed_off_transcript()
     }
 }
 
+/// A fix job's recorded spend includes its pre-PR reviewers', whose
+/// transcripts lie in the chain's review directories, not in `session/`.
+/// A resume of a reviewed fix cut off by a restart is metered across both:
+/// it is suspended with exactly its own work, the fixer's call and, when
+/// it was cut off mid-review, its reviewer's too. Metering `session/`
+/// alone would subtract the predecessor's review from the fixer's
+/// transcript and kill the job as if it had done nothing.
+#[tokio::test]
+async fn reconcile_meters_a_reviewed_fix_chain_across_its_review_sessions() {
+    for (reviewing, expected) in [(false, 1600), (true, 3200)] {
+        let (dir, path, pool) = fresh_db().await;
+        seed_repo(&pool).await;
+        seed_findings(&pool).await;
+        // Job 10: one fixer call and two reviewer calls.
+        sqlx::raw_sql(
+            "INSERT INTO jobs (id, kind, repo_id, finding_id, state, tokens_new, started_at, finished_at) \
+             VALUES (10, 'fix', 1, 2, 'suspended', 4800, 1000, 2000); \
+             INSERT INTO jobs (id, kind, repo_id, finding_id, state, started_at, resumed_from) \
+             VALUES (11, 'fix', 1, 2, 'running', 3000, 10);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let store = rw_store(&path).await;
+        let work_root = dir.subdir("work_root");
+        let root = work_root.join("jobs").join("10");
+        let session = root.join("session");
+        std::fs::create_dir_all(&session).unwrap();
+        // Job 10's fixer call, then job 11's.
+        std::fs::write(
+            session.join("s.jsonl"),
+            format!("{CALL_1600}\n{CALL_1600}\n"),
+        )
+        .unwrap();
+        let review = root.join("review-10-1");
+        std::fs::create_dir_all(&review).unwrap();
+        std::fs::write(
+            review.join("r.jsonl"),
+            format!("{CALL_1600}\n{CALL_1600}\n"),
+        )
+        .unwrap();
+        if reviewing {
+            let review = root.join("review-11-2");
+            std::fs::create_dir_all(&review).unwrap();
+            std::fs::write(review.join("r.jsonl"), format!("{CALL_1600}\n")).unwrap();
+        }
+
+        hunter::recovery::reconcile_and_log(store.take_unreconciled().unwrap(), &work_root)
+            .await
+            .unwrap();
+
+        let jobs = store.list_jobs(10).await.unwrap();
+        let fix = &jobs.iter().find(|j| j.job.id == 11).unwrap().job;
+        assert_eq!(
+            fix.state,
+            hunter::domain::JobState::Suspended,
+            "{reviewing}"
+        );
+        assert_eq!(fix.tokens_new, Some(expected), "{reviewing}");
+        assert_eq!(
+            fix.session_file.as_deref(),
+            session.join("s.jsonl").to_str(),
+            "{reviewing}: the fixer's transcript is the checkpoint"
+        );
+    }
+}
+
 /// A worker that outlived its daemon (one run by hand and killed) is
 /// still in its tree. Resuming that chain would put a second worker in
 /// the same tree and transcript, so the orphan is killed, not suspended.

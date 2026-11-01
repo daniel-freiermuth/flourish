@@ -40,6 +40,7 @@ struct RawConfig {
     backend: RawBackend,
     hunt: RawCaps,
     fix: RawCaps,
+    review: RawReview,
     scan: RawScan,
     modernization: RawScan,
     standards: RawScan,
@@ -95,6 +96,14 @@ struct RawCaps {
     max_findings: Option<i64>,
     #[serde(rename = "rehuntDays")]
     rehunt_days: Option<i64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawReview {
+    #[serde(rename = "maxRounds")]
+    max_rounds: Option<u32>,
+    curate: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -229,6 +238,14 @@ pub struct Config {
     pub hunt_max_findings: i64,
     pub hunt_rehunt_days: i64,
     pub fix_max_wall_s: i64,
+    /// review.maxRounds — how many times a finished fix is reviewed by a
+    /// fresh reviewer before it ships (`scheduler::review_fix`); the
+    /// fixer answers every round but the last. 0 ships unreviewed.
+    pub review_max_rounds: u32,
+    /// review.curate — once a review ends in a ship with more than one
+    /// commit, the fixer rewrites them into a few logical ones of the same
+    /// tree before the push (`scheduler::review`). Default on.
+    pub review_curate: bool,
     /// scan.intervalDays — per-repo hunt cadence gate
     /// (`types.Config.scan_interval_days`, read in `Config.load`).
     pub scan_interval_days: f64,
@@ -495,6 +512,8 @@ impl Config {
             hunt_max_findings: raw.hunt.max_findings.unwrap_or(8),
             hunt_rehunt_days: raw.hunt.rehunt_days.unwrap_or(90),
             fix_max_wall_s,
+            review_max_rounds: raw.review.max_rounds.unwrap_or(7),
+            review_curate: raw.review.curate.unwrap_or(true),
             scan_interval_days,
             modernization_interval_days,
             standards_interval_days,
