@@ -38,7 +38,8 @@ use crate::store::{AdminStore, FindingFilter, HoldRelease, RepoUpdate, Store, St
 use crate::transition::{Moved, OperatorVerdict, Transition, VerdictRefused};
 use crate::types::{
     ActivityStatus, BudgetState, Event, Finding, FindingDetail, FindingOut, HoldOut, JobListEntry,
-    Repo, RepoBrief, RepoHoldOut, RepoOut, RepoStreakOut, RepoWorkOut, Stats, Summary,
+    Repo, RepoBrief, RepoHoldOut, RepoOut, RepoStreakOut, RepoWorkOut, Stats, StatsHorizon,
+    Summary,
 };
 
 /// Handle to this process's two scheduler lanes: the job lane, which runs
@@ -734,11 +735,28 @@ async fn me(Extension(user): Extension<CurrentUser>) -> Json<SessionUser> {
     })
 }
 
-async fn stats(State(state): State<AppState>) -> Result<Json<Stats>, ApiError> {
+/// `?horizon=` windows all three aggregates on one cutoff, read from the
+/// clock once here so no job can fall inside one aggregate's window and
+/// outside another's.
+async fn stats(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Stats>, ApiError> {
+    let horizon = match param(&params, "horizon") {
+        None => StatsHorizon::All,
+        Some(h) => StatsHorizon::parse(h).ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "horizon must be one of {}",
+                StatsHorizon::ALL.map(StatsHorizon::as_str).join(", ")
+            ))
+        })?,
+    };
+    let since = horizon.since(crate::util::now_ms());
+    let store = &state.store;
     Ok(Json(Stats {
-        totals: state.store.stats_totals().await?,
-        by_kind: state.store.stats_by_kind().await?,
-        by_finding: state.store.stats_by_finding().await?,
+        totals: store.stats_totals(since).await?,
+        by_kind: store.stats_by_kind(since).await?,
+        by_finding: store.stats_by_finding(since).await?,
     }))
 }
 

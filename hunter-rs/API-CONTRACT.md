@@ -235,6 +235,8 @@ Handler: server.py:241-250 — the response is the **complete** three-key object
 { "totals": {...}, "by_kind": [...], "by_finding": [...] }
 ```
 
+Query: optional `horizon` — one of `24h`, `7d`, `30d`, `90d`, `all` (Rust addition; the Python handler took no parameters). Absent or empty means `all`, which is the unwindowed behavior below. Any other value answers `400 {"error": "horizon must be one of 24h, 7d, 30d, 90d, all"}`. A window keeps the jobs dated at or after `now - horizon` (epoch ms, computed once per request on the server and bound into all three queries) and applies the same predicate to every aggregate: `WHERE COALESCE(started_at, finished_at) >= ?` (for `by_finding` ANDed onto its `finding_id IS NOT NULL`, with `j.` columns). A job is dated by its start because its cost and outcome belong to the attempt; every insert stamps `started_at`, and the `finished_at` fallback only dates a row whose start is missing. A row with neither timestamp counts under `all` only. The SQL below is the `all` form.
+
 ### totals — `stats_totals()` (store.py:1588-1601), single object
 ```sql
 SELECT COUNT(*) AS jobs,
@@ -245,7 +247,7 @@ SELECT COUNT(*) AS jobs,
  SUM(CASE WHEN state='denied' THEN 1 ELSE 0 END) AS denied
 FROM jobs
 ```
-Keys: `jobs:int, total_tokens:int|null, total_calls:int|null, total_usage_delta:float|null, done:int|null, denied:int|null`. With zero job rows: `jobs = 0` and every SUM is null (SQL semantics) — the UI types `done`/`denied` as nullable (`StatsTotals`, generated from `src/types.rs`) and formats them with `?? '–'` (`pages/StatsPage.svelte:38,43`), so null survives and renders as a dash; replicate SQL behavior exactly. (`rows[0] if rows else {}` — the else branch is unreachable for an aggregate.)
+Keys: `jobs:int, total_tokens:int|null, total_calls:int|null, total_usage_delta:float|null, done:int|null, denied:int|null`. With zero job rows (including a `horizon` window no job falls in): `jobs = 0` and every SUM is null (SQL semantics) — the UI types `done`/`denied` as nullable (`StatsTotals`, generated from `src/types.rs`) and formats them with `?? '–'` (`pages/StatsPage.svelte:58,63`), so null survives and renders as a dash; replicate SQL behavior exactly. (`rows[0] if rows else {}` — the else branch is unreachable for an aggregate.)
 
 ### by_kind — `stats_by_kind()` (store.py:1554-1570), array
 ```sql

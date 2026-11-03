@@ -5464,8 +5464,17 @@ impl Store {
     }
 
     // -- stats -----------------------------------------------------------------
+    //
+    // `since` (epoch ms, None = every job ever) windows all three aggregates
+    // alike, on when the job started: `COALESCE(started_at, finished_at)`.
+    // A job's cost and outcome belong to the attempt, and the attempt is
+    // dated by its start; a job still running counts from the moment it
+    // began. Every insert stamps `started_at` -- this daemon's and the
+    // Python one's, `denied` rows included -- but the column is nullable,
+    // so a row without one is dated by its finish instead, and a row with
+    // neither falls outside every window and counts only under None.
 
-    pub async fn stats_totals(&self) -> sqlx::Result<StatsTotals> {
+    pub async fn stats_totals(&self, since: Option<i64>) -> sqlx::Result<StatsTotals> {
         sqlx::query_as!(
             StatsTotals,
             r#"
@@ -5476,13 +5485,15 @@ impl Store {
                    SUM(CASE WHEN state = 'done' THEN 1 ELSE 0 END) AS "done: i64",
                    SUM(CASE WHEN state = 'denied' THEN 1 ELSE 0 END) AS "denied: i64"
             FROM jobs
-            "#
+            WHERE ?1 IS NULL OR COALESCE(started_at, finished_at) >= ?1
+            "#,
+            since
         )
         .fetch_one(&self.pool)
         .await
     }
 
-    pub async fn stats_by_kind(&self) -> sqlx::Result<Vec<StatsByKind>> {
+    pub async fn stats_by_kind(&self, since: Option<i64>) -> sqlx::Result<Vec<StatsByKind>> {
         sqlx::query_as!(
             StatsByKind,
             r#"
@@ -5497,15 +5508,17 @@ impl Store {
                    SUM(usage_delta) AS "total_usage_delta: f64",
                    GROUP_CONCAT(DISTINCT model) AS "models: String"
             FROM jobs
+            WHERE ?1 IS NULL OR COALESCE(started_at, finished_at) >= ?1
             GROUP BY kind
             ORDER BY kind
-            "#
+            "#,
+            since
         )
         .fetch_all(&self.pool)
         .await
     }
 
-    pub async fn stats_by_finding(&self) -> sqlx::Result<Vec<StatsByFinding>> {
+    pub async fn stats_by_finding(&self, since: Option<i64>) -> sqlx::Result<Vec<StatsByFinding>> {
         // ORDER BY repeats the SUM expression: the Python source orders by the
         // `total_tokens` alias, but our alias carries a sqlx type override, so
         // the bare name would not resolve. Identical semantics (NULLs last on
@@ -5522,9 +5535,11 @@ impl Store {
             FROM jobs j
             JOIN findings f ON f.id = j.finding_id
             WHERE j.finding_id IS NOT NULL
+              AND (?1 IS NULL OR COALESCE(j.started_at, j.finished_at) >= ?1)
             GROUP BY j.finding_id
             ORDER BY SUM(j.tokens_new) DESC
-            "#
+            "#,
+            since
         )
         .fetch_all(&self.pool)
         .await

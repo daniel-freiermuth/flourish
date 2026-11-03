@@ -153,7 +153,7 @@ async fn stats_totals_empty_db_preserves_sum_null_semantics() {
     // No seeding: zero job rows.
     let store = open_store(pool, &path).await;
 
-    let totals = store.stats_totals().await.unwrap();
+    let totals = store.stats_totals(None).await.unwrap();
     assert_eq!(totals.jobs, 0);
     assert_eq!(totals.total_tokens, None);
     assert_eq!(totals.total_calls, None);
