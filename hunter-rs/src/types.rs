@@ -572,6 +572,56 @@ pub struct Stats {
     pub by_finding: Vec<StatsByFinding>,
 }
 
+/// How far back GET /api/stats looks (`?horizon=`): jobs started within
+/// the last 24 hours, 7, 30 or 90 days, or every job ever (`all`, also
+/// what an absent or empty parameter means).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, TS)]
+#[ts(export)]
+pub enum StatsHorizon {
+    #[ts(rename = "24h")]
+    Day,
+    #[ts(rename = "7d")]
+    Week,
+    #[ts(rename = "30d")]
+    Month,
+    #[ts(rename = "90d")]
+    Quarter,
+    #[ts(rename = "all")]
+    All,
+}
+
+impl StatsHorizon {
+    pub const ALL: [Self; 5] = [Self::Day, Self::Week, Self::Month, Self::Quarter, Self::All];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Day => "24h",
+            Self::Week => "7d",
+            Self::Month => "30d",
+            Self::Quarter => "90d",
+            Self::All => "all",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|h| h.as_str() == s)
+    }
+
+    /// The epoch-ms cutoff for a window ending at `now_ms`: jobs dated at
+    /// or after it are in. None for `all`, which has no cutoff.
+    pub fn since(self, now_ms: i64) -> Option<i64> {
+        const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+        let days = match self {
+            Self::Day => 1,
+            Self::Week => 7,
+            Self::Month => 30,
+            Self::Quarter => 90,
+            Self::All => return None,
+        };
+        Some(now_ms - days * DAY_MS)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Worker result (types.py RunResult; consumed by scheduler _record_job)
 // ---------------------------------------------------------------------------

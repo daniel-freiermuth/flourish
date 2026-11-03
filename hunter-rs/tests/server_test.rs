@@ -296,6 +296,114 @@ async fn unknown_filter_values_match_nothing_rather_than_everything() {
     assert_eq!(blank.len(), all.len(), "an empty filter is no filter");
 }
 
+/// `?horizon=` windows every aggregate of /api/stats on when a job
+/// started, falling back to when it finished for a row with no start.
+#[tokio::test]
+async fn stats_horizon_windows_every_aggregate() {
+    const HOUR: i64 = 60 * 60 * 1000;
+    const DAY: i64 = 24 * HOUR;
+    let state = test_state().await;
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let pool = sqlx::SqlitePool::connect_with(
+        sqlx::sqlite::SqliteConnectOptions::new().filename(&state.config.db_path),
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO findings (id, type, repo_id, fingerprint, severity, confidence, summary, \
+         status, created_at, updated_at) \
+         VALUES (2, 'bug', 1, 'fp-2', 'low', 0.5, 'second finding', 'new', 1000, 1000)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    // Job 2 never started: it is dated by its finish, two hours ago. Job 7
+    // has no timestamp at all and counts under `all` only.
+    sqlx::query(
+        "INSERT INTO jobs (id, kind, repo_id, finding_id, state, tokens_new, started_at, finished_at)
+         VALUES (1, 'hunt',    1, NULL, 'done',   100,  ?1 - ?2,       ?1),
+                (2, 'recheck', 1, 2,    'denied', NULL, NULL,          ?1 - 2 * ?2),
+                (3, 'fix',     1, 1,    'failed', 200,  ?1 - 3 * ?3,   NULL),
+                (4, 'fix',     1, 2,    'done',   400,  ?1 - 20 * ?3,  NULL),
+                (5, 'engage',  1, 1,    'done',   800,  ?1 - 60 * ?3,  NULL),
+                (6, 'hunt',    1, NULL, 'done',   1600, ?1 - 200 * ?3, NULL),
+                (7, 'hunt',    1, NULL, 'denied', NULL, NULL,          NULL)",
+    )
+    .bind(now)
+    .bind(HOUR)
+    .bind(DAY)
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    // Per query: the totals' jobs and tokens, then (kind, jobs) and
+    // (finding_id, jobs) in the order the endpoint lists them.
+    let every = json!({ "jobs": 7, "tokens": 3100,
+        "by_kind": [["engage", 1], ["fix", 2], ["hunt", 3], ["recheck", 1]],
+        "by_finding": [[1, 2], [2, 2]] });
+    let cases = [
+        (
+            "?horizon=24h",
+            json!({ "jobs": 2, "tokens": 100,
+            "by_kind": [["hunt", 1], ["recheck", 1]],
+            "by_finding": [[2, 1]] }),
+        ),
+        (
+            "?horizon=7d",
+            json!({ "jobs": 3, "tokens": 300,
+            "by_kind": [["fix", 1], ["hunt", 1], ["recheck", 1]],
+            "by_finding": [[1, 1], [2, 1]] }),
+        ),
+        (
+            "?horizon=30d",
+            json!({ "jobs": 4, "tokens": 700,
+            "by_kind": [["fix", 2], ["hunt", 1], ["recheck", 1]],
+            "by_finding": [[2, 2], [1, 1]] }),
+        ),
+        (
+            "?horizon=90d",
+            json!({ "jobs": 5, "tokens": 1500,
+            "by_kind": [["engage", 1], ["fix", 2], ["hunt", 1], ["recheck", 1]],
+            "by_finding": [[1, 2], [2, 2]] }),
+        ),
+        ("?horizon=all", every.clone()),
+        // Absent and blank both mean `all`.
+        ("", every.clone()),
+        ("?horizon=", every),
+    ];
+    for (query, expected) in cases {
+        let uri = format!("/api/stats{query}");
+        let (status, _, body) = get(&state, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        let v = as_json(&body);
+        let pairs = |key: &str, id: &str| -> Value {
+            v[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| json!([row[id], row["jobs"]]))
+                .collect()
+        };
+        let seen = json!({ "jobs": v["totals"]["jobs"], "tokens": v["totals"]["total_tokens"],
+            "by_kind": pairs("by_kind", "kind"), "by_finding": pairs("by_finding", "finding_id") });
+        assert_eq!(seen, expected, "{uri}");
+    }
+
+    let (status, _, body) = get(&state, "/api/stats?horizon=1y").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        as_json(&body),
+        json!({ "error": "horizon must be one of 24h, 7d, 30d, 90d, all" })
+    );
+}
+
 /// The Host check covers reads, not only mutations.
 ///
 /// The listener binds 127.0.0.1, so this is not about the network: a page

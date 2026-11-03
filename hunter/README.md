@@ -566,7 +566,7 @@ answers `401 {"error": "login required"}` without a live session cookie.
 | GET | `/api/repos` | List repos |
 | GET | `/api/repo/notes` | One repo's notes |
 | GET | `/api/events` | Recent event log |
-| GET | `/api/stats` | Aggregate stats |
+| GET | `/api/stats` | Aggregate job stats; `horizon` = `24h` \| `7d` \| `30d` \| `90d` \| `all` (default) counts only jobs started in that window |
 | POST | `/api/verdict` | Set a finding's triage status (queue for fix, wontfix, reject, note) |
 | POST | `/api/cycle` | Trigger one scheduler cycle immediately |
 | POST | `/api/scheduler` | Pause or resume automatic scheduler cycles (`{"paused": boolean}`); a running job is allowed to finish |
