@@ -42,7 +42,7 @@
       ...col,
       findings: filtered.filter((f) => !isHeld(f) && col.filter(f)),
       attentionCount: col.key === "pr_review"
-        ? filtered.filter((f) => f.status === "pr_open" && !!f.needs_attention).length
+        ? filtered.filter((f) => !isHeld(f) && f.status === "pr_open" && !!f.needs_attention).length
         : 0,
     }))
   );
