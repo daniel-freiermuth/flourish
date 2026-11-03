@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { clock, datetime, isHttpUrl, ts } from "./format";
+import { clock, datetime, isHttpUrl, ktok, ts } from "./format";
 
 /**
  * Repo URLs are operator-supplied and rendered as links. Only http(s)
@@ -64,5 +64,17 @@ describe("clock", () => {
 
   it("shows a dash when there is no instant", () => {
     expect(clock(null)).toBe("\u2013");
+  });
+});
+
+/** Counts that round up to 1000k belong to the M branch. */
+describe("ktok", () => {
+  it.each([
+    [999_499, "999k"],
+    [999_500, "1.0M"],
+    [999_999, "1.0M"],
+    [1_000_000, "1.0M"],
+  ])("formats %d as %s", (n, want) => {
+    expect(ktok(n)).toBe(want);
   });
 });
