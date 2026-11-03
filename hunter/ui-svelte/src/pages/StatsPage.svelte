@@ -2,16 +2,35 @@
   import { store } from "../lib/api.svelte";
   import { ktok, pct } from "../lib/format";
   import { navigation } from "../lib/navigation.svelte";
+  import { STATS_HORIZONS } from "../lib/statsHorizon";
+  import type { StatsHorizon } from "../lib/types";
 
   let stats = $derived(store.stats);
   let totals = $derived(stats?.totals ?? null);
   let byKind = $derived(stats?.by_kind ?? []);
   let byFinding = $derived(stats?.by_finding ?? []);
+  const horizons = Object.entries(STATS_HORIZONS) as [StatsHorizon, (typeof STATS_HORIZONS)[StatsHorizon]][];
 </script>
 
 <div class="page-enter">
   <div class="page">
-    <h2 class="page-title">Stats</h2>
+    <div class="page-head">
+      <h2 class="page-title">Stats</h2>
+      <div class="horizon" role="group" aria-label="Time horizon">
+        {#each horizons as [horizon, { label, window }] (horizon)}
+          <button
+            class="horizon-btn"
+            class:active={store.statsHorizon === horizon}
+            aria-pressed={store.statsHorizon === horizon}
+            title={window}
+            onclick={() => store.setStatsHorizon(horizon)}
+          >
+            {label}
+          </button>
+        {/each}
+      </div>
+    </div>
+    <p class="horizon-caption">{STATS_HORIZONS[store.statsHorizon].window}</p>
 
     {#if !stats}
       <p class="loading">Loading stats…</p>
@@ -152,9 +171,50 @@
     gap: 1.25rem;
   }
 
+  .page-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+  }
+
   .page-title {
     font-size: 1.25rem;
     font-weight: 700;
+  }
+
+  /* ── Horizon selector ───────────────────────────────────────── */
+  .horizon {
+    display: inline-flex;
+    gap: 0.25rem;
+    padding: 0.1875rem;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+  }
+
+  .horizon-btn {
+    padding: 0.25rem 0.625rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+    border-radius: var(--radius-sm);
+    color: var(--text-dim);
+    transition: background-color var(--transition), color var(--transition);
+  }
+  .horizon-btn:hover:not(.active) {
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text);
+  }
+  .horizon-btn.active {
+    background: var(--accent);
+    color: var(--bg);
+  }
+
+  .horizon-caption {
+    margin-top: -0.75rem;
+    color: var(--text-dim);
+    font-size: 0.75rem;
   }
 
   .loading {
