@@ -3,7 +3,7 @@
 /** Token count to human-readable: 150000 → "150k", 2100000 → "2.1M" */
 export function ktok(n: number | null): string {
   if (n == null) return "\u2013";
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
+  if (n >= 999_500) return (n / 1_000_000).toFixed(1) + "M";
   if (n >= 1_000) return Math.round(n / 1_000) + "k";
   return String(n);
 }
