@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { GET_TIMEOUT_MS, POLL_MS, post, store } from "./api.svelte";
+import { loadStatsHorizon, saveStatsHorizon } from "./statsHorizon";
 
 /**
  * `store` is a module singleton; clear what the previous test wrote so an
@@ -16,6 +17,7 @@ function resetStore() {
   store.error = null;
   store.user = null;
   store.needsLogin = false;
+  store.statsHorizon = "all";
 }
 
 // Bodies shaped like what the daemon serves, trimmed to what the
@@ -23,7 +25,12 @@ function resetStore() {
 // writes nothing, which would make every assertion below vacuous.
 let servedCounts: Record<string, number>;
 
-function bodyFor(path: string): unknown {
+// Stats answer with a job count that names the window they were asked
+// for, so an assertion can tell one horizon's numbers from another's.
+const JOBS_IN = { "24h": 1, "7d": 7, "30d": 30, "90d": 90, all: 1000 } as const;
+
+function bodyFor(url: string): unknown {
+  const [path, query] = url.split("?");
   switch (path) {
     case "/api/summary":
       return {
@@ -40,8 +47,10 @@ function bodyFor(path: string): unknown {
         scheduler_state: null,
         activity_status: { kind: "idle" },
       };
-    case "/api/stats":
-      return { totals: { jobs: 0 }, by_kind: [], by_finding: [] };
+    case "/api/stats": {
+      const horizon = new URLSearchParams(query).get("horizon") as keyof typeof JOBS_IN;
+      return { totals: { jobs: JOBS_IN[horizon] }, by_kind: [], by_finding: [] };
+    }
     default:
       return [];
   }
@@ -222,6 +231,98 @@ describe("poll scheduling", () => {
     // overwrite the write's result.
     await net.release(BATCH);
     expect(store.summary?.counts).toEqual({ new: 42 });
+  });
+
+  // A switch of horizon races the poll sent with the old one. Whichever
+  // order the two answers arrive in, the page must never show one
+  // window's numbers under another window's caption.
+  it("keeps a poll sent with the old horizon off screen when it lands first", async () => {
+    store.startPolling();
+    await net.release(BATCH);
+    expect(store.stats?.totals.jobs).toBe(JOBS_IN.all);
+
+    // The next poll leaves, still asking for `all`.
+    await vi.advanceTimersByTimeAsync(POLL_MS);
+    expect(net.paths.slice(BATCH)).toContain("/api/stats?horizon=all");
+
+    // The switch drops the old window's numbers at once and asks for the
+    // new window without waiting for that poll to come back.
+    store.setStatsHorizon("7d");
+    expect(store.stats).toBeNull();
+    expect(net.paths.slice(BATCH * 2)).toContain("/api/stats?horizon=7d");
+
+    await net.release(BATCH);
+    expect(store.stats).toBeNull();
+
+    await net.release(BATCH);
+    expect(store.stats?.totals.jobs).toBe(JOBS_IN["7d"]);
+  });
+
+  it("keeps a poll sent with the old horizon from overwriting the new one", async () => {
+    store.startPolling();
+    store.setStatsHorizon("7d");
+
+    await net.releaseNewest(BATCH);
+    expect(store.stats?.totals.jobs).toBe(JOBS_IN["7d"]);
+
+    await net.release(BATCH);
+    expect(store.stats?.totals.jobs).toBe(JOBS_IN["7d"]);
+
+    // And every later poll asks for the new window.
+    await vi.advanceTimersByTimeAsync(POLL_MS);
+    expect(net.paths.slice(BATCH * 2)).toContain("/api/stats?horizon=7d");
+    await net.release(BATCH);
+    expect(store.stats?.totals.jobs).toBe(JOBS_IN["7d"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Stats horizon preference
+// ---------------------------------------------------------------------------
+
+describe("stats horizon preference", () => {
+  let stored: Map<string, string>;
+
+  beforeEach(() => {
+    resetStore();
+    stored = new Map();
+    vi.stubGlobal("localStorage", {
+      getItem: (key: string) => stored.get(key) ?? null,
+      setItem: (key: string, value: string) => void stored.set(key, value),
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("survives a reload", async () => {
+    const net = installNet();
+    store.setStatsHorizon("30d");
+    await net.release(Number.POSITIVE_INFINITY);
+
+    // A reload evaluates the store module afresh, which a static import
+    // cannot do: this is the module-loading boundary under test.
+    vi.resetModules();
+    const { store: reloaded } = await import("./api.svelte");
+    expect(reloaded.statsHorizon).toBe("30d");
+  });
+
+  it("falls back to all on a value it does not know", () => {
+    saveStatsHorizon("90d");
+    expect(loadStatsHorizon()).toBe("90d");
+    // Corrupt whatever was written, without pinning the storage key.
+    for (const key of stored.keys()) stored.set(key, "1y");
+    expect(loadStatsHorizon()).toBe("all");
+  });
+
+  it("falls back to all without usable storage, and saving does not throw", () => {
+    vi.stubGlobal("localStorage", {
+      getItem: () => { throw new Error("SecurityError"); },
+      setItem: () => { throw new Error("QuotaExceededError"); },
+    });
+    expect(loadStatsHorizon()).toBe("all");
+    expect(() => saveStatsHorizon("7d")).not.toThrow();
   });
 });
 

@@ -2,8 +2,10 @@
 // via a singleton store object.
 
 import type {
-  Event, FindingDetail, FindingOut, JobListEntry, RepoNotesResponse, SessionUser, Stats, Summary,
+  Event, FindingDetail, FindingOut, JobListEntry, RepoNotesResponse, SessionUser, Stats,
+  StatsHorizon, Summary,
 } from "./types";
+import { loadStatsHorizon, saveStatsHorizon } from "./statsHorizon";
 import {
   isEventList, isFindingDetail, isFindingList, isJobList, isStats, isSummary,
 } from "./validate";
@@ -168,6 +170,12 @@ class HunterStore {
   stats = $state<Stats | null>(null);
   error = $state<string | null>(null);
 
+  /**
+   * Window `stats` is aggregated over; every refresh asks for it. A
+   * per-browser preference, so it outlives a session change.
+   */
+  statsHorizon = $state<StatsHorizon>(loadStatsHorizon());
+
   /** Account the session belongs to; null while not (yet) known. */
   user = $state<string | null>(null);
   /**
@@ -224,7 +232,7 @@ class HunterStore {
         get<FindingOut[]>("/api/findings"),
         get<JobListEntry[]>("/api/jobs"),
         get<Event[]>("/api/events"),
-        get<Stats>("/api/stats"),
+        get<Stats>(`/api/stats?horizon=${this.statsHorizon}`),
       ]);
       if (gen !== this.#refreshGeneration) return;
       if ([s, f, j, e, st].some((r) => r.status !== 200)) {
@@ -265,6 +273,21 @@ class HunterStore {
       if (gen !== this.#refreshGeneration) return;
       this.error = String(err);
     }
+  }
+
+  /**
+   * Switch the stats window, remember it, and refetch at once rather than
+   * on the next tick. The stats on screen describe the old window, so they
+   * go: the page shows "loading" until the new ones land. A refresh still
+   * in flight was sent with the old horizon; the new one supersedes it
+   * through the generation check in `refresh`.
+   */
+  setStatsHorizon(horizon: StatsHorizon) {
+    if (horizon === this.statsHorizon) return;
+    this.statsHorizon = horizon;
+    saveStatsHorizon(horizon);
+    this.stats = null;
+    void this.refresh();
   }
 
   async #poll() {

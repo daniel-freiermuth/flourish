@@ -16,4 +16,5 @@ export type { RepoBrief } from "./generated/RepoBrief";
 export type { RepoNotesResponse } from "./generated/RepoNotesResponse";
 export type { SessionUser } from "./generated/SessionUser";
 export type { Stats } from "./generated/Stats";
+export type { StatsHorizon } from "./generated/StatsHorizon";
 export type { Summary } from "./generated/Summary";
