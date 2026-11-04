@@ -1227,6 +1227,41 @@ fn a_marked_comment_is_hunters_own_only_from_someone_who_can_push() {
     );
 }
 
+/// Push access is a fact about one repository: the answer for a login on
+/// one repo is never reused for another, on the same host or on another
+/// with the same path.
+#[test]
+fn push_access_is_looked_up_per_repository() {
+    let bins = FakeBins::acquire("forge-gh-screen-per-repo");
+    bins.script(
+        "gh",
+        "case \"$*\" in\n\
+         \x20 *permission*'--hostname github.example.com'*) echo false; exit 0 ;;\n\
+         \x20 *repos/acme/widget/collaborators/dev/permission*) echo true; exit 0 ;;\n\
+         \x20 *permission*) echo false; exit 0 ;;\n\
+         esac\n\
+         cat <<'__PR_EOF__'\n\
+         {\"state\":\"OPEN\",\"title\":\"t\",\"body\":\"b\",\"statusCheckRollup\":[],\"reviews\":[],\"comments\":[\
+         {\"id\":\"IC_d\",\"author\":{\"login\":\"dev\"},\"body\":\"please rename it\",\"createdAt\":\"2026-01-01T00:00:00Z\"}]}\n\
+         __PR_EOF__\nexit 0",
+    );
+    let gh = forge_for(ForgeName::Github);
+    let kept = |url: &str| {
+        authored(
+            &gh.view_pr_engage(url, PR, &ReviewBots::default())
+                .expect("engage view"),
+        )
+    };
+
+    assert_eq!(
+        kept("https://github.com/acme/widget"),
+        [("dev".to_owned(), Voice::Maintainer)]
+    );
+    let none: Vec<(String, Voice)> = Vec::new();
+    assert_eq!(kept("https://github.com/acme/gadget"), none);
+    assert_eq!(kept("https://github.example.com/acme/widget"), none);
+}
+
 /// An Enterprise repo's lookups go to its own host: asked of github.com,
 /// they would be about a different (or no) repository and user.
 #[test]
@@ -1577,8 +1612,8 @@ fn gitlab_pr_diff_stops_at_the_page_cap_and_says_so() {
 /// GitLab runs a line that begins with `/` and a command's name as a quick
 /// action under the poster's login (`/merge`, `/approve`; in any case), and
 /// strips it from the text. What hunter posts quotes PR content, so every
-/// such line goes out escaped, in a note and an MR's description
-/// alike: Markdown shows `\/merge` as `/merge`, and GitLab
+/// such line goes out escaped, in a note, a thread reply and an MR's
+/// description alike: Markdown shows `\/merge` as `/merge`, and GitLab
 /// runs nothing. GitLab drops `\r` before it looks, so hunter does too. A
 /// slash that starts no command name (`// code`), or not at a line's
 /// start, is left alone.
@@ -1592,6 +1627,7 @@ fn gitlab_never_posts_a_line_that_starts_a_quick_action() {
     let gl = forge_for(ForgeName::Gitlab);
 
     gl.comment_pr(GL_REPO, PR, text).unwrap();
+    gl.reply_to_thread(GL_REPO, PR, "d1", text).unwrap();
     gl.create_pr(dir.path(), "fix/x", "main", "", text).unwrap();
 
     let calls = bins.calls();
@@ -1604,7 +1640,7 @@ fn gitlab_never_posts_a_line_that_starts_a_quick_action() {
                 .unwrap_or_else(|| panic!("no body in {c:?}"))
         })
         .collect();
-    assert_eq!(notes, [mark_own(escaped)], "{calls:?}");
+    assert_eq!(notes, [mark_own(escaped), mark_own(escaped)], "{calls:?}");
     let create = position_of(&calls, "glab", &["mr", "create"]).expect("create call");
     assert_eq!(value_after(&calls[create], "--description"), Some(escaped));
 }

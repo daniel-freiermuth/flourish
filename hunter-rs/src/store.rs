@@ -52,9 +52,10 @@ mod pr_review;
 mod pr_state;
 
 pub use pr_review::{
-    ApprovedRound, HEAD_STABLE_MS, InlineState, NewPrReview, POST_GIVE_UP_AT, PR_REVIEW_HOLD_AT,
-    PR_REVIEW_RETRY_MS, PostDecided, PostDecision, PostableIssue, PrReviewRound, PrReviewRow,
-    Requested, Trust,
+    ApprovedRound, EarlierIssue, HEAD_STABLE_MS, InlineState, IssueVerdict, NewPrReview,
+    POST_GIVE_UP_AT, PR_REVIEW_HOLD_AT, PR_REVIEW_RETRY_MS, PostDecided, PostDecision,
+    PostableIssue, PrReviewRound, PrReviewRow, Reply, ReportedIssue, Requested, Said, ThreadSeen,
+    ThreadSteps, ThreadToSettle, ThreadsRead, Trust, Verdict,
 };
 pub use pr_state::{PrRead, PrSyncPass};
 
@@ -6062,6 +6063,18 @@ impl JobStore {
     pub async fn end_own_pr_review(&self, id: i64) -> sqlx::Result<bool> {
         self.0.end_own_pr_review(id).await
     }
+
+    /// Record what a round's read found in the threads of posted review
+    /// issues, reopening those a human reopened on the forge and marking
+    /// those it found gone. See the private `Store` method of the same
+    /// name.
+    pub async fn observe_pr_review_threads(
+        &self,
+        read: &ThreadsRead,
+        read_at: i64,
+    ) -> sqlx::Result<u64> {
+        self.0.observe_pr_review_threads(read, read_at).await
+    }
 }
 
 impl std::ops::Deref for JobStore {
@@ -6218,8 +6231,51 @@ impl AdminStore {
             .await
     }
 
-    /// Record round `round_id` as posted, its inline comments' ids read
-    /// back. See the private `Store` method of the same name.
+    /// Record that a post found the threads of review issues `gone`
+    /// missing from the PR. See the private `Store` method of the same
+    /// name.
+    pub async fn record_pr_review_threads_gone(&self, gone: &[i64]) -> sqlx::Result<()> {
+        self.0.record_pr_review_threads_gone(gone).await
+    }
+
+    /// Record that hunter's answer giving round `round_id`'s `verdict`
+    /// landed in review issue `issue_id`'s thread. See the private `Store`
+    /// method of the same name.
+    pub async fn record_pr_review_answered(
+        &self,
+        (issue_id, round_id): (i64, i64),
+        verdict: IssueVerdict,
+    ) -> sqlx::Result<()> {
+        self.0
+            .record_pr_review_answered((issue_id, round_id), verdict)
+            .await
+    }
+
+    /// Record that hunter is about to resolve review issue `issue_id`'s
+    /// thread, or unresolve it. See the private `Store` method of the same
+    /// name.
+    pub async fn mark_pr_review_resolving(
+        &self,
+        issue_id: i64,
+        resolved: bool,
+    ) -> sqlx::Result<()> {
+        self.0.mark_pr_review_resolving(issue_id, resolved).await
+    }
+
+    /// Record that hunter resolved review issue `issue_id`'s thread, or
+    /// unresolved it. See the private `Store` method of the same name.
+    pub async fn record_pr_review_thread_resolution(
+        &self,
+        issue_id: i64,
+        resolved: bool,
+    ) -> sqlx::Result<()> {
+        self.0
+            .record_pr_review_thread_resolution(issue_id, resolved)
+            .await
+    }
+
+    /// Record round `round_id` as posted, threads and all. See the private
+    /// `Store` method of the same name.
     pub async fn record_pr_review_round_posted(&self, round_id: i64) -> sqlx::Result<()> {
         self.0.record_pr_review_round_posted(round_id).await
     }

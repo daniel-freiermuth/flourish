@@ -89,6 +89,9 @@ fn test_github_owner_repo_invalid() {
     let gh = GitHubForge;
     assert_eq!(gh.owner_repo("https://gitlab.com/acme/widgets"), None);
     assert_eq!(gh.owner_repo("not-a-url"), None);
+    // A path with an empty owner or repo names no repository.
+    assert_eq!(gh.owner_repo("https://github.com//widgets"), None);
+    assert_eq!(gh.owner_repo("https://github.com/acme/.git"), None);
 }
 
 // ============================================================

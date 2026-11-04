@@ -2,7 +2,7 @@
   import { onDestroy, onMount } from "svelte";
   import { SvelteSet } from "svelte/reactivity";
   import { POLL_MS, errorMessage, post, store } from "../lib/api.svelte";
-  import { clock, datetime, isHttpUrl, reviewStateLabel, roundWait } from "../lib/format";
+  import { clock, datetime, isHttpUrl, reviewIssueStatusLabel, reviewStateLabel, roundPostTally, roundWait } from "../lib/format";
   import { toast } from "../lib/toast.svelte";
   import type { OpenPrOut, PrReviewOut, PrReviewRoundOut } from "../lib/types";
 
@@ -220,13 +220,20 @@
       <span
         class="badge verdict-{round.verdict}"
         title={round.verdict === "partial"
-          ? "The reviewer was stopped before it finished: its issues count, but these commits are reviewed again"
+          ? "The reviewer was stopped before it finished: its issues and verdicts count, but these commits are reviewed again"
           : undefined}
       >{round.verdict}</span>
       {#if round.verdict !== "failed"}
         <span class="issue-count" class:has-blocking={blocking > 0}>
           {round.issues.length} {round.issues.length === 1 ? "issue" : "issues"}{blocking > 0 ? ` (${blocking} blocking)` : ""}
         </span>
+        {#if round.resolutions > 0}
+          <!-- A round can resolve earlier issues without finding new ones;
+               it is still posted, as replies that resolve their threads. -->
+          <span class="resolution-count" title="Earlier issues this round found addressed or whose rebuttal it accepted; posting replies to and resolves their threads">
+            {round.resolutions} {round.resolutions === 1 ? "resolution" : "resolutions"}
+          </span>
+        {/if}
       {/if}
       <span class="dim">{clock(round.finished_at)}</span>
       {#if round.job_id !== null}
@@ -238,9 +245,9 @@
           class="retry-btn"
           disabled={busy.has(review.id) || review.state !== "open"}
           onclick={() => reviewWrite(review, "/api/pr-review/post", { round_id: round.id }, "posting to the PR")}
-          title="Post this round's issues to the PR as one comment review under your forge login"
+          title="Post this round to the PR under your forge login: its issues as one comment review, and a reply resolving each earlier issue's thread it judged settled"
         >
-          Post to PR
+          Post to PR ({roundPostTally(round.issues.length, round.resolutions)})
         </button>
         {#if !round.landed}
           <button
@@ -274,9 +281,12 @@
     {/if}
     {#if round.issues.length > 0}
       <ul class="issues">
-        {#each round.issues as issue, i (i)}
-          <li class="issue" class:blocking={issue.blocking}>
+        {#each round.issues as issue (issue.id)}
+          <li class="issue" class:blocking={issue.blocking} class:settled={issue.status === "addressed" || issue.status === "rebutted"}>
             <div class="issue-head">
+              <span class="chip status-{issue.status}" title="As judged by this PR's later rounds">
+                {reviewIssueStatusLabel(issue.status)}
+              </span>
               <span class="chip" class:chip-blocking={issue.blocking}>
                 {issue.blocking ? "blocking" : "non-blocking"}
               </span>
@@ -290,6 +300,9 @@
               {#if issue.posted_inline}
                 <span class="chip chip-inline" title="Posted as a comment on this line of the PR's diff">inline</span>
               {/if}
+              {#if issue.resolved_on_forge}
+                <span class="chip chip-resolved" title="Hunter replied to this issue's thread on the PR and resolved it">resolved on forge</span>
+              {/if}
             </div>
             {#if issue.detail}
               <details class="issue-detail">
@@ -298,6 +311,26 @@
               </details>
             {:else}
               <p class="issue-summary">{issue.summary}</p>
+            {/if}
+            {#if issue.verdict_note}
+              <p class="verdict-note" title="The latest round's judgement of this issue">{issue.verdict_note}</p>
+            {/if}
+            {#if issue.posted_inline && (issue.replies.length > 0 || issue.hidden_replies > 0)}
+              <ul class="replies">
+                {#each issue.replies as reply, i (i)}
+                  <li class="reply" class:own={reply.own}>
+                    <span class="reply-author">{reply.author}</span>
+                    <p class="reply-body">{reply.body}</p>
+                  </li>
+                {/each}
+                {#if issue.hidden_replies > 0}
+                  <!-- Screening dropped replies from authors who cannot
+                       vouch for the PR; their text never reaches the UI. -->
+                  <li class="reply-hidden dim" title="Replies from authors who are not pushers, review bots or the PR author">
+                    {issue.hidden_replies} hidden {issue.hidden_replies === 1 ? "reply" : "replies"}
+                  </li>
+                {/if}
+              </ul>
             {/if}
           </li>
         {/each}
@@ -925,6 +958,7 @@
 
   .issue-count { color: var(--text-dim); }
   .issue-count.has-blocking { color: var(--bad); }
+  .resolution-count { color: var(--ok); }
 
   .round-failure {
     margin: 0;
@@ -952,6 +986,8 @@
     font-size: 0.8125rem;
   }
   .issue.blocking { border-left-color: var(--bad); }
+  /* Settled issues stay listed for the record, but recede. */
+  .issue.settled { border-left-color: var(--ok); opacity: 0.75; }
 
   .issue-head {
     display: flex;
@@ -981,6 +1017,18 @@
     background: rgba(88, 166, 255, 0.12);
     color: var(--accent);
   }
+  .chip.status-addressed, .chip.chip-resolved {
+    background: rgba(68, 238, 136, 0.1);
+    color: var(--ok);
+  }
+  .chip.status-rebutted {
+    background: rgba(167, 139, 250, 0.12);
+    color: #c4b5fd;
+  }
+  .chip.status-reopened {
+    background: rgba(238, 85, 68, 0.12);
+    color: var(--sev-medium);
+  }
 
   .location {
     font-size: 0.6875rem;
@@ -989,6 +1037,34 @@
   }
 
   .issue-summary { margin: 0; }
+
+  .verdict-note {
+    margin: 0.25rem 0 0;
+    font-size: 0.75rem;
+    color: var(--text-dim);
+    font-style: italic;
+  }
+
+  .replies {
+    list-style: none;
+    margin: 0.375rem 0 0;
+    padding: 0 0 0 0.625rem;
+    border-left: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    font-size: 0.75rem;
+  }
+  .reply-author {
+    font-weight: 600;
+    color: var(--text-dim);
+  }
+  .reply.own .reply-author { color: var(--accent); }
+  .reply-body {
+    margin: 0.0625rem 0 0;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
 
   .issue-detail summary { cursor: pointer; }
   .issue-detail pre {
