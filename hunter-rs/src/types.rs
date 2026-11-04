@@ -630,10 +630,12 @@ impl StatsHorizon {
 // PR reviews (migration 035; future.md §8.8)
 // ---------------------------------------------------------------------------
 
-/// One issue a review round reported, as the reviewer wrote it.
+/// One issue a review round reported, as the reviewer wrote it, with what
+/// later rounds and the PR's thread made of it.
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export)]
 pub struct PrReviewIssueOut {
+    pub id: i64,
     pub kind: String,
     pub blocking: bool,
     pub severity: Option<String>,
@@ -648,6 +650,33 @@ pub struct PrReviewIssueOut {
     /// Whether the issue went out as an inline comment on the PR's diff
     /// (rather than in the posted review's body).
     pub posted_inline: bool,
+    /// `open`, `addressed` (a later round found the new commits fix it),
+    /// `rebutted` (a later round accepted a reply's rebuttal) or `reopened`
+    /// (a human reopened the thread hunter had resolved, and no round
+    /// judged it since).
+    pub status: String,
+    /// Whether hunter answered and resolved the issue's thread on the PR.
+    pub resolved_on_forge: bool,
+    /// The newest round's note on this issue, when a round judged it.
+    pub verdict_note: Option<String>,
+    /// The replies in the issue's thread as the newest read saw them,
+    /// screened to the authors a review trusts; hunter's own flagged `own`.
+    pub replies: Vec<PrReviewReplyOut>,
+    /// Replies the screen dropped: counted, never shown.
+    pub hidden_replies: i64,
+}
+
+/// One reply in the thread of a posted issue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize, TS)]
+#[ts(export)]
+pub struct PrReviewReplyOut {
+    /// The author's login; `hunter` for one of hunter's own replies.
+    pub author: String,
+    pub body: String,
+    /// Whether it is hunter's own reply (it carried the own-comment mark
+    /// and came from hunter's login or a pusher). The only way to tell
+    /// one apart: a person's login may be `hunter` too.
+    pub own: bool,
 }
 
 /// One review attempt of the range `base_sha..head_sha`.
@@ -659,8 +688,8 @@ pub struct PrReviewRoundOut {
     pub base_sha: String,
     pub head_sha: String,
     /// `ok` (the reviewer finished the range, which counts as reviewed),
-    /// `partial` (it was stopped partway: its issues count, but the range
-    /// is reviewed again) or `failed` (nothing counts).
+    /// `partial` (it was stopped partway: its issues and verdicts count,
+    /// but the range is reviewed again) or `failed` (nothing counts).
     pub verdict: String,
     /// Why the round failed, or stopped partway.
     pub failure: Option<String>,
@@ -676,6 +705,9 @@ pub struct PrReviewRoundOut {
     /// Part of the round's post is on the PR already (a post that failed
     /// partway): it can only be approved again, never discarded.
     pub landed: bool,
+    /// Earlier issues this round judged addressed or rebutted whose inline
+    /// thread its post answers and resolves.
+    pub resolutions: i64,
     pub issues: Vec<PrReviewIssueOut>,
 }
 

@@ -1,21 +1,45 @@
 //! Requested reviews of pull requests hunter did not open (migration 035,
 //! future.md §8.8): the operator's requests, the PR sync's view of each
-//! PR, and the rounds the job lane ran.
+//! PR, the rounds the job lane ran, and the threads their posts opened.
 //!
 //! Who writes what: the operator requests, watches and retries (on
-//! [`Store`]); the admin lane's PR sync records the PR's head, title and end,
-//! and whether a post may have left drafts of hunter's on the PR
-//! ([`AdminStore`](super::AdminStore)); the job lane records rounds
-//! ([`JobStore`](super::JobStore)). The columns each writes are disjoint
-//! but for `failures`/`held`, which a round counts and the operator clears.
+//! [`Store`]); the admin lane's PR sync records the PR's head, title and end
+//! and what its posts left on the forge, drafts of hunter's a post may have
+//! left there too ([`AdminStore`](super::AdminStore));
+//! the job lane records rounds, their verdicts on earlier issues and what a
+//! round read of the issues' threads ([`JobStore`](super::JobStore)). The
+//! columns each writes are disjoint but for `failures`/`held`, which a
+//! round counts and the operator clears; a review's head, title and state,
+//! which every read of the PR records (a round's too), a request that
+//! finds a closed PR reopened sets, and either lane ends as `own` once the
+//! PR turns out to be hunter's; what hunter said in an issue's thread (its
+//! answer and resolution), which the admin lane sets and a round's read
+//! clears when a human reopened the thread; and whether an issue's thread
+//! is gone from the PR, which any complete read of the PR finds.
+//!
+//! An issue's state is derived, never kept (migration 037's
+//! `pr_review_issue_state`): its status is the newest verdict of a round
+//! not discarded, and what its thread on the PR is to show is the newest
+//! verdict of a round released to the PR (approved, posted, with nothing to
+//! post, or landed in part), a verdict over the thread as it stood before a
+//! human reopened it counting as none. What is recorded besides the
+//! verdicts is only what hunter has said in each thread ([`Said`]). A post
+//! makes every thread it touches show the released judgement
+//! ([`Said::steps`]), so it is idempotent and order-free: an older round
+//! posted after a newer one says the newer one's, a judgement is never
+//! said twice, and discarding a round takes its verdicts back without a
+//! write to undo. A round of which any part reached the PR is released for
+//! good: it can no longer be discarded.
 
 use std::collections::HashSet;
 use std::time::Duration;
 
+use serde::Serialize;
+
 use super::{ImmediateTx, Store};
 use crate::domain::{ForgeName, PrReviewState};
 use crate::forge;
-use crate::types::{PrReviewIssueOut, PrReviewRoundOut};
+use crate::types::{PrReviewIssueOut, PrReviewReplyOut, PrReviewRoundOut};
 use crate::util::now_ms;
 
 /// How long a watched PR's head must stay unchanged before it is reviewed
@@ -65,8 +89,7 @@ pub struct ApprovedRound {
     pub base_sha: String,
     pub head_sha: String,
     /// The forge's id of the round's review once it went up: a post that
-    /// failed afterwards, reading its inline comments' ids, retries only
-    /// the read.
+    /// failed afterwards, on a thread, retries only the threads.
     pub review_ref: Option<String>,
     /// An earlier post sent the round's review (`review_sent_at`) and none
     /// is recorded: the send may have landed though its call failed, so
@@ -76,6 +99,93 @@ pub struct ApprovedRound {
     /// (`merge_base_sha`): its LEFT lines number that base, and the PR's
     /// diff, whose old side is the merge-base, has other code at them.
     pub incremental: bool,
+}
+
+/// What hunter has said in an issue's thread on the PR so far.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Said {
+    /// The verdict hunter's newest reply in the thread gave; `None` while
+    /// its comment alone speaks, which says the issue stands, and once a
+    /// human reopened the thread ([`Self::reopened`]).
+    pub answer: Option<IssueVerdict>,
+    /// Hunter resolved the thread, and nobody unresolved it since.
+    pub resolved: bool,
+    /// A human reopened the thread hunter resolved, and hunter has not
+    /// answered since: the reopen voided hunter's answer (`answer` is
+    /// `None`), but that answer, which settled the issue, is still the
+    /// thread's last word on the PR. The reopen disputes it, and is
+    /// answered like a reply: the store's `answer IS NULL AND reopened_at
+    /// IS NOT NULL`, since a reopen clears `answer` and only an answer
+    /// hunter posts sets it again.
+    pub reopened: bool,
+}
+
+/// Which answer a post replies in a thread ([`Said::steps`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reply {
+    /// The issue is addressed or rebutted.
+    Settled,
+    /// It stands again, though hunter's last answer settled it.
+    OpenAgain,
+}
+
+/// What a post does in a thread to make it show a judgement.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ThreadSteps {
+    pub reply: Option<Reply>,
+    /// Resolve the thread (`true`) or unresolve it (`false`).
+    pub resolve: Option<bool>,
+}
+
+impl ThreadSteps {
+    pub const fn is_empty(&self) -> bool {
+        self.reply.is_none() && self.resolve.is_none()
+    }
+}
+
+impl Said {
+    /// What makes a thread where hunter said this show `verdict`: a reply
+    /// where hunter's standing answer says otherwise, or where a human's
+    /// reopen has none ([`Self::reopened`]); a settled issue's thread
+    /// resolved and an open one's not. Nothing once the thread shows it:
+    /// posting the same judgement again is a no-op.
+    pub fn steps(&self, verdict: IssueVerdict) -> ThreadSteps {
+        let standing = self.answer.unwrap_or(IssueVerdict::Open);
+        // A reopen voided an answer that settled the issue, the thread's
+        // last word: any verdict over it answers.
+        let reply = (standing != verdict || self.reopened).then_some(match verdict {
+            IssueVerdict::Open => Reply::OpenAgain,
+            IssueVerdict::Addressed | IssueVerdict::RebuttalAccepted => Reply::Settled,
+        });
+        let settled = verdict != IssueVerdict::Open;
+        let resolve = (self.resolved != settled).then_some(settled);
+        ThreadSteps { reply, resolve }
+    }
+}
+
+/// The thread of an issue a round's post touches, with what hunter said
+/// there and the judgement it is to show
+/// ([`Store::pr_review_round_threads`]).
+#[derive(Debug, Clone)]
+pub struct ThreadToSettle {
+    pub issue_id: i64,
+    /// The forge's id of the issue's inline comment: what the thread is
+    /// found by, on a read of every thread of the PR at post time.
+    pub thread_ref: String,
+    pub said: Said,
+    /// The round whose verdict the thread is to show.
+    pub round_id: i64,
+    pub verdict: IssueVerdict,
+    /// The reviewer's evidence for it.
+    pub note: String,
+    /// The head that round reviewed: where the issue was addressed.
+    pub head_sha: String,
+}
+
+impl ThreadToSettle {
+    pub fn steps(&self) -> ThreadSteps {
+        self.said.steps(self.verdict)
+    }
 }
 
 /// One issue of a round as a post needs it: with its id, to record the
@@ -185,6 +295,66 @@ pub struct PrReviewRow {
     pub running_job_id: Option<i64>,
 }
 
+/// An issue as the reviewer reported it, for [`PrReviewRound::Ok`].
+#[derive(Debug, Clone, Default)]
+pub struct ReportedIssue {
+    pub kind: String,
+    pub blocking: bool,
+    pub severity: Option<String>,
+    pub confidence: Option<f64>,
+    pub file: Option<String>,
+    pub line: Option<i64>,
+    /// `RIGHT` or `LEFT`, in any case; anything else is the reviewer not
+    /// saying.
+    pub side: Option<String>,
+    pub summary: String,
+    pub detail: String,
+}
+
+/// What a round said about one earlier issue (`pr_review_verdicts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueVerdict {
+    /// The new commits fix it.
+    Addressed,
+    /// A reply argued it is no issue, and the round checked the argument
+    /// against the code.
+    RebuttalAccepted,
+    /// It still stands.
+    Open,
+}
+
+impl IssueVerdict {
+    /// The word the reviewer writes and the table keeps.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Addressed => "addressed",
+            Self::RebuttalAccepted => "rebuttal-accepted",
+            Self::Open => "open",
+        }
+    }
+
+    pub fn parse(word: &str) -> Option<Self> {
+        match word {
+            "addressed" => Some(Self::Addressed),
+            "rebuttal-accepted" => Some(Self::RebuttalAccepted),
+            "open" => Some(Self::Open),
+            _ => None,
+        }
+    }
+}
+
+/// A round's verdict on earlier issue `issue_id`, with its evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verdict {
+    pub issue_id: i64,
+    pub verdict: IssueVerdict,
+    pub note: String,
+    /// The issue's `reopened_at` as the round read it
+    /// ([`EarlierIssue::reopened_at`]): the verdict counts only while no
+    /// later reopen is recorded.
+    pub seen_reopened_at: Option<i64>,
+}
+
 impl PrReviewRow {
     /// Whether the repo's URL is no longer the one the review was
     /// requested under: the request decided whether the PR's author can
@@ -233,17 +403,71 @@ impl PrReviewRow {
 /// [`JobStore::record_pr_review_round`]: super::JobStore::record_pr_review_round
 #[derive(Debug, Clone, Copy)]
 pub enum PrReviewRound<'a> {
-    /// The reviewer finished `base..head` and reported these issues.
-    Ok(&'a [PrReviewIssueOut]),
+    /// The reviewer finished `base..head`: it reported these issues and
+    /// judged these earlier ones.
+    Ok {
+        issues: &'a [ReportedIssue],
+        verdicts: &'a [Verdict],
+    },
     /// The reviewer was stopped before it finished, for reason `why`,
-    /// after it wrote these issues: they are kept as an `Ok` round's are,
-    /// but `base..head` is not reviewed.
+    /// after it wrote these issues and verdicts: they are kept as an `Ok`
+    /// round's are, but `base..head` is not reviewed.
     Partial {
-        issues: &'a [PrReviewIssueOut],
+        issues: &'a [ReportedIssue],
+        verdicts: &'a [Verdict],
         why: &'a str,
     },
     /// No usable review came out of the attempt, for this reason.
     Failed(&'a str),
+}
+
+/// An issue of a review's current chain, as the next round is shown it
+/// (`{{EARLIER_ISSUES}}`, serialized) and as its thread is read.
+#[derive(Debug, Clone, Serialize)]
+pub struct EarlierIssue {
+    /// What the round's verdict names it by.
+    pub id: i64,
+    pub kind: String,
+    pub blocking: bool,
+    pub severity: Option<String>,
+    pub file: Option<String>,
+    pub line: Option<i64>,
+    pub side: Option<String>,
+    pub summary: String,
+    pub detail: String,
+    /// `open`, `addressed`, `rebutted`, or `reopened` (a human reopened the
+    /// thread hunter had resolved, and no round judged it since).
+    pub status: String,
+    /// The thread's screened replies, as the newest read saw them.
+    pub replies: Vec<PrReviewReplyOut>,
+    /// The forge's id of the inline comment it was posted as; `None` when
+    /// it went into a review's body or was never posted.
+    #[serde(skip)]
+    pub thread_ref: Option<String>,
+    /// When a human last reopened its thread, as this read of the issues
+    /// found it (epoch ms): what a verdict on it is given over
+    /// ([`Verdict::seen_reopened_at`]).
+    #[serde(skip)]
+    pub reopened_at: Option<i64>,
+}
+
+/// What a round's read found in the thread of posted issue `issue_id`
+/// ([`JobStore::observe_pr_review_threads`](super::JobStore::observe_pr_review_threads)).
+#[derive(Debug, Clone)]
+pub struct ThreadSeen {
+    pub issue_id: i64,
+    pub resolved: bool,
+    pub replies: Vec<PrReviewReplyOut>,
+    pub hidden: i64,
+}
+
+/// What one read of every thread of a PR found of the threads of a
+/// review's posted issues: each one it found, and the issues whose thread
+/// it did not, which is gone from the PR.
+#[derive(Debug, Clone, Default)]
+pub struct ThreadsRead {
+    pub seen: Vec<ThreadSeen>,
+    pub gone: Vec<i64>,
 }
 
 /// Raw `pr_reviews` columns as one SELECT returns them; every reader goes
@@ -614,11 +838,87 @@ impl Store {
             .collect())
     }
 
+    /// The threads round `round_id`'s post touches: those of the issues
+    /// it judged and of its own issues, each posted inline and not known
+    /// gone, with what hunter said there and the judgement the thread is to
+    /// show, the issue's newest released verdict (see the module docs). An
+    /// issue none stands for (no released verdict, or a human reopened the
+    /// thread since) is left as it is. Its own issues are here because a
+    /// later round may have settled one while this one waited, when the
+    /// issue had no thread to answer yet: read after the round's inline
+    /// comments are read back, this lists the threads it just opened.
+    pub async fn pr_review_round_threads(
+        &self,
+        round_id: i64,
+    ) -> sqlx::Result<Vec<ThreadToSettle>> {
+        let rows = sqlx::query!(
+            r#"SELECT i.id AS "issue_id!: i64", i.thread_ref AS "thread_ref!",
+                      i.answer,
+                      i.resolved_at IS NOT NULL AS "resolved!: bool",
+                      i.answer IS NULL AND i.reopened_at IS NOT NULL AS "reopened!: bool",
+                      v.round_id AS "round_id!: i64", v.verdict, v.note, r.head_sha
+               FROM pr_review_issues i
+               JOIN pr_review_issue_state s ON s.issue_id = i.id
+               JOIN pr_review_verdicts v ON v.round_id = s.target_round_id
+                                        AND v.issue_id = i.id
+               JOIN pr_review_rounds r ON r.id = v.round_id
+               WHERE i.thread_ref IS NOT NULL AND i.thread_gone_at IS NULL
+                 AND (i.round_id = ?1
+                      OR EXISTS (SELECT 1 FROM pr_review_verdicts w
+                                 WHERE w.round_id = ?1 AND w.issue_id = i.id))
+               ORDER BY i.id"#,
+            round_id
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                Some(ThreadToSettle {
+                    issue_id: r.issue_id,
+                    thread_ref: r.thread_ref,
+                    said: Said {
+                        answer: r.answer.as_deref().and_then(IssueVerdict::parse),
+                        resolved: r.resolved,
+                        reopened: r.reopened,
+                    },
+                    round_id: r.round_id,
+                    verdict: IssueVerdict::parse(&r.verdict)?,
+                    note: r.note,
+                    head_sha: r.head_sha,
+                })
+            })
+            .collect())
+    }
+
+    /// Record that hunter's answer giving round `round_id`'s `verdict`
+    /// landed in issue `issue_id`'s thread: hunter's standing answer there,
+    /// and the round landed (whichever round's post said it). The admin
+    /// lane's write
+    /// ([`AdminStore::record_pr_review_answered`](super::AdminStore::record_pr_review_answered)).
+    pub(super) async fn record_pr_review_answered(
+        &self,
+        (issue_id, round_id): (i64, i64),
+        verdict: IssueVerdict,
+    ) -> sqlx::Result<()> {
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
+        let word = verdict.as_str();
+        sqlx::query!(
+            "UPDATE pr_review_issues SET answer = ?2 WHERE id = ?1",
+            issue_id,
+            word
+        )
+        .execute(&mut *tx)
+        .await?;
+        mark_landed(&mut tx, round_id).await?;
+        tx.commit().await
+    }
+
     /// Record that round `round_id`'s review is on the forge, with the
     /// forge's id of it and the issues it put `inline`. The round stays
-    /// `approved` until its inline comments are read back too
-    /// ([`Self::record_pr_review_round_posted`]), so a later failure
-    /// retries only that. The admin lane's write
+    /// `approved` until its inline comments are read back and its threads
+    /// answered too ([`Self::record_pr_review_round_posted`]), so a later
+    /// failure retries only those. The admin lane's write
     /// ([`AdminStore::record_pr_review_review_posted`](super::AdminStore::record_pr_review_review_posted)).
     pub(super) async fn record_pr_review_review_posted(
         &self,
@@ -685,9 +985,38 @@ impl Store {
         tx.commit().await
     }
 
-    /// Record the `approved` round `round_id` as posted: its review is on
-    /// the forge and its inline comments' ids are read back. The admin
-    /// lane's write
+    /// Record that a post's read of every thread of the PR found the
+    /// threads of issues `gone` missing: deleted on the forge, never to be
+    /// answered. The admin lane's write
+    /// ([`AdminStore::record_pr_review_threads_gone`](super::AdminStore::record_pr_review_threads_gone)).
+    pub(super) async fn record_pr_review_threads_gone(&self, gone: &[i64]) -> sqlx::Result<()> {
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
+        mark_gone(&mut tx, gone).await?;
+        tx.commit().await
+    }
+
+    /// Record that hunter resolved issue `issue_id`'s thread (`resolved`)
+    /// or unresolved it. The admin lane's write
+    /// ([`AdminStore::record_pr_review_thread_resolution`](super::AdminStore::record_pr_review_thread_resolution)).
+    pub(super) async fn record_pr_review_thread_resolution(
+        &self,
+        issue_id: i64,
+        resolved: bool,
+    ) -> sqlx::Result<()> {
+        let now = now_ms();
+        sqlx::query!(
+            "UPDATE pr_review_issues SET resolved_at = CASE WHEN ?2 THEN ?3 END WHERE id = ?1",
+            issue_id,
+            resolved,
+            now
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Record the `approved` round `round_id` as posted: its review and
+    /// every thread it answers are on the forge. The admin lane's write
     /// ([`AdminStore::record_pr_review_round_posted`](super::AdminStore::record_pr_review_round_posted)).
     pub(super) async fn record_pr_review_round_posted(&self, round_id: i64) -> sqlx::Result<()> {
         let now = now_ms();
@@ -893,22 +1222,34 @@ impl Store {
     pub async fn list_pr_review_rounds(&self) -> sqlx::Result<Vec<(i64, PrReviewRoundOut)>> {
         let rounds = sqlx::query!(
             r#"
-            SELECT id AS "id!: i64", review_id AS "review_id!: i64", job_id, base_sha,
-                   head_sha, verdict, failure, finished_at AS "finished_at!: i64",
-                   post_state, post_error, posted_at, landed_at IS NOT NULL AS "landed!: bool"
-            FROM pr_review_rounds
-            ORDER BY finished_at DESC, id DESC
+            SELECT r.id AS "id!: i64", r.review_id AS "review_id!: i64", r.job_id, r.base_sha,
+                   r.head_sha, r.verdict, r.failure, r.finished_at AS "finished_at!: i64",
+                   r.post_state, r.post_error, r.posted_at,
+                   r.landed_at IS NOT NULL AS "landed!: bool",
+                   (SELECT COUNT(*) FROM pr_review_verdicts v
+                    JOIN pr_review_issues i ON i.id = v.issue_id
+                    WHERE v.round_id = r.id AND v.verdict != 'open'
+                      AND i.inline AND i.thread_gone_at IS NULL) AS "resolutions!: i64"
+            FROM pr_review_rounds r
+            ORDER BY r.finished_at DESC, r.id DESC
             "#
         )
         .fetch_all(&self.pool)
         .await?;
         let issues = sqlx::query!(
             r#"
-            SELECT round_id AS "round_id!: i64", kind, blocking AS "blocking!: bool",
-                   severity, confidence, file, line, side, summary, detail,
-                   inline AS "posted_inline!: bool"
-            FROM pr_review_issues
-            ORDER BY round_id, blocking DESC, id
+            SELECT i.id AS "id!: i64", i.round_id AS "round_id!: i64", i.kind,
+                   i.blocking AS "blocking!: bool", i.severity, i.confidence, i.file, i.line,
+                   i.side, i.summary, i.detail,
+                   i.inline AS "posted_inline!: bool",
+                   s.status AS "status!: String",
+                   i.resolved_at IS NOT NULL AS "resolved_on_forge!: bool",
+                   (SELECT NULLIF(v.note, '') FROM pr_review_verdicts v
+                    WHERE v.round_id = s.judged_round_id AND v.issue_id = i.id)
+                     AS "verdict_note: String",
+                   i.replies_json, i.hidden_replies AS "hidden_replies!: i64"
+            FROM pr_review_issues i JOIN pr_review_issue_state s ON s.issue_id = i.id
+            ORDER BY i.round_id, i.blocking DESC, i.id
             "#
         )
         .fetch_all(&self.pool)
@@ -920,6 +1261,7 @@ impl Store {
                 .entry(i.round_id)
                 .or_default()
                 .push(PrReviewIssueOut {
+                    id: i.id,
                     kind: i.kind,
                     blocking: i.blocking,
                     severity: i.severity,
@@ -930,6 +1272,11 @@ impl Store {
                     summary: i.summary,
                     detail: i.detail,
                     posted_inline: i.posted_inline,
+                    status: i.status,
+                    resolved_on_forge: i.resolved_on_forge,
+                    verdict_note: i.verdict_note,
+                    replies: replies_of(&i.replies_json),
+                    hidden_replies: i.hidden_replies,
                 });
         }
         Ok(rounds
@@ -949,6 +1296,7 @@ impl Store {
                         post_error: r.post_error,
                         posted_at: r.posted_at,
                         landed: r.landed,
+                        resolutions: r.resolutions,
                         issues: by_round.remove(&r.id).unwrap_or_default(),
                     },
                 )
@@ -956,23 +1304,33 @@ impl Store {
             .collect())
     }
 
-    /// Issues of review `id`'s incremental chain that a round from `base`
-    /// continues: every kept round since the newest one that reviewed from
-    /// scratch (the first round, or one after a force-push), as each later
-    /// round's base is the head its predecessor reviewed. That is what the
-    /// round is told was already reported: a round that found nothing new
-    /// does not make the chain forget what came before it. A `partial`
-    /// round is in the chain from its base, but reviewed nothing up to its
-    /// head: the chain goes on from its base, which the next round reviews
-    /// from again. A round from anywhere else starts a new chain, and is
-    /// told of none.
-    /// Only rounds of the review's binding are in a chain: an earlier
-    /// binding's are about another PR ([`Self::request_pr_review`]).
-    pub async fn chain_pr_review_issues(
-        &self,
-        id: i64,
-        base: &str,
-    ) -> sqlx::Result<Vec<PrReviewIssueOut>> {
+    /// The earlier issues the next round of review `id` is told about and
+    /// judges: every issue of the current incremental chain (each later
+    /// round's base is the head its predecessor reviewed, back to the
+    /// newest round that reviewed from the merge-base), so a round that
+    /// found nothing new does not make the chain forget what came before
+    /// it; plus every issue of an older chain whose status holds whatever
+    /// the commits are -- still open, reopened, or rebutted -- or that a
+    /// verdict settled while hunter has not resolved its thread on the PR
+    /// (the round with that verdict is pending, never approved) and may
+    /// still. A force-push starts a new chain, and the issues it left
+    /// behind are not settled by it: without them a fixed issue's thread
+    /// would never be answered or resolved, an unfixed one would be
+    /// reported again as new, and a rebutted one -- the author won that
+    /// point, about the issue and not the commits it was made over -- would
+    /// be raised again by a review of the whole PR that is not told so.
+    /// Only an `addressed` one of an older chain is dropped once its thread
+    /// is resolved: that verdict is about code the force-push replaced,
+    /// which a review of the whole PR judges afresh, reporting the issue
+    /// again if its fix is gone. A `partial` round is in the chain from its
+    /// base, but reviewed nothing up to its head: the chain goes on from
+    /// its base, which the next round reviews from again. A discarded
+    /// round's issues were never the review's, in any chain; its head
+    /// still links the chain, being reviewed (the next round reviews from
+    /// it). A thread found gone has nothing left to resolve. Only the
+    /// rounds of the review's binding count, in a chain or out of one: an
+    /// earlier binding's are about another PR ([`Self::request_pr_review`]).
+    pub async fn earlier_pr_review_issues(&self, id: i64) -> sqlx::Result<Vec<EarlierIssue>> {
         let rounds = sqlx::query!(
             r#"
             SELECT id AS "id!: i64", base_sha, head_sha, verdict = 'ok' AS "finished!: bool"
@@ -994,15 +1352,17 @@ impl Store {
             chain.push(r.id);
             prev_head = Some(if r.finished { &r.head_sha } else { &r.base_sha });
         }
-        if prev_head != Some(base) {
-            return Ok(Vec::new());
-        }
         let rows = sqlx::query!(
             r#"
-            SELECT i.round_id AS "round_id!: i64", i.kind, i.blocking AS "blocking!: bool",
-                   i.severity, i.confidence, i.file, i.line, i.side, i.summary, i.detail,
-                   i.inline AS "posted_inline!: bool"
+            SELECT i.id AS "id!: i64", i.round_id AS "round_id!: i64", i.kind,
+                   i.blocking AS "blocking!: bool", i.severity, i.file, i.line, i.side,
+                   i.summary, i.detail, i.thread_ref, i.reopened_at,
+                   s.status AS "status!: String", i.replies_json,
+                   i.resolved_at IS NULL AS "unresolved!: bool",
+                   i.thread_gone_at IS NOT NULL AS "gone!: bool",
+                   r.post_state IS NOT NULL AND r.post_state = 'discarded' AS "discarded!: bool"
             FROM pr_review_issues i JOIN pr_review_rounds r ON r.id = i.round_id
+            JOIN pr_review_issue_state s ON s.issue_id = i.id
             WHERE r.review_id = ?1
               AND r.binding = (SELECT binding FROM pr_reviews WHERE id = ?1)
             ORDER BY r.finished_at, r.id, i.id
@@ -1013,23 +1373,104 @@ impl Store {
         .await?;
         Ok(rows
             .into_iter()
-            .filter(|i| chain.contains(&i.round_id))
-            .map(|i| PrReviewIssueOut {
+            .filter(|i| {
+                !i.discarded
+                    && (chain.contains(&i.round_id)
+                        || matches!(i.status.as_str(), "open" | "reopened" | "rebutted"))
+                    || (i.thread_ref.is_some() && !i.gone && i.unresolved)
+            })
+            .map(|i| EarlierIssue {
+                id: i.id,
                 kind: i.kind,
                 blocking: i.blocking,
                 severity: i.severity,
-                confidence: i.confidence,
                 file: i.file,
                 line: i.line,
                 side: i.side,
                 summary: i.summary,
                 detail: i.detail,
-                posted_inline: i.posted_inline,
+                status: i.status,
+                replies: replies_of(&i.replies_json),
+                thread_ref: i.thread_ref.filter(|_| !i.gone),
+                reopened_at: i.reopened_at,
             })
             .collect())
     }
 
-    /// The PR sync's view of review `id`'s PR: its head (a changed head
+    /// Every issue of review `id` posted inline whose thread is not known
+    /// gone, with its inline comment's forge id: the threads a read of the
+    /// PR looks at. Settled ones too, of any chain: a thread hunter
+    /// resolved that a human reopens reopens its issue only once a read
+    /// sees it ([`Self::observe_pr_review_threads`]). Only the review's
+    /// binding's: an earlier one's threads are on another PR.
+    pub async fn posted_pr_review_issues(&self, id: i64) -> sqlx::Result<Vec<(i64, String)>> {
+        let rows = sqlx::query!(
+            r#"SELECT i.id AS "id!: i64", i.thread_ref AS "thread_ref!"
+               FROM pr_review_issues i JOIN pr_review_rounds r ON r.id = i.round_id
+               WHERE r.review_id = ?1 AND i.thread_ref IS NOT NULL
+                 AND r.binding = (SELECT binding FROM pr_reviews WHERE id = ?1)
+                 AND i.thread_gone_at IS NULL
+               ORDER BY i.id"#,
+            id
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| (r.id, r.thread_ref)).collect())
+    }
+
+    /// Record what a round's read found in the threads of review issues
+    /// (`read`): each one's screened replies, and the issues whose thread
+    /// it found gone. A thread hunter resolved that the read found
+    /// unresolved was reopened by a human: the issue is open again (every
+    /// verdict before it void), and hunter's answer and resolution are
+    /// undone so a later verdict answers the reopen, open or settled
+    /// ([`Said::reopened`]). Only a resolution recorded
+    /// before the read began (`read_at`) counts as undone: one that landed
+    /// while the forge was being read is simply not in what it returned.
+    /// Returns how many issues were reopened. The job lane's write
+    /// ([`JobStore::observe_pr_review_threads`](super::JobStore::observe_pr_review_threads)).
+    pub(super) async fn observe_pr_review_threads(
+        &self,
+        read: &ThreadsRead,
+        read_at: i64,
+    ) -> sqlx::Result<u64> {
+        let now = now_ms();
+        let mut reopened = 0;
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
+        mark_gone(&mut tx, &read.gone).await?;
+        for t in &read.seen {
+            let replies = serde_json::to_string(&t.replies).unwrap_or_else(|_| "[]".to_owned());
+            sqlx::query!(
+                "UPDATE pr_review_issues SET replies_json = ?2, hidden_replies = ?3 WHERE id = ?1",
+                t.issue_id,
+                replies,
+                t.hidden
+            )
+            .execute(&mut *tx)
+            .await?;
+            if !t.resolved {
+                // The human's word voids hunter's standing answer and every
+                // verdict given over the thread as it stood before: each
+                // reopen gets a `reopened_at` past the last one's, so no
+                // verdict's `seen_reopened_at` names it.
+                reopened += sqlx::query!(
+                    "UPDATE pr_review_issues SET answer = NULL, resolved_at = NULL, \
+                         reopened_at = MAX(?2, COALESCE(reopened_at + 1, ?2)) \
+                     WHERE id = ?1 AND resolved_at IS NOT NULL AND resolved_at <= ?3",
+                    t.issue_id,
+                    now,
+                    read_at
+                )
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            }
+        }
+        tx.commit().await?;
+        Ok(reopened)
+    }
+
+    /// The PR review duty's view of review `id`'s PR: its head (a changed head
     /// restarts the stability wait; an empty one, a fresh GitLab MR's,
     /// is no known head), title and state. Only an open review
     /// is touched, the only kind the sync and a round read: a `closed` one
@@ -1086,23 +1527,29 @@ impl Store {
     /// Record one round of review `id` over `base..head`, by job `job_id`
     /// when one ran, with the merge-base it resolved (`merge_base`; `None`
     /// for a round that failed before resolving it), in one transaction
-    /// with its issues and the review's streak. The round ran under the review's `binding` as its pick read
+    /// with its issues, its verdicts on earlier issues and the review's
+    /// streak. The round ran under the review's `binding` as its pick read
     /// it; once a request bound the review to a new URL since, the round
     /// was about the PR at the earlier one, and is kept as history only: it
-    /// moves nothing of the review below. A finished round (`Ok`) moves `last_reviewed_sha` to `head`,
-    /// answers the request a round waited for (`round_requested`) and ends
-    /// the streak: only a reviewer that finished reviewed
-    /// `base..head`. A `Partial` one keeps its issues, as a finished one
-    /// does, but counts toward the hold as a failure does and leaves
-    /// `last_reviewed_sha` where it was, so the next round reviews the same
-    /// commits again; a reviewer whose budget never lets it finish them is
-    /// held rather than run forever. A failure counts one and holds the
-    /// review at [`PR_REVIEW_HOLD_AT`]. A kept round with issues is to be
-    /// posted: it starts `approved` when the review posts automatically,
-    /// `pending` otherwise, and `discarded` when it is of an earlier
-    /// binding, which is never posted; any other round has nothing to
-    /// post. Returns
-    /// the streak after this round. The job lane's write
+    /// moves nothing of the review below. A finished round (`Ok`)
+    /// moves `last_reviewed_sha` to `head`, answers the request a round
+    /// waited for (`round_requested`) and ends the streak: only a
+    /// reviewer that finished reviewed `base..head`. A `Partial` one keeps
+    /// what it wrote, as a finished one does, but counts toward the hold
+    /// as a failure does and leaves `last_reviewed_sha` where it was, so
+    /// the next round reviews the same commits again; a reviewer whose
+    /// budget never lets it finish them is held rather than run forever. A
+    /// failure counts one and holds the review at [`PR_REVIEW_HOLD_AT`],
+    /// and records no verdict. A verdict naming an issue of another review
+    /// or binding is dropped; the rest are the issues' newest judgement
+    /// from now on (see the module docs). A kept round with something to
+    /// post -- issues, or a verdict that would change what an issue's
+    /// thread shows ([`Said::steps`]), on a thread posted already or of a
+    /// round still to be posted, which opens it -- starts `approved` when
+    /// the review posts automatically, `pending` otherwise, and `discarded`
+    /// when it is of an earlier binding, which is never posted; any other
+    /// round has nothing to post, and its verdicts are released to the PR
+    /// at once. Returns the streak after this round. The job lane's write
     /// ([`JobStore::record_pr_review_round`](super::JobStore::record_pr_review_round)).
     pub(super) async fn record_pr_review_round(
         &self,
@@ -1114,22 +1561,16 @@ impl Store {
     ) -> sqlx::Result<i64> {
         let now = now_ms();
         let mut tx = ImmediateTx::begin(&self.pool).await?;
-        let (verdict, failure, has_issues) = match round {
-            PrReviewRound::Ok(issues) => ("ok", None, !issues.is_empty()),
-            PrReviewRound::Partial { issues, why } => ("partial", Some(why), !issues.is_empty()),
-            PrReviewRound::Failed(why) => ("failed", Some(why), false),
+        let (verdict, failure) = match round {
+            PrReviewRound::Ok { .. } => ("ok", None),
+            PrReviewRound::Partial { why, .. } => ("partial", Some(why)),
+            PrReviewRound::Failed(why) => ("failed", Some(why)),
         };
         let round_id = sqlx::query_scalar!(
             r#"INSERT INTO pr_review_rounds
                    (review_id, job_id, base_sha, head_sha, verdict, failure, finished_at,
-                    post_state, merge_base_sha, binding)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
-                       CASE WHEN ?8 THEN
-                           CASE WHEN (SELECT binding FROM pr_reviews WHERE id = ?1) != ?10
-                                THEN 'discarded'
-                                WHEN (SELECT auto_post FROM pr_reviews WHERE id = ?1)
-                                THEN 'approved' ELSE 'pending' END
-                       END, ?9, ?10)
+                    merge_base_sha, binding)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                RETURNING id AS "id!: i64""#,
             id,
             job_id,
@@ -1138,17 +1579,22 @@ impl Store {
             verdict,
             failure,
             now,
-            has_issues,
             merge_base,
             binding
         )
         .fetch_one(&mut *tx)
         .await?;
-        if let PrReviewRound::Ok(issues) | PrReviewRound::Partial { issues, .. } = round {
-            record_issues(&mut tx, round_id, issues).await?;
+        if let PrReviewRound::Ok {
+            issues, verdicts, ..
+        }
+        | PrReviewRound::Partial {
+            issues, verdicts, ..
+        } = round
+        {
+            record_kept(&mut tx, (id, round_id), issues, verdicts).await?;
         }
         let streak = match round {
-            PrReviewRound::Ok(_) => {
+            PrReviewRound::Ok { .. } => {
                 sqlx::query!(
                     "UPDATE pr_reviews SET last_reviewed_sha = ?2, round_requested = 0, \
                          failures = 0, last_failure = NULL WHERE id = ?1 AND binding = ?3",
@@ -1179,11 +1625,17 @@ impl Store {
     }
 }
 
-/// Record the `issues` kept round `round_id` reported.
-async fn record_issues(
+/// Record what kept round `round_id` of review `review_id` wrote: its
+/// `issues` and its `verdicts` on earlier issues, and its post state:
+/// `approved` when the review posts automatically, `pending` otherwise,
+/// when it has something to post, none when it has not, and `discarded`
+/// when the round is of an earlier binding than the review's now (see
+/// [`Store::record_pr_review_round`]).
+async fn record_kept(
     tx: &mut sqlx::SqliteConnection,
-    round_id: i64,
-    issues: &[PrReviewIssueOut],
+    (review_id, round_id): (i64, i64),
+    issues: &[ReportedIssue],
+    verdicts: &[Verdict],
 ) -> sqlx::Result<()> {
     for i in issues {
         // The column takes only the two words a forge knows; anything
@@ -1212,6 +1664,21 @@ async fn record_issues(
         .execute(&mut *tx)
         .await?;
     }
+    record_verdicts(&mut *tx, (review_id, round_id), verdicts).await?;
+    let says = !issues.is_empty() || verdicts_say_something(&mut *tx, round_id).await?;
+    sqlx::query!(
+        "UPDATE pr_review_rounds SET post_state = \
+             CASE WHEN binding != (SELECT binding FROM pr_reviews WHERE id = ?2) \
+                  THEN 'discarded' \
+                  WHEN (SELECT auto_post FROM pr_reviews WHERE id = ?2) \
+                  THEN 'approved' ELSE 'pending' END \
+         WHERE id = ?1 AND ?3",
+        round_id,
+        review_id,
+        says
+    )
+    .execute(&mut *tx)
+    .await?;
     Ok(())
 }
 
@@ -1261,4 +1728,143 @@ async fn mark_landed(tx: &mut sqlx::SqliteConnection, round_id: i64) -> sqlx::Re
     .execute(&mut *tx)
     .await?;
     Ok(())
+}
+
+/// Record round `round_id`'s `verdicts` on earlier issues of review
+/// `review_id`. A verdict on an issue of another review or another
+/// binding, or of this very round, is dropped: the reviewer was never
+/// shown it.
+async fn record_verdicts(
+    tx: &mut sqlx::SqliteConnection,
+    (review_id, round_id): (i64, i64),
+    verdicts: &[Verdict],
+) -> sqlx::Result<()> {
+    for v in verdicts {
+        let word = v.verdict.as_str();
+        sqlx::query!(
+            "INSERT INTO pr_review_verdicts (round_id, issue_id, verdict, note, seen_reopened_at) \
+             SELECT ?1, i.id, ?3, ?4, ?6 FROM pr_review_issues i \
+             JOIN pr_review_rounds r ON r.id = i.round_id \
+             WHERE i.id = ?2 AND r.review_id = ?5 AND r.id != ?1 \
+               AND r.binding = (SELECT binding FROM pr_review_rounds WHERE id = ?1) \
+             ON CONFLICT DO NOTHING",
+            round_id,
+            v.issue_id,
+            word,
+            v.note,
+            review_id,
+            v.seen_reopened_at
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Whether a post of round `round_id` would change what any thread shows:
+/// a verdict that still counts (no reopen recorded since its round read
+/// the thread) whose [`Said::steps`] are not empty, on an issue posted
+/// inline whose thread is not known gone, or on one whose round is still
+/// to be posted (its thread starts with hunter's comment alone).
+async fn verdicts_say_something(
+    tx: &mut sqlx::SqliteConnection,
+    round_id: i64,
+) -> sqlx::Result<bool> {
+    let rows = sqlx::query!(
+        r#"SELECT v.verdict, i.answer,
+                  i.resolved_at IS NOT NULL AS "resolved!: bool",
+                  i.answer IS NULL AND i.reopened_at IS NOT NULL AS "reopened!: bool"
+           FROM pr_review_verdicts v
+           JOIN pr_review_issues i ON i.id = v.issue_id
+           JOIN pr_review_rounds ir ON ir.id = i.round_id
+           WHERE v.round_id = ?1 AND i.reopened_at IS v.seen_reopened_at
+             AND ((i.inline AND i.thread_gone_at IS NULL)
+                  OR ir.post_state IN ('pending', 'approved'))"#,
+        round_id
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    Ok(rows.into_iter().any(|r| {
+        let said = Said {
+            answer: r.answer.as_deref().and_then(IssueVerdict::parse),
+            resolved: r.resolved,
+            reopened: r.reopened,
+        };
+        IssueVerdict::parse(&r.verdict).is_some_and(|v| !said.steps(v).is_empty())
+    }))
+}
+
+/// A `replies_json` column as the replies it holds; a value this code did
+/// not write reads as none rather than failing the whole listing.
+fn replies_of(json: &str) -> Vec<PrReviewReplyOut> {
+    serde_json::from_str(json).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IssueVerdict, Reply, Said, ThreadSteps};
+
+    const ADDRESSED: IssueVerdict = IssueVerdict::Addressed;
+    const OPEN: IssueVerdict = IssueVerdict::Open;
+
+    fn steps(reply: Option<Reply>, resolve: Option<bool>) -> ThreadSteps {
+        ThreadSteps { reply, resolve }
+    }
+
+    #[test]
+    fn a_settled_issue_is_answered_and_resolved_once() {
+        let fresh = Said::default();
+        assert_eq!(
+            fresh.steps(ADDRESSED),
+            steps(Some(Reply::Settled), Some(true))
+        );
+        let answered = Said {
+            answer: Some(ADDRESSED),
+            ..Said::default()
+        };
+        assert_eq!(answered.steps(ADDRESSED), steps(None, Some(true)));
+        let done = Said {
+            resolved: true,
+            ..answered
+        };
+        assert!(done.steps(ADDRESSED).is_empty());
+        // Rebutted after it was addressed: a new answer, resolved already.
+        assert_eq!(
+            done.steps(IssueVerdict::RebuttalAccepted),
+            steps(Some(Reply::Settled), None)
+        );
+    }
+
+    #[test]
+    fn an_open_issue_is_answered_only_where_hunter_settled_it() {
+        assert!(
+            Said::default().steps(OPEN).is_empty(),
+            "the comment says it"
+        );
+        let settled = Said {
+            answer: Some(ADDRESSED),
+            resolved: true,
+            ..Said::default()
+        };
+        assert_eq!(
+            settled.steps(OPEN),
+            steps(Some(Reply::OpenAgain), Some(false))
+        );
+    }
+
+    /// A human's reopen of a thread hunter settled and resolved disputes
+    /// hunter's answer, which is still the thread's last word: any verdict
+    /// over it answers, open or settled, and a settled one resolves again.
+    #[test]
+    fn a_reopen_is_answered_whatever_the_verdict() {
+        let reopened = Said {
+            reopened: true,
+            ..Said::default()
+        };
+        assert_eq!(reopened.steps(OPEN), steps(Some(Reply::OpenAgain), None));
+        assert_eq!(
+            reopened.steps(ADDRESSED),
+            steps(Some(Reply::Settled), Some(true))
+        );
+    }
 }

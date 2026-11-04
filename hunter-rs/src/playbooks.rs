@@ -9,6 +9,7 @@ use std::hash::BuildHasher;
 use std::path::Path;
 
 use crate::forge::{CodeLocation, GhAuthor, OWN_MARK, PrView, Voice};
+use crate::store::EarlierIssue;
 use crate::types::{Finding, PrState, Repo};
 
 /// `PLAYBOOK_DIR` = <`project_root>/playbooks` (types.py `PLAYBOOK_DIR`).
@@ -509,11 +510,25 @@ pub struct PrUnderReview<'a> {
     pub author: &'a str,
 }
 
+/// Where a PR reviewer writes: its new issues, and its verdicts on the
+/// earlier ones. Both outside the tree it reviews.
+#[derive(Debug, Clone, Copy)]
+pub struct ReviewOutputs<'a> {
+    pub issues: &'a Path,
+    pub earlier: &'a Path,
+}
+
 /// The prompt of a review of somebody else's PR (`pr_review.md`): a fresh
 /// session that reviews `<base>..HEAD` in `worktree`, the PR's head, and
-/// writes its issues to `out_path`, outside the tree. `earlier_issues` is
-/// the JSON array of what earlier rounds reported (`[]` on the first), so
-/// an incremental round does not report them again.
+/// writes its issues and its verdicts on `earlier` to `out`. `earlier` is
+/// what earlier rounds of the chain reported (none on the first), with
+/// each issue's id, status and the screened replies in its thread, so an
+/// incremental round does not report them again and can judge them.
+///
+/// The earlier issues go in as one JSON document: replies are other
+/// people's text, and JSON escaping keeps every line break and quote of
+/// theirs inside a string, where it cannot end the block or pass for
+/// prompt text.
 pub fn build_pr_review_prompt(
     root: &Path,
     repo: &Repo,
@@ -521,8 +536,8 @@ pub fn build_pr_review_prompt(
     worktree: &Path,
     base: &str,
     pr: PrUnderReview<'_>,
-    out_path: &Path,
-    earlier_issues: &str,
+    out: ReviewOutputs<'_>,
+    earlier: &[EarlierIssue],
 ) -> Result<String> {
     let notes = notes_or_default(repo_notes, "(No notes yet)");
     let template = read_template(root, "pr_review.md")?;
@@ -542,8 +557,12 @@ pub fn build_pr_review_prompt(
         },
     );
     slots.insert("PR_AUTHOR", pr.author.to_owned());
-    slots.insert("OUT_PATH", out_path.display().to_string());
-    slots.insert("EARLIER_ISSUES", earlier_issues.to_owned());
+    slots.insert("OUT_PATH", out.issues.display().to_string());
+    slots.insert("EARLIER_OUT", out.earlier.display().to_string());
+    slots.insert(
+        "EARLIER_ISSUES",
+        serde_json::to_string_pretty(earlier).context("serializing the earlier issues")?,
+    );
     render(&template, &slots)
 }
 

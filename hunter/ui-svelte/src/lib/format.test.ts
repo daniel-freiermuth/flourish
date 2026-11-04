@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { clock, datetime, isHttpUrl, ktok, reviewStateLabel, ts } from "./format";
+import { clock, datetime, isHttpUrl, ktok, reviewIssueStatusLabel, reviewStateLabel, roundPostTally, ts } from "./format";
 
 describe("reviewStateLabel", () => {
   it("names a review that ended on hunter's own PR", () => {
@@ -9,6 +9,34 @@ describe("reviewStateLabel", () => {
 
   it.each(["open", "merged", "closed"])("shows %s as is", (s) => {
     expect(reviewStateLabel(s)).toBe(s);
+  });
+});
+
+describe("reviewIssueStatusLabel", () => {
+  it("says a rebutted issue's rebuttal was accepted", () => {
+    expect(reviewIssueStatusLabel("rebutted")).toBe("rebuttal accepted");
+  });
+
+  it.each(["open", "addressed", "reopened"])("shows %s as is", (s) => {
+    expect(reviewIssueStatusLabel(s)).toBe(s);
+  });
+});
+
+/** The Post button's count of what posting a round sends. */
+describe("roundPostTally", () => {
+  it("counts issues alone when the round resolves nothing", () => {
+    expect(roundPostTally(1, 0)).toBe("1 issue");
+    expect(roundPostTally(2, 0)).toBe("2 issues");
+  });
+
+  it("adds the resolutions after the issues", () => {
+    expect(roundPostTally(2, 1)).toBe("2 issues, 1 resolution");
+    expect(roundPostTally(1, 3)).toBe("1 issue, 3 resolutions");
+  });
+
+  it("names only the resolutions of a round without new issues", () => {
+    expect(roundPostTally(0, 1)).toBe("1 resolution");
+    expect(roundPostTally(0, 2)).toBe("2 resolutions");
   });
 });
 

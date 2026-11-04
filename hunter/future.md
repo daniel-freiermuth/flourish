@@ -784,10 +784,12 @@ It blocks nothing; it would remove recurring review noise and a class of
 bug the current gates cannot see.
 
 ### 8.8 PR reviews: Watch on PRs hunter did not open
-**Status:** designed 2026-11-04; slices 1–2 built (manual request, Watch,
+**Status:** designed 2026-11-04; slices 1–3 built (manual request, Watch,
 review rounds, results in the UI; inline COMMENT posting with per-review
-auto-post or per-round approval). Not yet: thread replies and resolution
-(slice 3), issues still open at merge becoming findings (slice 4).
+auto-post or per-round approval; later rounds read the screened replies in
+hunter's threads, judge earlier issues addressed / rebuttal accepted /
+open, and answer and resolve the threads hunter opened when posted). Not
+yet: issues still open at merge becoming findings (slice 4).
 
 Reviews are enabled by hand, per PR, never by repo-wide discovery: the
 open PRs that are not hunter's own were, when designed, the operator's
@@ -868,8 +870,21 @@ for review traffic. Approving a round wakes the duty.
 - A thread hunter opened whose issue a later round no longer raises (or
   whose rebuttal it accepts) gets a reply naming the commit and is
   resolved by hunter (GitHub `resolveReviewThread`, GitLab discussion
-  `resolved=true`). Threads others opened are never resolved; a thread a
-  human reopened is live again.
+  `resolved=true`); one it settled that a later round finds open again
+  gets a reply and is unresolved. Threads others opened are never
+  resolved; a thread a human reopened is live again, and a verdict counts
+  only over the thread as its round read it. The verdict over a reopen is
+  always answered, `open` ("Open again") as much as a settled one: the
+  reopen disputes hunter's settling answer, which is still the thread's
+  last word. A failed resolve fails the
+  post like any other step: hunter's login can push, so it may resolve.
+- The status of an issue is derived, never kept: the newest verdict of a
+  round not discarded, and the thread is to show the newest one released
+  to the PR (approved, posted, landed in part, or with nothing to post).
+  Hunter records what it said in each thread, and a post does only what
+  the thread lacks, so rounds waiting for approval post in any order and
+  nothing is said twice. A round part of which is on the PR is never
+  discarded.
 
 **Data.** `pr_reviews(repo_id, pr_number, watch, auto_post, vouched_author,
 vouched_by, last_reviewed_sha, head_stable_since, state)` and
