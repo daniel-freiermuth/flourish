@@ -234,15 +234,17 @@ what actually runs):
 1. Any finding with an active **budget override** (any category) — human
    escape hatch, jumps the whole queue.
 2. **Engage** the flagged PR with the oldest-outstanding attention reason.
-3. **Harvest** the oldest merged or closed PR still pending its review
+3. **Review** a requested PR (§ PR reviews) whose next round is due: the
+   oldest request first. A human is waiting on it like on a flagged PR.
+4. **Harvest** the oldest merged or closed PR still pending its review
    (a closed PR qualifies only while its finding is `closed`, which no
    verdict can set; a finding a human moved on after the closure, even to
    `rejected`, is left alone. Closures from before the closed-PR harvest,
    which left their finding `rejected`, were moved to `closed` once by
    migration 016).
-4. **Recheck** the oldest finding stuck in `rechecking`.
-5. **Fix** the oldest queued finding.
-6. **Resume** the newest suspended attempt that can still be continued.
+5. **Recheck** the oldest finding stuck in `rechecking`.
+6. **Fix** the oldest queued finding.
+7. **Resume** the newest suspended attempt that can still be continued.
    A worker killed for running out of window headroom keeps its session
    and comes back as `suspended` rather than `killed`, and the next cycle
    hands omp that exact session instead of starting cold. So does one
@@ -793,7 +795,8 @@ table created by hand beforehand makes the migration fail at startup.
 It idles at zero token cost between cycles and wakes on a smart-sleep
 policy: right after a job with more queued work → drain immediately;
 budget denied → short retry if the ramp is actively rising, otherwise sleep
-to the window reset; genuinely idle → 15 minutes. PR-comment polling is
+to the window reset; genuinely idle → 15 minutes, or until the next PR
+review round comes due, if sooner. PR-comment polling is
 decoupled from the token-budget backoff loop, so a long budget-driven sleep
 never delays noticing new PR feedback. Every wake re-checks the budget gate
 before spending anything, and starts no job while the filesystem holding

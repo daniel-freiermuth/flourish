@@ -64,6 +64,9 @@ pub struct SchedulerHandle {
     /// Interrupts the sleep of the admin lane's PR sync duty, so open PRs
     /// are read now. Held as a permit while a sync runs, like `wake`.
     pub pr_sync_wake: Arc<tokio::sync::Notify>,
+    /// Interrupts the sleep of the admin lane's PR review duty, so open PR
+    /// reviews are read now. Held as a permit, like `wake`.
+    pub pr_review_wake: Arc<tokio::sync::Notify>,
     /// Interrupts the sleep of the admin lane's reaper duty, so a repo
     /// just deleted has its files removed now. Held as a permit, like
     /// `wake`.
@@ -1127,11 +1130,12 @@ async fn release_repo_hold(
 
 // -- POST /api/cycle (contract §2) --------------------------------------------
 
-/// Trigger both lanes now (contract §2): the admin lane syncs PRs at
-/// once, and the job lane starts its next cycle. The admin lane is woken
-/// whatever the job lane is doing: a pause stops only jobs, and a manual
-/// sync is most useful exactly while a long job runs. Then 409 `paused`
-/// while paused, 409 `busy` while a cycle is already running, else 202.
+/// Trigger both lanes now (contract §2): the admin lane syncs PRs and
+/// reads the PR reviews at once, and the job lane starts its next cycle.
+/// The admin lane is woken whatever the job lane is doing: a pause stops
+/// only jobs, and a manual sync is most useful exactly while a long job
+/// runs. Then 409 `paused` while paused, 409 `busy` while a cycle is
+/// already running, else 202.
 ///
 /// The busy check is advisory, as Python's non-blocking lock acquire was:
 /// a trigger that races the loop into its next cycle is held as a notify
@@ -1139,6 +1143,7 @@ async fn release_repo_hold(
 async fn cycle(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
     post_gate(&headers)?;
     state.scheduler.pr_sync_wake.notify_one();
+    state.scheduler.pr_review_wake.notify_one();
     if state.scheduler.paused.load(Ordering::SeqCst) {
         return Ok(error_body(StatusCode::CONFLICT, "paused"));
     }

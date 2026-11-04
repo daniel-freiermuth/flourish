@@ -469,6 +469,9 @@ pub struct Summary {
 pub enum AdminTask {
     /// Reading every open PR from its forge (`scheduler::sync_prs`).
     PrSync,
+    /// Reading every open PR review's PR from its forge
+    /// (`scheduler::sync_pr_reviews`).
+    PrReviews,
     /// Removing the clones of deleted repos (`server::reap_deleted_repos`).
     Reap,
     /// Fetching enabled repos' clones ahead of their jobs
