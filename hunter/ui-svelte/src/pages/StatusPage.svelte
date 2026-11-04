@@ -95,6 +95,7 @@
 
   const ADMIN_TASK_LABEL: Record<AdminTask, string> = {
     pr_sync: "syncing open PRs",
+    pr_reviews: "reading PR reviews",
     reap: "removing deleted repos' clones",
     fetch_ahead: "fetching repos ahead of their jobs",
     dependency_scan: "scanning dependencies with Renovate",
@@ -130,7 +131,7 @@
             disabled={schedulerBusy}
             onclick={toggleScheduler}
             aria-label={store.summary.scheduler_paused ? "Resume jobs" : "Pause jobs"}
-            title="Pauses new jobs. PR sync, repo reaping, fetch-ahead, Renovate scans and workspace cleanup keep running."
+            title="Pauses new jobs. PR sync, PR review reads, repo reaping, fetch-ahead, Renovate scans and workspace cleanup keep running."
           >
             <span class="scheduler-icon">{store.summary.scheduler_paused ? "▶" : "⏸"}</span>
             <span>{store.summary.scheduler_paused ? "Resume jobs" : "Pause jobs"}</span>

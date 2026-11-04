@@ -269,6 +269,7 @@ async fn a_pr_sync_does_not_wait_for_a_dependency_scan() {
             notes_lock: Arc::default(),
             status: scheduler.admin.clone(),
             pr_sync_wake: scheduler.pr_sync_wake.clone(),
+            pr_review_wake: scheduler.pr_review_wake.clone(),
             reap_wake: scheduler.reap_wake.clone(),
             pr_sync_passes: hunter::daemon::PrSyncPasses::default(),
             job_wake: scheduler.wake.clone(),
@@ -338,6 +339,7 @@ fn start_admin_lane(
             notes_lock: Arc::default(),
             status: scheduler.admin.clone(),
             pr_sync_wake: scheduler.pr_sync_wake.clone(),
+            pr_review_wake: scheduler.pr_review_wake.clone(),
             reap_wake: scheduler.reap_wake.clone(),
             pr_sync_passes: passes.clone(),
             job_wake: scheduler.wake.clone(),
@@ -759,11 +761,12 @@ fn a_sync_made_work_when_it_ended_flagged_or_requeued_something() {
     }
 }
 
-/// A duty's run is work for the job lane when its sync made some, or its
-/// dependency scan handed a repo to the AI scan; reaping, fetching and
-/// sweeping never are.
+/// A duty's run is work for the job lane when its sync made some, its
+/// refresh of the PR reviews brought a round forward, or its dependency
+/// scan handed a repo to the AI scan; reaping, fetching and sweeping never
+/// are.
 #[test]
-fn a_duty_made_work_only_through_a_sync_or_a_scan_fallback() {
+fn a_duty_made_work_only_through_a_sync_a_review_or_a_scan_fallback() {
     use hunter::scheduler::{DepScans, FetchAhead, SyncResult};
     let merged = SyncResult {
         merged: 1,
@@ -773,6 +776,8 @@ fn a_duty_made_work_only_through_a_sync_or_a_scan_fallback() {
         (DutyRun::Synced(None), false),
         (DutyRun::Synced(Some(SyncResult::default())), false),
         (DutyRun::Synced(Some(merged)), true),
+        (DutyRun::Reviewed { due_sooner: false }, false),
+        (DutyRun::Reviewed { due_sooner: true }, true),
         (
             DutyRun::Scanned(DepScans {
                 scanned: 3,

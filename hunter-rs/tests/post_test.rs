@@ -782,14 +782,15 @@ async fn cycle_starts_returns_202() {
 }
 
 /// Contract §2: the 202 is not cosmetic -- it must actually reach both
-/// lanes: the job lane's next cycle, and the admin lane's PR sync duty. The
-/// handler notifies before responding, so each permit is already held and
-/// `notified()` resolves immediately.
+/// lanes: the job lane's next cycle, and the admin lane's PR sync and PR
+/// review duties. The handler notifies before responding, so each permit
+/// is already held and `notified()` resolves immediately.
 #[tokio::test]
 async fn cycle_wakes_both_scheduler_lanes() {
     let state = test_state().await;
     let wake = Arc::clone(&state.scheduler.wake);
     let pr_sync_wake = Arc::clone(&state.scheduler.pr_sync_wake);
+    let pr_review_wake = Arc::clone(&state.scheduler.pr_review_wake);
     let (status, _) = post(&state, "/api/cycle", json!({})).await;
     assert_eq!(status, StatusCode::ACCEPTED);
     tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified())
@@ -798,6 +799,9 @@ async fn cycle_wakes_both_scheduler_lanes() {
     tokio::time::timeout(std::time::Duration::from_secs(1), pr_sync_wake.notified())
         .await
         .expect("POST /api/cycle must wake the PR sync");
+    tokio::time::timeout(std::time::Duration::from_secs(1), pr_review_wake.notified())
+        .await
+        .expect("POST /api/cycle must wake the PR reviews");
 }
 
 /// Contract §2: a cycle already under way is refused, not queued twice --

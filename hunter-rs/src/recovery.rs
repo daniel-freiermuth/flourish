@@ -543,6 +543,19 @@ impl CycleScope<'_> {
             .await
     }
 
+    /// [`Self::create_job`] for a PR review round, recording the commit
+    /// the round reviews from (`jobs.base_sha`) with the same INSERT.
+    pub async fn create_pr_review_job(
+        &self,
+        start: JobStart,
+        base_sha: &str,
+        cap_tokens: Option<i64>,
+        estimated_tokens: Option<i64>,
+    ) -> Result<CreatedJob, JobInsertError> {
+        self.insert(start, Some(base_sha), cap_tokens, estimated_tokens)
+            .await
+    }
+
     async fn insert(
         &self,
         start: JobStart,
