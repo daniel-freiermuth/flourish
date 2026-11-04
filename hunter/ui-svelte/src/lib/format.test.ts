@@ -1,6 +1,43 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { clock, datetime, isHttpUrl, ktok, ts } from "./format";
+import { clock, datetime, isHttpUrl, ktok, reviewStateLabel, roundWait, ts } from "./format";
+import type { PrReviewOut } from "./types";
+
+describe("reviewStateLabel", () => {
+  it("names a review that ended on hunter's own PR", () => {
+    expect(reviewStateLabel("own")).toBe("hunter's own PR");
+  });
+
+  it.each(["open", "merged", "closed"])("shows %s as is", (s) => {
+    expect(reviewStateLabel(s)).toBe(s);
+  });
+});
+
+/** Whether a review shows as waiting for a round is the daemon's `due_at`. */
+describe("roundWait", () => {
+  const now = 1_700_000_000_000;
+  const review = (extra: Partial<PrReviewOut>) => ({
+    watch: true, head_sha: "b", last_reviewed_sha: "a", running_job_id: null, due_at: null, rounds: [], ...extra,
+  }) as PrReviewOut;
+
+  it("shows an unwatched review a request asked a round of as pending", () => {
+    const wait = roundWait(review({ watch: false, due_at: 0 }), now);
+    expect(wait).toEqual({ label: "pending", title: "Waiting for the scheduler" });
+  });
+
+  it("shows no badge while no round is due, as for a review whose repo moved", () => {
+    expect(roundWait(review({ due_at: null }), now)).toBeNull();
+    expect(roundWait(review({ watch: false, last_reviewed_sha: null, due_at: null }), now)).toBeNull();
+  });
+
+  it("shows no badge while the round runs", () => {
+    expect(roundWait(review({ due_at: 0, running_job_id: 3 }), now)).toBeNull();
+  });
+
+  it("says a round due later waits for the head to stay unchanged", () => {
+    expect(roundWait(review({ due_at: now + 60_000 }), now)?.title).toMatch(/^Waiting for the head to stay unchanged until /);
+  });
+});
 
 /**
  * Repo URLs are operator-supplied and rendered as links. Only http(s)

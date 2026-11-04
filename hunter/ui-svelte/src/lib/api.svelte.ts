@@ -2,12 +2,13 @@
 // via a singleton store object.
 
 import type {
-  Event, FindingDetail, FindingOut, JobListEntry, RepoNotesResponse, SessionUser, Stats,
-  StatsHorizon, Summary,
+  Event, FindingDetail, FindingOut, JobListEntry, OpenPrOut, PrReviewOut, RepoNotesResponse,
+  SessionUser, Stats, StatsHorizon, Summary,
 } from "./types";
 import { loadStatsHorizon, saveStatsHorizon } from "./statsHorizon";
 import {
-  isEventList, isFindingDetail, isFindingList, isJobList, isStats, isSummary,
+  isEventList, isFindingDetail, isFindingList, isJobList, isOpenPrList, isPrReviewList, isStats,
+  isSummary,
 } from "./validate";
 
 /** Dashboard poll period. Exported so a test can drive the timer by it. */
@@ -156,7 +157,7 @@ async function postWithDeadline<T>(path: string, body: Record<string, unknown>):
 // ---------------------------------------------------------------------------
 
 /** The `{"error": "..."}` body every failing endpoint answers with, if it is one. */
-function errorMessage(body: unknown): string | null {
+export function errorMessage(body: unknown): string | null {
   if (typeof body !== "object" || body === null) return null;
   const msg = (body as Record<string, unknown>).error;
   return typeof msg === "string" ? msg : null;
@@ -474,6 +475,37 @@ class HunterStore {
     }
     this.repoNotesCache.set(id, r.body.notes);
     return r.body.notes;
+  }
+
+  /**
+   * `/api/pr-reviews`, for `ReviewsPage`'s own poll: only that page shows
+   * reviews, so the dashboard poll does not carry them. Throws on any
+   * answer the page must not render, including one read under a session
+   * that has since ended.
+   */
+  async fetchPrReviews(): Promise<PrReviewOut[]> {
+    const epoch = this.#sessionEpoch;
+    const r = await get<PrReviewOut[]>("/api/pr-reviews");
+    if (epoch !== this.#sessionEpoch) throw new Error("GET /api/pr-reviews: the session ended meanwhile");
+    if (!r.ok) {
+      throw new Error(errorMessage(r.body) ?? `GET /api/pr-reviews failed (status ${r.status})`);
+    }
+    if (!isPrReviewList(r.body)) throw new Error("GET /api/pr-reviews: malformed response body");
+    return r.body;
+  }
+
+  /**
+   * A repo's open PRs as the forge lists them right now. Not cached: the
+   * point of the list is what is open and already reviewed at this moment.
+   */
+  async fetchOpenPrs(repoId: number): Promise<OpenPrOut[]> {
+    const path = `/api/repo/open-prs?id=${repoId}`;
+    const epoch = this.#sessionEpoch;
+    const r = await get<OpenPrOut[]>(path);
+    if (epoch !== this.#sessionEpoch) throw new Error(`GET ${path}: the session ended meanwhile`);
+    if (!r.ok) throw new Error(errorMessage(r.body) ?? `GET ${path} failed (status ${r.status})`);
+    if (!isOpenPrList(r.body)) throw new Error(`GET ${path}: malformed response body`);
+    return r.body;
   }
 }
 

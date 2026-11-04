@@ -1,6 +1,6 @@
 <script lang="ts">
   import { store, post } from "../lib/api.svelte";
-  import { ts, clock, countdown, dur, ktok } from "../lib/format";
+  import { ts, clock, countdown, dur, jobKindLabel, ktok } from "../lib/format";
   import type { AdminTask, JobPhase, NextCandidate } from "../lib/types";
 
   let btnText = $state("Run Cycle");
@@ -67,6 +67,9 @@
     }
   }
 
+  // A PR review's label is the daemon's "PR #<n> <title>"; its id is the
+  // review's, which means nothing to the operator, so only a finding shows
+  // its id.
   function candidateLabel(nc: NextCandidate): string {
     return nc.is_finding ? `#${nc.id} ${nc.label || ""}` : (nc.label || "");
   }
@@ -168,13 +171,15 @@
     <div class="activity-card">
       {#if store.summary.activity_status.kind === "running"}
         {@const cj = store.summary.activity_status.job}
+        <!-- A repo-level job (scan, PR review) has no finding: the repo
+             names the work, and a PR review's kind label says which. -->
         {@const label = cj.finding_id != null
           ? `#${cj.finding_id} ${cj.finding_summary || cj.finding_fingerprint || ""}`
           : cj.repo_name}
         <div class="row">
           <span class="status-icon running">▶</span>
           <b class="running">running</b>
-          <span>{cj.kind}: {label}</span>
+          <span>{jobKindLabel(cj.kind)}: {label}</span>
           <span class="dim">({dur(cj.started_at, cj.finished_at)}, {ktok(cj.tokens_new)} tok, job #{cj.id})</span>
           {#if store.summary.job_activity}
             {@const ja = store.summary.job_activity}
@@ -214,7 +219,7 @@
         <div class="row">
           <span class="status-icon paused-icon">⏸</span>
           <b class="paused">paused</b>
-          <span>next up: {nc.kind} {candidateLabel(nc)}</span>
+          <span>next up: {jobKindLabel(nc.kind)} {candidateLabel(nc)}</span>
           <span>&middot; budget: <span class="b-denied">denied</span> ({nc.budget_reason})</span>
         </div>
         {#if nc.budget_retry_at}
@@ -234,7 +239,7 @@
         <div class="row">
           <span class="status-icon ready-icon">🚀</span>
           <b class="ready-text">ready</b>
-          <span>next up: {nc.kind} {candidateLabel(nc)}</span>
+          <span>next up: {jobKindLabel(nc.kind)} {candidateLabel(nc)}</span>
           <span>&middot; budget: <span class={nc.budget_state === "denied" ? "b-denied" : nc.budget_state === "allowed" ? "b-allowed" : "b-exempt"}>{nc.budget_state}</span></span>
         </div>
         {#if ss?.next_wake_at}
