@@ -1,7 +1,7 @@
 <script lang="ts">
   // A repo's work held for the operator, and the work that is failing
   // without a hold yet (WORK-MODEL.md §17). One block per repo: the Repos
-  // page shows it under each repo, Kanban's "Needs you" for every repo
+  // page shows it under each repo, Kanban's "Held scans" for every repo
   // with a hold.
   import { store, post } from "../lib/api.svelte";
   import { datetime, holdReasonLabel, releaseActionLabel, repoWorkLabel } from "../lib/format";

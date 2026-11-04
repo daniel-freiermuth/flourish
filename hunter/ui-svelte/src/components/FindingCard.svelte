@@ -769,14 +769,18 @@
     border-top: 1px solid var(--border);
   }
 
+  /* Wraps so the input and its buttons stay inside a narrow card (a
+     Kanban column); in a wide one everything still fits on one line. */
   .reason-row {
     display: flex;
+    flex-wrap: wrap;
     gap: 0.375rem;
     align-items: center;
   }
 
   .reason-input {
-    flex: 1;
+    flex: 1 1 8rem;
+    min-width: 0;
     background: var(--bg-panel);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);

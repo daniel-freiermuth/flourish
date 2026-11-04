@@ -5,6 +5,7 @@
   import { filterFindings } from "../lib/findingFilter";
   import { Filter } from "../lib/filter.svelte";
   import { readSelection } from "../lib/filterUrl";
+  import { loadFoldedColumns, saveFoldedColumns } from "../lib/kanbanFolds";
   import type { FindingOut } from "../lib/types";
   import FilterBar from "../components/FilterBar.svelte";
   import FindingCard from "../components/FindingCard.svelte";
@@ -12,7 +13,14 @@
 
   const repoNames = $derived(new Map((store.summary?.repos ?? []).map((r) => [r.id, r.name])));
 
+  // Work held for the operator (WORK-MODEL.md §9): absent from a daemon
+  // that predates the field. Held findings wait in their own column, not
+  // in the column of a status nothing will move them out of until a
+  // release, whatever that status is.
+  const isHeld = (f: FindingOut) => (f.holds ?? []).length > 0;
+
   const COLUMNS = [
+    { key: "held", label: "Held", filter: isHeld },
     { key: "rechecking", label: "Rechecking", filter: (f: FindingOut) => f.status === "rechecking" },
     { key: "queued", label: "Queued", filter: (f: FindingOut) => f.status === "queued" },
     { key: "fixing", label: "Fixing", filter: (f: FindingOut) => f.status === "fixing" },
@@ -24,30 +32,24 @@
     { key: "closed", label: "Closed", filter: (f: FindingOut) => f.status === "closed" },
   ];
 
-  // Work held for the operator (WORK-MODEL.md §9): absent from a daemon
-  // that predates the field. Held findings wait in "Needs you", not in the
-  // column of a status nothing will move them out of until a release.
-  const isHeld = (f: FindingOut) => (f.holds ?? []).length > 0;
-
   // Active pipeline and held work share the same filters.
   const pipelineFindings = $derived(
-    store.findings.filter((f) => isHeld(f) || COLUMNS.some((c) => c.filter(f)))
+    store.findings.filter((f) => COLUMNS.some((c) => c.filter(f)))
   );
 
   const filtered = $derived(filterFindings(pipelineFindings, navigation.route.params, { repoNames, showStatus: false }));
 
-  // Group filtered findings by column
+  // Group filtered findings by column; a held finding shows only in Held.
   const columns = $derived(
     COLUMNS.map((col) => ({
       ...col,
-      findings: filtered.filter((f) => !isHeld(f) && col.filter(f)),
+      findings: filtered.filter((f) => (col.key === "held") === isHeld(f) && col.filter(f)),
       attentionCount: col.key === "pr_review"
         ? filtered.filter((f) => !isHeld(f) && f.status === "pr_open" && !!f.needs_attention).length
         : 0,
     }))
   );
 
-  const held = $derived(filtered.filter(isHeld));
   // A repo's held scans (WORK-MODEL.md §17) wait beside held findings,
   // under the same repo filter. Absent from a daemon that predates the
   // field.
@@ -56,7 +58,7 @@
   );
   const repoFilter = $derived(new Filter(readSelection(navigation.route.params, "repo")));
   const heldRepos = $derived(reposWithHolds.filter((r) => repoFilter.accepts(r.name)));
-  const hasHeld = $derived(store.findings.some(isHeld) || reposWithHolds.length > 0);
+  const hasHeldRepos = $derived(reposWithHolds.length > 0);
 
   // Suppressed (rejected + wontfix) and notes — below the pipeline
   const suppressed = $derived(
@@ -75,6 +77,15 @@
   let suppressedOpen = $state(false);
   let supersededOpen = $state(false);
   let notesOpen = $state(false);
+
+  // Folded columns shrink to a strip with name and counts, e.g. for the
+  // ones that are empty almost all the time (Rechecking, Closed).
+  const folded = new SvelteSet<string>(loadFoldedColumns());
+
+  function toggleFold(key: string) {
+    if (!folded.delete(key)) folded.add(key);
+    saveFoldedColumns(folded);
+  }
 
   // Findings with a verdict in flight. Both buttons write the same row
   // with an unconditional UPDATE, so letting them overlap means the last
@@ -116,20 +127,29 @@
 
   <div class="board" data-scroll-x="board">
     {#each columns as col (col.label)}
-      <div class="column">
-        <div class="col-header">
+      {@const isFolded = folded.has(col.key)}
+      <div class="column" class:folded={isFolded} class:held={col.key === "held"} class:empty={col.findings.length === 0}>
+        <button
+          class="col-header"
+          aria-expanded={!isFolded}
+          title="{isFolded ? 'Unfold' : 'Fold'} {col.label}"
+          onclick={() => toggleFold(col.key)}
+        >
+          <span class="toggle-arrow">{isFolded ? "▸" : "▾"}</span>
           <span class="col-name">{col.label}</span>
           <span class="col-count">{col.findings.length}</span>
           {#if col.attentionCount > 0}
             <span class="attn-badge" title="{col.attentionCount} need attention">⚠ {col.attentionCount}</span>
           {/if}
-        </div>
-        {#if col.findings.length === 0}
+        </button>
+        {#if isFolded}
+          <!-- Nothing below the header: the strip is the whole column. -->
+        {:else if col.findings.length === 0}
           <p class="col-empty">—</p>
         {:else}
           <div class="col-cards" data-scroll-list={col.label}>
             {#each col.findings as finding (finding.id)}
-              <FindingCard {finding} actions={false} />
+              <FindingCard {finding} actions={col.key === "held"} />
             {/each}
           </div>
         {/if}
@@ -137,29 +157,19 @@
     {/each}
   </div>
 
-  {#if hasHeld}
+  {#if hasHeldRepos}
     <section class="held-section" aria-labelledby="held-heading">
       <h3 id="held-heading" class="held-heading">
-        Needs you
-        <!-- One per card below: a held finding, or a repo with held work. -->
-        <span class="section-count">{held.length + heldRepos.length}</span>
+        Held scans
+        <span class="section-count">{heldRepos.length}</span>
       </h3>
-      <p class="held-help">Work stopped for you: a missing prerequisite, a failure that kept repeating, or a chain that ran out of budget. Continue resumes the retained work with a fresh budget; restart starts it over.</p>
-      {#if heldRepos.length > 0}
+      <p class="held-help">Repo work stopped for you: a missing prerequisite, a failure that kept repeating, or a chain that ran out of budget. Held findings wait in the Held column. Continue resumes the retained work with a fresh budget; restart starts it over.</p>
+      {#if heldRepos.length === 0}
+        <p class="held-help">No held scans match the current repo filter.</p>
+      {:else}
         <div class="section-body" data-scroll-list="held-repos">
           {#each heldRepos as repo (repo.id)}
             <RepoWork {repo} showFailing={false} />
-          {/each}
-        </div>
-      {/if}
-      {#if held.length === 0}
-        {#if heldRepos.length === 0}
-          <p class="held-help">No held work matches the current filters.</p>
-        {/if}
-      {:else}
-        <div class="section-body" data-scroll-list="held">
-          {#each held as finding (finding.id)}
-            <FindingCard {finding} actions={true} />
           {/each}
         </div>
       {/if}
@@ -279,9 +289,10 @@
   }
 
   /* ── Board ──────────────────────────────────────────────────── */
+  /* Flex rather than a grid: a folded column keeps only the width of its
+     strip and the open ones share the rest. */
   .board {
-    display: grid;
-    grid-template-columns: repeat(7, minmax(0, 1fr));
+    display: flex;
     gap: 0.625rem;
     min-height: 200px;
   }
@@ -295,6 +306,18 @@
     flex-direction: column;
     overflow: hidden;
     min-width: 0;
+    flex: 1 1 0;
+  }
+  .column.folded {
+    flex: 0 0 auto;
+    padding: 0;
+  }
+  /* Held work waits for the operator: amber, like the hold blocks. */
+  .column.held {
+    border-color: var(--sev-medium);
+  }
+  .column.held .col-name {
+    color: var(--sev-medium);
   }
 
   .col-header {
@@ -306,8 +329,25 @@
     display: flex;
     align-items: center;
     gap: 0.375rem;
+    border: none;
     border-bottom: 1px solid var(--border);
     margin-bottom: 0.375rem;
+    width: 100%;
+    cursor: pointer;
+    text-align: left;
+  }
+  .col-header:hover .col-name {
+    color: var(--text);
+  }
+  .folded .col-header {
+    flex-direction: column;
+    flex: 1;
+    padding: 0.5rem 0.375rem;
+    border-bottom: none;
+    margin-bottom: 0;
+  }
+  .folded .col-name {
+    writing-mode: vertical-rl;
   }
 
   .col-name {
@@ -490,13 +530,18 @@
   /* ── Responsive ──────────────────────────────────────────────── */
   @media (max-width: 1200px) {
     .board {
-      grid-template-columns: repeat(3, minmax(0, 1fr));
+      flex-wrap: wrap;
+    }
+    .column:not(.folded) {
+      flex-basis: calc((100% - 2 * 0.625rem) / 3);
     }
   }
 
   @media (max-width: 767px) {
     .board {
       display: flex;
+      /* Undo the ≤1200px wrap: phones scroll the columns sideways. */
+      flex-wrap: nowrap;
       overflow-x: auto;
       scroll-snap-type: x mandatory;
       gap: 0.625rem;
@@ -507,15 +552,19 @@
     .board::-webkit-scrollbar {
       display: none;
     }
-    .column {
+    .column:not(.folded) {
       width: 85vw;
       min-width: 85vw;
       max-width: 85vw;
       scroll-snap-align: start;
       flex-shrink: 0;
     }
-    /* Hide empty columns on mobile */
-    .column:has(.col-empty) {
+    .column.folded {
+      scroll-snap-align: start;
+    }
+    /* Hide empty columns on mobile, folded or not: a folded column
+       renders no .col-empty, so this keys on the count instead. */
+    .column.empty {
       display: none;
     }
   }
