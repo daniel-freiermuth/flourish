@@ -3,4 +3,14 @@
 /**
  * One issue a review round reported, as the reviewer wrote it.
  */
-export type PrReviewIssueOut = { kind: string, blocking: boolean, severity: string | null, confidence: number | null, file: string | null, line: number | null, summary: string, detail: string, };
+export type PrReviewIssueOut = { kind: string, blocking: boolean, severity: string | null, confidence: number | null, file: string | null, line: number | null, 
+/**
+ * `"RIGHT"` when `line` numbers the PR's head, `"LEFT"` the base (code
+ * the PR removes); null when the reviewer did not say, read as RIGHT.
+ */
+side: string | null, summary: string, detail: string, 
+/**
+ * Whether the issue went out as an inline comment on the PR's diff
+ * (rather than in the posted review's body).
+ */
+posted_inline: boolean, };

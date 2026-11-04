@@ -75,6 +75,8 @@
   let repoId = $state<number | null>(null);
   let prInput = $state("");
   let watch = $state(true);
+  // Off by default: a post goes out under the operator's own forge login.
+  let autoPost = $state(false);
   let submitting = $state(false);
 
   // The open-PR picker belongs to the repo it was loaded for; switching the
@@ -129,7 +131,7 @@
     }
     submitting = true;
     try {
-      const body: Record<string, unknown> = { repo_id: id, pr, watch };
+      const body: Record<string, unknown> = { repo_id: id, pr, watch, auto_post: autoPost };
       let r = await post<{ id?: number; outcome?: string }>("/api/pr-review", body);
       const vouch = r.status === 409 ? vouchRequest(r.body) : null;
       if (vouch) {
@@ -148,8 +150,8 @@
         toast(errorMessage(r.body) ?? `Review request failed (HTTP ${r.status})`, false);
         return;
       }
-      // `updated` (watch set on a review that exists), `reopened` (its PR
-      // was reopened), or `requested`.
+      // `updated` (watch and auto-post set on a review that exists),
+      // `reopened` (its PR was reopened), or `requested`.
       const outcome = typeof r.body?.outcome === "string" ? r.body.outcome : "requested";
       toast(`Review of PR ${pr} ${outcome}`, true);
       prInput = "";
@@ -201,9 +203,15 @@
       && review.head_sha !== review.last_reviewed_sha
       && (review.watch || review.last_reviewed_sha === null);
   }
+
+  /** Discarding is final, so it asks first. */
+  function discardRound(review: PrReviewOut, round: PrReviewRoundOut) {
+    if (!confirm(`Never post round ${short(round.base_sha)}..${short(round.head_sha)} to the PR?`)) return;
+    void reviewWrite(review, "/api/pr-review/discard", { round_id: round.id }, "round discarded");
+  }
 </script>
 
-{#snippet roundView(round: PrReviewRoundOut)}
+{#snippet roundView(review: PrReviewOut, round: PrReviewRoundOut)}
   {@const blocking = round.issues.filter((i) => i.blocking).length}
   <div class="round">
     <div class="round-head">
@@ -223,9 +231,45 @@
       {#if round.job_id !== null}
         <span class="dim">job #{round.job_id}</span>
       {/if}
+      {#if round.post_state === "pending"}
+        <span class="badge post-pending" title="Waiting for a decision: nothing is posted without one">{round.landed ? "partly posted" : "not posted"}</span>
+        <button
+          class="retry-btn"
+          disabled={busy.has(review.id) || review.state !== "open"}
+          onclick={() => reviewWrite(review, "/api/pr-review/post", { round_id: round.id }, "posting to the PR")}
+          title="Post this round's issues to the PR as one comment review under your forge login"
+        >
+          Post to PR
+        </button>
+        {#if !round.landed}
+          <button
+            class="discard-btn"
+            disabled={busy.has(review.id)}
+            onclick={() => discardRound(review, round)}
+          >
+            Discard
+          </button>
+        {/if}
+      {:else if round.post_state === "approved"}
+        {#if review.state === "open"}
+          <span class="badge accent" title="Posted on the next refresh of the reviews, at once after an approval">posting…</span>
+        {:else}
+          <span class="badge" title="Only an open review's rounds are posted">not posted ({reviewStateLabel(review.state)})</span>
+        {/if}
+      {:else if round.post_state === "posted"}
+        <span class="badge verdict-ok">posted{round.posted_at !== null ? ` ${clock(round.posted_at)}` : ""}</span>
+      {:else if round.post_state === "discarded"}
+        <span class="badge">discarded</span>
+      {/if}
     </div>
     {#if round.failure}
       <p class="round-failure">{round.failure}</p>
+    {/if}
+    {#if round.post_error && (round.post_state === "pending" || round.post_state === "approved")}
+      <p class="round-failure">
+        {round.post_state === "pending" ? "Posting failed; approve to try again:" : "Posting failed, retrying:"}
+        {round.post_error}
+      </p>
     {/if}
     {#if round.issues.length > 0}
       <ul class="issues">
@@ -241,6 +285,9 @@
               <span class="chip">{issue.kind}</span>
               {#if issue.file}
                 <code class="location">{issue.file}{issue.line !== null ? `:${issue.line}` : ""}</code>
+              {/if}
+              {#if issue.posted_inline}
+                <span class="chip chip-inline" title="Posted as a comment on this line of the PR's diff">inline</span>
               {/if}
             </div>
             {#if issue.detail}
@@ -287,6 +334,10 @@
         <label class="watch-field" title="Review every new head once it has stopped changing, not just the current one">
           <input type="checkbox" bind:checked={watch} />
           Watch
+        </label>
+        <label class="watch-field" title="Post each round's issues to the PR without waiting for your approval (under your forge login)">
+          <input type="checkbox" bind:checked={autoPost} />
+          Post automatically
         </label>
       </div>
       <div class="request-actions">
@@ -425,6 +476,22 @@
                 >
                   {review.watch ? "Watching" : "Watch"}
                 </button>
+                <button
+                  class="toggle-btn"
+                  class:is-on={review.auto_post}
+                  disabled={busy.has(review.id) || review.state !== "open"}
+                  onclick={() => reviewWrite(
+                    review, "/api/pr-review/auto-post", { id: review.id, auto_post: !review.auto_post },
+                    review.auto_post ? "rounds wait for approval" : "rounds are posted automatically",
+                  )}
+                  aria-pressed={review.auto_post}
+                  aria-label="Auto-post {review.repo_name} PR #{review.pr_number}"
+                  title={review.auto_post
+                    ? "New rounds are posted to the PR without approval. Click to approve each one."
+                    : "New rounds wait for your approval. Click to post them automatically."}
+                >
+                  {review.auto_post ? "Auto-posting" : "Auto-post"}
+                </button>
               </div>
             </div>
 
@@ -465,12 +532,12 @@
             {#if review.rounds[0]}
               {@const earlier = review.rounds.slice(1)}
               <div class="rounds">
-                {@render roundView(review.rounds[0])}
+                {@render roundView(review, review.rounds[0])}
                 {#if earlier.length > 0}
                   <details class="earlier">
                     <summary>{earlier.length} earlier {earlier.length === 1 ? "round" : "rounds"}</summary>
                     {#each earlier as round (round.id)}
-                      {@render roundView(round)}
+                      {@render roundView(review, round)}
                     {/each}
                   </details>
                 {/if}
@@ -752,6 +819,20 @@
     color: var(--sev-medium);
   }
   .badge.verdict-ok { background: rgba(68, 238, 136, 0.1); color: var(--ok); }
+  .badge.post-pending {
+    background: rgba(255, 153, 0, 0.12);
+    color: var(--sev-medium);
+  }
+
+  .discard-btn {
+    font-size: 0.6875rem;
+    padding: 0.1875rem 0.625rem;
+    border-radius: var(--radius-sm);
+    color: var(--text-dim);
+    background: rgba(255, 255, 255, 0.04);
+  }
+  .discard-btn:hover:not(:disabled) { color: var(--bad); background: rgba(238, 85, 68, 0.1); }
+  .discard-btn:disabled { opacity: 0.4; cursor: default; }
 
   .review-actions {
     display: flex;
@@ -886,6 +967,10 @@
   .chip.sev-high { color: var(--sev-high); }
   .chip.sev-medium { color: var(--sev-medium); }
   .chip.sev-low { color: var(--sev-low); }
+  .chip.chip-inline {
+    background: rgba(88, 166, 255, 0.12);
+    color: var(--accent);
+  }
 
   .location {
     font-size: 0.6875rem;

@@ -51,7 +51,10 @@ use crate::util::now_ms;
 mod pr_review;
 mod pr_state;
 
-pub use pr_review::{HEAD_STABLE_MS, NewPrReview, PR_REVIEW_HOLD_AT, PrReviewRound, PrReviewRow};
+pub use pr_review::{
+    ApprovedRound, HEAD_STABLE_MS, InlineState, NewPrReview, POST_GIVE_UP_AT, PR_REVIEW_HOLD_AT,
+    PostDecided, PostDecision, PostableIssue, PrReviewRound, PrReviewRow,
+};
 pub use pr_state::{PrRead, PrSyncPass};
 
 /// A `pr_state` row as the store read it ([`Store::get_pr_state`]).
@@ -6011,10 +6014,11 @@ impl JobStore {
         (id, binding): (i64, i64),
         job_id: Option<i64>,
         range: (&str, &str),
+        merge_base: Option<&str>,
         round: PrReviewRound<'_>,
     ) -> sqlx::Result<i64> {
         self.0
-            .record_pr_review_round((id, binding), job_id, range, round)
+            .record_pr_review_round((id, binding), job_id, range, merge_base, round)
             .await
     }
 
@@ -6154,6 +6158,81 @@ impl AdminStore {
     /// `Store` method of the same name.
     pub async fn end_own_pr_review(&self, id: i64) -> sqlx::Result<bool> {
         self.0.end_own_pr_review(id).await
+    }
+
+    /// Record that round `round_id`'s review is on the forge, with the
+    /// issues it put inline. See the private `Store` method of the same
+    /// name.
+    pub async fn record_pr_review_review_posted(
+        &self,
+        round_id: i64,
+        review_ref: &str,
+        inline: &[i64],
+    ) -> sqlx::Result<()> {
+        self.0
+            .record_pr_review_review_posted(round_id, review_ref, inline)
+            .await
+    }
+
+    /// Record that some of round `round_id`'s inline comments are on the
+    /// forge though its review is not. See the private `Store` method of
+    /// the same name.
+    pub async fn record_pr_review_comments_posted(
+        &self,
+        round_id: i64,
+        inline: &[i64],
+    ) -> sqlx::Result<()> {
+        self.0
+            .record_pr_review_comments_posted(round_id, inline)
+            .await
+    }
+
+    /// Record what reading back round `round_id`'s inline comments found:
+    /// their forge ids, and those gone from the PR. See the private
+    /// `Store` method of the same name.
+    pub async fn record_pr_review_thread_refs(
+        &self,
+        round_id: i64,
+        found: &[(i64, String)],
+        gone: &[i64],
+    ) -> sqlx::Result<()> {
+        self.0
+            .record_pr_review_thread_refs(round_id, found, gone)
+            .await
+    }
+
+    /// Record round `round_id` as posted, its inline comments' ids read
+    /// back. See the private `Store` method of the same name.
+    pub async fn record_pr_review_round_posted(&self, round_id: i64) -> sqlx::Result<()> {
+        self.0.record_pr_review_round_posted(round_id).await
+    }
+
+    /// Count one failed post of round `round_id`. See the private `Store`
+    /// method of the same name.
+    pub async fn record_pr_review_post_failure(
+        &self,
+        round_id: i64,
+        why: &str,
+    ) -> sqlx::Result<i64> {
+        self.0.record_pr_review_post_failure(round_id, why).await
+    }
+
+    /// Record that a post of review `id` may leave drafts of hunter's on
+    /// the PR. See the private `Store` method of the same name.
+    pub async fn mark_pr_review_drafts(&self, id: i64) -> sqlx::Result<()> {
+        self.0.mark_pr_review_drafts(id).await
+    }
+
+    /// Record that a post is sending round `round_id`'s review. See the
+    /// private `Store` method of the same name.
+    pub async fn mark_pr_review_sent(&self, round_id: i64) -> sqlx::Result<()> {
+        self.0.mark_pr_review_sent(round_id).await
+    }
+
+    /// Record that no draft of hunter's is left on review `id`'s PR. See
+    /// the private `Store` method of the same name.
+    pub async fn clear_pr_review_drafts(&self, id: i64) -> sqlx::Result<()> {
+        self.0.clear_pr_review_drafts(id).await
     }
 }
 
