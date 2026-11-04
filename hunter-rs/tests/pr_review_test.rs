@@ -1,7 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Reviews of PRs hunter did not open (migration 035, future.md §8.8):
 //! when a round is due, where the tier sits, what a round records, how a
-//! failing review is held and released, and the PR sync's refresh.
+//! failing review is held and released, the request's trust check, and the
+//! PR sync's refresh.
 //!
 //! Executor tests use the `runner_harvest_test` scaffolding: a real repo
 //! with a bare origin (the PR head pushed as `refs/pull/7/head`), a scripted
@@ -12,15 +13,19 @@ mod support;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
 use hunter::config::Config;
 use hunter::domain::{ForgeName, JobKind, PrJobKind, PrReviewState};
 use hunter::scheduler::{Candidate, pick_next, run_cycle};
+use hunter::server::{AppState, router};
 use hunter::store::{
     FindingInsert, HEAD_STABLE_MS, NewPrReview, PR_REVIEW_HOLD_AT, PR_REVIEW_RETRY_MS,
     PrReviewRound, Store, Trust,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use support::{FakeBins, GitRepo, ScriptedBackend, TempDir, fresh_store, git};
+use tower::util::ServiceExt;
 
 const REPO_URL: &str = "https://github.com/acme/widget";
 
@@ -135,6 +140,11 @@ fn gh(bins: &FakeBins, f: &Fixture, push: bool) {
 const FORK: Option<&str> = Some("outsider");
 
 fn set_view(f: &Fixture, state: &str, head: &str, author: &str) {
+    set_fork_view(f, state, (head, author), FORK.unwrap());
+}
+
+/// [`set_view`] of a PR whose head is in `owner`'s fork.
+fn set_fork_view(f: &Fixture, state: &str, (head, author): (&str, &str), owner: &str) {
     let view = json!({
         "state": state,
         "headRefOid": head,
@@ -144,26 +154,36 @@ fn set_view(f: &Fixture, state: &str, head: &str, author: &str) {
         "title": "make the widget faster",
         "body": "it is faster now",
         "isCrossRepository": true,
-        "headRepositoryOwner": { "login": FORK.unwrap() },
+        "headRepositoryOwner": { "login": owner },
     });
     std::fs::write(f.dir.join("view.json"), view.to_string()).unwrap();
+}
+
+/// A request of PR #7 at `head`, as [`request`] records it: from the
+/// author's fork, both trusted.
+fn new_review(head: &str) -> NewPrReview<'_> {
+    NewPrReview {
+        repo_id: 0,
+        pr_number: 7,
+        repo_url: REPO_URL,
+        title: "make the widget faster",
+        author: "outsider",
+        base_ref: "main",
+        cross_repo: true,
+        head_sha: head,
+        watch: true,
+        head_owner: FORK,
+        trust: Some(Trust::default()),
+        requested_by: "tester",
+    }
 }
 
 async fn request(f: &Fixture, head: &str, watch: bool) -> i64 {
     f.store
         .request_pr_review(&NewPrReview {
             repo_id: f.rid,
-            pr_number: 7,
-            repo_url: REPO_URL,
-            title: "make the widget faster",
-            author: "outsider",
-            base_ref: "main",
-            cross_repo: true,
-            head_sha: head,
             watch,
-            head_owner: FORK,
-            trust: Some(Trust::default()),
-            requested_by: "tester",
+            ..new_review(head)
         })
         .await
         .unwrap()
@@ -172,6 +192,16 @@ async fn request(f: &Fixture, head: &str, watch: bool) -> i64 {
 
 fn due_ids(rows: &[hunter::store::PrReviewRow]) -> Vec<i64> {
     rows.iter().map(|r| r.id).collect()
+}
+
+/// The messages of the events of `kind` logged so far, oldest first.
+async fn events(f: &Fixture, kind: &str) -> Vec<String> {
+    let mut all = f.store.recent_events(10_000).await.unwrap();
+    all.reverse();
+    all.into_iter()
+        .filter(|e| e.kind == kind)
+        .map(|e| e.message)
+        .collect()
 }
 
 /// The first round is due at once; afterwards only a watched review with a
@@ -969,17 +999,8 @@ async fn a_rebound_review_starts_afresh() {
     f.store
         .request_pr_review(&NewPrReview {
             repo_id: f.rid,
-            pr_number: 7,
             repo_url: moved,
-            title: "make the widget faster",
-            author: "outsider",
-            base_ref: "main",
-            cross_repo: false,
-            head_sha: "bbb",
-            watch: true,
-            head_owner: None,
-            trust: Some(Trust::default()),
-            requested_by: "tester",
+            ..new_review("bbb")
         })
         .await
         .unwrap();
@@ -1352,13 +1373,7 @@ async fn a_reviewer_stopped_by_its_cap_keeps_the_issues_it_wrote() {
         (review.failures, review.last_reviewed_sha.as_deref()),
         (0, Some(head.as_str()))
     );
-    let mut logged = f.store.recent_events(10_000).await.unwrap();
-    logged.reverse();
-    let logged: Vec<String> = logged
-        .into_iter()
-        .filter(|e| e.kind == "pr_review")
-        .map(|e| e.message)
-        .collect();
+    let logged = events(&f, "pr_review").await;
     let rounds: Vec<&String> = logged
         .iter()
         .filter(|m| m.contains("stopped partway") || m.contains(": reviewed "))
@@ -1723,4 +1738,1250 @@ async fn the_sync_ends_a_review_whose_pr_merged() {
             .unwrap()
             .is_empty()
     );
+}
+
+fn app_state(f: &Fixture) -> AppState {
+    AppState {
+        store: Arc::new(f.store.clone()),
+        config: Arc::new(f.cfg.clone()),
+        backend: Arc::new(hunter::backend::NullBackend),
+        repo_notes: Arc::new(tokio::sync::Mutex::new(())),
+        scheduler: hunter::server::SchedulerHandle::default(),
+    }
+}
+
+async fn post(state: &AppState, path: &str, body: Value) -> (StatusCode, Value) {
+    let cookie = support::auth_cookie(&state.store).await;
+    let response = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(axum::http::header::COOKIE, cookie.as_str())
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+async fn get(state: &AppState, path: &str) -> (StatusCode, Value) {
+    let cookie = support::auth_cookie(&state.store).await;
+    let response = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri(path)
+                .header(axum::http::header::COOKIE, cookie.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+/// An author who cannot push needs the requester's vouch: without it the
+/// request answers 409 `needs_vouch` and records nothing; with it the
+/// review is recorded with the vouched author. A trusted author needs none.
+/// Holding a configured review bot's login is no trust: a human may hold
+/// that name too.
+#[tokio::test]
+async fn requesting_a_review_of_an_untrusted_author_needs_a_vouch() {
+    let bins = FakeBins::acquire("prr-vouch");
+    let mut f = fixture("prr-vouch").await;
+    f.cfg.review_bots = hunter::forge::ReviewBots::new(["outsider"]);
+    gh(&bins, &f, false);
+    set_view(&f, "OPEN", "aaa", "outsider");
+    let state = app_state(&f);
+    let url = "https://github.com/acme/widget/pull/7";
+
+    let (status, body) = post(
+        &state,
+        "/api/pr-review",
+        json!({ "repo_id": f.rid, "pr": url, "watch": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["needs_vouch"], json!(true));
+    assert_eq!(body["author"], json!("outsider"));
+    assert_eq!(body["cross_repo"], json!(true));
+    assert_eq!(
+        body["vouch_for"],
+        json!(["outsider"]),
+        "the author's own fork: one vouch"
+    );
+    assert!(f.store.list_pr_reviews().await.unwrap().is_empty());
+
+    let (status, body) = post(
+        &state,
+        "/api/pr-review",
+        json!({ "repo_id": f.rid, "pr": url, "watch": true, "vouch": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id = body["id"].as_i64().unwrap();
+    let review = f.store.get_pr_review(id).await.unwrap().unwrap();
+    assert_eq!(review.vouched_author.as_deref(), Some("outsider"));
+    assert_eq!(review.requested_by, "tester");
+    assert_eq!(review.head_sha.as_deref(), Some("aaa"));
+
+    // A trusted author: PR #8 from their own fork by someone who can push.
+    gh(&bins, &f, true);
+    set_fork_view(&f, "OPEN", ("ccc", "maintainer"), "maintainer");
+    let (status, body) = post(
+        &state,
+        "/api/pr-review",
+        json!({ "repo_id": f.rid, "pr": "8", "watch": false }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let review = f
+        .store
+        .get_pr_review(body["id"].as_i64().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(review.vouched_author, None);
+    assert!(!review.watch);
+}
+
+/// A pasted MR URL names its repo by host and path: the same path on
+/// another GitLab (a mirror) is another repo, whose !7 is another MR.
+#[tokio::test]
+async fn a_pasted_url_of_another_gitlab_is_refused() {
+    let bins = FakeBins::acquire("prr-gl-host");
+    bins.script(
+        "glab",
+        "echo 'glab: 502 Bad Gateway (HTTP 502)' >&2; exit 1",
+    );
+    let f = fixture("prr-gl-host").await;
+    let rid = f
+        .store
+        .add_repo(
+            "gl-widget",
+            "https://gitlab.com/acme/widget",
+            &f.dir.subdir("gl-repos"),
+            "main",
+            ForgeName::Gitlab,
+        )
+        .await
+        .unwrap();
+    let state = app_state(&f);
+    let ask = |url: &'static str| {
+        let state = state.clone();
+        async move {
+            post(
+                &state,
+                "/api/pr-review",
+                json!({ "repo_id": rid, "pr": url, "watch": true }),
+            )
+            .await
+        }
+    };
+
+    let (status, body) = ask("https://gitlab.example.org/acme/widget/-/merge_requests/7").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.to_string().contains("is not a PR of"), "{body}");
+    let (status, body) = ask("https://GitLab.com/acme/widget/-/merge_requests/7").await;
+    assert!(
+        !body.to_string().contains("is not a PR of"),
+        "its own host: {status} {body}"
+    );
+    assert!(f.store.list_pr_reviews().await.unwrap().is_empty());
+}
+
+/// GitLab sends `null` for any field it has no value for: an MR nobody
+/// described has `"description": null`, a fresh one a `null` `sha` and
+/// `diff_refs` shas. Such an MR is listed among the repo's open MRs beside
+/// the others, can be requested, and its review is followed by the sync to
+/// its end; one with no head commit yet is recorded with no head, which
+/// makes no round due until a read finds one.
+#[tokio::test]
+async fn a_gitlab_mr_with_null_fields_is_reviewable() {
+    use hunter::forge::Forge as _;
+    let bins = FakeBins::acquire("prr-gl-null");
+    let f = fixture("prr-gl-null").await;
+    let head = "a".repeat(40);
+    let mr = |iid: i64, sha: &Value, state: &str| {
+        json!({
+            "iid": iid, "state": state, "sha": sha, "title": "t", "description": null,
+            "source_branch": "feature", "target_branch": "main",
+            "author": { "id": 5, "username": "nulldesc" },
+            "source_project_id": 1, "target_project_id": 1, "draft": false,
+            "web_url": format!("https://gitlab.com/acme/widget/-/merge_requests/{iid}"),
+            "detailed_merge_status": null, "merge_status": null, "updated_at": null,
+            "head_pipeline": null, "pipeline": null,
+            "diff_refs": { "base_sha": null, "start_sha": null, "head_sha": sha },
+        })
+    };
+    let (seven, eight, list) = (
+        f.dir.join("mr7.json"),
+        f.dir.join("mr8.json"),
+        f.dir.join("mrs.json"),
+    );
+    let write = |path: &Path, v: &Value| std::fs::write(path, v.to_string()).unwrap();
+    write(&seven, &mr(7, &json!(head), "opened"));
+    write(&eight, &mr(8, &Value::Null, "opened"));
+    write(
+        &list,
+        &json!([mr(7, &json!(head), "opened"), mr(8, &Value::Null, "opened")]),
+    );
+    bins.script(
+        "glab",
+        &format!(
+            r#"case "$2" in
+  */merge_requests/7) cat '{seven}';;
+  */merge_requests/8) cat '{eight}';;
+  */merge_requests\?state=opened*) cat '{list}';;
+  users\?username=nulldesc) echo '[{{"id":5,"username":"nulldesc"}}]';;
+  */members/all/5) echo '{{"access_level":30}}';;
+  *) echo "unexpected glab $*" >&2; exit 1;;
+esac"#,
+            seven = seven.display(),
+            eight = eight.display(),
+            list = list.display(),
+        ),
+    );
+    let url = "https://gitlab.com/acme/widget";
+    let rid = f
+        .store
+        .add_repo(
+            "gl-widget",
+            url,
+            &f.dir.subdir("gl-repos"),
+            "main",
+            ForgeName::Gitlab,
+        )
+        .await
+        .unwrap();
+
+    let open = hunter::forge::GitLabForge.list_open_prs(url).unwrap();
+    let numbers: Vec<i64> = open.iter().map(|p| p.number).collect();
+    assert_eq!(numbers, [7, 8]);
+
+    let state = app_state(&f);
+    let ask = |n: i64| {
+        let state = state.clone();
+        async move {
+            post(
+                &state,
+                "/api/pr-review",
+                json!({ "repo_id": rid, "pr": format!("{url}/-/merge_requests/{n}"), "watch": true }),
+            )
+            .await
+        }
+    };
+    let (status, body) = ask(7).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id = body["id"].as_i64().unwrap();
+    assert_eq!(
+        f.store.get_pr_review(id).await.unwrap().unwrap().head_sha,
+        Some(head.clone())
+    );
+    let (status, body) = ask(8).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let fresh = f
+        .store
+        .get_pr_review(body["id"].as_i64().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fresh.head_sha, None, "no head commit yet");
+    let due = f
+        .store
+        .list_due_pr_reviews(hunter::util::now_ms())
+        .await
+        .unwrap();
+    assert_eq!(due_ids(&due), vec![id], "the fresh MR is due for nothing");
+
+    write(&seven, &mr(7, &json!(head), "merged"));
+    let admin = support::admin(&f.store);
+    hunter::scheduler::sync_pr_reviews(admin.store(), || false).await;
+    assert_eq!(
+        f.store.get_pr_review(id).await.unwrap().unwrap().state,
+        PrReviewState::Merged
+    );
+}
+
+/// A GitLab MR is requested like a GitHub PR: one from a fork's project is
+/// cross-repo, and an author who is no developer of the project needs a
+/// vouch. The repo's open MRs say which come from a fork, and the reviews
+/// list links the MR.
+#[tokio::test]
+async fn a_gitlab_request_reads_the_mr_and_whether_its_author_can_push() {
+    let bins = FakeBins::acquire("prr-gl-request");
+    let f = fixture("prr-gl-request").await;
+    let mr = |iid: i64, source: i64| {
+        json!({
+            "iid": iid, "state": "opened", "sha": "a".repeat(40), "title": format!("mr {iid}"),
+            "description": "d", "source_branch": "feature", "target_branch": "main",
+            "author": { "id": 5, "username": "guest" },
+            "source_project_id": source, "target_project_id": 1, "draft": false,
+            "web_url": format!("https://gitlab.com/acme/widget/-/merge_requests/{iid}"),
+        })
+    };
+    let (seven, list) = (f.dir.join("mr7.json"), f.dir.join("mrs.json"));
+    std::fs::write(&seven, mr(7, 2).to_string()).unwrap();
+    std::fs::write(&list, json!([mr(7, 2), mr(8, 1)]).to_string()).unwrap();
+    bins.script(
+        "glab",
+        &format!(
+            r#"case "$2" in
+  */merge_requests/7) cat '{seven}';;
+  */merge_requests\?state=opened*) cat '{list}';;
+  projects/2) echo '{{"id":2,"namespace":{{"full_path":"guest","kind":"user"}}}}';;
+  users\?username=guest) echo '[{{"id":5,"username":"guest"}}]';;
+  */members/all/5) echo '{{"access_level":10}}';;
+  *) echo "unexpected glab $*" >&2; exit 1;;
+esac"#,
+            seven = seven.display(),
+            list = list.display(),
+        ),
+    );
+    let rid = f
+        .store
+        .add_repo(
+            "gl-widget",
+            "https://gitlab.com/acme/widget",
+            &f.dir.subdir("gl-repos"),
+            "main",
+            ForgeName::Gitlab,
+        )
+        .await
+        .unwrap();
+    let state = app_state(&f);
+
+    let (status, body) = get(&state, &format!("/api/repo/open-prs?id={rid}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let forks: Vec<(i64, bool)> = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            (
+                p["number"].as_i64().unwrap(),
+                p["cross_repo"] == json!(true),
+            )
+        })
+        .collect();
+    assert_eq!(forks, [(7, true), (8, false)]);
+
+    let ask = |vouch: bool| {
+        let state = state.clone();
+        async move {
+            post(
+                &state,
+                "/api/pr-review",
+                json!({ "repo_id": rid, "pr": 7, "watch": true, "vouch": vouch }),
+            )
+            .await
+        }
+    };
+    let (status, body) = ask(false).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        (&body["needs_vouch"], &body["cross_repo"]),
+        (&json!(true), &json!(true))
+    );
+    let (status, body) = ask(true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let review = f
+        .store
+        .get_pr_review(body["id"].as_i64().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(review.cross_repo);
+    assert_eq!(review.vouched_author.as_deref(), Some("guest"));
+
+    let (status, body) = get(&state, "/api/pr-reviews").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body[0]["pr_url"],
+        json!("https://gitlab.com/acme/widget/-/merge_requests/7")
+    );
+}
+
+/// `gh` answering `pr view` from `view.json` in the fixture and the
+/// push-permission lookup true for `maintainer` alone.
+fn gh_maintainer_pushes(bins: &FakeBins, f: &Fixture) {
+    let view = f.dir.join("view.json");
+    bins.script(
+        "gh",
+        &format!(
+            "if [ \"$1\" = api ]; then\n  case \"$2\" in\n    \
+             */collaborators/maintainer/*) echo true;;\n    *) echo false;;\n  esac\n  \
+             exit 0\nfi\ncat '{}'\nexit 0",
+            view.display()
+        ),
+    );
+}
+
+/// A round runs the code of the repository the PR's head lives in, so the
+/// fork's owner is decided about as the author is: a maintainer's PR from
+/// a stranger's fork needs a vouch for the stranger, which is recorded
+/// with the review. A fork that changes hands since (its owner transferred
+/// it) stops the review: the round that finds it runs no reviewer, and no
+/// round is due until a request decides about the new owner.
+#[tokio::test]
+async fn a_pr_from_somebody_elses_fork_needs_a_vouch_for_its_owner() {
+    let bins = FakeBins::acquire("prr-fork-owner");
+    let f = fixture("prr-fork-owner").await;
+    gh_maintainer_pushes(&bins, &f);
+    let head = rev(&f.origin_work, "HEAD");
+    set_fork_view(&f, "OPEN", (&head, "maintainer"), "stranger");
+    let state = app_state(&f);
+    let ask = |vouch: bool| {
+        let state = state.clone();
+        async move {
+            post(
+                &state,
+                "/api/pr-review",
+                json!({ "repo_id": f.rid, "pr": 7, "watch": true, "vouch": vouch }),
+            )
+            .await
+        }
+    };
+    let due = || async {
+        due_ids(
+            &f.store
+                .list_due_pr_reviews(hunter::util::now_ms())
+                .await
+                .unwrap(),
+        )
+    };
+
+    let (status, body) = ask(false).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        (
+            &body["needs_vouch"],
+            &body["vouch_for"],
+            &body["head_owner"]
+        ),
+        (&json!(true), &json!(["stranger"]), &json!("stranger")),
+        "the author can push; the fork's owner cannot"
+    );
+    assert!(
+        body["error"].as_str().unwrap().contains("stranger's fork"),
+        "{body}"
+    );
+    assert!(f.store.list_pr_reviews().await.unwrap().is_empty());
+    let (status, body) = ask(true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id = body["id"].as_i64().unwrap();
+    let review = f.store.get_pr_review(id).await.unwrap().unwrap();
+    assert_eq!(
+        (
+            review.vouched_author.as_deref(),
+            review.vouched_head_owner.as_deref(),
+            review.decided_head_owner.as_deref(),
+            review.head_owner.as_deref(),
+        ),
+        (None, Some("stranger"), Some("stranger"), Some("stranger"))
+    );
+    assert_eq!(due().await, vec![id]);
+
+    // The stranger transfers the fork to a newcomer before the round runs.
+    set_fork_view(&f, "OPEN", (&head, "maintainer"), "newcomer");
+    let backend = reporting();
+    let summary = run_cycle(&mut support::jobs(&f.store), &f.cfg, &backend, None).await;
+    assert!(backend.runs().is_empty(), "no reviewer ran: {summary:?}");
+    assert!(
+        summary
+            .skipped
+            .as_deref()
+            .is_some_and(|why| why.contains("newcomer's fork")),
+        "{summary:?}"
+    );
+    let review = f.store.get_pr_review(id).await.unwrap().unwrap();
+    assert!(review.fork_changed_hands(), "{review:?}");
+    assert!(due().await.is_empty(), "nobody decided about the newcomer");
+    let (_, listed) = get(&state, "/api/pr-reviews").await;
+    assert_eq!(listed[0]["fork_changed_hands"], json!(true), "{listed}");
+
+    // A request decides about the newcomer afresh.
+    let (status, body) = ask(false).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["vouch_for"], json!(["newcomer"]));
+    let (status, body) = ask(true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let review = f.store.get_pr_review(id).await.unwrap().unwrap();
+    assert_eq!(
+        (
+            review.decided_head_owner.as_deref(),
+            review.vouched_head_owner.as_deref()
+        ),
+        (Some("newcomer"), Some("newcomer"))
+    );
+    assert!(!review.fork_changed_hands());
+    assert_eq!(due().await, vec![id]);
+
+    // The newcomer's own PR from their fork needs one vouch, for them as
+    // its author.
+    set_fork_view(&f, "OPEN", (&head, "newcomer"), "newcomer");
+    let (status, body) = post(
+        &state,
+        "/api/pr-review",
+        json!({ "repo_id": f.rid, "pr": 8, "watch": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["vouch_for"], json!(["newcomer"]));
+}
+
+/// What a request decided is recorded and logged: a fork its author owns
+/// is decided about as the author, vouched for once, and the request's
+/// event names whom it vouched for. The PR review duty's read of a fork
+/// as decided says nothing; the read that finds it changed hands says so,
+/// once.
+#[tokio::test]
+async fn a_requests_vouches_are_recorded_and_a_forks_new_owner_logged_once() {
+    let bins = FakeBins::acquire("prr-fork-vouches");
+    let f = fixture("prr-fork-vouches").await;
+    gh_maintainer_pushes(&bins, &f);
+    let head = rev(&f.origin_work, "HEAD");
+    let state = app_state(&f);
+    let ask = |pr: i64| {
+        let state = state.clone();
+        async move {
+            let req = json!({ "repo_id": f.rid, "pr": pr, "watch": true, "vouch": true });
+            let (status, body) = post(&state, "/api/pr-review", req).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            body["id"].as_i64().unwrap()
+        }
+    };
+    set_fork_view(&f, "OPEN", (&head, "maintainer"), "stranger");
+    ask(7).await;
+    set_fork_view(&f, "OPEN", (&head, "newcomer"), "newcomer");
+    let own_fork = f.store.get_pr_review(ask(8).await).await.unwrap();
+    let own_fork = own_fork.unwrap();
+    assert_eq!(
+        (
+            own_fork.vouched_author.as_deref(),
+            own_fork.vouched_head_owner.as_deref(),
+            own_fork.decided_head_owner.as_deref(),
+        ),
+        (Some("newcomer"), None, Some("newcomer")),
+        "vouched for once, as the author"
+    );
+    let requests: Vec<String> = events(&f, "pr_review")
+        .await
+        .into_iter()
+        .filter(|m| m.starts_with("review of "))
+        .collect();
+    assert_eq!(
+        requests,
+        [
+            "review of widget PR #7 requested (vouched for stranger)",
+            "review of widget PR #8 requested (vouched for newcomer)",
+        ]
+    );
+
+    let admin = support::admin(&f.store);
+    let sync = || hunter::scheduler::sync_pr_reviews(admin.store(), || false);
+    let said = || async {
+        events(&f, "pr_review")
+            .await
+            .into_iter()
+            .filter(|m| m.starts_with("pr_review widget #7:") && m.contains("nobody decided"))
+            .count()
+    };
+    set_fork_view(&f, "OPEN", (&head, "maintainer"), "stranger");
+    sync().await;
+    assert_eq!(said().await, 0, "the fork #7 decided about");
+    set_fork_view(&f, "OPEN", (&head, "maintainer"), "third");
+    sync().await;
+    assert_eq!(said().await, 1, "the fork changed hands");
+    sync().await;
+    assert_eq!(said().await, 1, "logged once");
+}
+
+/// A GitLab MR's fork is its source project, owned by the project's
+/// namespace: a developer's MR from a stranger's project needs a vouch for
+/// the stranger. A group's namespace is no user, so its path is never
+/// looked up as a username (`forks/sub` is not user `forkssub`): only a
+/// vouch lets its code run.
+#[tokio::test]
+async fn a_gitlab_mr_from_somebody_elses_project_needs_a_vouch_for_its_namespace() {
+    let bins = FakeBins::acquire("prr-gl-fork-owner");
+    let f = fixture("prr-gl-fork-owner").await;
+    let mr = |iid: i64, source: i64| {
+        json!({
+            "iid": iid, "state": "opened", "sha": "a".repeat(40), "title": format!("mr {iid}"),
+            "description": "d", "source_branch": "feature", "target_branch": "main",
+            "author": { "id": 6, "username": "dev" },
+            "source_project_id": source, "target_project_id": 1, "draft": false,
+            "web_url": format!("https://gitlab.com/acme/widget/-/merge_requests/{iid}"),
+        })
+    };
+    let (seven, eight) = (f.dir.join("mr7.json"), f.dir.join("mr8.json"));
+    std::fs::write(&seven, mr(7, 2).to_string()).unwrap();
+    std::fs::write(&eight, mr(8, 3).to_string()).unwrap();
+    bins.script(
+        "glab",
+        &format!(
+            r#"case "$2" in
+  */merge_requests/7) cat '{seven}';;
+  */merge_requests/8) cat '{eight}';;
+  projects/2) echo '{{"id":2,"namespace":{{"full_path":"stranger","kind":"user"}}}}';;
+  projects/3) echo '{{"id":3,"namespace":{{"full_path":"forks/sub","kind":"group"}}}}';;
+  users\?username=dev) echo '[{{"id":6,"username":"dev"}}]';;
+  users\?username=stranger) echo '[]';;
+  */members/all/6) echo '{{"access_level":30}}';;
+  *) echo "unexpected glab $*" >&2; exit 1;;
+esac"#,
+            seven = seven.display(),
+            eight = eight.display(),
+        ),
+    );
+    let rid = f
+        .store
+        .add_repo(
+            "gl-widget",
+            "https://gitlab.com/acme/widget",
+            &f.dir.subdir("gl-repos"),
+            "main",
+            ForgeName::Gitlab,
+        )
+        .await
+        .unwrap();
+    let state = app_state(&f);
+    let ask = |pr: i64, vouch: bool| {
+        let state = state.clone();
+        async move {
+            post(
+                &state,
+                "/api/pr-review",
+                json!({ "repo_id": rid, "pr": pr, "watch": true, "vouch": vouch }),
+            )
+            .await
+        }
+    };
+
+    for (pr, owner) in [(7, "stranger"), (8, "forks/sub")] {
+        let (status, body) = ask(pr, false).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            (&body["vouch_for"], &body["head_owner"]),
+            (&json!([owner]), &json!(owner)),
+            "the developer can push; {owner} cannot"
+        );
+        let (status, body) = ask(pr, true).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let review = f
+            .store
+            .get_pr_review(body["id"].as_i64().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                review.vouched_author.as_deref(),
+                review.vouched_head_owner.as_deref()
+            ),
+            (None, Some(owner))
+        );
+    }
+}
+
+/// The Reviews page lists every review with a link to its PR, and a
+/// repo's open PRs come from its forge, each with its own review, if one
+/// was requested.
+#[tokio::test]
+async fn the_reviews_api_lists_reviews_and_a_repos_open_prs() {
+    let bins = FakeBins::acquire("prr-api-reviews");
+    let f = fixture("prr-api-reviews").await;
+    let list = json!([
+        { "number": 7, "title": "make the widget faster", "author": { "login": "outsider" },
+          "isDraft": false, "isCrossRepository": true, "url": "https://github.com/acme/widget/pull/7" },
+        { "number": 9, "title": "a draft", "author": { "login": "maintainer" },
+          "isDraft": true, "isCrossRepository": false, "url": "https://github.com/acme/widget/pull/9" },
+    ]);
+    std::fs::write(f.dir.join("prs.json"), list.to_string()).unwrap();
+    bins.script(
+        "gh",
+        &format!(
+            "case \"$*\" in\n\
+             'pr list -R acme/widget '*) cat '{}';;\n\
+             *) echo \"unexpected gh $*\" >&2; exit 1;;\n\
+             esac",
+            f.dir.join("prs.json").display()
+        ),
+    );
+    let gadget = f
+        .store
+        .add_repo(
+            "gadget",
+            "https://github.com/acme/gadget",
+            &f.dir.subdir("gadget-repos"),
+            "main",
+            ForgeName::Github,
+        )
+        .await
+        .unwrap();
+    let other = f
+        .store
+        .request_pr_review(&NewPrReview {
+            repo_id: gadget,
+            pr_number: 9,
+            repo_url: "https://github.com/acme/gadget",
+            ..new_review("ccc")
+        })
+        .await
+        .unwrap()
+        .id;
+    let id = request(&f, "aaa", true).await;
+    let state = app_state(&f);
+
+    let (status, body) = get(&state, "/api/pr-reviews").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut urls: Vec<(i64, String)> = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["id"].as_i64().unwrap(),
+                r["pr_url"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    urls.sort_unstable();
+    assert_eq!(
+        urls,
+        [
+            (other, "https://github.com/acme/gadget/pull/9".to_owned()),
+            (id, "https://github.com/acme/widget/pull/7".to_owned()),
+        ]
+    );
+
+    let (status, body) = get(&state, &format!("/api/repo/open-prs?id={}", f.rid)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let open: Vec<(i64, bool, Option<i64>)> = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            (
+                p["number"].as_i64().unwrap(),
+                p["cross_repo"] == json!(true),
+                p["review_id"].as_i64(),
+            )
+        })
+        .collect();
+    assert_eq!(open, [(7, true, Some(id)), (9, false, None)]);
+}
+
+/// A PR hunter opened for a finding is its own work, never reviewed.
+#[tokio::test]
+async fn hunters_own_pr_cannot_be_reviewed() {
+    let f = fixture("prr-own").await;
+    let fid = pr_finding(&f, "w:own", 7).await;
+    f.store.mark_pr_closed(fid, 7, 1).await.unwrap();
+    let state = app_state(&f);
+
+    let (status, body) = post(
+        &state,
+        "/api/pr-review",
+        json!({ "repo_id": f.rid, "pr": 7, "watch": true }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body.get("needs_vouch"), None);
+    assert!(f.store.list_pr_reviews().await.unwrap().is_empty());
+}
+
+/// A PR hunter just opened is its own from that moment: the finding's
+/// `pr_url` names it before any PR sync recorded its number. A request
+/// is refused, and a review that exists already (requested before hunter
+/// opened the PR) ends `own` at its next round or PR sync, unrun and
+/// unread.
+#[tokio::test]
+async fn a_pr_hunter_just_opened_is_its_own_before_any_sync() {
+    let bins = FakeBins::acquire("prr-own-shipped");
+    let f = fixture("prr-own-shipped").await;
+    gh(&bins, &f, true);
+    set_view(&f, "OPEN", "aaa", "outsider");
+    let id = request(&f, "aaa", true).await;
+    pr_finding(&f, "w:own", 7).await;
+    let state = app_state(&f);
+
+    let (status, body) = post(
+        &state,
+        "/api/pr-review",
+        json!({ "repo_id": f.rid, "pr": 7, "watch": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("hunter opened"),
+        "{body}"
+    );
+
+    let backend = reporting();
+    let summary = run_cycle(&mut support::jobs(&f.store), &f.cfg, &backend, None).await;
+    assert!(
+        summary
+            .skipped
+            .as_deref()
+            .is_some_and(|s| s.contains("hunter opened")),
+        "{summary:?}"
+    );
+    assert!(backend.runs().is_empty());
+    let review = f.store.get_pr_review(id).await.unwrap().unwrap();
+    assert_eq!(review.state, PrReviewState::Own);
+    assert!(bins.calls_to("gh").is_empty(), "the PR was never read");
+
+    // The PR sync ends one too, without reading the PR.
+    let other = f
+        .store
+        .request_pr_review(&NewPrReview {
+            repo_id: f.rid,
+            pr_number: 8,
+            ..new_review("aaa")
+        })
+        .await
+        .unwrap()
+        .id;
+    pr_finding(&f, "w:own8", 8).await;
+    let admin = support::admin(&f.store);
+    let read = hunter::scheduler::sync_pr_reviews(admin.store(), || false).await;
+    assert_eq!(read, 0);
+    let review = f.store.get_pr_review(other).await.unwrap().unwrap();
+    assert_eq!(review.state, PrReviewState::Own);
+    assert!(bins.calls_to("gh").is_empty(), "the PR was never read");
+    assert!(
+        f.store
+            .list_due_pr_reviews(hunter::util::now_ms())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let ended: Vec<String> = events(&f, "pr_review")
+        .await
+        .into_iter()
+        .filter(|m| m.contains("review ended"))
+        .collect();
+    assert_eq!(ended.len(), 2, "one event per review ended: {ended:?}");
+    assert!(
+        !admin.store().end_own_pr_review(other).await.unwrap(),
+        "ended already"
+    );
+}
+
+/// A review follows its PR: once the PR's close ended it, a request finds
+/// the PR reopened and reviews it again, at the head it has now and with
+/// the vouch the first request gave. While the PR is still closed the
+/// request is refused, and a merged PR's review has ended for good.
+#[tokio::test]
+async fn a_closed_prs_review_reopens_with_the_pr() {
+    let bins = FakeBins::acquire("prr-reopened-pr");
+    let f = fixture("prr-reopened-pr").await;
+    gh(&bins, &f, false);
+    set_view(&f, "OPEN", "aaa", "outsider");
+    let state = app_state(&f);
+    let ask = |vouch: bool| {
+        let state = state.clone();
+        let rid = f.rid;
+        async move {
+            post(
+                &state,
+                "/api/pr-review",
+                json!({ "repo_id": rid, "pr": 7, "watch": true, "vouch": vouch }),
+            )
+            .await
+        }
+    };
+    let admin = support::admin(&f.store);
+    let sync = || hunter::scheduler::sync_pr_reviews(admin.store(), || false);
+
+    let (status, body) = ask(true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["outcome"], json!("requested"));
+    let id = body["id"].as_i64().unwrap();
+    set_view(&f, "CLOSED", "aaa", "outsider");
+    sync().await;
+    let review = || async { f.store.get_pr_review(id).await.unwrap().unwrap() };
+    assert_eq!(review().await.state, PrReviewState::Closed);
+
+    let (status, body) = ask(false).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(review().await.state, PrReviewState::Closed);
+
+    set_view(&f, "OPEN", "bbb", "outsider");
+    let (status, body) = ask(false).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        (body["id"].as_i64(), &body["outcome"]),
+        (Some(id), &json!("reopened"))
+    );
+    let reopened = review().await;
+    assert_eq!(reopened.state, PrReviewState::Open);
+    assert_eq!(reopened.head_sha.as_deref(), Some("bbb"));
+    assert_eq!(reopened.vouched_author.as_deref(), Some("outsider"));
+    assert_eq!(
+        due_ids(
+            &f.store
+                .list_due_pr_reviews(hunter::util::now_ms())
+                .await
+                .unwrap()
+        ),
+        vec![id]
+    );
+
+    set_view(&f, "MERGED", "bbb", "outsider");
+    sync().await;
+    let (status, body) = ask(false).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().ends_with("it is merged"),
+        "{body}"
+    );
+    assert_eq!(review().await.state, PrReviewState::Merged);
+}
+
+/// `merged` ends a review for good at the URL it is bound to, being a fact
+/// about the PR its number named there. Once the repo's URL changes, the
+/// number names the PR at the new URL: a request rebinds the review like
+/// any moved one, reading that PR and deciding about its author afresh,
+/// and the review is open again -- unless the PR there is itself merged,
+/// which is refused and changes nothing. `own` is no fact about a URL:
+/// hunter's PRs are the repo's, whatever its URL, so a review that ended
+/// `own` stays so and a request is refused before any rebind.
+#[tokio::test]
+async fn a_moved_review_that_ended_is_rebound_by_a_request() {
+    let bins = FakeBins::acquire("prr-ended-moved");
+    let f = fixture("prr-ended-moved").await;
+    gh(&bins, &f, false);
+    set_view(&f, "OPEN", "aaa", "outsider");
+    let state = app_state(&f);
+    let ask = |pr: i64, vouch: bool| {
+        let state = state.clone();
+        let rid = f.rid;
+        async move {
+            post(
+                &state,
+                "/api/pr-review",
+                json!({ "repo_id": rid, "pr": pr, "watch": true, "vouch": vouch }),
+            )
+            .await
+        }
+    };
+    let store = &f.store;
+    let review = |id: i64| async move { store.get_pr_review(id).await.unwrap().unwrap() };
+    let pool = f.pool().await;
+
+    let (status, body) = ask(7, true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let merged = body["id"].as_i64().unwrap();
+    set_view(&f, "MERGED", "aaa", "outsider");
+    let admin = support::admin(&f.store);
+    hunter::scheduler::sync_pr_reviews(admin.store(), || false).await;
+    assert_eq!(review(merged).await.state, PrReviewState::Merged);
+    let (status, body) = ask(7, true).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("ended for good"),
+        "{body}"
+    );
+
+    // Hunter opened PR #8 after its review was requested: the PR sync
+    // ends the review `own`.
+    set_view(&f, "OPEN", "aaa", "outsider");
+    let (status, body) = ask(8, true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let own = body["id"].as_i64().unwrap();
+    pr_finding(&f, "w:own8", 8).await;
+    hunter::scheduler::sync_pr_reviews(admin.store(), || false).await;
+    assert_eq!(review(own).await.state, PrReviewState::Own);
+
+    let moved = "https://github.com/someone-else/widget";
+    sqlx::query("UPDATE repos SET url = ?1 WHERE id = ?2")
+        .bind(moved)
+        .bind(f.rid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // The PR #7 names at the new URL is merged: refused, nothing changes.
+    set_view(&f, "MERGED", "ccc", "outsider");
+    let (status, body) = ask(7, true).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("not open"),
+        "{body}"
+    );
+    let ended = review(merged).await;
+    assert_eq!((ended.state, ended.binding), (PrReviewState::Merged, 1));
+    assert!(ended.repo_moved());
+
+    set_view(&f, "OPEN", "bbb", "outsider");
+    let (status, body) = ask(8, true).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("hunter opened"),
+        "{body}"
+    );
+    let still = review(own).await;
+    assert_eq!((still.state, still.binding), (PrReviewState::Own, 1));
+
+    let (status, body) = ask(7, false).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["needs_vouch"], json!(true), "trust is decided afresh");
+    let (status, body) = ask(7, true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        (body["id"].as_i64(), &body["outcome"]),
+        (Some(merged), &json!("rebound"))
+    );
+    let rebound = review(merged).await;
+    assert_eq!(
+        (rebound.state, rebound.binding),
+        (PrReviewState::Open, 2),
+        "{rebound:?}"
+    );
+    assert!(!rebound.repo_moved());
+    assert_eq!(rebound.bound_url, moved);
+    assert_eq!(rebound.head_sha.as_deref(), Some("bbb"));
+    assert_eq!(rebound.vouched_author.as_deref(), Some("outsider"));
+    assert_eq!(
+        due_ids(
+            &f.store
+                .list_due_pr_reviews(hunter::util::now_ms())
+                .await
+                .unwrap()
+        ),
+        vec![merged]
+    );
+}
+
+/// A request asks for a round at the head the PR has, watched or not, and
+/// so does one that reopens a review the PR's close ended: an unwatched
+/// review whose earlier round reviewed another head is due again, once.
+/// The round that reviews it answers the request, so a later push to the
+/// unwatched PR is not reviewed; and a PR reopened at the head already
+/// reviewed has nothing to review.
+#[tokio::test]
+async fn a_reopened_review_is_due_for_its_new_head_watched_or_not() {
+    let bins = FakeBins::acquire("prr-reopened-unwatched");
+    let f = fixture("prr-reopened-unwatched").await;
+    gh(&bins, &f, false);
+    set_view(&f, "OPEN", "aaa", "outsider");
+    let state = app_state(&f);
+    let ask = || {
+        let state = state.clone();
+        let rid = f.rid;
+        async move {
+            let (status, body) = post(
+                &state,
+                "/api/pr-review",
+                json!({ "repo_id": rid, "pr": 7, "watch": false, "vouch": true }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            (body["id"].as_i64().unwrap(), body["outcome"].clone())
+        }
+    };
+    let admin = support::admin(&f.store);
+    let sync = || hunter::scheduler::sync_pr_reviews(admin.store(), || false);
+    let due = |later: i64| {
+        let store = f.store.clone();
+        async move {
+            let at = hunter::util::now_ms() + later;
+            due_ids(&store.list_due_pr_reviews(at).await.unwrap())
+        }
+    };
+    let jobs = support::scope(&f.store);
+    let reviewed = |id: i64, head: &'static str| {
+        let store = jobs.store();
+        async move {
+            store
+                .record_pr_review_round((id, BINDING), None, ("base", head), PrReviewRound::Ok(&[]))
+                .await
+                .unwrap();
+        }
+    };
+    let settled = hunter::store::HEAD_STABLE_MS + 1;
+
+    let (id, outcome) = ask().await;
+    assert_eq!(outcome, json!("requested"));
+    assert_eq!(due(0).await, vec![id], "the request's round");
+    reviewed(id, "aaa").await;
+    assert!(due(settled).await.is_empty(), "unwatched: one round");
+
+    set_view(&f, "CLOSED", "aaa", "outsider");
+    sync().await;
+    set_view(&f, "OPEN", "bbb", "outsider");
+    assert_eq!(ask().await, (id, json!("reopened")));
+    assert_eq!(
+        due(0).await,
+        vec![id],
+        "reopened at a new head: due at once"
+    );
+    reviewed(id, "bbb").await;
+    assert!(due(settled).await.is_empty(), "the round answered it");
+
+    set_view(&f, "OPEN", "ccc", "outsider");
+    sync().await;
+    assert!(due(settled).await.is_empty(), "a push to an unwatched PR");
+
+    set_view(&f, "CLOSED", "bbb", "outsider");
+    sync().await;
+    set_view(&f, "OPEN", "bbb", "outsider");
+    assert_eq!(ask().await, (id, json!("reopened")));
+    assert!(
+        due(settled).await.is_empty(),
+        "reopened at the reviewed head"
+    );
+}
+
+/// Requesting a review that already follows the open PR asks for a review
+/// of the head the PR has now, as a request that reopens one does, watched
+/// or not: the request reads the PR and records its head, which is due at
+/// once, hold or no hold, unless a round already reviewed it (the request
+/// then only sets the toggles). The reviews API says when each review's
+/// round is due, by the rule the scheduler picks by: at once after such a
+/// request, never while the repo's URL is not the one the review is bound
+/// to.
+#[tokio::test]
+async fn requesting_an_open_review_again_reviews_its_new_head() {
+    let bins = FakeBins::acquire("prr-rerequested");
+    let f = fixture("prr-rerequested").await;
+    gh(&bins, &f, false);
+    set_view(&f, "OPEN", "aaa", "outsider");
+    let state = app_state(&f);
+    let ask = || {
+        let state = state.clone();
+        let rid = f.rid;
+        async move {
+            let (status, body) = post(
+                &state,
+                "/api/pr-review",
+                json!({ "repo_id": rid, "pr": 7, "watch": false, "vouch": true }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            (body["id"].as_i64().unwrap(), body["outcome"].clone())
+        }
+    };
+    let listed_due_at = || {
+        let state = state.clone();
+        async move {
+            let (status, body) = get(&state, "/api/pr-reviews").await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            body[0]["due_at"].clone()
+        }
+    };
+    let due = || async {
+        due_ids(
+            &f.store
+                .list_due_pr_reviews(hunter::util::now_ms())
+                .await
+                .unwrap(),
+        )
+    };
+    let pool = f.pool().await;
+    let sql = |query: &'static str, id: i64| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(query).bind(id).execute(&pool).await.unwrap();
+        }
+    };
+
+    let (id, outcome) = ask().await;
+    assert_eq!(outcome, json!("requested"));
+    // The request's round reviews the head it asked for.
+    sql(
+        "UPDATE pr_reviews SET last_reviewed_sha = head_sha, round_requested_at = NULL, \
+             requested_head_sha = NULL WHERE id = ?1",
+        id,
+    )
+    .await;
+    assert_eq!(
+        ask().await,
+        (id, json!("updated")),
+        "a round already reviewed the head"
+    );
+    assert!(due().await.is_empty(), "nothing to review");
+    assert_eq!(listed_due_at().await, Value::Null);
+
+    set_view(&f, "OPEN", "bbb", "outsider");
+    sql(
+        "UPDATE pr_reviews SET failures = 3, held = 1 WHERE id = ?1",
+        id,
+    )
+    .await;
+    assert_eq!(ask().await, (id, json!("requested")), "a new head");
+    let review = f.store.get_pr_review(id).await.unwrap().unwrap();
+    assert_eq!(
+        (
+            review.head_sha.as_deref(),
+            review.requested_head_sha.as_deref(),
+            review.held,
+            review.failures
+        ),
+        (Some("bbb"), Some("bbb"), false, 0)
+    );
+    assert_eq!(due().await, vec![id], "due at once, unwatched");
+    assert_eq!(listed_due_at().await, json!(0));
+
+    sql(
+        "UPDATE repos SET url = 'https://github.com/someone-else/widget' WHERE id = ?1",
+        f.rid,
+    )
+    .await;
+    assert!(due().await.is_empty(), "the repo moved");
+    assert_eq!(listed_due_at().await, Value::Null);
+}
+
+/// Hunter's login must be able to push to a repo it reviews: on GitHub
+/// only a pusher may ask who else can, and every trust check rests on
+/// that. Without it a request fails saying so, not with an internal error.
+#[tokio::test]
+async fn a_request_where_hunter_cannot_push_says_it_needs_to() {
+    let bins = FakeBins::acquire("prr-no-push");
+    let f = fixture("prr-no-push").await;
+    set_view(&f, "OPEN", "aaa", "outsider");
+    bins.script(
+        "gh",
+        &format!(
+            "case \"$*\" in\n\
+             *collaborators/*/permission*) \
+                echo '{{\"message\":\"Must have push access to view collaborator permission.\",\"status\":\"403\"}}'; \
+                echo 'gh: Must have push access to view collaborator permission. (HTTP 403)' >&2; exit 1;;\n\
+             'pr view'*) cat '{}';;\n\
+             *) echo \"unexpected gh $*\" >&2; exit 1;;\n\
+             esac",
+            f.dir.join("view.json").display()
+        ),
+    );
+    let state = app_state(&f);
+
+    let (status, body) = post(
+        &state,
+        "/api/pr-review",
+        json!({ "repo_id": f.rid, "pr": 7, "watch": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("needs push access"),
+        "{body}"
+    );
+    assert!(f.store.list_pr_reviews().await.unwrap().is_empty());
 }

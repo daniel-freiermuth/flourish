@@ -22,7 +22,7 @@
 
 use crate::domain::{
     BudgetOverride, BugClass, FindingJobKind, FindingStatus, FindingType, ForgeName, HoldReason,
-    JobKind, JobState, ReleaseAction, RepoWorkKind, Severity,
+    JobKind, JobState, PrReviewState, ReleaseAction, RepoWorkKind, Severity,
 };
 use serde::Serialize;
 use ts_rs::TS;
@@ -659,6 +659,73 @@ pub struct PrReviewRoundOut {
     pub failure: Option<String>,
     pub finished_at: i64,
     pub issues: Vec<PrReviewIssueOut>,
+}
+
+/// GET /api/pr-reviews: one requested review, rounds newest first.
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the review's independent flags, as the UI reads them"
+)]
+pub struct PrReviewOut {
+    pub id: i64,
+    pub repo_id: i64,
+    pub repo_name: String,
+    pub pr_number: i64,
+    pub pr_url: String,
+    pub title: String,
+    pub author: String,
+    pub cross_repo: bool,
+    pub watch: bool,
+    pub state: PrReviewState,
+    pub head_sha: Option<String>,
+    pub last_reviewed_sha: Option<String>,
+    pub vouched_author: Option<String>,
+    /// The owner of the fork the PR's head lives in, as the newest read
+    /// reported it: a round runs their repository's code. Null for a head
+    /// in the repo itself; empty when the forge names no owner.
+    pub head_owner: Option<String>,
+    /// The fork's owner, when they are not the author, cannot push and a
+    /// user vouched for running code from their fork.
+    pub vouched_head_owner: Option<String>,
+    pub requested_by: String,
+    pub requested_at: i64,
+    pub failures: i64,
+    pub last_failure: Option<String>,
+    pub held: bool,
+    /// Whether the repo's URL changed since the review was requested: the
+    /// review does nothing until a request binds it to the new URL,
+    /// deciding about the author afresh.
+    pub repo_moved: bool,
+    /// Whether the fork the head lives in changed hands since the request
+    /// decided about its owner (`head_owner` is somebody else): the review
+    /// runs no round until a request decides about the new owner.
+    pub fork_changed_hands: bool,
+    pub running_job_id: Option<i64>,
+    /// When the review's next round is due (epoch ms;
+    /// [`crate::store::PrReviewRow::due_at`]): what the scheduler picks by,
+    /// so a review shows as waiting for a round exactly when it is. Null
+    /// while nothing makes one due: the review is not open, held, its repo
+    /// moved or its fork changed hands, or -- unwatched -- no request waits
+    /// for a round.
+    pub due_at: Option<i64>,
+    pub rounds: Vec<PrReviewRoundOut>,
+}
+
+/// GET /api/repo/open-prs: one open PR of a repo, with whether hunter
+/// opened it (not reviewable) and the review already requested for it.
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export)]
+pub struct OpenPrOut {
+    pub number: i64,
+    pub title: String,
+    pub author: String,
+    pub is_draft: bool,
+    pub cross_repo: bool,
+    pub url: String,
+    pub hunter_own: bool,
+    pub review_id: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
