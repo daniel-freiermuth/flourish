@@ -1569,3 +1569,42 @@ fn gitlab_pr_diff_stops_at_the_page_cap_and_says_so() {
         &diff[diff.len().saturating_sub(200)..]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Quick actions — GitLab
+// ---------------------------------------------------------------------------
+
+/// GitLab runs a line that begins with `/` and a command's name as a quick
+/// action under the poster's login (`/merge`, `/approve`; in any case), and
+/// strips it from the text. What hunter posts quotes PR content, so every
+/// such line goes out escaped, in a note and an MR's description
+/// alike: Markdown shows `\/merge` as `/merge`, and GitLab
+/// runs nothing. GitLab drops `\r` before it looks, so hunter does too. A
+/// slash that starts no command name (`// code`), or not at a line's
+/// start, is left alone.
+#[test]
+fn gitlab_never_posts_a_line_that_starts_a_quick_action() {
+    let bins = FakeBins::acquire("forge-gl-quick-actions");
+    let dir = TempDir::new("forge-gl-quick-actions-cwd");
+    bins.ok("glab", "https://gitlab.com/group/widget/-/merge_requests/3");
+    let text = "see below\r\n/merge\n\r/Approve now\n  /close\n// a comment\nnot /label ~x";
+    let escaped = "see below\n\\/merge\n\\/Approve now\n  /close\n// a comment\nnot /label ~x";
+    let gl = forge_for(ForgeName::Gitlab);
+
+    gl.comment_pr(GL_REPO, PR, text).unwrap();
+    gl.create_pr(dir.path(), "fix/x", "main", "", text).unwrap();
+
+    let calls = bins.calls();
+    let notes: Vec<&str> = calls
+        .iter()
+        .filter(|c| c.get(2).is_some_and(|p| p.ends_with("/notes")))
+        .map(|c| {
+            value_after(c, "-f")
+                .and_then(|f| f.strip_prefix("body="))
+                .unwrap_or_else(|| panic!("no body in {c:?}"))
+        })
+        .collect();
+    assert_eq!(notes, [mark_own(escaped)], "{calls:?}");
+    let create = position_of(&calls, "glab", &["mr", "create"]).expect("create call");
+    assert_eq!(value_after(&calls[create], "--description"), Some(escaped));
+}

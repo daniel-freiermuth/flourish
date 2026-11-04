@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 use crate::clones::{Force, Unheld};
 use crate::domain::ForgeName;
-use crate::util::{run_cmd, run_cmd_in};
+use crate::util::{run_cmd, run_cmd_in, run_cmd_input};
 
 /// Git forge PR/MR lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -207,6 +207,8 @@ pub struct GlAuthor {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct GlNote {
+    #[serde(default)]
+    pub id: Option<i64>,
     #[serde(default, deserialize_with = "nullable")]
     pub body: String,
     #[serde(default)]
@@ -260,6 +262,9 @@ impl GlPosition {
 /// the diff, which `gh pr view` does not return at all.
 #[derive(Debug, Default, Deserialize)]
 struct GhReviewComment {
+    /// The comment's id, in the order GitHub created the comments.
+    #[serde(default)]
+    id: i64,
     #[serde(default)]
     node_id: String,
     #[serde(default)]
@@ -365,6 +370,24 @@ struct GlMergeRequest {
     draft: bool,
     #[serde(default, deserialize_with = "nullable")]
     web_url: String,
+    /// The shas a diff position on the MR's current version names.
+    #[serde(default)]
+    diff_refs: Option<GlDiffRefs>,
+}
+
+/// `diff_refs` of a GitLab MR: the commits its current diff is between.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "GitLab's own field names, deserialized as sent"
+)]
+struct GlDiffRefs {
+    #[serde(default, deserialize_with = "nullable")]
+    base_sha: String,
+    #[serde(default, deserialize_with = "nullable")]
+    start_sha: String,
+    #[serde(default, deserialize_with = "nullable")]
+    head_sha: String,
 }
 
 /// What a review of somebody else's PR needs to know about it
@@ -407,6 +430,204 @@ pub struct OpenPr {
     pub is_draft: bool,
     pub cross_repo: bool,
     pub url: String,
+}
+
+/// Which version of a file a review comment's line numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Side {
+    /// The PR's head: added and unchanged lines.
+    #[default]
+    Right,
+    /// The base: lines the PR removes (and unchanged ones).
+    Left,
+}
+
+impl Side {
+    /// The word GitHub's review API and `pr_review_issues.side` use.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Right => "RIGHT",
+            Self::Left => "LEFT",
+        }
+    }
+}
+
+/// One issue of a [`ReviewPost`] placed on a line of the PR's diff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineComment {
+    /// The `pr_review_issues` row this comment carries.
+    pub issue_id: i64,
+    /// The file's path in the head (in the base, for a deleted file).
+    pub path: String,
+    /// The file's path in the base: `path`, unless the PR renamed it.
+    pub old_path: String,
+    /// The line as the reviewer gave it, numbered on `side`.
+    pub line: i64,
+    pub side: Side,
+    /// The line's number in the base and in the head, where it has one: an
+    /// unchanged line has both, which GitLab's position needs.
+    pub old_line: Option<i64>,
+    pub new_line: Option<i64>,
+    pub body: String,
+}
+
+/// The most characters GitHub takes in a review's body, and in each of its
+/// comments: a longer one is refused (422, "body is too long") on every
+/// attempt alike. GitLab takes 1,000,000 in a note, so this bounds what
+/// hunter posts either forge.
+pub const REVIEW_TEXT_MAX_CHARS: usize = 65_536;
+
+/// A COMMENT review as [`Forge::post_review`] sends it: posts go out under
+/// the operator's forge login, so hunter never approves or requests
+/// changes in their name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewPost {
+    /// The head the review read; the comments' lines number its diff.
+    pub commit_id: String,
+    /// Markdown: the body's first lines.
+    pub header: String,
+    /// The issues no comment carries, each as the body shows it
+    /// ([`Self::push_unplaced`]), in order.
+    pub unplaced: Vec<String>,
+    /// The body's last line: the step mark the review is found by
+    /// ([`step_mark`]).
+    pub mark: String,
+    pub comments: Vec<InlineComment>,
+}
+
+impl ReviewPost {
+    /// Add to the body an issue that is not on a line of the diff, at
+    /// `location` (`file:line`) if it names one.
+    pub fn push_unplaced(&mut self, location: Option<&str>, text: &str) {
+        let mut item = String::from("\n\n---\n\n");
+        if let Some(at) = location {
+            item.push('`');
+            item.push_str(at);
+            item.push_str("`\n\n");
+        }
+        item.push_str(text);
+        self.unplaced.push(item);
+    }
+
+    /// The body [`Forge::post_review`] sends, before the own-comment mark
+    /// it adds ([`mark_own`]): the header, then the unplaced issues in
+    /// order for as long as the whole stays within
+    /// [`REVIEW_TEXT_MAX_CHARS`], a line counting those left out, and the
+    /// step mark last. Every issue in a body past the forge's limit would
+    /// fail the post on every attempt; the marks, which a retry and the
+    /// read-back find the review by, are never cut.
+    pub fn body(&self) -> String {
+        let left_out = |n: usize| {
+            format!(
+                "\n\n---\n\n_{n} more issue(s) left out: a review's body holds at most \
+                 {REVIEW_TEXT_MAX_CHARS} characters._"
+            )
+        };
+        let chars = |s: &str| s.chars().count();
+        // What follows the issues, at its longest: the count of those left
+        // out, the step mark, and the own-comment mark.
+        let tail =
+            chars(&left_out(self.unplaced.len())) + chars(&self.mark) + chars(&mark_own("")) + 2;
+        let room = REVIEW_TEXT_MAX_CHARS.saturating_sub(tail);
+        let mut body = self.header.clone();
+        let mut used = chars(&body);
+        let mut shown = 0;
+        for item in &self.unplaced {
+            let n = chars(item);
+            if used + n > room {
+                break;
+            }
+            body.push_str(item);
+            used += n;
+            shown += 1;
+        }
+        if shown < self.unplaced.len() {
+            body.push_str(&left_out(self.unplaced.len() - shown));
+        }
+        body.push_str("\n\n");
+        body.push_str(&self.mark);
+        body
+    }
+
+    /// This post with every inline comment moved into the body: the lines
+    /// they name are not where the forge would put them (the PR moved on
+    /// since the review read it).
+    #[must_use]
+    pub fn without_inline(mut self) -> Self {
+        for c in std::mem::take(&mut self.comments) {
+            let at = format!(
+                "{}:{}{}",
+                c.path,
+                c.line,
+                if c.side == Side::Left { " (base)" } else { "" }
+            );
+            self.push_unplaced(Some(&at), &c.body);
+        }
+        self
+    }
+}
+
+/// What [`Forge::post_review`] posted: the forge's id of the review, and
+/// the issues whose comment went inline. The inline comments' own ids are
+/// read back from the PR afterwards ([`Forge::inline_comment_refs`]): a
+/// read that fails then leaves the review up and only the read to retry.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PostedReview {
+    pub review_ref: String,
+    pub inline: Vec<i64>,
+}
+
+/// What an earlier post of a review left on the PR, as
+/// [`Forge::find_review`] reads it: the review itself, by the forge login
+/// and carrying the post's step mark, and the issues whose inline comment
+/// the login has there (GitLab publishes them one by one, before the body;
+/// on GitHub they go up with their review or not at all).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FoundReview {
+    pub review_ref: Option<String>,
+    pub inline: Vec<i64>,
+}
+
+/// What a failed [`Forge::post_review`] already put on the PR: GitLab
+/// publishes a review's notes one by one, so a failure can come after some
+/// inline comments are out. Their issues, as [`PostedReview::inline`]
+/// names them; the post's error carries it as context, so the retry leaves
+/// them out instead of posting them again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartlyPosted {
+    pub inline: Vec<i64>,
+}
+
+impl std::fmt::Display for PartlyPosted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} inline comment(s) published before the failure",
+            self.inline.len()
+        )
+    }
+}
+
+/// A failed [`Forge::post_review`] put none of the review on the PR: it
+/// failed before the call that may put it there, or the forge refused that
+/// call outright ([`refused_outright`]). The post's error carries it as
+/// context. Without it, a failed post may have landed all the same (a
+/// timeout, a 5xx after the write).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NothingPosted;
+
+impl std::fmt::Display for NothingPosted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("nothing of the review was posted")
+    }
+}
+
+/// Whether a failed `gh api` or `glab api` call's output, `out`, is the
+/// forge refusing the request: both end an HTTP error's message with
+/// `(HTTP <status>)`, and a 4xx answers a request the forge did not act
+/// on. A timeout or a 5xx says nothing of what the forge did.
+fn refused_outright(out: &str) -> bool {
+    out.contains("(HTTP 4")
 }
 
 /// One file of `merge_requests/:iid/diffs`: GitLab returns the hunks
@@ -485,6 +706,26 @@ pub const OWN_MARK: &str = "<!-- posted by hunter -->";
 /// `body` as hunter posts it, with [`OWN_MARK`] on a line of its own.
 pub fn mark_own(body: &str) -> String {
     format!("{body}\n\n{OWN_MARK}")
+}
+
+/// The hidden line naming one step of a review post, `step` (a round's
+/// review, its answer in a thread), put in what the step posts. A forge
+/// call can fail after the forge acted on it (a timeout, a 5xx after the
+/// write): a later read finds the step by this line before taking it again
+/// ([`Forge::find_review`]).
+pub fn step_mark(step: &str) -> String {
+    format!("{STEP_MARK_OPEN}{step}{STEP_MARK_CLOSE}")
+}
+
+const STEP_MARK_OPEN: &str = "<!-- hunter step: ";
+const STEP_MARK_CLOSE: &str = " -->";
+
+/// Whether `line` is the step mark of `step` ([`step_mark`]).
+fn is_step_mark(line: &str, step: &str) -> bool {
+    line.trim()
+        .strip_prefix(STEP_MARK_OPEN)
+        .and_then(|rest| rest.strip_suffix(STEP_MARK_CLOSE))
+        == Some(step)
 }
 
 /// The review bots whose feedback is let through (`feedback.bots`).
@@ -967,6 +1208,64 @@ pub trait Forge: Send + Sync {
     /// The fetch refspec that brings PR `pr_number`'s head, fork or not,
     /// into the clone as `refs/hunter/pr/<n>` ([`pr_head_ref`]).
     fn pr_head_refspec(&self, pr_number: i64) -> String;
+    /// Post `post` on PR `pr_number` as one COMMENT review, its body
+    /// ([`ReviewPost::body`], within the forge's limit) marked as hunter's
+    /// own ([`mark_own`]). Where each comment goes was decided
+    /// by the caller from [`Self::pr_diff`]. A failed post may leave
+    /// drafts of hunter's on the PR, which the caller deletes
+    /// ([`Self::delete_own_drafts`]).
+    fn post_review(
+        &self,
+        url: &str,
+        pr_number: i64,
+        post: &ReviewPost,
+    ) -> anyhow::Result<PostedReview>;
+    /// Delete every draft of hunter's the forge login has on PR
+    /// `pr_number`: what a post that failed, or was stopped, before it
+    /// published all of them left behind. A draft is the login's, so the
+    /// operator's next review by hand would publish it under their name.
+    /// Hunter's drafts are told from the operator's by [`OWN_MARK`], which
+    /// every draft hunter creates carries. The number deleted; `Ok` means
+    /// none of hunter's is left.
+    fn delete_own_drafts(&self, url: &str, pr_number: i64) -> anyhow::Result<usize>;
+    /// What a post of a review marked as step `step` ([`step_mark`]) left
+    /// on PR `pr_number`, sent earlier by a call that failed: the forge
+    /// may have acted on it all the same (a timeout, a 5xx after the
+    /// write). The review is the forge login's whose body holds the step's
+    /// mark on a line of its own; of `comments` (the issue, its inline
+    /// comment's text as [`InlineComment::body`] gave it) those whose
+    /// comment the login has on the PR, found as
+    /// [`Self::inline_comment_refs`] finds them: on GitLab, whose notes
+    /// are published one by one, by the issue's own mark, so a comment of
+    /// another issue -- of this round or an earlier one, the same text or
+    /// not -- is never taken for it. Only the login's count: anybody can
+    /// copy hunter's text, mark included.
+    fn find_review(
+        &self,
+        url: &str,
+        pr_number: i64,
+        step: &str,
+        comments: &[(i64, &str)],
+    ) -> anyhow::Result<FoundReview>;
+    /// The forge's id of each inline comment `comments` (the issue it
+    /// carries, its text as [`InlineComment::body`] gave it) of review
+    /// `review_ref` ([`PostedReview::review_ref`]) of PR `pr_number`,
+    /// found by its text; `comments` come in the order the post created
+    /// them, which tells two of one text apart within one GitHub review,
+    /// the forge numbering comments in creation order. GitLab's notes
+    /// belong to no review, so each carries its issue's hidden mark, and
+    /// only a note with the issue's own is its comment. Only comments the
+    /// forge login wrote count: anybody can copy hunter's text, mark
+    /// included, onto the PR. A comment missing from an `Ok` answer is not
+    /// on the PR: the read lists every comment, so one it does not find
+    /// was deleted.
+    fn inline_comment_refs(
+        &self,
+        url: &str,
+        pr_number: i64,
+        review_ref: &str,
+        comments: &[(i64, &str)],
+    ) -> anyhow::Result<Vec<(i64, String)>>;
 }
 
 /// The local ref a PR's head is fetched into ([`Forge::pr_head_refspec`]).
@@ -1044,6 +1343,19 @@ fn gitlab_project_owner(url: &str, project_id: i64) -> anyhow::Result<String> {
     let project: Project = serde_json::from_str(out.trim())
         .map_err(|e| anyhow::anyhow!("glab api {api}: unparseable project: {e}"))?;
     Ok(project.namespace.map(|n| n.full_path).unwrap_or_default())
+}
+
+/// GitLab user id of the login `glab` is authenticated as on the
+/// instance at `url`: hunter's own account.
+fn gitlab_own_id(url: &str) -> anyhow::Result<i64> {
+    let (rc, out) = gitlab_api(url, "user", None, &[]);
+    if rc != 0 {
+        anyhow::bail!("glab api user failed (rc={rc}): {out}");
+    }
+    let user: GlAuthor = serde_json::from_str(out.trim())
+        .map_err(|e| anyhow::anyhow!("glab api user: unparseable user: {e}"))?;
+    user.id
+        .ok_or_else(|| anyhow::anyhow!("glab api user: no user id in {}", out.trim()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1395,6 +1707,430 @@ fn gitlab_api(
     run_cmd(&refs, 30)
 }
 
+/// `glab api --method <method> <path>` sending `body` (JSON) as the request
+/// body: a draft note's position is nested, which `-f` fields cannot say.
+fn gitlab_api_json(url: &str, api_path: &str, method: &str, body: &str) -> (i32, String) {
+    let mut args = vec![
+        "glab",
+        "api",
+        api_path,
+        "--method",
+        method,
+        "--header",
+        "Content-Type: application/json",
+        "--input",
+        "-",
+    ];
+    if let Some((host, _)) = gitlab_host_path(url)
+        && host != "gitlab.com"
+    {
+        args.extend(["--hostname", host]);
+    }
+    run_cmd_input(&args, body, 30)
+}
+
+/// `text` as hunter sends it to GitLab, which runs a line that begins with
+/// `/` and a command's name (`/merge`, `/approve`, `/close`, ...) as a
+/// quick action under the poster's login, and strips it from the note: in
+/// a note, a draft note once published, or an MR's description alike. The
+/// text is the reviewer's or a worker's, quoting PR content, so every such
+/// line gets a backslash before its slash: Markdown renders `\/` as `/`,
+/// and no line begins with a command any more. GitLab drops every `\r`
+/// before it looks, so they go first. Every text hunter posts to GitLab
+/// goes through this, and so does the text a read-back matches what GitLab
+/// lists against ([`Forge::inline_comment_refs`]).
+fn gitlab_text(text: &str) -> String {
+    let text = text.replace('\r', "");
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let command = line
+            .strip_prefix('/')
+            .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_'));
+        if command {
+            out.push('\\');
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+/// The step of issue `issue_id`'s inline note on GitLab ([`step_mark`]).
+/// GitLab publishes a review's notes one by one, before its body, so a
+/// send that failed may have left some on the MR, and its retry must tell
+/// which issue each of hunter's notes there is ([`Forge::find_review`]).
+/// Text alone cannot: two issues, of one round or of two, may read the
+/// same. The issue is a row of one round, so a note carrying its mark was
+/// published by a send of that round, for that issue, and no other.
+fn issue_step(issue_id: i64) -> String {
+    format!("comment of issue {issue_id}")
+}
+
+/// Issue `issue_id`'s inline comment `text` as hunter publishes it on
+/// GitLab: marked with the issue's step ([`issue_step`]) and as hunter's
+/// own ([`mark_own`]), escaped ([`gitlab_text`]). What a read-back matches
+/// the MR's notes against ([`gitlab_published_refs`]).
+fn gitlab_inline_note(issue_id: i64, text: &str) -> String {
+    let marked = format!("{text}\n\n{}", step_mark(&issue_step(issue_id)));
+    gitlab_text(&mark_own(&marked))
+}
+
+/// Create a draft note on MR `pr_number` (project `enc`, URL-encoded) from
+/// `body`; the note's id.
+fn gitlab_draft_note(
+    url: &str,
+    enc: &str,
+    pr_number: i64,
+    body: &serde_json::Value,
+) -> anyhow::Result<i64> {
+    #[derive(Deserialize)]
+    struct Created {
+        id: i64,
+    }
+    let api = format!("projects/{enc}/merge_requests/{pr_number}/draft_notes");
+    let (rc, out) = gitlab_api_json(url, &api, "POST", &body.to_string());
+    if rc != 0 {
+        anyhow::bail!("glab api POST {api} failed (rc={rc}): {out}");
+    }
+    let created: Created = serde_json::from_str(out.trim())
+        .map_err(|e| anyhow::anyhow!("glab api POST {api}: unparseable draft note: {e}"))?;
+    Ok(created.id)
+}
+
+/// The drafts of a GitLab review, published one by one: one per inline
+/// comment, positioned on the diff `refs` names and marked with its
+/// issue's step ([`gitlab_inline_note`]), then the body, each
+/// marked as hunter's own ([`mark_own`]). Not `bulk_publish`: that
+/// publishes every draft the operator's login has on the MR, a review they
+/// started by hand included. Nothing is on the MR until the first publish:
+/// a failure before it, or its refusal, says so ([`NothingPosted`]). A
+/// failure part way leaves the inline notes published so far on the MR,
+/// and the error says which ([`PartlyPosted`]); the body goes last, so the
+/// post fails before it is out. Every draft it did not publish is left for
+/// the caller to delete ([`Forge::delete_own_drafts`]), found by its mark
+/// like any other a post left, a daemon stopped between creating and
+/// publishing included.
+fn gitlab_publish_review(
+    url: &str,
+    enc: &str,
+    pr_number: i64,
+    (post, refs): (&ReviewPost, &GlDiffRefs),
+) -> anyhow::Result<PostedReview> {
+    let mut drafts = Vec::with_capacity(post.comments.len() + 1);
+    let mut inline = Vec::with_capacity(post.comments.len());
+    for c in &post.comments {
+        let mut position = serde_json::json!({
+            "position_type": "text",
+            "base_sha": refs.base_sha,
+            "start_sha": refs.start_sha,
+            "head_sha": refs.head_sha,
+            "old_path": c.old_path,
+            "new_path": c.path,
+        });
+        if let Some(line) = c.old_line {
+            position["old_line"] = line.into();
+        }
+        if let Some(line) = c.new_line {
+            position["new_line"] = line.into();
+        }
+        let note = serde_json::json!({
+            "note": gitlab_inline_note(c.issue_id, &c.body),
+            "position": position,
+        });
+        let id =
+            gitlab_draft_note(url, enc, pr_number, &note).map_err(|e| e.context(NothingPosted))?;
+        drafts.push(id);
+        inline.push(c.issue_id);
+    }
+    let body = serde_json::json!({ "note": gitlab_text(&mark_own(&post.body())) });
+    let body_id =
+        gitlab_draft_note(url, enc, pr_number, &body).map_err(|e| e.context(NothingPosted))?;
+    drafts.push(body_id);
+    // The drafts are in `inline`'s order, the body last: the first
+    // `published` of them are the inline notes out so far.
+    for (published, id) in drafts.iter().enumerate() {
+        let api = format!("projects/{enc}/merge_requests/{pr_number}/draft_notes/{id}/publish");
+        let (rc, out) = gitlab_api(url, &api, Some("PUT"), &[]);
+        if rc != 0 {
+            let e = anyhow::anyhow!("glab api PUT {api} failed (rc={rc}): {out}");
+            if published == 0 {
+                return Err(if refused_outright(&out) {
+                    e.context(NothingPosted)
+                } else {
+                    e
+                });
+            }
+            inline.truncate(published);
+            return Err(e.context(PartlyPosted { inline }));
+        }
+    }
+    Ok(PostedReview {
+        review_ref: body_id.to_string(),
+        inline,
+    })
+}
+
+/// One of the forge login's draft notes on an MR.
+#[derive(Debug, Deserialize)]
+struct GlDraftNote {
+    id: i64,
+    #[serde(default, deserialize_with = "nullable")]
+    note: String,
+}
+
+/// Delete every draft note of hunter's on MR `pr_number` (project `enc`,
+/// URL-encoded): see [`Forge::delete_own_drafts`]. GitLab lists the
+/// login's drafts on the MR in one answer (the endpoint is not paginated),
+/// the operator's own among them; only those whose last line is
+/// [`OWN_MARK`] ([`is_own`]) are hunter's, and only those are deleted.
+/// The number deleted; any failed call fails the whole, for a later call
+/// to list what is left again.
+fn gitlab_delete_own_drafts(url: &str, enc: &str, pr_number: i64) -> anyhow::Result<usize> {
+    let api = format!("projects/{enc}/merge_requests/{pr_number}/draft_notes");
+    let (rc, out) = gitlab_api(url, &api, None, &[]);
+    if rc != 0 {
+        anyhow::bail!("glab api {api} failed (rc={rc}): {out}");
+    }
+    let drafts: Vec<GlDraftNote> = serde_json::from_str(out.trim())
+        .map_err(|e| anyhow::anyhow!("glab api {api}: unparseable draft notes: {e}"))?;
+    let mut deleted = 0;
+    for draft in drafts.iter().filter(|d| is_own(&d.note)) {
+        let api = format!("{api}/{}", draft.id);
+        let (rc, out) = gitlab_api(url, &api, Some("DELETE"), &[]);
+        if rc != 0 {
+            anyhow::bail!("glab api DELETE {api} failed (rc={rc}): {out}");
+        }
+        deleted += 1;
+    }
+    Ok(deleted)
+}
+
+/// Whether a comment the forge lists reads `posted`: the text as sent, up
+/// to line endings and surrounding whitespace, which a forge may change.
+fn same_text(listed: &str, posted: &str) -> bool {
+    let norm = |s: &str| s.replace("\r\n", "\n").trim().to_owned();
+    norm(listed) == norm(posted)
+}
+
+/// Each of `comments` (issue, text), in the order one post created them,
+/// matched to one of `listed` (the forge's creation-ordered id, the id to
+/// record, text). A post creates its comments in the order given, each
+/// the newest of its text when it is created, so of `listed` with one
+/// text the newest, as many as `comments` has of it, are that post's, in
+/// its order: two comments of one text each get their own, and a copy an
+/// earlier post left is older than both. A comment with none left is left
+/// out.
+fn match_by_text<'a>(
+    comments: &[(i64, &str)],
+    listed: impl IntoIterator<Item = (i64, String, &'a str)>,
+) -> Vec<(i64, String)> {
+    let mut listed: Vec<(i64, String, &str)> = listed.into_iter().collect();
+    listed.sort_by_key(|&(created, ..)| created);
+    comments
+        .iter()
+        .enumerate()
+        .filter_map(|(at, &(issue, text))| {
+            let of_text: Vec<&String> = listed
+                .iter()
+                .filter(|(_, _, body)| same_text(body, text))
+                .map(|(_, id, _)| id)
+                .collect();
+            let wanted = comments.iter().filter(|(_, t)| same_text(t, text)).count();
+            let rank = comments[..at]
+                .iter()
+                .filter(|(_, t)| same_text(t, text))
+                .count();
+            let id = of_text.get(of_text.len().saturating_sub(wanted) + rank)?;
+            Some((issue, (*id).clone()))
+        })
+        .collect()
+}
+
+/// The node id of each of `comments` (issue, text) among the inline
+/// comments of GitHub review `review_id`, matched by text in the order the
+/// review created them (their ids): see [`Forge::inline_comment_refs`].
+/// Read from the PR's comment list, every page of it, filtered to the
+/// review.
+fn github_inline_refs(
+    url: &str,
+    pr_number: i64,
+    review_id: &str,
+    comments: &[(i64, &str)],
+) -> anyhow::Result<Vec<(i64, String)>> {
+    let review_id: i64 = review_id
+        .parse()
+        .map_err(|e| anyhow::anyhow!("GitHub review id {review_id:?}: {e}"))?;
+    let (host, path) =
+        url_host_path(url).ok_or_else(|| anyhow::anyhow!("cannot parse owner/repo from {url}"))?;
+    let path = path.trim_end_matches('/').trim_end_matches(".git");
+    let api = format!("repos/{path}/pulls/{pr_number}/comments?per_page=100");
+    let jq = format!(".[] | select(.pull_request_review_id == {review_id})");
+    let mut argv = vec!["gh", "api", "--paginate", &api, "--jq", &jq];
+    if !host.eq_ignore_ascii_case("github.com") {
+        argv.extend(["--hostname", host]);
+    }
+    let (rc, out) = run_cmd(&argv, 60);
+    if rc != 0 {
+        anyhow::bail!("gh api {api} failed (rc={rc}): {out}");
+    }
+    let listed: Vec<GhReviewComment> = serde_json::Deserializer::from_str(&out)
+        .into_iter::<GhReviewComment>()
+        .collect::<Result<_, _>>()
+        .map_err(|e| anyhow::anyhow!("gh api {api}: unparseable review comments: {e}"))?;
+    Ok(match_by_text(
+        comments,
+        listed
+            .iter()
+            .map(|l| (l.id, l.node_id.clone(), l.body.as_str())),
+    ))
+}
+
+/// See [`Forge::find_review`]: the PR's reviews, every page, read for the
+/// forge login's (`gh api user`) whose body carries `step`'s mark; its
+/// inline comments, which went up with it, by [`github_inline_refs`].
+fn github_find_review(
+    url: &str,
+    pr_number: i64,
+    step: &str,
+    comments: &[(i64, &str)],
+) -> anyhow::Result<FoundReview> {
+    #[derive(Deserialize)]
+    struct Listed {
+        id: i64,
+        #[serde(default)]
+        body: String,
+        #[serde(default)]
+        login: String,
+    }
+    let (rc, login) = github_api_jq(url, "user", ".login")?;
+    let login = login.trim();
+    if rc != 0 || login.is_empty() {
+        anyhow::bail!("gh api user failed (rc={rc}): {login}");
+    }
+    let (host, path) =
+        url_host_path(url).ok_or_else(|| anyhow::anyhow!("cannot parse owner/repo from {url}"))?;
+    let path = path.trim_end_matches('/').trim_end_matches(".git");
+    let api = format!("repos/{path}/pulls/{pr_number}/reviews?per_page=100");
+    let jq = ".[] | {id, body, login: .user.login}";
+    let mut argv = vec!["gh", "api", "--paginate", &api, "--jq", jq];
+    if !host.eq_ignore_ascii_case("github.com") {
+        argv.extend(["--hostname", host]);
+    }
+    let (rc, out) = run_cmd(&argv, 60);
+    if rc != 0 {
+        anyhow::bail!("gh api {api} failed (rc={rc}): {out}");
+    }
+    let listed: Vec<Listed> = serde_json::Deserializer::from_str(&out)
+        .into_iter::<Listed>()
+        .collect::<Result<_, _>>()
+        .map_err(|e| anyhow::anyhow!("gh api {api}: unparseable reviews: {e}"))?;
+    let own = normalize_login(login);
+    let Some(found) = listed.iter().find(|r| {
+        normalize_login(&r.login) == own && r.body.lines().any(|l| is_step_mark(l, step))
+    }) else {
+        return Ok(FoundReview::default());
+    };
+    let review_ref = found.id.to_string();
+    let inline = github_inline_refs(url, pr_number, &review_ref, comments)?
+        .into_iter()
+        .map(|(issue, _)| issue)
+        .collect();
+    Ok(FoundReview {
+        review_ref: Some(review_ref),
+        inline,
+    })
+}
+
+/// One of an MR's `discussions`.
+#[derive(Debug, Default, Deserialize)]
+struct GlDiscussion {
+    #[serde(default, deserialize_with = "nullable")]
+    notes: Vec<GlNote>,
+}
+
+/// Every discussion of MR `pr_number` (project `enc`, URL-encoded), read
+/// in pages of 100. An MR with more than [`MAX_DIFF_PAGES`] full pages is
+/// an error: a read that stopped short would take every discussion past
+/// it for gone ([`Forge::inline_comment_refs`]).
+fn gitlab_discussions(url: &str, enc: &str, pr_number: i64) -> anyhow::Result<Vec<GlDiscussion>> {
+    const PER_PAGE: usize = 100;
+    let mut all = Vec::new();
+    for page in 1..=MAX_DIFF_PAGES {
+        let api = format!(
+            "projects/{enc}/merge_requests/{pr_number}/discussions?per_page={PER_PAGE}&page={page}"
+        );
+        let (rc, out) = gitlab_api(url, &api, None, &[]);
+        if rc != 0 {
+            anyhow::bail!("glab api {api} failed (rc={rc}): {out}");
+        }
+        let batch: Vec<GlDiscussion> = serde_json::from_str(out.trim())
+            .map_err(|e| anyhow::anyhow!("glab api {api}: unparseable discussions: {e}"))?;
+        let last = batch.len() < PER_PAGE;
+        all.extend(batch);
+        if last {
+            return Ok(all);
+        }
+    }
+    anyhow::bail!(
+        "MR !{pr_number} has at least {} discussions; not reading them",
+        PER_PAGE * MAX_DIFF_PAGES
+    )
+}
+
+/// The id of the note each of `comments` (issue, its comment's text as the
+/// round wrote it) became once published: the first note, with a position
+/// on the diff and written by hunter's own account (user `own_id`), of a
+/// discussion reading as the issue's note does ([`gitlab_inline_note`]),
+/// the issue's own mark included -- so the note of another issue never
+/// matches, however alike their texts, be it one of the same round or one
+/// an earlier round posted -- the newest such ([`match_by_text`]; see
+/// [`Forge::inline_comment_refs`]). A thread is found by its first note's
+/// id, which publishing gives a draft. Somebody else's copy of the note,
+/// mark included, is never hunter's thread, however new.
+fn gitlab_published_refs(
+    discussions: &[GlDiscussion],
+    own_id: i64,
+    comments: &[(i64, &str)],
+) -> Vec<(i64, String)> {
+    let notes: Vec<(i64, String)> = comments
+        .iter()
+        .map(|&(issue, text)| (issue, gitlab_inline_note(issue, text)))
+        .collect();
+    let notes: Vec<(i64, &str)> = notes.iter().map(|(i, t)| (*i, t.as_str())).collect();
+    let firsts = discussions
+        .iter()
+        .filter_map(|d| d.notes.first())
+        .filter(|n| n.position.is_some())
+        .filter(|n| n.author.as_ref().and_then(|a| a.id) == Some(own_id))
+        .filter_map(|n| Some((n.id?, n.body.as_str())));
+    match_by_text(&notes, firsts.map(|(id, body)| (id, id.to_string(), body)))
+}
+
+/// See [`Forge::find_review`]: the MR's discussions read for a note of
+/// hunter's own account (user `own_id`) off the diff whose body carries
+/// `step`'s mark -- a review's body, published last -- and for the inline
+/// notes of `comments`, published one by one before it, found as
+/// [`gitlab_published_refs`] finds them.
+fn gitlab_find_review(
+    discussions: &[GlDiscussion],
+    own_id: i64,
+    step: &str,
+    comments: &[(i64, &str)],
+) -> FoundReview {
+    let review_ref = discussions
+        .iter()
+        .flat_map(|d| &d.notes)
+        .filter(|n| n.position.is_none())
+        .filter(|n| n.author.as_ref().and_then(|a| a.id) == Some(own_id))
+        .find(|n| n.body.lines().any(|l| is_step_mark(l, step)))
+        .and_then(|n| n.id)
+        .map(|id| id.to_string());
+    let inline = gitlab_published_refs(discussions, own_id, comments)
+        .into_iter()
+        .map(|(issue, _)| issue)
+        .collect();
+    FoundReview { review_ref, inline }
+}
+
 // ---------------------------------------------------------------------------
 // GitHub (via `gh` CLI) — `forge.GitHubForge`
 // ---------------------------------------------------------------------------
@@ -1719,6 +2455,101 @@ impl Forge for GitHubForge {
     fn pr_head_refspec(&self, pr_number: i64) -> String {
         format!("+refs/pull/{pr_number}/head:{}", pr_head_ref(pr_number))
     }
+
+    fn post_review(
+        &self,
+        url: &str,
+        pr_number: i64,
+        post: &ReviewPost,
+    ) -> anyhow::Result<PostedReview> {
+        #[derive(Deserialize)]
+        struct Created {
+            id: i64,
+        }
+        // Nothing is on the PR until the POST: a failure before it, or the
+        // POST's refusal, puts none of the review there.
+        let before = |e: anyhow::Error| e.context(NothingPosted);
+        let (host, _) = url_host_path(url)
+            .ok_or_else(|| before(anyhow::anyhow!("cannot parse owner/repo from {url}")))?;
+        // A renamed or transferred repo answers its old path with a 301 on
+        // a GET, which gh follows, but with a 307 on a POST, which it does
+        // not: ask for the repo's current name first.
+        let (owner, repo) = self
+            .owner_repo(url)
+            .ok_or_else(|| before(anyhow::anyhow!("cannot parse owner/repo from {url}")))?;
+        let (rc, full_name) =
+            github_api_jq(url, &format!("repos/{owner}/{repo}"), ".full_name").map_err(before)?;
+        let full_name = full_name.trim();
+        if rc != 0 || full_name.is_empty() {
+            return Err(before(anyhow::anyhow!(
+                "gh api repos/{owner}/{repo} failed (rc={rc}): {full_name}"
+            )));
+        }
+        let api = format!("repos/{full_name}/pulls/{pr_number}/reviews");
+        let comments: Vec<serde_json::Value> = post
+            .comments
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "path": c.path,
+                    "line": c.line,
+                    "side": c.side.as_str(),
+                    "body": c.body,
+                })
+            })
+            .collect();
+        let payload = serde_json::json!({
+            "commit_id": post.commit_id,
+            "event": "COMMENT",
+            "body": mark_own(&post.body()),
+            "comments": comments,
+        });
+        let mut argv = vec!["gh", "api", "-X", "POST", &api, "--input", "-"];
+        if !host.eq_ignore_ascii_case("github.com") {
+            argv.extend(["--hostname", host]);
+        }
+        let (rc, out) = run_cmd_input(&argv, &payload.to_string(), 60);
+        if rc != 0 {
+            let e = anyhow::anyhow!("gh api POST {api} failed (rc={rc}): {out}");
+            return Err(if refused_outright(&out) {
+                e.context(NothingPosted)
+            } else {
+                e
+            });
+        }
+        let created: Created = serde_json::from_str(out.trim())
+            .map_err(|e| anyhow::anyhow!("gh api POST {api}: unparseable review: {e}"))?;
+        Ok(PostedReview {
+            review_ref: created.id.to_string(),
+            inline: post.comments.iter().map(|c| c.issue_id).collect(),
+        })
+    }
+
+    fn delete_own_drafts(&self, _url: &str, _pr_number: i64) -> anyhow::Result<usize> {
+        // A review is created and submitted in the one call above, its
+        // comments with it: hunter never leaves a draft on GitHub.
+        Ok(0)
+    }
+
+    fn find_review(
+        &self,
+        url: &str,
+        pr_number: i64,
+        step: &str,
+        comments: &[(i64, &str)],
+    ) -> anyhow::Result<FoundReview> {
+        github_find_review(url, pr_number, step, comments)
+    }
+
+    fn inline_comment_refs(
+        &self,
+        url: &str,
+        pr_number: i64,
+        review_ref: &str,
+        comments: &[(i64, &str)],
+    ) -> anyhow::Result<Vec<(i64, String)>> {
+        github_inline_refs(url, pr_number, review_ref, comments)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1778,7 +2609,7 @@ impl Forge for GitLabForge {
                 "--title",
                 title_arg,
                 "--description",
-                body,
+                &gitlab_text(body),
                 "--yes",
             ],
             repo_path,
@@ -1915,7 +2746,7 @@ impl Forge for GitLabForge {
             .ok_or_else(|| anyhow::anyhow!("cannot parse GitLab URL: {url}"))?;
         let enc = path.replace('/', "%2F");
         let api_path = format!("projects/{enc}/merge_requests/{pr_number}/notes");
-        let body = mark_own(body);
+        let body = gitlab_text(&mark_own(body));
         let (rc, out) = gitlab_api(url, &api_path, Some("POST"), &[("body", &body)]);
         if rc != 0 {
             anyhow::bail!("glab api POST notes failed (rc={rc}): {out}");
@@ -2040,6 +2871,81 @@ impl Forge for GitLabForge {
             "+refs/merge-requests/{pr_number}/head:{}",
             pr_head_ref(pr_number)
         )
+    }
+
+    fn post_review(
+        &self,
+        url: &str,
+        pr_number: i64,
+        post: &ReviewPost,
+    ) -> anyhow::Result<PostedReview> {
+        let before = |e: anyhow::Error| e.context(NothingPosted);
+        let (_, path) = gitlab_host_path(url)
+            .ok_or_else(|| before(anyhow::anyhow!("cannot parse GitLab URL: {url}")))?;
+        let enc = path.replace('/', "%2F");
+        let api = format!("projects/{enc}/merge_requests/{pr_number}");
+        let (rc, out) = gitlab_api(url, &api, None, &[]);
+        if rc != 0 {
+            return Err(before(anyhow::anyhow!(
+                "glab api {api} failed (rc={rc}): {out}"
+            )));
+        }
+        let mr: GlMergeRequest = serde_json::from_str(out.trim())
+            .map_err(|e| before(anyhow::anyhow!("glab api {api}: unparseable MR: {e}")))?;
+        let refs = mr.diff_refs.unwrap_or_default();
+        // A position names the MR's current version, which is not the one
+        // the review read once the author pushed again: its lines would
+        // land on whatever the new version has there.
+        let moved;
+        let post = if refs.head_sha == post.commit_id {
+            post
+        } else {
+            moved = post.clone().without_inline();
+            &moved
+        };
+        // A failure leaves the drafts it did not publish for the caller to
+        // delete ([`Forge::delete_own_drafts`]).
+        gitlab_publish_review(url, &enc, pr_number, (post, &refs))
+    }
+
+    fn delete_own_drafts(&self, url: &str, pr_number: i64) -> anyhow::Result<usize> {
+        let (_, path) = gitlab_host_path(url)
+            .ok_or_else(|| anyhow::anyhow!("cannot parse GitLab URL: {url}"))?;
+        let enc = path.replace('/', "%2F");
+        gitlab_delete_own_drafts(url, &enc, pr_number)
+    }
+
+    fn find_review(
+        &self,
+        url: &str,
+        pr_number: i64,
+        step: &str,
+        comments: &[(i64, &str)],
+    ) -> anyhow::Result<FoundReview> {
+        let (_, path) = gitlab_host_path(url)
+            .ok_or_else(|| anyhow::anyhow!("cannot parse GitLab URL: {url}"))?;
+        let enc = path.replace('/', "%2F");
+        let own_id = gitlab_own_id(url)?;
+        let discussions = gitlab_discussions(url, &enc, pr_number)?;
+        Ok(gitlab_find_review(&discussions, own_id, step, comments))
+    }
+
+    fn inline_comment_refs(
+        &self,
+        url: &str,
+        pr_number: i64,
+        _review_ref: &str,
+        comments: &[(i64, &str)],
+    ) -> anyhow::Result<Vec<(i64, String)>> {
+        // A published note belongs to no review the API names: the MR's
+        // discussions are read, and only the login's own notes carrying
+        // the issue's mark are its ([`gitlab_published_refs`]).
+        let (_, path) = gitlab_host_path(url)
+            .ok_or_else(|| anyhow::anyhow!("cannot parse GitLab URL: {url}"))?;
+        let enc = path.replace('/', "%2F");
+        let own_id = gitlab_own_id(url)?;
+        let discussions = gitlab_discussions(url, &enc, pr_number)?;
+        Ok(gitlab_published_refs(&discussions, own_id, comments))
     }
 }
 
@@ -2311,5 +3217,80 @@ mod gitlab_norm_state_tests {
         assert_eq!(gitlab_norm_state("opened"), PrState::Open);
         assert_eq!(gitlab_norm_state("merged"), PrState::Merged);
         assert_eq!(gitlab_norm_state("closed"), PrState::Closed);
+    }
+}
+
+#[cfg(test)]
+mod read_back_tests {
+    use super::*;
+
+    /// A discussion opened by note `id` of user `author`, on the diff.
+    fn thread(id: i64, author: i64, body: &str) -> GlDiscussion {
+        GlDiscussion {
+            notes: vec![GlNote {
+                id: Some(id),
+                body: body.to_owned(),
+                author: Some(GlAuthor {
+                    id: Some(author),
+                    username: String::new(),
+                }),
+                position: Some(GlPosition::default()),
+                ..GlNote::default()
+            }],
+        }
+    }
+
+    /// Each comment gets the note published for its issue, found by the
+    /// issue's mark: never another issue's note of the same text, be it
+    /// of the same post (published before a failure) or an earlier
+    /// round's, and never somebody else's copy, however new.
+    #[test]
+    fn gitlab_finds_each_issues_note_by_its_mark() {
+        let note = gitlab_inline_note;
+        let discussions = [
+            thread(12, 1, &note(102, "same")),
+            thread(13, 2, &note(100, "same")),
+            thread(5, 1, &note(7, "same")),
+            thread(11, 1, &note(100, "same")),
+            thread(10, 1, &note(101, "other")),
+        ];
+        let comments = [(100, "same"), (101, "other"), (102, "same")];
+        assert_eq!(
+            gitlab_published_refs(&discussions, 1, &comments),
+            [
+                (100, "11".to_owned()),
+                (101, "10".to_owned()),
+                (102, "12".to_owned())
+            ]
+        );
+        assert_eq!(
+            gitlab_published_refs(&discussions, 1, &[(102, "same")]),
+            [(102, "12".to_owned())]
+        );
+        // Issue 100's own note is not on the MR: the notes of the same
+        // text, issue 102's of its round and issue 7's of an earlier one,
+        // are neither its.
+        let without = [
+            thread(12, 1, &note(102, "same")),
+            thread(5, 1, &note(7, "same")),
+        ];
+        assert_eq!(
+            gitlab_published_refs(&without, 1, &[(100, "same")]),
+            Vec::<(i64, String)>::new()
+        );
+    }
+
+    /// GitHub's comments of one review match the same way, in the order
+    /// of their ids, not of the listing.
+    #[test]
+    fn github_tells_two_comments_of_one_text_apart_by_creation() {
+        let listed = [
+            (8, "IC_b".to_owned(), "same"),
+            (7, "IC_a".to_owned(), "same"),
+        ];
+        assert_eq!(
+            match_by_text(&[(1, "same"), (2, "same")], listed),
+            [(1, "IC_a".to_owned()), (2, "IC_b".to_owned())]
+        );
     }
 }
