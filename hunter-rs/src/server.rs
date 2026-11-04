@@ -32,14 +32,18 @@ use crate::clones::{ClonePermit, Lane, Unheld};
 use crate::config::{Config, HostAllowList};
 use crate::domain::{
     BudgetOverride, ClosureClass, FindingJobKind, FindingStatus, FindingType, ForgeName,
-    ReleaseAction, RepoWorkKind, Severity,
+    PrReviewState, ReleaseAction, RepoWorkKind, Severity,
 };
-use crate::store::{AdminStore, FindingFilter, HoldRelease, RepoUpdate, Store, StoreWriteError};
+use crate::forge;
+use crate::store::{
+    AdminStore, FindingFilter, HoldRelease, NewPrReview, PrReviewRow, RepoUpdate, Store,
+    StoreWriteError,
+};
 use crate::transition::{Moved, OperatorVerdict, Transition, VerdictRefused};
 use crate::types::{
     ActivityStatus, BudgetState, Event, Finding, FindingDetail, FindingOut, HoldOut, JobListEntry,
-    Repo, RepoBrief, RepoHoldOut, RepoOut, RepoStreakOut, RepoWorkOut, Stats, StatsHorizon,
-    Summary,
+    OpenPrOut, PrReviewOut, PrReviewRoundOut, Repo, RepoBrief, RepoHoldOut, RepoOut, RepoStreakOut,
+    RepoWorkOut, Stats, StatsHorizon, Summary,
 };
 
 /// Handle to this process's two scheduler lanes: the job lane, which runs
@@ -290,6 +294,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/repo/notes", get(repo_notes).post(add_repo_note))
         .route("/api/repo/delete", post(delete_repo))
         .route("/api/repo/rehunt", post(request_rehunt))
+        .route("/api/repo/open-prs", get(repo_open_prs))
+        .route("/api/pr-reviews", get(pr_reviews))
+        .route("/api/pr-review", post(request_pr_review))
+        .route("/api/pr-review/watch", post(set_pr_review_watch))
+        .route("/api/pr-review/retry", post(retry_pr_review))
         .route("/api/events", get(events))
         .route("/api/stats", get(stats))
         .route("/api/verdict", post(verdict))
@@ -2064,4 +2073,348 @@ async fn add_repo_note(
         Json(json!({ "ok": true, "notes": notes })),
     )
         .into_response())
+}
+
+// -- PR reviews (future.md §8.8) ---------------------------------------------
+
+/// GET /api/pr-reviews: every requested review, newest request first, with
+/// its rounds newest first.
+async fn pr_reviews(State(state): State<AppState>) -> Result<Json<Vec<PrReviewOut>>, ApiError> {
+    let mut rounds: HashMap<i64, Vec<PrReviewRoundOut>> = HashMap::new();
+    for (review_id, round) in state.store.list_pr_review_rounds().await? {
+        rounds.entry(review_id).or_default().push(round);
+    }
+    let out = state
+        .store
+        .list_pr_reviews()
+        .await?
+        .into_iter()
+        .map(|r| PrReviewOut {
+            pr_url: forge::forge_for(r.forge).pr_web_url(&r.repo_url, r.pr_number),
+            rounds: rounds.remove(&r.id).unwrap_or_default(),
+            repo_moved: r.repo_moved(),
+            id: r.id,
+            repo_id: r.repo_id,
+            repo_name: r.repo_name,
+            pr_number: r.pr_number,
+            title: r.title,
+            author: r.author,
+            cross_repo: r.cross_repo,
+            watch: r.watch,
+            state: r.state,
+            head_sha: r.head_sha,
+            last_reviewed_sha: r.last_reviewed_sha,
+            vouched_author: r.vouched_author,
+            requested_by: r.requested_by,
+            requested_at: r.requested_at,
+            failures: r.failures,
+            last_failure: r.last_failure,
+            held: r.held,
+            running_job_id: r.running_job_id,
+        })
+        .collect();
+    Ok(Json(out))
+}
+
+/// The PR number `pr` names for `repo`: a number, as a JSON number or a
+/// string, or the web URL of one of this repo's PRs. A URL names its repo
+/// by host and path, and both must be the repo's: GitLab's PR URL parse
+/// keeps only the path, and the same path on another instance (a mirror)
+/// is another repo whose numbers mean other MRs.
+fn pr_number_of(repo: &Repo, pr: &Value) -> Result<i64, ApiError> {
+    let bad = || ApiError::BadRequest("pr must be a PR number or URL".to_owned());
+    let n = match pr {
+        Value::Number(_) => as_int(pr).ok_or_else(bad)?,
+        Value::String(s) => {
+            let s = s.trim().trim_start_matches('#');
+            if let Ok(n) = s.parse::<i64>() {
+                n
+            } else {
+                let fg = forge::forge_for(repo.forge);
+                let (slug, n) = fg.parse_pr_url(s).ok_or_else(bad)?;
+                let ours = fg
+                    .owner_repo(&repo.url)
+                    .map(|(owner, name)| format!("{owner}/{name}"));
+                let same_host = forge::url_host(s)
+                    .zip(forge::url_host(&repo.url))
+                    .is_some_and(|(theirs, ours)| theirs.eq_ignore_ascii_case(ours));
+                if !same_host || ours.is_none_or(|ours| !ours.eq_ignore_ascii_case(&slug)) {
+                    return Err(ApiError::BadRequest(format!(
+                        "{s} is not a PR of {}",
+                        repo.name
+                    )));
+                }
+                n
+            }
+        }
+        _ => return Err(bad()),
+    };
+    if n <= 0 {
+        return Err(bad());
+    }
+    Ok(n)
+}
+
+/// A forge read off the async runtime: every forge call is a subprocess.
+async fn forge_call<T: Send + 'static>(
+    f: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<T> {
+    tokio::task::spawn_blocking(f).await?
+}
+
+/// POST /api/pr-review {`repo_id`, pr, watch, vouch?}: request a review of
+/// a PR hunter did not open. An author who cannot push to the repo needs
+/// `vouch: true`: reviewing runs their code with the daemon's credentials.
+/// A `reviewBots` login is no exception: a login is just a name a human
+/// may hold too (`forge::screen_feedback` confirms a bot by its author
+/// type, which a PR's metadata does not carry). Without it the answer is
+/// a 409 carrying `needs_vouch`, so the UI can ask. A PR already under
+/// review only has its `watch` set; one whose review ended with the PR's
+/// close is read again and, reopened on the forge, reviewed again (its
+/// review follows the PR; a merged PR's has ended for good). A review
+/// requested before the repo's URL changed is bound to the new URL like a
+/// new one is requested, whatever its state (merged, closed or own said
+/// so of the PR at the earlier URL): the PR is read there, refused unless
+/// open, and its author passes the push check or is vouched for afresh;
+/// the review starts over, none of its rounds at the earlier URL counting
+/// again ([`Store::request_pr_review`]). The answer's `outcome` says
+/// which: `requested`, `updated`, `reopened` or `rebound`.
+async fn request_pr_review(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> Result<Response, ApiError> {
+    post_gate(&headers)?;
+    let body = parse_object(&raw)?;
+    let rid = require_int(&body, "repo_id", "repo_id must be an integer")?;
+    let Some(Value::Bool(watch)) = body.get("watch") else {
+        return Err(ApiError::BadRequest("watch must be a boolean".to_owned()));
+    };
+    let watch = *watch;
+    let vouch = match body.get("vouch") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(ApiError::BadRequest("vouch must be a boolean".to_owned())),
+    };
+    let repo = fetch_repo(&state.store, rid).await?;
+    let n = pr_number_of(&repo, body.get("pr").unwrap_or(&Value::Null))?;
+    if state.store.is_hunter_pr(repo.id, n).await? {
+        return Err(ApiError::Conflict(format!(
+            "PR #{n} of {} is one hunter opened; it is engaged, not reviewed",
+            repo.name
+        )));
+    }
+    let existing = match state.store.find_pr_review(repo.id, n).await? {
+        Some(id) => state.store.get_pr_review(id).await?,
+        None => None,
+    };
+    // A review requested under another URL of the repo is bound to this
+    // one only by a request that reads the PR here and decides about its
+    // author afresh ([`PrReviewRow::repo_moved`]).
+    let moved = existing.as_ref().is_some_and(PrReviewRow::repo_moved);
+    if let Some(review) = existing
+        .as_ref()
+        .filter(|r| r.state == PrReviewState::Open && !moved)
+    {
+        return update_pr_review(&state, &user, (&repo, review.id, n), watch).await;
+    }
+    // A merged or own review ended for good at the URL it is bound to; at
+    // another, its number names another PR, read below like a new one's.
+    if let Some(review) = existing
+        .as_ref()
+        .filter(|r| !moved && !matches!(r.state, PrReviewState::Closed | PrReviewState::Open))
+    {
+        return Err(ApiError::Conflict(format!(
+            "PR #{n}'s review has ended for good: it is {}",
+            review.state.as_str()
+        )));
+    }
+    let url = repo.url.clone();
+    let fg_forge = repo.forge;
+    let pr = forge_call(move || forge::forge_for(fg_forge).view_pr_meta(&url, n))
+        .await
+        .map_err(|e| ApiError::BadRequest(format!("cannot read PR #{n}: {e}")))?;
+    if pr.state != forge::PrState::Open {
+        return Err(ApiError::Conflict(format!("PR #{n} is not open")));
+    }
+    // A review the PR's close ended keeps what its request decided about
+    // the author, who is the same ([`Store::request_pr_review`]): only a
+    // new review, or one bound to the repo's URL anew, asks whether they
+    // can push.
+    let vouched = if existing.is_some() && !moved {
+        None
+    } else {
+        let (url, author) = (repo.url.clone(), pr.author.clone());
+        let trusted = forge_call(move || forge::forge_for(fg_forge).can_push(&url, &author))
+            .await
+            .map_err(|e| {
+                ApiError::BadRequest(format!("cannot tell whether {} can push: {e:#}", pr.author))
+            })?;
+        if !trusted && !vouch {
+            return Ok(needs_vouch(&repo, &pr));
+        }
+        (!trusted).then_some(pr.author.as_str())
+    };
+    let id = state
+        .store
+        .request_pr_review(&NewPrReview {
+            repo_id: repo.id,
+            pr_number: n,
+            repo_url: &repo.url,
+            title: &pr.title,
+            author: &pr.author,
+            base_ref: &pr.base_ref,
+            cross_repo: pr.cross_repo,
+            head_sha: &pr.head_sha,
+            watch,
+            vouched_author: vouched,
+            requested_by: &user.username,
+        })
+        .await?;
+    let outcome = match &existing {
+        Some(_) if moved => "rebound",
+        Some(_) => "reopened",
+        None => "requested",
+    };
+    let mut msg = format!("review of {} PR #{n} {outcome}", repo.name);
+    if let Some(author) = vouched {
+        use std::fmt::Write;
+        let _ = write!(msg, " (vouched for {author})");
+    }
+    state
+        .store
+        .log_user_event(&user, "pr_review", &msg, None)
+        .await?;
+    state.scheduler.wake.notify_one();
+    Ok(Json(json!({ "ok": true, "id": id, "outcome": outcome })).into_response())
+}
+
+/// The answer to a request for PR `n` of `repo` whose review `id` already
+/// follows the open PR: only its `watch` is set.
+async fn update_pr_review(
+    state: &AppState,
+    user: &CurrentUser,
+    (repo, id, n): (&Repo, i64, i64),
+    watch: bool,
+) -> Result<Response, ApiError> {
+    state.store.set_pr_review_watch(id, watch).await?;
+    let msg = format!(
+        "review of {} PR #{n}: watch {}",
+        repo.name,
+        if watch { "on" } else { "off" }
+    );
+    state
+        .store
+        .log_user_event(user, "pr_review", &msg, None)
+        .await?;
+    state.scheduler.wake.notify_one();
+    Ok(Json(json!({ "ok": true, "id": id, "outcome": "updated" })).into_response())
+}
+
+/// The 409 asking the requester to vouch for the author of `pr`, who
+/// cannot push to `repo`: the UI asks, and repeats the request with
+/// `vouch`.
+fn needs_vouch(repo: &Repo, pr: &forge::PrMeta) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": format!(
+                "{} cannot push to {}: reviewing runs their code with your credentials",
+                pr.author, repo.name
+            ),
+            "needs_vouch": true,
+            "author": pr.author,
+            "cross_repo": pr.cross_repo,
+        })),
+    )
+        .into_response()
+}
+
+/// POST /api/pr-review/watch {id, watch}: turning watch on also clears a
+/// failure streak and its hold.
+async fn set_pr_review_watch(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> Result<Response, ApiError> {
+    post_gate(&headers)?;
+    let body = parse_object(&raw)?;
+    let id = require_int(&body, "id", "id must be an integer")?;
+    let Some(Value::Bool(watch)) = body.get("watch") else {
+        return Err(ApiError::BadRequest("watch must be a boolean".to_owned()));
+    };
+    if !state.store.set_pr_review_watch(id, *watch).await? {
+        return Err(ApiError::NotFound(format!("no PR review {id}")));
+    }
+    let msg = format!(
+        "PR review {id}: watch {}",
+        if *watch { "on" } else { "off" }
+    );
+    state
+        .store
+        .log_user_event(&user, "pr_review", &msg, None)
+        .await?;
+    state.scheduler.wake.notify_one();
+    Ok(Json(json!({ "ok": true })).into_response())
+}
+
+/// POST /api/pr-review/retry {id}: clear a review's failure streak and
+/// hold, so its next round is due again.
+async fn retry_pr_review(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> Result<Response, ApiError> {
+    post_gate(&headers)?;
+    let body = parse_object(&raw)?;
+    let id = require_int(&body, "id", "id must be an integer")?;
+    if !state.store.retry_pr_review(id).await? {
+        return Err(ApiError::NotFound(format!("no PR review {id}")));
+    }
+    state
+        .store
+        .log_user_event(&user, "pr_review", &format!("PR review {id}: retry"), None)
+        .await?;
+    state.scheduler.wake.notify_one();
+    Ok(Json(json!({ "ok": true })).into_response())
+}
+
+/// GET /api/repo/open-prs?id=N: the repo's open PRs from its forge, each
+/// marked when hunter opened it and with its review, if one was requested.
+async fn repo_open_prs(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Vec<OpenPrOut>>, ApiError> {
+    let rid = param(&params, "id")
+        .and_then(|v| v.parse::<i64>().ok())
+        .ok_or_else(|| ApiError::BadRequest("id must be an integer".to_owned()))?;
+    let repo = fetch_repo(&state.store, rid).await?;
+    let (url, forge_name) = (repo.url.clone(), repo.forge);
+    let open = forge_call(move || forge::forge_for(forge_name).list_open_prs(&url)).await?;
+    let own = state.store.hunter_pr_numbers(rid).await?;
+    let reviews: HashMap<i64, i64> = state
+        .store
+        .list_pr_reviews()
+        .await?
+        .into_iter()
+        .filter(|r| r.repo_id == rid)
+        .map(|r| (r.pr_number, r.id))
+        .collect();
+    Ok(Json(
+        open.into_iter()
+            .map(|p| OpenPrOut {
+                hunter_own: own.contains(&p.number),
+                review_id: reviews.get(&p.number).copied(),
+                number: p.number,
+                title: p.title,
+                author: p.author,
+                is_draft: p.is_draft,
+                cross_repo: p.cross_repo,
+                url: p.url,
+            })
+            .collect(),
+    ))
 }
