@@ -119,12 +119,32 @@ pub fn run_cmd(argv: &[&str], timeout_s: u64) -> (i32, String) {
 /// copies did not: the fix landed four times, one of them two rounds
 /// late. There is one body now, so there is one place to get it right.
 pub fn run_cmd_in(argv: &[&str], cwd: Option<&Path>, timeout_s: u64) -> (i32, String) {
+    run_cmd_fed(argv, cwd, None, timeout_s)
+}
+
+/// [`run_cmd`] with `input` written to the command's stdin, for a request
+/// body too structured for flags (`gh api --input -`).
+pub fn run_cmd_input(argv: &[&str], input: &str, timeout_s: u64) -> (i32, String) {
+    run_cmd_fed(argv, None, Some(input), timeout_s)
+}
+
+/// The one body behind every `run_cmd*` (see [`run_cmd_in`]).
+fn run_cmd_fed(
+    argv: &[&str],
+    cwd: Option<&Path>,
+    input: Option<&str>,
+    timeout_s: u64,
+) -> (i32, String) {
     let Some((prog, rest)) = argv.split_first() else {
         return (127, "empty argv".to_owned());
     };
     let mut cmd = Command::new(prog);
     cmd.args(rest)
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(dir) = cwd {
@@ -140,6 +160,18 @@ pub fn run_cmd_in(argv: &[&str], cwd: Option<&Path>, timeout_s: u64) -> (i32, St
         Ok(c) => c,
         Err(e) => return (127, e.to_string()),
     };
+    // Fed from a thread, like the pipes are drained: a child that answers
+    // before reading all of its input would otherwise block us on a full
+    // stdin pipe while we never get to read its output. Dropping the
+    // handle at the end is the EOF the child waits for.
+    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+        let input = input.to_owned();
+        std::thread::spawn(move || {
+            use std::io::Write as _;
+            // A child that exits without reading is its own answer.
+            let _ = stdin.write_all(input.as_bytes());
+        });
+    }
     // Readers start now, not after the wait: see `drain_pipe`. Every exit
     // path below reaps the child first, so the joins see a closed pipe.
     let so = drain_pipe(child.stdout.take());

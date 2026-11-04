@@ -51,7 +51,10 @@ use crate::util::now_ms;
 mod pr_review;
 mod pr_state;
 
-pub use pr_review::{HEAD_STABLE_MS, NewPrReview, PR_REVIEW_HOLD_AT, PrReviewRound, PrReviewRow};
+pub use pr_review::{
+    ApprovedRound, HEAD_STABLE_MS, NewPrReview, POST_GIVE_UP_AT, PR_REVIEW_HOLD_AT, PostDecided,
+    PostDecision, PostableIssue, PrReviewRound, PrReviewRow,
+};
 pub use pr_state::{PrRead, PrSyncPass};
 
 /// A `pr_state` row as the store read it ([`Store::get_pr_state`]).
@@ -6038,6 +6041,29 @@ impl AdminStore {
         state: crate::domain::PrReviewState,
     ) -> sqlx::Result<()> {
         self.0.observe_pr_review(id, head_sha, title, state).await
+    }
+
+    /// Record round `round_id` as posted to the forge. See the private
+    /// `Store` method of the same name.
+    pub async fn record_pr_review_posted(
+        &self,
+        round_id: i64,
+        review_ref: &str,
+        thread_refs: &[(i64, String)],
+    ) -> sqlx::Result<()> {
+        self.0
+            .record_pr_review_posted(round_id, review_ref, thread_refs)
+            .await
+    }
+
+    /// Count one failed post of round `round_id`. See the private `Store`
+    /// method of the same name.
+    pub async fn record_pr_review_post_failure(
+        &self,
+        round_id: i64,
+        why: &str,
+    ) -> sqlx::Result<i64> {
+        self.0.record_pr_review_post_failure(round_id, why).await
     }
 }
 

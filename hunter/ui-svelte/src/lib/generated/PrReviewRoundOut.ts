@@ -4,4 +4,15 @@ import type { PrReviewIssueOut } from "./PrReviewIssueOut";
 /**
  * One review attempt of the range `base_sha..head_sha`.
  */
-export type PrReviewRoundOut = { id: number, job_id: number | null, base_sha: string, head_sha: string, verdict: string, failure: string | null, finished_at: number, issues: Array<PrReviewIssueOut>, };
+export type PrReviewRoundOut = { id: number, job_id: number | null, base_sha: string, head_sha: string, verdict: string, failure: string | null, finished_at: number, 
+/**
+ * Null when there is nothing to post (failed, or no issues);
+ * otherwise `pending` (awaiting a user), `approved` (posted on the next
+ * PR sync), `posted` or `discarded`.
+ */
+post_state: string | null, 
+/**
+ * The newest failed post's reason; kept after the round fell back to
+ * `pending`, cleared once it is approved again.
+ */
+post_error: string | null, posted_at: number | null, issues: Array<PrReviewIssueOut>, };

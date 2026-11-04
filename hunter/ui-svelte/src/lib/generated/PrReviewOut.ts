@@ -5,4 +5,9 @@ import type { PrReviewState } from "./PrReviewState";
 /**
  * GET /api/pr-reviews: one requested review, rounds newest first.
  */
-export type PrReviewOut = { id: number, repo_id: number, repo_name: string, pr_number: number, pr_url: string, title: string, author: string, cross_repo: boolean, watch: boolean, state: PrReviewState, head_sha: string | null, last_reviewed_sha: string | null, vouched_author: string | null, requested_by: string, requested_at: number, failures: number, last_failure: string | null, held: boolean, running_job_id: number | null, rounds: Array<PrReviewRoundOut>, };
+export type PrReviewOut = { id: number, repo_id: number, repo_name: string, pr_number: number, pr_url: string, title: string, author: string, cross_repo: boolean, watch: boolean, 
+/**
+ * Whether a new round with issues is posted without waiting for a
+ * user's approval.
+ */
+auto_post: boolean, state: PrReviewState, head_sha: string | null, last_reviewed_sha: string | null, vouched_author: string | null, requested_by: string, requested_at: number, failures: number, last_failure: string | null, held: boolean, running_job_id: number | null, rounds: Array<PrReviewRoundOut>, };

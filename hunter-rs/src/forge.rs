@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 use crate::clones::{Force, Unheld};
 use crate::domain::ForgeName;
-use crate::util::{run_cmd, run_cmd_in};
+use crate::util::{run_cmd, run_cmd_in, run_cmd_input};
 
 /// Git forge PR/MR lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -346,6 +346,24 @@ struct GlMergeRequest {
     draft: bool,
     #[serde(default)]
     web_url: String,
+    /// The shas a diff position on the MR's current version names.
+    #[serde(default)]
+    diff_refs: Option<GlDiffRefs>,
+}
+
+/// `diff_refs` of a GitLab MR: the commits its current diff is between.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "GitLab's own field names, deserialized as sent"
+)]
+struct GlDiffRefs {
+    #[serde(default)]
+    base_sha: String,
+    #[serde(default)]
+    start_sha: String,
+    #[serde(default)]
+    head_sha: String,
 }
 
 /// What a review of somebody else's PR needs to know about it
@@ -374,6 +392,96 @@ pub struct OpenPr {
     pub is_draft: bool,
     pub cross_repo: bool,
     pub url: String,
+}
+
+/// Which version of a file a review comment's line numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Side {
+    /// The PR's head: added and unchanged lines.
+    #[default]
+    Right,
+    /// The base: lines the PR removes (and unchanged ones).
+    Left,
+}
+
+impl Side {
+    /// The word GitHub's review API and `pr_review_issues.side` use.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Right => "RIGHT",
+            Self::Left => "LEFT",
+        }
+    }
+}
+
+/// One issue of a [`ReviewPost`] placed on a line of the PR's diff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineComment {
+    /// The `pr_review_issues` row this comment carries.
+    pub issue_id: i64,
+    /// The file's path in the head (in the base, for a deleted file).
+    pub path: String,
+    /// The file's path in the base: `path`, unless the PR renamed it.
+    pub old_path: String,
+    /// The line as the reviewer gave it, numbered on `side`.
+    pub line: i64,
+    pub side: Side,
+    /// The line's number in the base and in the head, where it has one: an
+    /// unchanged line has both, which GitLab's position needs.
+    pub old_line: Option<i64>,
+    pub new_line: Option<i64>,
+    pub body: String,
+}
+
+/// A COMMENT review as [`Forge::post_review`] sends it: posts go out under
+/// the operator's forge login, so hunter never approves or requests
+/// changes in their name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewPost {
+    /// The head the review read; the comments' lines number its diff.
+    pub commit_id: String,
+    /// Markdown; [`Forge::post_review`] adds the own-comment mark.
+    pub body: String,
+    pub comments: Vec<InlineComment>,
+}
+
+impl ReviewPost {
+    /// Add to the body an issue that is not on a line of the diff, at
+    /// `location` (`file:line`) if it names one.
+    pub fn push_unplaced(&mut self, location: Option<&str>, text: &str) {
+        self.body.push_str("\n\n---\n\n");
+        if let Some(at) = location {
+            self.body.push('`');
+            self.body.push_str(at);
+            self.body.push_str("`\n\n");
+        }
+        self.body.push_str(text);
+    }
+
+    /// This post with every inline comment moved into the body: the lines
+    /// they name are not where the forge would put them (the PR moved on
+    /// since the review read it).
+    #[must_use]
+    pub fn without_inline(mut self) -> Self {
+        for c in std::mem::take(&mut self.comments) {
+            let at = format!(
+                "{}:{}{}",
+                c.path,
+                c.line,
+                if c.side == Side::Left { " (base)" } else { "" }
+            );
+            self.push_unplaced(Some(&at), &c.body);
+        }
+        self
+    }
+}
+
+/// What [`Forge::post_review`] posted: the forge's id of the review and of
+/// each inline comment, by the issue it carries.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PostedReview {
+    pub review_ref: String,
+    pub thread_refs: Vec<(i64, String)>,
 }
 
 /// One file of `merge_requests/:iid/diffs`: GitLab returns the hunks
@@ -912,6 +1020,15 @@ pub trait Forge: Send + Sync {
     /// The fetch refspec that brings PR `pr_number`'s head, fork or not,
     /// into the clone as `refs/hunter/pr/<n>` ([`pr_head_ref`]).
     fn pr_head_refspec(&self, pr_number: i64) -> String;
+    /// Post `post` on PR `pr_number` as one COMMENT review, its body marked
+    /// as hunter's own ([`mark_own`]). Where each comment goes was decided
+    /// by the caller from [`Self::pr_diff`].
+    fn post_review(
+        &self,
+        url: &str,
+        pr_number: i64,
+        post: &ReviewPost,
+    ) -> anyhow::Result<PostedReview>;
 }
 
 /// The local ref a PR's head is fetched into ([`Forge::pr_head_refspec`]).
@@ -1307,6 +1424,137 @@ fn gitlab_api(
     run_cmd(&refs, 30)
 }
 
+/// `glab api --method <method> <path>` sending `body` (JSON) as the request
+/// body: a draft note's position is nested, which `-f` fields cannot say.
+fn gitlab_api_json(url: &str, api_path: &str, method: &str, body: &str) -> (i32, String) {
+    let mut args = vec![
+        "glab",
+        "api",
+        api_path,
+        "--method",
+        method,
+        "--header",
+        "Content-Type: application/json",
+        "--input",
+        "-",
+    ];
+    if let Some((host, _)) = gitlab_host_path(url)
+        && host != "gitlab.com"
+    {
+        args.extend(["--hostname", host]);
+    }
+    run_cmd_input(&args, body, 30)
+}
+
+/// Create a draft note on MR `pr_number` (project `enc`, URL-encoded) from
+/// `body`; the note's id.
+fn gitlab_draft_note(
+    url: &str,
+    enc: &str,
+    pr_number: i64,
+    body: &serde_json::Value,
+) -> anyhow::Result<i64> {
+    #[derive(Deserialize)]
+    struct Created {
+        id: i64,
+    }
+    let api = format!("projects/{enc}/merge_requests/{pr_number}/draft_notes");
+    let (rc, out) = gitlab_api_json(url, &api, "POST", &body.to_string());
+    if rc != 0 {
+        anyhow::bail!("glab api POST {api} failed (rc={rc}): {out}");
+    }
+    let created: Created = serde_json::from_str(out.trim())
+        .map_err(|e| anyhow::anyhow!("glab api POST {api}: unparseable draft note: {e}"))?;
+    Ok(created.id)
+}
+
+/// The drafts of a GitLab review, published together: one per inline
+/// comment, positioned on the diff `refs` names, then the body. Every
+/// draft created is pushed to `drafts`, so a failure can take them back.
+fn gitlab_publish_review(
+    url: &str,
+    enc: &str,
+    pr_number: i64,
+    (post, refs): (&ReviewPost, &GlDiffRefs),
+    drafts: &mut Vec<i64>,
+) -> anyhow::Result<PostedReview> {
+    let mut thread_refs = Vec::with_capacity(post.comments.len());
+    for c in &post.comments {
+        let mut position = serde_json::json!({
+            "position_type": "text",
+            "base_sha": refs.base_sha,
+            "start_sha": refs.start_sha,
+            "head_sha": refs.head_sha,
+            "old_path": c.old_path,
+            "new_path": c.path,
+        });
+        if let Some(line) = c.old_line {
+            position["old_line"] = line.into();
+        }
+        if let Some(line) = c.new_line {
+            position["new_line"] = line.into();
+        }
+        let note = serde_json::json!({ "note": c.body, "position": position });
+        let id = gitlab_draft_note(url, enc, pr_number, &note)?;
+        drafts.push(id);
+        thread_refs.push((c.issue_id, id.to_string()));
+    }
+    let body = serde_json::json!({ "note": mark_own(&post.body) });
+    let body_id = gitlab_draft_note(url, enc, pr_number, &body)?;
+    drafts.push(body_id);
+    let api = format!("projects/{enc}/merge_requests/{pr_number}/draft_notes/bulk_publish");
+    let (rc, out) = gitlab_api(url, &api, Some("POST"), &[]);
+    if rc != 0 {
+        anyhow::bail!("glab api POST {api} failed (rc={rc}): {out}");
+    }
+    Ok(PostedReview {
+        review_ref: body_id.to_string(),
+        thread_refs,
+    })
+}
+
+/// The node id of each of `comments` among the inline comments GitHub
+/// recorded for review `review_id`, matched by file and line in order;
+/// a comment with no match gets none. Read from the PR's comment list,
+/// not `reviews/{id}/comments`: that endpoint leaves `line` and
+/// `original_line` null, so nothing would ever match.
+fn github_thread_refs(
+    url: &str,
+    pr_number: i64,
+    review_id: i64,
+    comments: &[InlineComment],
+) -> anyhow::Result<Vec<(i64, String)>> {
+    let (host, path) =
+        url_host_path(url).ok_or_else(|| anyhow::anyhow!("cannot parse owner/repo from {url}"))?;
+    let path = path.trim_end_matches('/').trim_end_matches(".git");
+    let api = format!("repos/{path}/pulls/{pr_number}/comments?per_page=100");
+    let jq = format!(".[] | select(.pull_request_review_id == {review_id})");
+    let mut argv = vec!["gh", "api", "--paginate", &api, "--jq", &jq];
+    if !host.eq_ignore_ascii_case("github.com") {
+        argv.extend(["--hostname", host]);
+    }
+    let (rc, out) = run_cmd(&argv, 60);
+    if rc != 0 {
+        anyhow::bail!("gh api {api} failed (rc={rc}): {out}");
+    }
+    let mut listed: Vec<Option<GhReviewComment>> = serde_json::Deserializer::from_str(&out)
+        .into_iter::<GhReviewComment>()
+        .map(|c| c.map(Some))
+        .collect::<Result<_, _>>()
+        .map_err(|e| anyhow::anyhow!("gh api {api}: unparseable review comments: {e}"))?;
+    Ok(comments
+        .iter()
+        .filter_map(|c| {
+            let slot = listed.iter_mut().find(|l| {
+                l.as_ref().is_some_and(|l| {
+                    l.path == c.path && (l.line == Some(c.line) || l.original_line == Some(c.line))
+                })
+            })?;
+            slot.take().map(|l| (c.issue_id, l.node_id))
+        })
+        .collect())
+}
+
 // ---------------------------------------------------------------------------
 // GitHub (via `gh` CLI) — `forge.GitHubForge`
 // ---------------------------------------------------------------------------
@@ -1622,6 +1870,77 @@ impl Forge for GitHubForge {
 
     fn pr_head_refspec(&self, pr_number: i64) -> String {
         format!("+refs/pull/{pr_number}/head:{}", pr_head_ref(pr_number))
+    }
+
+    fn post_review(
+        &self,
+        url: &str,
+        pr_number: i64,
+        post: &ReviewPost,
+    ) -> anyhow::Result<PostedReview> {
+        #[derive(Deserialize)]
+        struct Created {
+            id: i64,
+        }
+        let (host, _) = url_host_path(url)
+            .ok_or_else(|| anyhow::anyhow!("cannot parse owner/repo from {url}"))?;
+        // A renamed or transferred repo answers its old path with a 301 on
+        // a GET, which gh follows, but with a 307 on a POST, which it does
+        // not: ask for the repo's current name first.
+        let (owner, repo) = self
+            .owner_repo(url)
+            .ok_or_else(|| anyhow::anyhow!("cannot parse owner/repo from {url}"))?;
+        let (rc, full_name) = github_api_jq(url, &format!("repos/{owner}/{repo}"), ".full_name")?;
+        let full_name = full_name.trim();
+        if rc != 0 || full_name.is_empty() {
+            anyhow::bail!("gh api repos/{owner}/{repo} failed (rc={rc}): {full_name}");
+        }
+        let api = format!("repos/{full_name}/pulls/{pr_number}/reviews");
+        let comments: Vec<serde_json::Value> = post
+            .comments
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "path": c.path,
+                    "line": c.line,
+                    "side": c.side.as_str(),
+                    "body": c.body,
+                })
+            })
+            .collect();
+        let payload = serde_json::json!({
+            "commit_id": post.commit_id,
+            "event": "COMMENT",
+            "body": mark_own(&post.body),
+            "comments": comments,
+        });
+        let mut argv = vec!["gh", "api", "-X", "POST", &api, "--input", "-"];
+        if !host.eq_ignore_ascii_case("github.com") {
+            argv.extend(["--hostname", host]);
+        }
+        let (rc, out) = run_cmd_input(&argv, &payload.to_string(), 60);
+        if rc != 0 {
+            anyhow::bail!("gh api POST {api} failed (rc={rc}): {out}");
+        }
+        let created: Created = serde_json::from_str(out.trim())
+            .map_err(|e| anyhow::anyhow!("gh api POST {api}: unparseable review: {e}"))?;
+        // The review is up whatever happens next; without the comments'
+        // ids it is only missing what a later slice resolves threads by.
+        let thread_refs = if post.comments.is_empty() {
+            Vec::new()
+        } else {
+            github_thread_refs(url, pr_number, created.id, &post.comments).unwrap_or_else(|e| {
+                tracing::warn!(
+                    "PR #{pr_number}: review {} posted, comment ids: {e}",
+                    created.id
+                );
+                Vec::new()
+            })
+        };
+        Ok(PostedReview {
+            review_ref: created.id.to_string(),
+            thread_refs,
+        })
     }
 }
 
@@ -1948,6 +2267,45 @@ impl Forge for GitLabForge {
             "+refs/merge-requests/{pr_number}/head:{}",
             pr_head_ref(pr_number)
         )
+    }
+
+    fn post_review(
+        &self,
+        url: &str,
+        pr_number: i64,
+        post: &ReviewPost,
+    ) -> anyhow::Result<PostedReview> {
+        let (_, path) = gitlab_host_path(url)
+            .ok_or_else(|| anyhow::anyhow!("cannot parse GitLab URL: {url}"))?;
+        let enc = path.replace('/', "%2F");
+        let api = format!("projects/{enc}/merge_requests/{pr_number}");
+        let (rc, out) = gitlab_api(url, &api, None, &[]);
+        if rc != 0 {
+            anyhow::bail!("glab api {api} failed (rc={rc}): {out}");
+        }
+        let mr: GlMergeRequest = serde_json::from_str(out.trim())
+            .map_err(|e| anyhow::anyhow!("glab api {api}: unparseable MR: {e}"))?;
+        let refs = mr.diff_refs.unwrap_or_default();
+        // A position names the MR's current version, which is not the one
+        // the review read once the author pushed again: its lines would
+        // land on whatever the new version has there.
+        let moved;
+        let post = if refs.head_sha == post.commit_id {
+            post
+        } else {
+            moved = post.clone().without_inline();
+            &moved
+        };
+        let mut drafts = Vec::new();
+        let posted = gitlab_publish_review(url, &enc, pr_number, (post, &refs), &mut drafts);
+        if posted.is_err() {
+            // Unpublished drafts would go out with the next attempt's, or
+            // with whatever the operator publishes next by hand.
+            for id in drafts {
+                let _ = gitlab_api(url, &format!("{api}/draft_notes/{id}"), Some("DELETE"), &[]);
+            }
+        }
+        posted
     }
 }
 

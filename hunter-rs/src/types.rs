@@ -636,8 +636,14 @@ pub struct PrReviewIssueOut {
     pub confidence: Option<f64>,
     pub file: Option<String>,
     pub line: Option<i64>,
+    /// `"RIGHT"` when `line` numbers the PR's head, `"LEFT"` the base (code
+    /// the PR removes); null when the reviewer did not say, read as RIGHT.
+    pub side: Option<String>,
     pub summary: String,
     pub detail: String,
+    /// Whether the issue went out as an inline comment on the PR's diff
+    /// (rather than in the posted review's body).
+    pub posted_inline: bool,
 }
 
 /// One review attempt of the range `base_sha..head_sha`.
@@ -651,12 +657,24 @@ pub struct PrReviewRoundOut {
     pub verdict: String,
     pub failure: Option<String>,
     pub finished_at: i64,
+    /// Null when there is nothing to post (failed, or no issues);
+    /// otherwise `pending` (awaiting a user), `approved` (posted on the next
+    /// PR sync), `posted` or `discarded`.
+    pub post_state: Option<String>,
+    /// The newest failed post's reason; kept after the round fell back to
+    /// `pending`, cleared once it is approved again.
+    pub post_error: Option<String>,
+    pub posted_at: Option<i64>,
     pub issues: Vec<PrReviewIssueOut>,
 }
 
 /// GET /api/pr-reviews: one requested review, rounds newest first.
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the review's independent flags, as the UI reads them"
+)]
 pub struct PrReviewOut {
     pub id: i64,
     pub repo_id: i64,
@@ -667,6 +685,9 @@ pub struct PrReviewOut {
     pub author: String,
     pub cross_repo: bool,
     pub watch: bool,
+    /// Whether a new round with issues is posted without waiting for a
+    /// user's approval.
+    pub auto_post: bool,
     pub state: PrReviewState,
     pub head_sha: Option<String>,
     pub last_reviewed_sha: Option<String>,

@@ -784,8 +784,10 @@ It blocks nothing; it would remove recurring review noise and a class of
 bug the current gates cannot see.
 
 ### 8.8 PR reviews: Watch on PRs hunter did not open
-**Status:** designed 2026-11-04; slice 1 built (manual request, Watch,
-review rounds, results in the UI; no forge posting yet).
+**Status:** designed 2026-11-04; slices 1–2 built (manual request, Watch,
+review rounds, results in the UI; inline COMMENT posting with per-review
+auto-post or per-round approval). Not yet: thread replies and resolution
+(slice 3), issues still open at merge becoming findings (slice 4).
 
 Reviews are enabled by hand, per PR, never by repo-wide discovery: the
 open PRs that are not hunter's own were, when designed, the operator's

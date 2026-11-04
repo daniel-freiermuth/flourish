@@ -72,6 +72,7 @@ twenty guesses. An empty array is a valid verdict. Each entry:
   "blocking": true,
   "file": "path/file.ext",
   "line": 0,
+  "side": "RIGHT",
   "severity": "high|medium|low",
   "confidence": 0.0,
   "summary": "one sentence",
@@ -80,5 +81,10 @@ twenty guesses. An empty array is a valid verdict. Each entry:
 ```
 
 `blocking` is true only for a correctness defect you would refuse to merge.
-Report an issue only when you can point at the code that proves it. Then
-stop.
+`file` is the path in the repo, relative to its root. `side` says which
+version `line` numbers: `"RIGHT"` (the default) is the file at HEAD; use
+`"LEFT"` only for code the change REMOVES, with `line` numbered in
+`{{BASE}}`. Point `line` at a line the change adds, removes or sits right
+next to where you can: an issue may be posted as a comment on that line of
+the PR's diff. Report an issue only when you can point at the code that
+proves it. Then stop.

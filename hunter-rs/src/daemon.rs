@@ -236,8 +236,11 @@ pub async fn admin_duty(
 
 /// [`crate::scheduler::sync_prs`], logged as a `prsync` event when it made
 /// work for the job lane, then the refresh of every open PR review
-/// ([`crate::scheduler::sync_pr_reviews`]). Its failures are already events
-/// of their own, one per PR (`sync #<id>: ...`, `pr_review <repo> #<n>: ...`).
+/// ([`crate::scheduler::sync_pr_reviews`]) and the posting of every
+/// approved review round ([`crate::scheduler::post_pr_reviews`]), which
+/// reads the heads the refresh just recorded. Its failures are already
+/// events of their own, one per PR (`sync #<id>: ...`,
+/// `pr_review <repo> #<n>: ...`).
 async fn sync_open_prs(
     admin: &AdminAuthority,
     cfg: &Config,
@@ -262,6 +265,7 @@ async fn sync_open_prs(
     if !*shutdown.borrow() {
         let stop = shutdown.clone();
         crate::scheduler::sync_pr_reviews(admin.store(), || *stop.borrow()).await;
+        crate::scheduler::post_pr_reviews(admin.store(), cfg, || *stop.borrow()).await;
     }
     Some(s)
 }

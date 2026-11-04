@@ -33,7 +33,7 @@ mod pr_review;
 mod review;
 pub use attempt::{Attempt, Kind, Resumed, kind};
 use pr_review::run_pr_review;
-pub use pr_review::sync_pr_reviews;
+pub use pr_review::{post_pr_reviews, sync_pr_reviews};
 
 /// Everything a resumed attempt needs and a cold one does not.
 ///

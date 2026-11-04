@@ -22,6 +22,58 @@ pub const HEAD_STABLE_MS: i64 = 10 * 60 * 1000;
 /// retrying every cycle would only spend budget on it.
 pub const PR_REVIEW_HOLD_AT: i64 = 3;
 
+/// Failed posts of an approved round after which it falls back to
+/// `pending`: the forge keeps refusing it (the PR moved, a comment it
+/// rejects), and a user should look before it is sent again.
+pub const POST_GIVE_UP_AT: i64 = 3;
+
+/// A user's decision on a pending round
+/// ([`Store::decide_pr_review_post`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostDecision {
+    /// Post it on the next PR sync.
+    Approve,
+    /// Never post it.
+    Discard,
+}
+
+/// What [`Store::decide_pr_review_post`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PostDecided {
+    /// The round moved; it belongs to this review.
+    Moved {
+        review_id: i64,
+    },
+    NoSuchRound,
+    /// The round takes no decision now, for this reason.
+    Refused(String),
+}
+
+/// An `approved` round, for the PR sync to post.
+#[derive(Debug, Clone)]
+pub struct ApprovedRound {
+    pub id: i64,
+    pub review_id: i64,
+    pub base_sha: String,
+    pub head_sha: String,
+}
+
+/// One issue of a round as a post needs it: with its id, to record the
+/// inline comment it became.
+#[derive(Debug, Clone)]
+pub struct PostableIssue {
+    pub id: i64,
+    pub kind: String,
+    pub blocking: bool,
+    pub severity: Option<String>,
+    pub file: Option<String>,
+    pub line: Option<i64>,
+    /// `line` numbers the base (code the PR removes), not the head.
+    pub left: bool,
+    pub summary: String,
+    pub detail: String,
+}
+
 /// What a request records about the PR, read from the forge at request
 /// time.
 #[derive(Debug, Clone)]
@@ -34,6 +86,8 @@ pub struct NewPrReview<'a> {
     pub cross_repo: bool,
     pub head_sha: &'a str,
     pub watch: bool,
+    /// Post each round with issues without waiting for a user's approval.
+    pub auto_post: bool,
     /// The author, when they cannot push and the requester vouched.
     pub vouched_author: Option<&'a str>,
     pub requested_by: &'a str,
@@ -41,6 +95,10 @@ pub struct NewPrReview<'a> {
 
 /// A `pr_reviews` row with its repo's name, URL and forge.
 #[derive(Debug, Clone)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the table's independent flags, read as stored; an enum would invent states"
+)]
 pub struct PrReviewRow {
     pub id: i64,
     pub repo_id: i64,
@@ -53,6 +111,7 @@ pub struct PrReviewRow {
     pub base_ref: String,
     pub cross_repo: bool,
     pub watch: bool,
+    pub auto_post: bool,
     pub state: PrReviewState,
     pub head_sha: Option<String>,
     pub head_seen_at: Option<i64>,
@@ -89,6 +148,7 @@ macro_rules! select_reviews {
                    r.forge AS "forge!: ForgeName",
                    p.pr_number AS "pr_number!: i64", p.title, p.author, p.base_ref,
                    p.cross_repo AS "cross_repo!: bool", p.watch AS "watch!: bool",
+                   p.auto_post AS "auto_post!: bool",
                    p.state AS "state!: PrReviewState",
                    p.head_sha, p.head_seen_at, p.last_reviewed_sha, p.vouched_author,
                    p.requested_by, p.requested_at AS "requested_at!: i64",
@@ -121,6 +181,7 @@ macro_rules! review_row {
             base_ref: r.base_ref,
             cross_repo: r.cross_repo,
             watch: r.watch,
+            auto_post: r.auto_post,
             state: r.state,
             head_sha: r.head_sha,
             head_seen_at: r.head_seen_at,
@@ -138,22 +199,23 @@ macro_rules! review_row {
 
 impl Store {
     /// Record the operator's request for a review of `new.pr_number`, or,
-    /// when one exists, set its `watch` (and, turning it on, clear its
-    /// failures as [`Self::set_pr_review_watch`] does). Nothing else of an
-    /// existing review changes: a request never reopens an ended one or
-    /// re-vouches. The first round is due at once (`last_reviewed_sha` is
-    /// NULL, which [`Self::list_due_pr_reviews`] exempts from the
-    /// stability wait). Returns the review's id.
+    /// when one exists, set its `watch` and `auto_post` (and, turning watch
+    /// on, clear its failures as [`Self::set_pr_review_watch`] does).
+    /// Nothing else of an existing review changes: a request never reopens
+    /// an ended one or re-vouches. The first round is due at once
+    /// (`last_reviewed_sha` is NULL, which [`Self::list_due_pr_reviews`]
+    /// exempts from the stability wait). Returns the review's id.
     pub async fn request_pr_review(&self, new: &NewPrReview<'_>) -> sqlx::Result<i64> {
         let now = now_ms();
         sqlx::query_scalar!(
             r#"
             INSERT INTO pr_reviews (repo_id, pr_number, title, author, base_ref, cross_repo,
                                     watch, head_sha, head_seen_at, vouched_author,
-                                    requested_by, requested_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?9)
+                                    requested_by, requested_at, auto_post)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?9, ?12)
             ON CONFLICT (repo_id, pr_number) DO UPDATE SET
                 watch = excluded.watch,
+                auto_post = excluded.auto_post,
                 failures = CASE WHEN excluded.watch THEN 0 ELSE failures END,
                 held = CASE WHEN excluded.watch THEN 0 ELSE held END
             RETURNING id AS "id!: i64"
@@ -169,6 +231,7 @@ impl Store {
             now,
             new.vouched_author,
             new.requested_by,
+            new.auto_post,
         )
         .fetch_one(&self.pool)
         .await
@@ -201,6 +264,192 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(r.rows_affected() > 0)
+    }
+
+    /// Set review `id`'s `auto_post`. Only rounds recorded from now on
+    /// follow it: a pending round still waits for a user. `false` when
+    /// there is no such review.
+    pub async fn set_pr_review_auto_post(&self, id: i64, auto_post: bool) -> sqlx::Result<bool> {
+        let r = sqlx::query!(
+            "UPDATE pr_reviews SET auto_post = ?2 WHERE id = ?1",
+            id,
+            auto_post
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// A user's decision on round `round_id` of a review: only a `pending`
+    /// round takes one. Approving clears the newest post error and the
+    /// attempt count, so a round that fell back after failed posts is
+    /// tried afresh; it is refused once the PR ended, since only an open
+    /// review's rounds are posted. Discarding is final.
+    pub async fn decide_pr_review_post(
+        &self,
+        round_id: i64,
+        decision: PostDecision,
+    ) -> sqlx::Result<PostDecided> {
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
+        let row = sqlx::query!(
+            r#"SELECT r.post_state, p.state AS "state!: PrReviewState", p.id AS "review_id!: i64"
+               FROM pr_review_rounds r
+               JOIN pr_reviews p ON p.id = r.review_id
+               JOIN repos rp ON rp.id = p.repo_id
+               WHERE r.id = ?1 AND rp.deleted_at IS NULL"#,
+            round_id
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            return Ok(PostDecided::NoSuchRound);
+        };
+        if row.post_state.as_deref() != Some("pending") {
+            let now = row.post_state.as_deref().unwrap_or("nothing to post");
+            return Ok(PostDecided::Refused(format!("round {round_id} is {now}")));
+        }
+        match decision {
+            PostDecision::Approve if row.state != PrReviewState::Open => {
+                return Ok(PostDecided::Refused(format!(
+                    "the PR is {}; only an open PR's rounds are posted",
+                    row.state.as_str()
+                )));
+            }
+            PostDecision::Approve => {
+                sqlx::query!(
+                    "UPDATE pr_review_rounds SET post_state = 'approved', post_error = NULL, \
+                         post_attempts = 0 WHERE id = ?1",
+                    round_id
+                )
+                .execute(&mut *tx)
+                .await?;
+            }
+            PostDecision::Discard => {
+                sqlx::query!(
+                    "UPDATE pr_review_rounds SET post_state = 'discarded' WHERE id = ?1",
+                    round_id
+                )
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(PostDecided::Moved {
+            review_id: row.review_id,
+        })
+    }
+
+    /// Every `approved` round of an open review, oldest first: what the
+    /// PR sync posts.
+    pub async fn approved_pr_review_rounds(&self) -> sqlx::Result<Vec<ApprovedRound>> {
+        let rows = sqlx::query!(
+            r#"SELECT r.id AS "id!: i64", r.review_id AS "review_id!: i64", r.base_sha,
+                      r.head_sha
+               FROM pr_review_rounds r
+               JOIN pr_reviews p ON p.id = r.review_id
+               JOIN repos rp ON rp.id = p.repo_id
+               WHERE r.post_state = 'approved' AND p.state = 'open'
+                 AND rp.deleted_at IS NULL
+               ORDER BY r.finished_at, r.id"#
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| ApprovedRound {
+                id: r.id,
+                review_id: r.review_id,
+                base_sha: r.base_sha,
+                head_sha: r.head_sha,
+            })
+            .collect())
+    }
+
+    /// Round `round_id`'s issues as a post needs them, blocking first.
+    pub async fn pr_review_round_issues(&self, round_id: i64) -> sqlx::Result<Vec<PostableIssue>> {
+        let rows = sqlx::query!(
+            r#"SELECT id AS "id!: i64", kind, blocking AS "blocking!: bool", severity, file,
+                      line, side, summary, detail
+               FROM pr_review_issues WHERE round_id = ?1
+               ORDER BY blocking DESC, id"#,
+            round_id
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|i| PostableIssue {
+                id: i.id,
+                kind: i.kind,
+                blocking: i.blocking,
+                severity: i.severity,
+                file: i.file,
+                line: i.line,
+                left: i.side.as_deref() == Some("LEFT"),
+                summary: i.summary,
+                detail: i.detail,
+            })
+            .collect())
+    }
+
+    /// Record round `round_id` as posted, with the forge's id of the
+    /// review and of each issue's inline comment. Only an `approved` round
+    /// moves. The admin lane's write
+    /// ([`AdminStore::record_pr_review_posted`](super::AdminStore::record_pr_review_posted)).
+    pub(super) async fn record_pr_review_posted(
+        &self,
+        round_id: i64,
+        review_ref: &str,
+        thread_refs: &[(i64, String)],
+    ) -> sqlx::Result<()> {
+        let now = now_ms();
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
+        sqlx::query!(
+            "UPDATE pr_review_rounds SET post_state = 'posted', posted_at = ?2, \
+                 forge_review_ref = ?3, post_error = NULL \
+             WHERE id = ?1 AND post_state = 'approved'",
+            round_id,
+            now,
+            review_ref
+        )
+        .execute(&mut *tx)
+        .await?;
+        for (issue, thread) in thread_refs {
+            sqlx::query!(
+                "UPDATE pr_review_issues SET thread_ref = ?3 WHERE id = ?1 AND round_id = ?2",
+                issue,
+                round_id,
+                thread
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await
+    }
+
+    /// Count one failed post of the `approved` round `round_id`, keeping
+    /// `why`; at [`POST_GIVE_UP_AT`] failures the round falls back to
+    /// `pending`, for a user to decide. Returns the attempts counted, `0`
+    /// when the round was not `approved`. The admin lane's write
+    /// ([`AdminStore::record_pr_review_post_failure`](super::AdminStore::record_pr_review_post_failure)).
+    pub(super) async fn record_pr_review_post_failure(
+        &self,
+        round_id: i64,
+        why: &str,
+    ) -> sqlx::Result<i64> {
+        let attempts = sqlx::query_scalar!(
+            r#"UPDATE pr_review_rounds SET post_attempts = post_attempts + 1, post_error = ?2,
+                   post_state = CASE WHEN post_attempts + 1 >= ?3 THEN 'pending'
+                                     ELSE post_state END
+               WHERE id = ?1 AND post_state = 'approved'
+               RETURNING post_attempts AS "attempts!: i64""#,
+            round_id,
+            why,
+            POST_GIVE_UP_AT
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(attempts.unwrap_or(0))
     }
 
     /// Whether PR `pr_number` of repo `repo_id` is one hunter opened for a
@@ -296,7 +545,8 @@ impl Store {
         let rounds = sqlx::query!(
             r#"
             SELECT id AS "id!: i64", review_id AS "review_id!: i64", job_id, base_sha,
-                   head_sha, verdict, failure, finished_at AS "finished_at!: i64"
+                   head_sha, verdict, failure, finished_at AS "finished_at!: i64",
+                   post_state, post_error, posted_at
             FROM pr_review_rounds
             ORDER BY finished_at DESC, id DESC
             "#
@@ -306,7 +556,8 @@ impl Store {
         let issues = sqlx::query!(
             r#"
             SELECT round_id AS "round_id!: i64", kind, blocking AS "blocking!: bool",
-                   severity, confidence, file, line, summary, detail
+                   severity, confidence, file, line, side, summary, detail,
+                   thread_ref IS NOT NULL AS "posted_inline!: bool"
             FROM pr_review_issues
             ORDER BY round_id, blocking DESC, id
             "#
@@ -326,8 +577,10 @@ impl Store {
                     confidence: i.confidence,
                     file: i.file,
                     line: i.line,
+                    side: i.side,
                     summary: i.summary,
                     detail: i.detail,
+                    posted_inline: i.posted_inline,
                 });
         }
         Ok(rounds
@@ -343,6 +596,9 @@ impl Store {
                         verdict: r.verdict,
                         failure: r.failure,
                         finished_at: r.finished_at,
+                        post_state: r.post_state,
+                        post_error: r.post_error,
+                        posted_at: r.posted_at,
                         issues: by_round.remove(&r.id).unwrap_or_default(),
                     },
                 )
@@ -379,7 +635,8 @@ impl Store {
         let rows = sqlx::query!(
             r#"
             SELECT i.round_id AS "round_id!: i64", i.kind, i.blocking AS "blocking!: bool",
-                   i.severity, i.confidence, i.file, i.line, i.summary, i.detail
+                   i.severity, i.confidence, i.file, i.line, i.side, i.summary, i.detail,
+                   i.thread_ref IS NOT NULL AS "posted_inline!: bool"
             FROM pr_review_issues i JOIN pr_review_rounds r ON r.id = i.round_id
             WHERE r.review_id = ?1
             ORDER BY r.finished_at, r.id, i.id
@@ -398,8 +655,10 @@ impl Store {
                 confidence: i.confidence,
                 file: i.file,
                 line: i.line,
+                side: i.side,
                 summary: i.summary,
                 detail: i.detail,
+                posted_inline: i.posted_inline,
             })
             .collect())
     }
@@ -436,8 +695,11 @@ impl Store {
     /// when one ran, in one transaction with its issues and the review's
     /// streak. A success moves `last_reviewed_sha` to `head` and ends the
     /// streak; a failure counts one and holds the review at
-    /// [`PR_REVIEW_HOLD_AT`]. Returns the streak after this round. The job
-    /// lane's write ([`JobStore::record_pr_review_round`](super::JobStore::record_pr_review_round)).
+    /// [`PR_REVIEW_HOLD_AT`]. A success with issues is to be posted: it
+    /// starts `approved` when the review posts automatically, `pending`
+    /// otherwise; any other round has nothing to post. Returns the streak
+    /// after this round. The job lane's write
+    /// ([`JobStore::record_pr_review_round`](super::JobStore::record_pr_review_round)).
     pub(super) async fn record_pr_review_round(
         &self,
         id: i64,
@@ -447,14 +709,19 @@ impl Store {
     ) -> sqlx::Result<i64> {
         let now = now_ms();
         let mut tx = ImmediateTx::begin(&self.pool).await?;
-        let (verdict, failure) = match round {
-            PrReviewRound::Ok(_) => ("ok", None),
-            PrReviewRound::Failed(why) => ("failed", Some(why)),
+        let (verdict, failure, has_issues) = match round {
+            PrReviewRound::Ok(issues) => ("ok", None, !issues.is_empty()),
+            PrReviewRound::Failed(why) => ("failed", Some(why), false),
         };
         let round_id = sqlx::query_scalar!(
             r#"INSERT INTO pr_review_rounds
-                   (review_id, job_id, base_sha, head_sha, verdict, failure, finished_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                   (review_id, job_id, base_sha, head_sha, verdict, failure, finished_at,
+                    post_state)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                       CASE WHEN ?8 THEN
+                           CASE WHEN (SELECT auto_post FROM pr_reviews WHERE id = ?1)
+                                THEN 'approved' ELSE 'pending' END
+                       END)
                RETURNING id AS "id!: i64""#,
             id,
             job_id,
@@ -462,18 +729,26 @@ impl Store {
             head,
             verdict,
             failure,
-            now
+            now,
+            has_issues
         )
         .fetch_one(&mut *tx)
         .await?;
         let streak = match round {
             PrReviewRound::Ok(issues) => {
                 for i in issues {
+                    // The column takes only the two words a forge knows;
+                    // anything else is the reviewer not saying.
+                    let side = i
+                        .side
+                        .as_deref()
+                        .map(str::to_ascii_uppercase)
+                        .filter(|s| s == "RIGHT" || s == "LEFT");
                     sqlx::query!(
                         "INSERT INTO pr_review_issues \
                              (round_id, kind, blocking, severity, confidence, file, line, \
-                              summary, detail) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                              side, summary, detail) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                         round_id,
                         i.kind,
                         i.blocking,
@@ -481,6 +756,7 @@ impl Store {
                         i.confidence,
                         i.file,
                         i.line,
+                        side,
                         i.summary,
                         i.detail
                     )

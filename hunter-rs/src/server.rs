@@ -36,7 +36,8 @@ use crate::domain::{
 };
 use crate::forge;
 use crate::store::{
-    AdminStore, FindingFilter, HoldRelease, NewPrReview, RepoUpdate, Store, StoreWriteError,
+    AdminStore, FindingFilter, HoldRelease, NewPrReview, PostDecided, PostDecision, RepoUpdate,
+    Store, StoreWriteError,
 };
 use crate::transition::{Moved, OperatorVerdict, Transition, VerdictRefused};
 use crate::types::{
@@ -295,6 +296,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/pr-review", post(request_pr_review))
         .route("/api/pr-review/watch", post(set_pr_review_watch))
         .route("/api/pr-review/retry", post(retry_pr_review))
+        .route("/api/pr-review/auto-post", post(set_pr_review_auto_post))
+        .route("/api/pr-review/post", post(approve_pr_review_post))
+        .route("/api/pr-review/discard", post(discard_pr_review_post))
         .route("/api/events", get(events))
         .route("/api/stats", get(stats))
         .route("/api/verdict", post(verdict))
@@ -2094,6 +2098,7 @@ async fn pr_reviews(State(state): State<AppState>) -> Result<Json<Vec<PrReviewOu
             author: r.author,
             cross_repo: r.cross_repo,
             watch: r.watch,
+            auto_post: r.auto_post,
             state: r.state,
             head_sha: r.head_sha,
             last_reviewed_sha: r.last_reviewed_sha,
@@ -2149,12 +2154,13 @@ async fn forge_call<T: Send + 'static>(
     tokio::task::spawn_blocking(f).await?
 }
 
-/// POST /api/pr-review {`repo_id`, pr, watch, vouch?}: request a review of
-/// a PR hunter did not open. An author who cannot push to the repo (and is
-/// no configured review bot) needs `vouch: true`: reviewing runs their
-/// code with the daemon's credentials. Without it the answer is a 409
-/// carrying `needs_vouch`, so the UI can ask. A PR already under review
-/// only has its `watch` set.
+/// POST /api/pr-review {`repo_id`, pr, watch, `auto_post`?, vouch?}: request
+/// a review of a PR hunter did not open. An author who cannot push to the
+/// repo (and is no configured review bot) needs `vouch: true`: reviewing
+/// runs their code with the daemon's credentials. Without it the answer is
+/// a 409 carrying `needs_vouch`, so the UI can ask. A PR already under
+/// review only has its `watch` and `auto_post` set. `auto_post` (default
+/// false) posts each round with issues without waiting for approval.
 async fn request_pr_review(
     State(state): State<AppState>,
     Extension(user): Extension<CurrentUser>,
@@ -2168,11 +2174,8 @@ async fn request_pr_review(
         return Err(ApiError::BadRequest("watch must be a boolean".to_owned()));
     };
     let watch = *watch;
-    let vouch = match body.get("vouch") {
-        None | Some(Value::Null) => false,
-        Some(Value::Bool(b)) => *b,
-        Some(_) => return Err(ApiError::BadRequest("vouch must be a boolean".to_owned())),
-    };
+    let vouch = optional_bool(&body, "vouch")?;
+    let auto_post = optional_bool(&body, "auto_post")?;
     let repo = fetch_repo(&state.store, rid).await?;
     let n = pr_number_of(&repo, body.get("pr").unwrap_or(&Value::Null))?;
     if state.store.is_hunter_pr(repo.id, n).await? {
@@ -2183,10 +2186,12 @@ async fn request_pr_review(
     }
     if let Some(id) = state.store.find_pr_review(repo.id, n).await? {
         state.store.set_pr_review_watch(id, watch).await?;
+        state.store.set_pr_review_auto_post(id, auto_post).await?;
         let msg = format!(
-            "review of {} PR #{n}: watch {}",
+            "review of {} PR #{n}: watch {}, auto-post {}",
             repo.name,
-            if watch { "on" } else { "off" }
+            if watch { "on" } else { "off" },
+            if auto_post { "on" } else { "off" }
         );
         state
             .store
@@ -2234,11 +2239,15 @@ async fn request_pr_review(
             cross_repo: pr.cross_repo,
             head_sha: &pr.head_sha,
             watch,
+            auto_post,
             vouched_author: vouched,
             requested_by: &user.username,
         })
         .await?;
     let mut msg = format!("review of {} PR #{n} requested", repo.name);
+    if auto_post {
+        msg.push_str(" (auto-post)");
+    }
     if let Some(author) = vouched {
         use std::fmt::Write;
         let _ = write!(msg, " (vouched for {author})");
@@ -2299,6 +2308,106 @@ async fn retry_pr_review(
         .log_user_event(&user, "pr_review", &format!("PR review {id}: retry"), None)
         .await?;
     state.scheduler.wake.notify_one();
+    Ok(Json(json!({ "ok": true })).into_response())
+}
+
+/// An optional boolean field of a request body: absent or null is false.
+fn optional_bool(body: &serde_json::Map<String, Value>, key: &str) -> Result<bool, ApiError> {
+    match body.get(key) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => Err(ApiError::BadRequest(format!("{key} must be a boolean"))),
+    }
+}
+
+/// POST /api/pr-review/auto-post {id, `auto_post`}: whether rounds recorded
+/// from now on are posted without waiting for approval. Rounds already
+/// pending stay so.
+async fn set_pr_review_auto_post(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> Result<Response, ApiError> {
+    post_gate(&headers)?;
+    let body = parse_object(&raw)?;
+    let id = require_int(&body, "id", "id must be an integer")?;
+    let Some(Value::Bool(auto_post)) = body.get("auto_post") else {
+        return Err(ApiError::BadRequest(
+            "auto_post must be a boolean".to_owned(),
+        ));
+    };
+    if !state.store.set_pr_review_auto_post(id, *auto_post).await? {
+        return Err(ApiError::NotFound(format!("no PR review {id}")));
+    }
+    let msg = format!(
+        "PR review {id}: auto-post {}",
+        if *auto_post { "on" } else { "off" }
+    );
+    state
+        .store
+        .log_user_event(&user, "pr_review", &msg, None)
+        .await?;
+    Ok(Json(json!({ "ok": true })).into_response())
+}
+
+/// POST /api/pr-review/post {`round_id`}: approve a pending round for
+/// posting (also a round that fell back after failed posts: its error is
+/// cleared). The PR sync is woken to post it now. 409 unless the round is
+/// pending and its PR open.
+async fn approve_pr_review_post(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> Result<Response, ApiError> {
+    decide_pr_review_post(state, user, &headers, &raw, PostDecision::Approve).await
+}
+
+/// POST /api/pr-review/discard {`round_id`}: never post a pending round.
+/// 409 unless the round is pending.
+async fn discard_pr_review_post(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> Result<Response, ApiError> {
+    decide_pr_review_post(state, user, &headers, &raw, PostDecision::Discard).await
+}
+
+async fn decide_pr_review_post(
+    state: AppState,
+    user: CurrentUser,
+    headers: &HeaderMap,
+    raw: &Bytes,
+    decision: PostDecision,
+) -> Result<Response, ApiError> {
+    post_gate(headers)?;
+    let body = parse_object(raw)?;
+    let round = require_int(&body, "round_id", "round_id must be an integer")?;
+    let review = match state.store.decide_pr_review_post(round, decision).await? {
+        PostDecided::Moved { review_id } => review_id,
+        PostDecided::NoSuchRound => {
+            return Err(ApiError::NotFound(format!("no PR review round {round}")));
+        }
+        PostDecided::Refused(why) => return Err(ApiError::Conflict(why)),
+    };
+    let what = match decision {
+        PostDecision::Approve => "approved for posting",
+        PostDecision::Discard => "discarded",
+    };
+    state
+        .store
+        .log_user_event(
+            &user,
+            "pr_review",
+            &format!("PR review {review}: round {round} {what}"),
+            None,
+        )
+        .await?;
+    if decision == PostDecision::Approve {
+        state.scheduler.pr_sync_wake.notify_one();
+    }
     Ok(Json(json!({ "ok": true })).into_response())
 }
 
