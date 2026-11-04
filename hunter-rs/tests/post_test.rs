@@ -255,7 +255,7 @@ impl tracing_subscriber::fmt::MakeWriter<'_> for LogSink {
     }
 }
 
-const POST_PATHS: [&str; 11] = [
+const POST_PATHS: [&str; 14] = [
     "/api/verdict",
     "/api/cycle",
     "/api/recheck",
@@ -267,6 +267,9 @@ const POST_PATHS: [&str; 11] = [
     "/api/repo/notes",
     "/api/repo/rehunt",
     "/api/hold/release",
+    "/api/pr-review",
+    "/api/pr-review/watch",
+    "/api/pr-review/retry",
 ];
 
 // -- §0.1 Content-Type gate ---------------------------------------------------
@@ -2065,6 +2068,11 @@ async fn every_api_route_needs_a_session() {
         ("POST", "/api/repo/notes"),
         ("POST", "/api/repo/delete"),
         ("POST", "/api/repo/rehunt"),
+        ("GET", "/api/repo/open-prs?id=1"),
+        ("GET", "/api/pr-reviews"),
+        ("POST", "/api/pr-review"),
+        ("POST", "/api/pr-review/watch"),
+        ("POST", "/api/pr-review/retry"),
         ("GET", "/api/events"),
         ("GET", "/api/stats"),
         ("POST", "/api/verdict"),

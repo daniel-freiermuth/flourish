@@ -582,6 +582,11 @@ answers `401 {"error": "login required"}` without a live session cookie.
 | POST | `/api/repo/delete` | Remove a repo |
 | POST | `/api/repo/rehunt` | Queue a full re-hunt of a repo |
 | POST | `/api/repo/notes` | Append a note to a repo |
+| GET | `/api/repo/open-prs` | A repo's open PRs from its forge (`id`), marked when hunter opened them or a review exists |
+| GET | `/api/pr-reviews` | Requested PR reviews with their rounds and issues, newest request first |
+| POST | `/api/pr-review` | Request a review (`{"repo_id", "pr": URL or number, "watch", "vouch"?}`); 409 `needs_vouch` when the author cannot push, 409 for hunter's own PR; for an existing review, sets its `watch` and asks for a round at the PR's head unless a round already reviewed it (`outcome`: `requested`, `updated`, `reopened` or `rebound`) |
+| POST | `/api/pr-review/watch` | Turn a review's Watch on or off (`{"id", "watch"}`); on also clears a hold |
+| POST | `/api/pr-review/retry` | Clear a review's failures and hold (`{"id"}`) |
 
 ## Architecture
 
