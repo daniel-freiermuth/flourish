@@ -245,6 +245,30 @@ fn review_prompts_render() {
 }
 
 #[test]
+fn pr_review_prompt_renders() {
+    let repo = sample_repo();
+    let prompt = playbooks::build_pr_review_prompt(
+        &root(),
+        &repo,
+        "repo notes",
+        Path::new("/tmp/worktree"),
+        "abc123",
+        playbooks::PrUnderReview {
+            number: 7,
+            title: "make it faster",
+            body: "it is {{faster}} now",
+            author: "outsider",
+        },
+        &out_path(),
+        "[]",
+    )
+    .expect("pr_review.md must render with the slots build_pr_review_prompt supplies");
+    assert_usable("pr_review", &prompt);
+    // The author's text is emitted verbatim, never expanded.
+    assert!(prompt.contains("it is {{faster}} now"));
+}
+
+#[test]
 fn recheck_prompt_renders() {
     let repo = sample_repo();
     let finding = sample_finding(FindingType::Bug);
@@ -490,6 +514,7 @@ fn every_playbook_is_covered_by_this_test() {
         "engage",
         "harvest",
         "harvest-closed",
+        "pr_review",
         "review",
         "review_followup",
         "curate",
