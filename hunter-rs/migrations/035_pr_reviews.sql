@@ -22,7 +22,7 @@ CREATE TABLE pr_reviews (
     -- binding's URL named, so only the current binding's rounds are the
     -- review's, and nothing of an earlier one's counts again.
     binding INTEGER NOT NULL DEFAULT 1,
-    -- Refreshed by the PR sync; shown in the UI and the job label.
+    -- Refreshed by the PR review duty; shown in the UI and the job label.
     title TEXT NOT NULL DEFAULT '',
     -- Forge login of the PR's author at request time.
     author TEXT NOT NULL,

@@ -537,7 +537,7 @@ impl Store {
         Ok(rows.into_iter().map(|r| review_row!(r)).collect())
     }
 
-    /// Reviews still following an open PR, for the PR sync.
+    /// Reviews still following an open PR, for the PR review duty.
     pub async fn open_pr_reviews(&self) -> sqlx::Result<Vec<PrReviewRow>> {
         let rows = select_reviews!(" AND p.state = 'open' ORDER BY p.id")
             .fetch_all(&self.pool)
@@ -634,18 +634,23 @@ impl Store {
             .collect())
     }
 
-    /// Issues of review `id`'s current incremental chain: every kept round
-    /// since the newest one that reviewed from scratch (the first round, or
-    /// one after a force-push), as each later round's base is the head its
-    /// predecessor reviewed. That is what the next incremental round is
-    /// told was already reported: a round that found nothing new does not
-    /// make the chain forget what came before it. A `partial` round is in
-    /// the chain from its base, but reviewed nothing up to its head: the
-    /// chain goes on from its base, which the next round reviews from
-    /// again.
+    /// Issues of review `id`'s incremental chain that a round from `base`
+    /// continues: every kept round since the newest one that reviewed from
+    /// scratch (the first round, or one after a force-push), as each later
+    /// round's base is the head its predecessor reviewed. That is what the
+    /// round is told was already reported: a round that found nothing new
+    /// does not make the chain forget what came before it. A `partial`
+    /// round is in the chain from its base, but reviewed nothing up to its
+    /// head: the chain goes on from its base, which the next round reviews
+    /// from again. A round from anywhere else starts a new chain, and is
+    /// told of none.
     /// Only rounds of the review's binding are in a chain: an earlier
     /// binding's are about another PR ([`Self::request_pr_review`]).
-    pub async fn chain_pr_review_issues(&self, id: i64) -> sqlx::Result<Vec<PrReviewIssueOut>> {
+    pub async fn chain_pr_review_issues(
+        &self,
+        id: i64,
+        base: &str,
+    ) -> sqlx::Result<Vec<PrReviewIssueOut>> {
         let rounds = sqlx::query!(
             r#"
             SELECT id AS "id!: i64", base_sha, head_sha, verdict = 'ok' AS "finished!: bool"
@@ -666,6 +671,9 @@ impl Store {
             }
             chain.push(r.id);
             prev_head = Some(if r.finished { &r.head_sha } else { &r.base_sha });
+        }
+        if prev_head != Some(base) {
+            return Ok(Vec::new());
         }
         let rows = sqlx::query!(
             r#"

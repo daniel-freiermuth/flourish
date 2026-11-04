@@ -1134,7 +1134,7 @@ async fn review_round(
     let before = tree_state(&start.ws.tree).await;
     // A detached `HEAD` (no branch) is a state like any other; only a
     // commit or status git could not report leaves nothing to compare.
-    if before.head.is_none() || before.status.is_none() {
+    if !before.readable() {
         // Nothing to hold the reviewer's tree against, or to put back to:
         // no review this round, and nothing in the tree is touched.
         let why = "the worktree's state could not be read (git failed)".to_owned();
@@ -1346,7 +1346,7 @@ async fn answer_review(
 /// description that becomes the PR body (untracked, so `status` shows it
 /// the same whatever it says).
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct TreeState {
+pub(super) struct TreeState {
     head: Option<String>,
     /// The ref `HEAD` points at (`refs/heads/<branch>`); `None` detached.
     branch: Option<String>,
@@ -1354,7 +1354,15 @@ struct TreeState {
     description: Option<Vec<u8>>,
 }
 
-async fn tree_state(tree: &Path) -> TreeState {
+impl TreeState {
+    /// Whether git reported the commit and the status: only then is there
+    /// a state to compare a reviewer's tree against.
+    pub(super) const fn readable(&self) -> bool {
+        self.head.is_some() && self.status.is_some()
+    }
+}
+
+pub(super) async fn tree_state(tree: &Path) -> TreeState {
     let tree: PathBuf = tree.to_owned();
     tokio::task::spawn_blocking(move || {
         let ok = |(rc, out): (i32, String)| (rc == 0).then(|| out.trim().to_owned());
@@ -1382,7 +1390,7 @@ async fn tree_state(tree: &Path) -> TreeState {
 /// string `summary` is an issue, one whose `blocking` is not a boolean is
 /// taken as blocking (a slip in severity must not let a defect ship), and
 /// anything else is counted and dropped, never taking the others with it.
-fn parse_review(out: &Path) -> Result<(Vec<serde_json::Value>, usize), String> {
+pub(super) fn parse_review(out: &Path) -> Result<(Vec<serde_json::Value>, usize), String> {
     let bytes = std::fs::read(out).map_err(|e| format!("no review file: {e}"))?;
     let entries: Vec<serde_json::Value> = serde_json::from_slice(&bytes)
         .map_err(|e| format!("the review file is not an array: {e}"))?;

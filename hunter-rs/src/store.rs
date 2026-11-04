@@ -6038,7 +6038,7 @@ impl JobStore {
     }
 
     /// Record what a review round's own forge read saw of PR review
-    /// `id`'s PR under its `binding`, as the PR sync does
+    /// `id`'s PR under its `binding`, as the PR review duty does
     /// ([`AdminStore::observe_pr_review`]): a round that finds the PR
     /// ended, its head moved or its fork changed hands records it so the
     /// next pick reads where the PR is now instead of picking it again.
@@ -6054,7 +6054,7 @@ impl JobStore {
             .await
     }
 
-    /// End PR review `id` as one of hunter's own PRs, as the PR sync does
+    /// End PR review `id` as one of hunter's own PRs, as the PR review duty does
     /// ([`AdminStore::end_own_pr_review`]). See the private `Store` method
     /// of the same name.
     pub async fn end_own_pr_review(&self, id: i64) -> sqlx::Result<bool> {
@@ -6155,7 +6155,7 @@ impl AdminStore {
         self.0.forget_deleted_repo(repo_id).await
     }
 
-    /// Record the PR sync's view of PR review `id`'s PR under its
+    /// Record the PR review duty's view of PR review `id`'s PR under its
     /// `binding`. See the private `Store` method of the same name.
     pub async fn observe_pr_review(
         &self,
