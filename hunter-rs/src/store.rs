@@ -32,7 +32,7 @@ use crate::auth::CurrentUser;
 use crate::clones::{ClonePermit, Clones};
 use crate::domain::{
     BudgetOverride, BugClass, ClosureClass, FindingJobKind, FindingStatus, FindingType,
-    FinishedState, ForgeName, HoldReason, JobKind, JobState, ReleaseAction, RepoJobKind,
+    FinishedState, ForgeName, HoldReason, JobKind, JobState, PrJobKind, ReleaseAction, RepoJobKind,
     RepoWorkKind, Severity,
 };
 use crate::recovery::{
@@ -48,8 +48,10 @@ use crate::types::{
 };
 use crate::util::now_ms;
 
+mod pr_review;
 mod pr_state;
 
+pub use pr_review::{HEAD_STABLE_MS, NewPrReview, PR_REVIEW_HOLD_AT, PrReviewRound, PrReviewRow};
 pub use pr_state::{PrRead, PrSyncPass};
 
 /// A `pr_state` row as the store read it ([`Store::get_pr_state`]).
@@ -244,6 +246,12 @@ pub enum JobInsertError {
     /// longer lists the finding, so losing that race is a skip.
     #[error("finding {finding_id} has no open PR -- cannot start an engage")]
     NoEngageDue { finding_id: i64 },
+    /// A review of a PR that is no longer open, or whose review was
+    /// removed with its repo: the admin lane's PR sync recorded the
+    /// merge or close between the pick and the insert. The review queue
+    /// no longer lists it, so losing that race is a skip.
+    #[error("PR review {review_id} is not open -- cannot start a review")]
+    NoPrReviewDue { review_id: i64 },
     #[error(transparent)]
     Db(#[from] sqlx::Error),
 }
@@ -269,11 +277,12 @@ pub enum JobStart {
     Handoff { engage: i64 },
 }
 
-/// What fresh work is for: a finding-level kind on one finding, or a
-/// repo-level kind on one repo. Nothing else can be named, so a job row
-/// always has a finding exactly when its kind is a finding's. A finding's
-/// work runs in the finding's own repo, read from its row inside the
-/// insert, so no job can pair a finding with another repo's clone.
+/// What fresh work is for: a finding-level kind on one finding, a
+/// repo-level kind on one repo, or PR work on one requested review. Nothing
+/// else can be named, so a job row always has a finding exactly when its
+/// kind is a finding's. A finding's work runs in the finding's own repo,
+/// and a review's in its review's repo, read from the row inside the
+/// insert, so no job can pair a target with another repo's clone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FreshWork {
     Finding {
@@ -283,6 +292,10 @@ pub enum FreshWork {
     Repo {
         kind: RepoJobKind,
         repo_id: i64,
+    },
+    Pr {
+        kind: PrJobKind,
+        review_id: i64,
     },
 }
 
@@ -296,6 +309,11 @@ impl JobStart {
     pub const fn fresh_repo(kind: RepoJobKind, repo_id: i64) -> Self {
         Self::Fresh(FreshWork::Repo { kind, repo_id })
     }
+
+    /// Fresh `kind` work on PR review `review_id`.
+    pub const fn fresh_pr(kind: PrJobKind, review_id: i64) -> Self {
+        Self::Fresh(FreshWork::Pr { kind, review_id })
+    }
 }
 
 impl std::fmt::Display for JobStart {
@@ -306,6 +324,9 @@ impl std::fmt::Display for JobStart {
             }
             Self::Fresh(FreshWork::Repo { kind, repo_id }) => {
                 write!(f, "fresh {kind} of repo {repo_id}")
+            }
+            Self::Fresh(FreshWork::Pr { kind, review_id }) => {
+                write!(f, "fresh {kind} of PR review {review_id}")
             }
             Self::Resume { checkpoint } => write!(f, "resume of job {checkpoint}"),
             Self::Handoff { engage } => write!(f, "handoff of engage job {engage}"),
@@ -3314,12 +3335,16 @@ impl Store {
             }
             _ => {}
         }
+        let review_id = match start {
+            JobStart::Fresh(FreshWork::Pr { review_id, .. }) => Some(review_id),
+            _ => None,
+        };
         let id = Self::insert_running_row(
             &mut tx,
             (kind, repo_id, finding_id),
             (cap_tokens, estimated_tokens),
             resumed_from,
-            base_sha,
+            (base_sha, review_id),
         )
         .await?;
         let mut retired = Vec::new();
@@ -3412,6 +3437,19 @@ impl Store {
     ) -> Result<(JobKind, i64, Option<i64>, Option<i64>), JobInsertError> {
         match start {
             JobStart::Fresh(FreshWork::Repo { kind, repo_id }) => {
+                Ok((kind.into(), repo_id, None, None))
+            }
+            JobStart::Fresh(FreshWork::Pr { kind, review_id }) => {
+                // Only an open review: the sync may have closed it since
+                // the pick (see `JobInsertError::NoPrReviewDue`).
+                let repo_id = sqlx::query_scalar!(
+                    r#"SELECT repo_id AS "repo_id!: i64" FROM pr_reviews
+                       WHERE id = ?1 AND state = 'open'"#,
+                    review_id
+                )
+                .fetch_optional(&mut **tx)
+                .await?
+                .ok_or(JobInsertError::NoPrReviewDue { review_id })?;
                 Ok((kind.into(), repo_id, None, None))
             }
             JobStart::Fresh(FreshWork::Finding { kind, finding_id }) => {
@@ -3526,23 +3564,23 @@ impl Store {
     }
 
     /// [`Self::insert_job`]'s INSERT: the `running` row, its chain's pins
-    /// copied from `resumed_from` (`base_sha` from the caller when given).
-    /// Refused for a deleted repo, and for a place another `running` job
-    /// holds.
+    /// copied from `resumed_from` (`base_sha` from the caller when given),
+    /// and the PR review it runs for, if any. Refused for a deleted repo,
+    /// and for a place another `running` job holds.
     async fn insert_running_row(
         tx: &mut ImmediateTx,
         (kind, repo_id, finding_id): (JobKind, i64, Option<i64>),
         (cap_tokens, estimated_tokens): (Option<i64>, Option<i64>),
         resumed_from: Option<i64>,
-        base_sha: Option<&str>,
+        (base_sha, pr_review_id): (Option<&str>, Option<i64>),
     ) -> Result<i64, JobInsertError> {
         let now = now_ms();
         let result = sqlx::query!(
             "INSERT INTO jobs \
              (kind, repo_id, finding_id, cap_tokens, state, started_at, estimated_tokens, \
-              resumed_from, pinned_sha, base_sha, seen_activity_at, \
-              started_on_fingerprint, started_on_head_sha, full_history, \
-              full_hunt_request) \
+             resumed_from, pinned_sha, base_sha, seen_activity_at, \
+             started_on_fingerprint, started_on_head_sha, full_history, \
+             full_hunt_request, pr_review_id) \
              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, \
                     (SELECT p.pinned_sha FROM jobs p WHERE p.id = ?8), \
                     COALESCE(?9, (SELECT p.base_sha FROM jobs p WHERE p.id = ?8)), \
@@ -3550,7 +3588,8 @@ impl Store {
                     (SELECT p.started_on_fingerprint FROM jobs p WHERE p.id = ?8), \
                     (SELECT p.started_on_head_sha FROM jobs p WHERE p.id = ?8), \
                     COALESCE((SELECT p.full_history FROM jobs p WHERE p.id = ?8), 0), \
-                    (SELECT p.full_hunt_request FROM jobs p WHERE p.id = ?8) \
+                    (SELECT p.full_hunt_request FROM jobs p WHERE p.id = ?8), \
+                    ?10 \
              WHERE EXISTS (SELECT 1 FROM repos WHERE id = ?2 AND deleted_at IS NULL)",
             kind,
             repo_id,
@@ -3560,7 +3599,8 @@ impl Store {
             now,
             estimated_tokens,
             resumed_from,
-            base_sha
+            base_sha,
+            pr_review_id
         )
         .execute(&mut **tx)
         .await;
@@ -5962,6 +6002,45 @@ impl JobStore {
             .hold_repo_work(repo_id, kind, reason, detail, job)
             .await
     }
+
+    /// Record one round of PR review `id`, run under its `binding`, and
+    /// its effect on the review's streak and hold. See the private `Store`
+    /// method of the same name.
+    pub async fn record_pr_review_round(
+        &self,
+        (id, binding): (i64, i64),
+        job_id: Option<i64>,
+        range: (&str, &str),
+        round: PrReviewRound<'_>,
+    ) -> sqlx::Result<i64> {
+        self.0
+            .record_pr_review_round((id, binding), job_id, range, round)
+            .await
+    }
+
+    /// Record what a review round's own forge read saw of PR review
+    /// `id`'s PR under its `binding`, as the PR sync does
+    /// ([`AdminStore::observe_pr_review`]): a round that finds the PR
+    /// ended, or its head moved, records it so the next pick reads where
+    /// the PR is now instead of picking it again.
+    pub async fn observe_pr_review(
+        &self,
+        (id, binding): (i64, i64),
+        head_sha: &str,
+        title: &str,
+        state: crate::domain::PrReviewState,
+    ) -> sqlx::Result<()> {
+        self.0
+            .observe_pr_review((id, binding), head_sha, title, state)
+            .await
+    }
+
+    /// End PR review `id` as one of hunter's own PRs, as the PR sync does
+    /// ([`AdminStore::end_own_pr_review`]). See the private `Store` method
+    /// of the same name.
+    pub async fn end_own_pr_review(&self, id: i64) -> sqlx::Result<bool> {
+        self.0.end_own_pr_review(id).await
+    }
 }
 
 impl std::ops::Deref for JobStore {
@@ -6055,6 +6134,26 @@ impl AdminStore {
     /// and notes; see the private `Store` method of the same name.
     pub async fn forget_deleted_repo(&self, repo_id: i64) -> sqlx::Result<()> {
         self.0.forget_deleted_repo(repo_id).await
+    }
+
+    /// Record the PR sync's view of PR review `id`'s PR under its
+    /// `binding`. See the private `Store` method of the same name.
+    pub async fn observe_pr_review(
+        &self,
+        (id, binding): (i64, i64),
+        head_sha: &str,
+        title: &str,
+        state: crate::domain::PrReviewState,
+    ) -> sqlx::Result<()> {
+        self.0
+            .observe_pr_review((id, binding), head_sha, title, state)
+            .await
+    }
+
+    /// End PR review `id` as one of hunter's own PRs. See the private
+    /// `Store` method of the same name.
+    pub async fn end_own_pr_review(&self, id: i64) -> sqlx::Result<bool> {
+        self.0.end_own_pr_review(id).await
     }
 }
 

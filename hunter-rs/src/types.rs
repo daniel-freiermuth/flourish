@@ -623,6 +623,42 @@ impl StatsHorizon {
 }
 
 // ---------------------------------------------------------------------------
+// PR reviews (migration 035; future.md §8.8)
+// ---------------------------------------------------------------------------
+
+/// One issue a review round reported, as the reviewer wrote it.
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export)]
+pub struct PrReviewIssueOut {
+    pub kind: String,
+    pub blocking: bool,
+    pub severity: Option<String>,
+    pub confidence: Option<f64>,
+    pub file: Option<String>,
+    pub line: Option<i64>,
+    pub summary: String,
+    pub detail: String,
+}
+
+/// One review attempt of the range `base_sha..head_sha`.
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export)]
+pub struct PrReviewRoundOut {
+    pub id: i64,
+    pub job_id: Option<i64>,
+    pub base_sha: String,
+    pub head_sha: String,
+    /// `ok` (the reviewer finished the range, which counts as reviewed),
+    /// `partial` (it was stopped partway: its issues count, but the range
+    /// is reviewed again) or `failed` (nothing counts).
+    pub verdict: String,
+    /// Why the round failed, or stopped partway.
+    pub failure: Option<String>,
+    pub finished_at: i64,
+    pub issues: Vec<PrReviewIssueOut>,
+}
+
+// ---------------------------------------------------------------------------
 // Worker result (types.py RunResult; consumed by scheduler _record_job)
 // ---------------------------------------------------------------------------
 

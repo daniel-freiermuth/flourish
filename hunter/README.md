@@ -640,6 +640,13 @@ for the schema — most columns carry comments explaining *why*, not just *what*
 - **`pr_state`** — one row per finding with an open/merged PR: forge state,
   attention fingerprint + suppression marker (state-based, see § PR
   follow-up loop), harvest tracking.
+- **`pr_reviews`**, **`pr_review_rounds`**, **`pr_review_issues`** —
+  requested reviews of PRs hunter did not open (PR, author, Watch, vouch,
+  newest and last reviewed head, whether a request still awaits its
+  round, failure streak and hold), each attempt's
+  `base..head` and verdict (`ok`, `partial`: stopped before it finished,
+  or `failed`), and the issues a round reported.
+  `jobs.pr_review_id` names the review a `pr_review` job ran for.
 - **`window_log`** — mirror of budget observations at decision time.
 - **`calibration_samples`** — empirical tokens-spent → used-fraction-moved
   correlation, informational only (estimates real remaining capacity;

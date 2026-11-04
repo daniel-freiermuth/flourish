@@ -16,7 +16,7 @@ use crate::clones::{ClonePermit, FetchOutcome, FetchedBy, Force, Lane, LastFetch
 use crate::config::Config;
 use crate::domain::{
     BudgetOverride, ClosureClass, FindingJobKind, FindingStatus, FindingType, FinishedState,
-    HoldReason, JobKind, JobState, RepoJobKind, RepoWorkKind, Severity,
+    HoldReason, JobKind, JobState, PrJobKind, RepoJobKind, RepoWorkKind, Severity,
 };
 use crate::store::{
     AdminStore, FindingFilter, JobInsertError, JobOutcome, JobPlace, JobStart, JobStore,
@@ -827,6 +827,9 @@ fn resume_prompt(kind: JobKind, plan: &ResumePlan) -> String {
         JobKind::Finding(FindingJobKind::Fix) => ("fix", "PR-DESCRIPTION.md"),
         JobKind::Finding(FindingJobKind::Harvest) => ("PR review", "what the playbook asks for"),
         JobKind::Repo(_) => ("scan", "the findings file your playbook names"),
+        // A PR review keeps no checkpoint (`point_checkpoint` records
+        // none for it), so it is never resumed; named for completeness.
+        JobKind::Pr(PrJobKind::Review) => ("PR review", "your review file"),
     };
     match reason {
         HoldReason::Stuck | HoldReason::GaveUp => format!(
@@ -917,7 +920,8 @@ async fn pick_resume(
             }
             (JobKind::Finding(kind), Some(fid)) => held.finding(fid, kind),
             (JobKind::Repo(kind), _) => held.repo(job.repo_id, kind),
-            (JobKind::Finding(_), None) => false,
+            // No checkpoint is ever recorded for a PR review.
+            (JobKind::Finding(_), None) | (JobKind::Pr(_), _) => false,
         };
         if is_held || running.contains(&JobPlace::of(job.kind, job.repo_id, job.finding_id)) {
             continue;
@@ -1399,7 +1403,7 @@ async fn resume_plan<'s>(
             store.repo_last_release_at(job.repo_id, kind).await?,
             store.repo_continued_hold(job.repo_id, kind, job.id).await?,
         ),
-        (JobKind::Finding(_), None) => (None, None),
+        (JobKind::Finding(_), None) | (JobKind::Pr(_), _) => (None, None),
     };
     let own = if released_at.is_some() {
         store.resume_chain_stats(job.id, released_at).await?
@@ -1510,7 +1514,8 @@ async fn end_checkpoint(scope: &CycleScope<'_>, job: &Job, msg: &str) -> bool {
                 .drop_repo_checkpoint(job.repo_id, kind, job.id, msg)
                 .await
         }
-        (JobKind::Finding(_), None) => return false,
+        // A PR review has no checkpoint to drop.
+        (JobKind::Finding(_), None) | (JobKind::Pr(_), _) => return false,
     };
     dropped.unwrap_or(false)
 }
@@ -1770,6 +1775,7 @@ fn job_refused(kind: JobKind, repo: &str, err: JobInsertError) -> anyhow::Result
     match err {
         JobInsertError::RepoDeleted { .. }
         | JobInsertError::NotContinuable { .. }
+        | JobInsertError::NoPrReviewDue { .. }
         | JobInsertError::NoHarvestDue { .. }
         | JobInsertError::NoEngageDue { .. } => Ok(CycleSummary {
             kind: Some(kind),
@@ -9446,6 +9452,13 @@ async fn run_resume(
             let resumed = Resumed::<kind::Harvest>::load(store, plan).await?;
             run_harvest(scope, lane, cfg, Attempt::Resume(&resumed), backend).await
         }
+        // Never planned: a PR review records no checkpoint
+        // (`point_checkpoint`), so no resume of one is ever listed. A plan
+        // naming one is a fault to surface, not work to run.
+        JobKind::Pr(PrJobKind::Review) => anyhow::bail!(
+            "job {} is a PR review, which cannot be resumed",
+            plan.predecessor_id
+        ),
     }
 }
 
