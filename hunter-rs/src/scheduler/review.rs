@@ -757,9 +757,13 @@ async fn end_loop(
     }
     let _ = std::fs::remove_file(root.join(ENDING_FILE));
     let _ = std::fs::remove_file(root.join(HELD_FILE));
-    if !keep {
-        return;
+    if keep {
+        save_ending(start, ending).await;
     }
+}
+
+/// Save `ending` ([`ENDING_FILE`]) for `start`'s tree as it is now.
+async fn save_ending(start: &FixStart, ending: &Ending) {
     let saved = Saved {
         note: ending.note.clone(),
         title: ending.title.clone(),
@@ -767,9 +771,23 @@ async fn end_loop(
     };
     let written = serde_json::to_vec(&saved)
         .map_err(std::io::Error::other)
-        .and_then(|bytes| std::fs::write(root.join(ENDING_FILE), bytes));
+        .and_then(|bytes| std::fs::write(start.ws.root.join(ENDING_FILE), bytes));
     if let Err(e) = written {
         tracing::warn!("fix #{}: recording the review's end: {e}", start.finding.id);
+    }
+}
+
+/// Keep `ending`, which the forge refused to publish, for the retry of
+/// the kept attempt: whatever the review loop decided about saving it (a
+/// failed round or unanswered issues ship with a note and are otherwise
+/// reviewed again), the retry only has to publish the same verdict, on the
+/// same tree, however its own run ends. Anything the fixer changes since
+/// is reviewed afresh, as for any saved verdict. One that ships a
+/// reviewer-pinned commit in place of `HEAD` is not kept, and is reviewed
+/// again: a verdict is saved for `HEAD` only.
+pub(super) async fn keep_for_publish(start: &FixStart, ending: &Ending) {
+    if ending.head.is_none() {
+        save_ending(start, ending).await;
     }
 }
 

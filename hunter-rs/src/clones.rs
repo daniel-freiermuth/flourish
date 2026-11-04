@@ -613,6 +613,10 @@ pub enum Unheld<'a> {
     /// `rev-list -1 --before=<before> <rev>`: the newest commit reachable
     /// from `rev` that is older than `before`.
     LastBefore { rev: &'a str, before: &'a str },
+    /// `ls-remote <url> refs/heads/<branch>`: the branch's commit on the
+    /// remote, `<sha>\t<ref>`; empty when it has no such branch. It reads
+    /// the remote only.
+    RemoteHead { url: &'a str, branch: &'a str },
 }
 
 /// How an [`Unheld::Push`] may replace the remote branch.
@@ -679,6 +683,10 @@ impl Unheld<'_> {
             Self::LastBefore { rev, before } => {
                 spec = format!("--before={before}");
                 args.extend(["rev-list", "-1", &spec, rev]);
+            }
+            Self::RemoteHead { url, branch } => {
+                spec = format!("refs/heads/{branch}");
+                args.extend(["ls-remote", url, &spec]);
             }
         }
         run_git(dir, &args, timeout_s)

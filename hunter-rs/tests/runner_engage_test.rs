@@ -597,17 +597,22 @@ async fn only_maintainers_and_configured_bots_flag_new_comments() {
 /// other kind of work. Until the work model, engage had no failure streak,
 /// so the attention reason was marked addressed instead and the PR left
 /// review until it changed. Now a refused withdrawal counts in the engage
-/// streak like any failed engage: the third in a row holds the engage for
-/// the operator, and the attention is left as the forge reports it.
+/// streak as a refused publish: the sixth in a row holds the engage for
+/// the operator, and the attention is left as the forge reports it. A
+/// one-shot override is kept for the retries, and spent by the hold, which
+/// concludes the attempt.
 #[tokio::test]
 async fn a_failed_withdrawal_counts_toward_the_engage_streak() {
     let f = fixture("engage-close-fails-bounded").await;
     let bins = FakeBins::acquire("engage-close-fails-bounded");
     bins.ok_unless_action("gh", "pr comment", PR_VIEW_JSON);
     let backend = ScriptedBackend::writing("WITHDRAW.md", "not worth pursuing");
-
-    let mut outcomes = Vec::new();
-    for _ in 0..3 {
+    f.store
+        .set_budget_override(f.fid, Some(BudgetOverride::Once))
+        .await
+        .unwrap();
+    let (mut outcomes, mut overrides) = (Vec::new(), Vec::new());
+    for _ in 0..6 {
         let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
         let summary = hunter::scheduler::run_engage(
             &support::scope(&f.store),
@@ -619,16 +624,22 @@ async fn a_failed_withdrawal_counts_toward_the_engage_streak() {
         .await
         .unwrap();
         outcomes.push(summary.outcome);
+        let left = f
+            .store
+            .get_finding(f.fid)
+            .await
+            .unwrap()
+            .unwrap()
+            .budget_override;
+        overrides.push(left);
     }
 
-    assert_eq!(
-        outcomes,
-        [
-            Some("withdraw-failed".into()),
-            Some("withdraw-failed".into()),
-            Some("held".into())
-        ]
-    );
+    let mut expected = vec![Some("withdraw-failed".to_owned()); 5];
+    expected.push(Some("held".into()));
+    assert_eq!(outcomes, expected);
+    let mut kept = vec![Some(BudgetOverride::Once); 5];
+    kept.push(None);
+    assert_eq!(overrides, kept, "kept for the retries, spent by the hold");
     assert_eq!(
         f.addressed_fp().await,
         None,
@@ -654,11 +665,12 @@ async fn a_failed_withdrawal_counts_toward_the_engage_streak() {
     );
 }
 
-/// A withdrawing engage is an attempt like any other: it spends a `once`
-/// override and keeps an `exempt` one, whether the close lands or not.
-/// A `once` left behind would hand the closed PR's harvest the
-/// prioritized budget and put it at the head of the queue, so a single
-/// override would pay for a second job.
+/// A withdrawing engage is an attempt like any other: a close that lands
+/// spends a `once` override and keeps an `exempt` one. A `once` left
+/// behind would hand the closed PR's harvest the prioritized budget and
+/// put it at the head of the queue, so a single override would pay for a
+/// second job. A close the forge refuses keeps both: the attempt is kept
+/// to publish, and its retry is the one the override is for.
 #[tokio::test]
 async fn a_withdrawal_spends_only_a_once_override() {
     let bins = FakeBins::acquire("engage-withdraw-override");
@@ -701,6 +713,7 @@ async fn a_withdrawal_spends_only_a_once_override() {
                 "{mode}: {summary:?}"
             );
             let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+            let left = if close_fails { Some(mode) } else { left };
             assert_eq!(after.budget_override, left, "{outcome}, {mode} override");
             if !close_fails {
                 let next = hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
@@ -2714,8 +2727,8 @@ async fn a_conflict_recorded_while_an_engage_was_suspended_stays_flagged_after_i
 
 /// A push that fails leaves the engage incomplete: no reply is posted, the
 /// finished job is recorded failed, nothing is marked addressed or engaged
-/// (so the next cycle tries again), and the attempt still spends a one-shot
-/// override.
+/// (so the next cycle tries again), and, the attempt being kept to
+/// publish, a one-shot override is kept for the retry that publishes.
 #[tokio::test]
 async fn an_engage_whose_push_fails_posts_nothing_and_fails_its_job() {
     let f = fixture("engage-push-fails").await;
@@ -2754,7 +2767,944 @@ async fn an_engage_whose_push_fails_posts_nothing_and_fails_its_job() {
     assert_eq!(ps.addressed_fingerprint, None);
     assert_eq!(ps.last_engaged_activity_at, None, "watermark untouched");
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-    assert_eq!(finding.budget_override, None);
+    assert_eq!(
+        finding.budget_override,
+        Some(hunter::domain::BudgetOverride::Once),
+        "kept for the retry that publishes"
+    );
+}
+
+/// The sixth refused push in a row holds the engage: the hold concludes
+/// the attempt, so a one-shot override is spent, as by any other hold.
+#[tokio::test]
+async fn an_engage_held_at_its_sixth_refused_push_spends_a_once_override() {
+    let f = fixture("engage-push-held").await;
+    let bins = FakeBins::acquire("engage-push-held");
+    bins.ok("gh", PR_VIEW_JSON);
+    push_to(&f, Some("/nonexistent/origin.git")).await;
+    for _ in 0..5 {
+        support::scope(&f.store)
+            .store()
+            .record_work_failure(
+                f.fid,
+                hunter::domain::FindingJobKind::Engage,
+                "publish refused",
+            )
+            .await
+            .unwrap();
+    }
+    f.store
+        .set_budget_override(f.fid, Some(hunter::domain::BudgetOverride::Once))
+        .await
+        .unwrap();
+
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Cold(&finding),
+        &committing_and_replying(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("held"), "{summary:?}");
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(finding.budget_override, None, "spent by the hold");
+}
+
+/// A finished engage whose push the forge refused is kept as the
+/// checkpoint, so the retry publishes it instead of redoing it, but only
+/// while the PR branch is where the attempt started: a branch someone
+/// pushed to meanwhile (the lease refused the push) is taken up cold, on
+/// the branch as it now is.
+#[tokio::test]
+async fn a_refused_push_keeps_the_attempt_only_while_the_branch_is_unmoved() {
+    for moved in [false, true] {
+        let label = if moved {
+            "engage-push-moved"
+        } else {
+            "engage-push-refused"
+        };
+        let f = fixture(label).await;
+        let bins = FakeBins::acquire(label);
+        bins.ok("gh", PR_VIEW_JSON);
+        let origin = push_to(&f, None).await;
+        let backend = if moved {
+            // Someone else pushes to the PR while the worker runs.
+            let other = origin.clone();
+            ScriptedBackend::new(move |tree| {
+                let theirs = tree.parent().unwrap().join("theirs");
+                let (o, t) = (other.to_string_lossy(), theirs.to_string_lossy());
+                git(tree, &["clone", "-q", "-b", BRANCH, &o, &t]);
+                git(&theirs, &["commit", "--allow-empty", "-qm", "theirs"]);
+                git(&theirs, &["push", "-q", "origin", BRANCH]);
+                git(tree, &["commit", "--allow-empty", "-qm", "address review"]);
+                support::done_with_transcript(tree)
+            })
+        } else {
+            // The forge answers, and refuses every push.
+            let hook = origin.join("hooks/pre-receive");
+            std::fs::write(
+                &hook,
+                "#!/bin/sh\necho 'Internal Server Error' >&2\nexit 1\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
+            ScriptedBackend::new(|tree| {
+                git(tree, &["commit", "--allow-empty", "-qm", "address review"]);
+                support::done_with_transcript(tree)
+            })
+        };
+
+        let summary = f.run(&backend).await.unwrap();
+
+        assert_eq!(
+            summary.outcome.as_deref(),
+            Some("retry"),
+            "{label}: {summary:?}"
+        );
+        let checkpoint = f
+            .store
+            .checkpoint_job(f.fid, hunter::domain::FindingJobKind::Engage)
+            .await
+            .unwrap()
+            .map(|j| j.id);
+        let kept = if moved { None } else { summary.job_id };
+        assert_eq!(checkpoint, kept, "{label}");
+    }
+}
+
+/// The retry of an engage kept to publish still publishes when its own run
+/// fails before its first token (a rate limit): that run left the finished
+/// attempt's tree as it was. Refused again, the attempt stays kept and the
+/// refusal counts as the same failure, so the work is neither redone nor
+/// its streak reset.
+#[tokio::test]
+async fn a_kept_engage_publishes_even_when_its_retry_run_does_nothing() {
+    let f = fixture("engage-kept-retry").await;
+    let bins = FakeBins::acquire("engage-kept-retry");
+    bins.ok("gh", PR_VIEW_JSON);
+    let origin = push_to(&f, None).await;
+    let hook = origin.join("hooks/pre-receive");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\necho 'Internal Server Error' >&2\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let finished = ScriptedBackend::new(|tree| {
+        git(tree, &["commit", "--allow-empty", "-qm", "address review"]);
+        std::fs::write(tree.join("PR-REPLY.md"), "addressed").unwrap();
+        support::done_with_transcript(tree)
+    });
+    let refused = f.run(&finished).await.unwrap();
+    assert_eq!(refused.outcome.as_deref(), Some("retry"), "{refused:?}");
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    let rate_limited = ScriptedBackend::staged(|_, session| RunResult {
+        exit_code: Some(1),
+        tokens_new: 0,
+        session_file: session.map(|p| p.to_string_lossy().into_owned()),
+        ..done()
+    });
+    let retry = async || {
+        // Past any wait, however many refusals came before.
+        sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
+            .bind(24 * 60 * 60_000_i64)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
+            hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
+                .await
+                .unwrap()
+        else {
+            panic!("the kept engage is continued");
+        };
+        hunter::scheduler::run_engage(
+            &support::scope(&f.store),
+            f.store.test_lane(),
+            &f.cfg,
+            Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
+            &rate_limited,
+        )
+        .await
+        .unwrap()
+    };
+
+    let again = retry().await;
+
+    assert_eq!(again.outcome.as_deref(), Some("retry"), "{again:?}");
+    let checkpoint = f
+        .store
+        .checkpoint_job(f.fid, hunter::domain::FindingJobKind::Engage)
+        .await
+        .unwrap()
+        .map(|j| j.id);
+    assert_eq!(checkpoint, again.job_id, "still kept");
+    let streak = f
+        .store
+        .work_streak(f.fid, hunter::domain::FindingJobKind::Engage)
+        .await
+        .unwrap();
+    assert_eq!(
+        (streak.streak, streak.last_failure.as_deref()),
+        (2, Some("publish refused"))
+    );
+
+    std::fs::remove_file(&hook).unwrap();
+    let published = retry().await;
+
+    assert_eq!(
+        published.outcome.as_deref(),
+        Some("engaged"),
+        "{published:?}"
+    );
+    assert!(bins.called_with("gh", "comment"), "{:?}", bins.calls());
+    assert_eq!(
+        git(&origin, &["log", "-1", "--format=%s", BRANCH]).trim(),
+        "address review"
+    );
+}
+
+/// An engage whose push landed but whose reply the forge refused is kept
+/// too, while the PR's head is still its push: the retry finds its commits
+/// already on the PR and only replies, instead of the whole engagement
+/// being redone cold, and waits like any refused publish.
+#[tokio::test]
+async fn an_engage_whose_reply_was_refused_after_its_push_only_replies_again() {
+    let f = fixture("engage-reply-refused").await;
+    let bins = FakeBins::acquire("engage-reply-refused");
+    bins.ok_unless_action("gh", "pr comment", PR_VIEW_JSON);
+    let origin = push_to(&f, None).await;
+    let finished = ScriptedBackend::new(|tree| {
+        git(tree, &["commit", "--allow-empty", "-qm", "address review"]);
+        std::fs::write(tree.join("PR-REPLY.md"), "addressed").unwrap();
+        support::done_with_transcript(tree)
+    });
+
+    let refused = f.run(&finished).await.unwrap();
+
+    assert_eq!(refused.outcome.as_deref(), Some("retry"), "{refused:?}");
+    let pushed = git(&origin, &["rev-parse", BRANCH]);
+    let checkpoint = f
+        .store
+        .checkpoint_job(f.fid, hunter::domain::FindingJobKind::Engage)
+        .await
+        .unwrap()
+        .map(|j| j.id);
+    assert_eq!(checkpoint, refused.job_id, "kept to reply");
+    let waits = hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
+        .await
+        .unwrap();
+    assert!(
+        !matches!(
+            waits,
+            Some(
+                hunter::scheduler::Candidate::Resume { .. }
+                    | hunter::scheduler::Candidate::Finding { .. }
+            )
+        ),
+        "neither continued nor redone before the wait: {waits:?}"
+    );
+
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
+        .bind(hunter::scheduler::PUBLISH_RETRY_MS)
+        .execute(&pool)
+        .await
+        .unwrap();
+    bins.ok("gh", PR_VIEW_JSON);
+    let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
+            .await
+            .unwrap()
+    else {
+        panic!("the kept engage is continued");
+    };
+    let replied = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
+        &ScriptedBackend::new(support::done_with_transcript),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(replied.outcome.as_deref(), Some("engaged"), "{replied:?}");
+    assert!(bins.called_with("gh", "comment"), "{:?}", bins.calls());
+    assert_eq!(
+        git(&origin, &["rev-parse", BRANCH]),
+        pushed,
+        "no second push"
+    );
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    let push_count: i64 =
+        sqlx::query_scalar("SELECT push_count FROM pr_state WHERE finding_id = ?1")
+            .bind(f.fid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(push_count, 1, "the one push is counted once");
+}
+
+/// The fixture engage after its push landed and its reply was refused:
+/// kept to reply, and its wait already over. The forge then answers again.
+async fn kept_after_its_push(f: &Fixture, bins: &FakeBins) -> std::path::PathBuf {
+    bins.ok_unless_action("gh", "pr comment", PR_VIEW_JSON);
+    let origin = push_to(f, None).await;
+    let finished = ScriptedBackend::new(|tree| {
+        git(tree, &["commit", "--allow-empty", "-qm", "address review"]);
+        std::fs::write(tree.join("PR-REPLY.md"), "addressed").unwrap();
+        support::done_with_transcript(tree)
+    });
+    let refused = f.run(&finished).await.unwrap();
+    assert_eq!(refused.outcome.as_deref(), Some("retry"), "{refused:?}");
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
+        .bind(24 * 60 * 60_000_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+    bins.ok("gh", PR_VIEW_JSON);
+    origin
+}
+
+/// A kept engage whose retry cannot read the PR branch from the forge
+/// still knows its commits are on the PR when its tree is the commit the
+/// chain itself pushed: it only replies, and records no second push.
+#[tokio::test]
+async fn a_kept_engage_that_cannot_read_the_branch_does_not_push_again() {
+    let f = fixture("engage-kept-unreadable").await;
+    let bins = FakeBins::acquire("engage-kept-unreadable");
+    let origin = kept_after_its_push(&f, &bins).await;
+    let pushed = git(&origin, &["rev-parse", BRANCH]);
+    // The forge's branch can no longer be read (nor pushed to).
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let clone = std::path::PathBuf::from(
+        f.store
+            .get_repo_by_id(finding.repo_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .path,
+    );
+    let key = format!("url.{}.insteadOf", origin.display());
+    git(&clone, &["config", "--unset-all", &key]);
+    push_to(&f, Some("/nonexistent/remote.git")).await;
+    let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
+            .await
+            .unwrap()
+    else {
+        panic!("the kept engage is continued");
+    };
+
+    let replied = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
+        &ScriptedBackend::new(support::done_with_transcript),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(replied.outcome.as_deref(), Some("engaged"), "{replied:?}");
+    assert_eq!(git(&origin, &["rev-parse", BRANCH]), pushed);
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    let push_count: i64 =
+        sqlx::query_scalar("SELECT push_count FROM pr_state WHERE finding_id = ?1")
+            .bind(f.fid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(push_count, 1, "the one push is counted once");
+}
+
+/// A kept engage whose retry adds a commit on top of its own earlier push
+/// pushes it: the lease is to the PR's head this tree contains, not to the
+/// chain's first commit, which the chain's own push already moved off.
+#[tokio::test]
+async fn a_kept_engage_that_commits_again_pushes_over_its_own_push() {
+    let f = fixture("engage-kept-commits").await;
+    let bins = FakeBins::acquire("engage-kept-commits");
+    let origin = kept_after_its_push(&f, &bins).await;
+    let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
+            .await
+            .unwrap()
+    else {
+        panic!("the kept engage is continued");
+    };
+    let more = ScriptedBackend::new(|tree| {
+        git(tree, &["commit", "--allow-empty", "-qm", "one more"]);
+        support::done_with_transcript(tree)
+    });
+
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
+        &more,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
+    assert_eq!(
+        git(&origin, &["log", "-1", "--format=%s", BRANCH]).trim(),
+        "one more"
+    );
+    assert!(bins.called_with("gh", "comment"), "{:?}", bins.calls());
+}
+
+/// A kept engage is not continued into its old reply once someone else
+/// has given feedback on the PR while it waited: a resume is shown no PR,
+/// so the engage is decided again cold, on the PR as it now is.
+#[tokio::test]
+async fn a_kept_engage_is_redecided_after_new_feedback() {
+    let f = fixture("engage-kept-feedback").await;
+    let bins = FakeBins::acquire("engage-kept-feedback");
+    kept_after_its_push(&f, &bins).await;
+    let pass = support::pr_sync(&f.store);
+    let feedback = observed(&pass, f.fid, hunter::util::now_ms() + 1).await;
+    let recorded = f.store.record_open_pr(f.fid, &feedback).await.unwrap();
+    assert!(
+        matches!(recorded, OpenPrRecorded::Recorded(_)),
+        "{recorded:?}"
+    );
+    drop(pass);
+
+    let picked = hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(picked, Some(hunter::scheduler::Candidate::Finding { .. })),
+        "a cold engage: {picked:?}"
+    );
+    assert_eq!(
+        f.store
+            .checkpoint_job(f.fid, hunter::domain::FindingJobKind::Engage)
+            .await
+            .unwrap()
+            .map(|j| j.id),
+        None,
+        "the old attempt is given up"
+    );
+}
+
+/// Whether the fixture's kept engage is given up and decided again cold
+/// once the PR sync has last read the PR at `synced_at` with head `head`
+/// and its newest feedback at `activity`. The chain is taken to have
+/// started on no recorded head, so only the commit its tree was created
+/// at counts as its start.
+async fn redecided(f: &Fixture, head: &str, synced_at: i64, activity: Option<i64>) -> bool {
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    sqlx::query(
+        "UPDATE pr_state SET head_sha = ?1, synced_at = ?2, last_activity_at = ?3 \
+         WHERE finding_id = ?4",
+    )
+    .bind(head)
+    .bind(synced_at)
+    .bind(activity)
+    .bind(f.fid)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE jobs SET started_on_head_sha = NULL")
+        .execute(&pool)
+        .await
+        .unwrap();
+    match hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
+        .await
+        .unwrap()
+    {
+        Some(hunter::scheduler::Candidate::Resume { .. }) => false,
+        Some(hunter::scheduler::Candidate::Finding { .. }) => true,
+        other => panic!("the engage is continued or redone: {other:?}"),
+    }
+}
+
+/// A kept engage that pushed is where it left its PR while the branch is
+/// at its own push and no one else has spoken since it started. Feedback
+/// since, or the branch back at the start commit as read after that push
+/// (a rewind), is a PR that moved on; the start commit as read before the
+/// push landed is only a stale read.
+#[tokio::test]
+async fn a_kept_engage_that_pushed_is_redecided_only_when_its_pr_moved() {
+    let now = hunter::util::now_ms();
+    let hour = 60 * 60_000;
+    for (case, at_start, synced_at, activity, moved) in [
+        ("own-push", false, now, None, false),
+        ("feedback", false, now, Some(now + hour), true),
+        ("rewound", true, now + hour, None, true),
+        ("stale-read", true, now - hour, None, false),
+    ] {
+        let label = format!("engage-kept-moved-{case}");
+        let f = fixture(&label).await;
+        let bins = FakeBins::acquire(&label);
+        let origin = kept_after_its_push(&f, &bins).await;
+        let rev = if at_start { "~1" } else { "" };
+        let head = git(&origin, &["rev-parse", &format!("{BRANCH}{rev}")]);
+
+        let redecided = redecided(&f, head.trim(), synced_at, activity).await;
+
+        assert_eq!(redecided, moved, "{case}");
+        drop(bins);
+    }
+}
+
+/// A kept engage that has not pushed is where it left its PR while the
+/// branch is at the commit its tree was created at; any other head is a
+/// PR that moved on.
+#[tokio::test]
+async fn a_kept_reply_is_redecided_when_its_branch_moved() {
+    let now = hunter::util::now_ms();
+    for (case, moved) in [("at-start", false), ("moved", true)] {
+        let label = format!("engage-kept-reply-{case}");
+        let f = fixture(&label).await;
+        let bins = FakeBins::acquire(&label);
+        bins.ok_unless_action("gh", "pr comment", PR_VIEW_JSON);
+        let origin = push_to(&f, None).await;
+        let start = git(&origin, &["rev-parse", BRANCH]);
+        let replying = ScriptedBackend::new(|tree| {
+            std::fs::write(tree.join("PR-REPLY.md"), "addressed").unwrap();
+            support::done_with_transcript(tree)
+        });
+        let refused = f.run(&replying).await.unwrap();
+        assert_eq!(refused.outcome.as_deref(), Some("retry"), "{refused:?}");
+        let pool = sqlx::SqlitePool::connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
+            .bind(24 * 60 * 60_000_i64)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let head = if moved {
+            "0123456789abcdef0123456789abcdef01234567"
+        } else {
+            start.trim()
+        };
+
+        let redecided = redecided(&f, head, now, None).await;
+
+        assert_eq!(redecided, moved, "{case}");
+        drop(bins);
+    }
+}
+
+/// A retry of a kept engage publishes the kept tree whatever its own run
+/// ended as only when that run did no metered work: one that worked and
+/// then failed may have left the tree half-changed, and publishes nothing.
+#[tokio::test]
+async fn a_kept_engage_whose_retry_worked_and_failed_publishes_nothing() {
+    let f = fixture("engage-kept-retry-fails").await;
+    let bins = FakeBins::acquire("engage-kept-retry-fails");
+    let origin = kept_after_its_push(&f, &bins).await;
+    let pushed = git(&origin, &["rev-parse", BRANCH]);
+    let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
+            .await
+            .unwrap()
+    else {
+        panic!("the kept engage is continued");
+    };
+    let failing = ScriptedBackend::new(|_| RunResult {
+        exit_code: Some(1),
+        ..done()
+    });
+
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
+        &failing,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("retry"), "{summary:?}");
+    let comments = bins
+        .calls_to("gh")
+        .into_iter()
+        .filter(|c| c.iter().any(|a| a == "comment"))
+        .count();
+    assert_eq!(comments, 1, "only the kept attempt's refused reply");
+    assert_eq!(git(&origin, &["rev-parse", BRANCH]), pushed);
+}
+
+/// A withdrawal the forge refused is kept only while the PR's branch is
+/// where the chain left it: one someone pushed to meanwhile is decided
+/// again cold, and nothing is left to resume into the old withdrawal.
+#[tokio::test]
+async fn a_refused_withdrawal_on_a_moved_branch_is_not_kept() {
+    let f = fixture("engage-withdraw-moved").await;
+    let bins = FakeBins::acquire("engage-withdraw-moved");
+    bins.ok_unless_action("gh", "pr comment", PR_VIEW_JSON);
+    let origin = push_to(&f, None).await;
+    let other = origin.clone();
+    let withdrawing = ScriptedBackend::new(move |tree| {
+        let theirs = tree.parent().unwrap().join("theirs");
+        let (o, t) = (other.to_string_lossy(), theirs.to_string_lossy());
+        git(tree, &["clone", "-q", "-b", BRANCH, &o, &t]);
+        git(&theirs, &["commit", "--allow-empty", "-qm", "theirs"]);
+        git(&theirs, &["push", "-q", "origin", BRANCH]);
+        std::fs::write(tree.join("WITHDRAW.md"), "superseded by #9").unwrap();
+        support::done_with_transcript(tree)
+    });
+
+    let summary = f.run(&withdrawing).await.unwrap();
+
+    assert_eq!(
+        summary.outcome.as_deref(),
+        Some("withdraw-failed"),
+        "{summary:?}"
+    );
+    assert_eq!(
+        f.store
+            .checkpoint_job(f.fid, hunter::domain::FindingJobKind::Engage)
+            .await
+            .unwrap()
+            .map(|j| j.id),
+        None
+    );
+}
+
+/// A kept engage whose retry amends the commit the chain already pushed
+/// force-pushes the amended one: the lease is to the chain's own recorded
+/// push, which is the PR's head, so only what this chain put there is
+/// replaced.
+#[tokio::test]
+async fn a_kept_engage_that_amends_its_own_push_pushes_the_amend() {
+    let f = fixture("engage-kept-amends").await;
+    let bins = FakeBins::acquire("engage-kept-amends");
+    let origin = kept_after_its_push(&f, &bins).await;
+    let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
+            .await
+            .unwrap()
+    else {
+        panic!("the kept engage is continued");
+    };
+    let amending = ScriptedBackend::new(|tree| {
+        git(
+            tree,
+            &["commit", "--amend", "--allow-empty", "-qm", "amended"],
+        );
+        support::done_with_transcript(tree)
+    });
+
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
+        &amending,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
+    assert_eq!(
+        git(&origin, &["log", "-1", "--format=%s", BRANCH]).trim(),
+        "amended"
+    );
+}
+
+/// An engage whose PR branch someone rewound while it ran (reset to an
+/// older commit, to drop one) does not push the dropped commit back: the
+/// rewound head is an ancestor of the engage's tree, but not the commit
+/// the chain started from nor one it pushed, so the lease refuses, and the
+/// attempt is not kept: a cold engage takes the PR up as it now is.
+#[tokio::test]
+async fn an_engage_does_not_push_over_a_rewound_branch() {
+    let f = fixture("engage-rewound").await;
+    let bins = FakeBins::acquire("engage-rewound");
+    bins.ok("gh", PR_VIEW_JSON);
+    let origin = push_to(&f, None).await;
+    let other = origin.clone();
+    let rewinding = ScriptedBackend::new(move |tree| {
+        let theirs = tree.parent().unwrap().join("theirs");
+        let (o, t) = (other.to_string_lossy(), theirs.to_string_lossy());
+        git(tree, &["clone", "-q", "-b", BRANCH, &o, &t]);
+        git(&theirs, &["reset", "-q", "--hard", "HEAD~1"]);
+        git(&theirs, &["push", "-q", "--force", "origin", BRANCH]);
+        git(tree, &["commit", "--allow-empty", "-qm", "address review"]);
+        support::done_with_transcript(tree)
+    });
+
+    let summary = f.run(&rewinding).await.unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("retry"), "{summary:?}");
+    assert_ne!(
+        git(&origin, &["log", "-1", "--format=%s", BRANCH]).trim(),
+        "address review",
+        "the rewind stands"
+    );
+    assert_eq!(
+        f.store
+            .checkpoint_job(f.fid, hunter::domain::FindingJobKind::Engage)
+            .await
+            .unwrap()
+            .map(|j| j.id),
+        None
+    );
+}
+
+/// A kept engage whose push someone undid by resetting the PR branch to
+/// the chain's start commit does not push it back: once the chain has
+/// pushed, only its own push counts as where it left the branch, so the
+/// lease refuses, and the attempt is not kept.
+#[tokio::test]
+async fn a_kept_engage_does_not_push_over_a_rewind_to_its_start() {
+    let f = fixture("engage-kept-rewound").await;
+    let bins = FakeBins::acquire("engage-kept-rewound");
+    let origin = kept_after_its_push(&f, &bins).await;
+    let start = git(&origin, &["rev-parse", &format!("{BRANCH}~1")]);
+    git(
+        &origin,
+        &["update-ref", &format!("refs/heads/{BRANCH}"), start.trim()],
+    );
+    let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
+            .await
+            .unwrap()
+    else {
+        panic!("the kept engage is continued");
+    };
+
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
+        &ScriptedBackend::new(support::done_with_transcript),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("retry"), "{summary:?}");
+    assert_eq!(
+        git(&origin, &["rev-parse", BRANCH]),
+        start,
+        "the rewind stands"
+    );
+    assert_eq!(
+        f.store
+            .checkpoint_job(f.fid, hunter::domain::FindingJobKind::Engage)
+            .await
+            .unwrap()
+            .map(|j| j.id),
+        None
+    );
+}
+
+/// A withdrawal reason that landed is not posted again by the retry of a
+/// withdrawal the forge refused: neither one the forge took (only the
+/// close was refused), nor one it reported failed but posted all the same
+/// (a 502, a timeout), which the retry finds on the PR.
+#[tokio::test]
+async fn a_retried_withdrawal_posts_its_reason_once() {
+    for comment_errs in [false, true] {
+        withdrawal_reason_posted_once(comment_errs).await;
+    }
+}
+
+async fn withdrawal_reason_posted_once(comment_errs: bool) {
+    let label = format!("engage-withdraw-once-{comment_errs}");
+    let f = fixture(&label).await;
+    let bins = FakeBins::acquire(&label);
+    let posted = f.cfg.work_root.join("posted");
+    let shown = PR_VIEW_JSON.replace(
+        r#""comments":[]"#,
+        r#""comments":[{"id":"c1","author":{"login":"me"},"body":"superseded by #9\n\n<!-- posted by hunter -->","createdAt":"2099-01-01T00:00:00Z"}]"#,
+    );
+    let comment = if comment_errs {
+        format!("touch '{}'; echo 'HTTP 502' >&2; exit 1", posted.display())
+    } else {
+        format!("touch '{}'", posted.display())
+    };
+    bins.script(
+        "gh",
+        &format!(
+            "case \"$1 $2\" in\n\"pr close\") echo 'HTTP 500' >&2; exit 1;;\n\
+             \"pr comment\") {comment};;\n\
+             \"pr view\") if [ -e '{p}' ]; then printf '%s\\n' '{shown}'; else echo '{PR_VIEW_JSON}'; fi;;\n\
+             \"api \"*/collaborators/*) echo true;;\n\
+             esac\nexit 0",
+            p = posted.display()
+        ),
+    );
+    let withdrawing = ScriptedBackend::new(|tree| {
+        std::fs::write(tree.join("WITHDRAW.md"), "superseded by #9").unwrap();
+        support::done_with_transcript(tree)
+    });
+    let refused = f.run(&withdrawing).await.unwrap();
+    assert_eq!(
+        refused.outcome.as_deref(),
+        Some("withdraw-failed"),
+        "{refused:?}"
+    );
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
+        .bind(24 * 60 * 60_000_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
+            .await
+            .unwrap()
+    else {
+        panic!("the kept withdrawal is continued");
+    };
+
+    let again = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
+        &ScriptedBackend::new(support::done_with_transcript),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        again.outcome.as_deref(),
+        Some("withdraw-failed"),
+        "{again:?}"
+    );
+    let count = |verb: &str| {
+        bins.calls_to("gh")
+            .into_iter()
+            .filter(|c| c.iter().any(|a| a == verb))
+            .count()
+    };
+    assert_eq!(count("comment"), 1, "{label}: {:?}", bins.calls());
+    let closes = if comment_errs { 1 } else { 2 };
+    assert_eq!(count("close"), closes, "{label}: {:?}", bins.calls());
+}
+
+/// A reply the forge reported failed but posted all the same (a 502 from
+/// its frontend, `gh` killed at its timeout) is not posted again: the
+/// retry finds its own reply on the PR, made since its first try, and
+/// counts the engage answered. One that never landed is posted again, even
+/// when an earlier engage of the PR left a reply with the same text: only
+/// a comment made since this chain's try counts.
+#[tokio::test]
+async fn a_reply_that_landed_despite_an_error_is_not_posted_again() {
+    for landed in [true, false] {
+        let label = format!("engage-reply-landed-{landed}");
+        let f = fixture(&label).await;
+        let bins = FakeBins::acquire(&label);
+        let posted = f.cfg.work_root.join("posted");
+        let at = if landed { "2099-01-01" } else { "2020-01-01" };
+        let shown = PR_VIEW_JSON.replace(
+            r#""comments":[]"#,
+            &format!(
+                r#""comments":[{{"id":"c1","author":{{"login":"me"}},"body":"addressed\n\n<!-- posted by hunter -->","createdAt":"{at}T00:00:00Z"}}]"#
+            ),
+        );
+        // Landed: the comment the failed post made shows from then on.
+        // Not landed: an earlier engage's identical reply shows throughout.
+        let touch = if landed {
+            format!("touch '{}'; ", posted.display())
+        } else {
+            String::new()
+        };
+        let seen = if landed {
+            format!("[ -e '{}' ]", posted.display())
+        } else {
+            "true".to_owned()
+        };
+        bins.script(
+            "gh",
+            &format!(
+                "case \"$1 $2\" in\n\"pr comment\") {touch}echo 'HTTP 502' >&2; exit 1;;\n\
+                 \"pr view\") if {seen}; then printf '%s\\n' '{shown}'; else echo '{PR_VIEW_JSON}'; fi;;\n\
+                 \"api \"*/collaborators/*) echo true;;\n\
+                 esac\nexit 0"
+            ),
+        );
+        let replying = ScriptedBackend::new(|tree| {
+            std::fs::write(tree.join("PR-REPLY.md"), "addressed").unwrap();
+            support::done_with_transcript(tree)
+        });
+        let refused = f.run(&replying).await.unwrap();
+        assert_eq!(refused.outcome.as_deref(), Some("retry"), "{refused:?}");
+        let pool = sqlx::SqlitePool::connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
+            .bind(24 * 60 * 60_000_i64)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
+            hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
+                .await
+                .unwrap()
+        else {
+            panic!("the kept engage is continued");
+        };
+
+        let again = hunter::scheduler::run_engage(
+            &support::scope(&f.store),
+            f.store.test_lane(),
+            &f.cfg,
+            Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
+            &ScriptedBackend::new(support::done_with_transcript),
+        )
+        .await
+        .unwrap();
+
+        let (outcome, posts) = if landed { ("engaged", 1) } else { ("retry", 2) };
+        assert_eq!(
+            again.outcome.as_deref(),
+            Some(outcome),
+            "{label}: {again:?}"
+        );
+        let comments = bins
+            .calls_to("gh")
+            .into_iter()
+            .filter(|c| c.iter().any(|a| a == "comment"))
+            .count();
+        assert_eq!(comments, posts, "{label}: {:?}", bins.calls());
+        drop(bins);
+    }
 }
 
 /// A worker that did not finish publishes nothing, whatever it staged.
@@ -3093,12 +4043,12 @@ async fn a_suspended_engage_that_withdrew_keeps_no_checkpoint_and_continues_into
     assert!(!runs[0].tree.exists(), "the chain's tree must be released");
 }
 
-/// A cap-killed engage whose withdrawal the forge refused keeps no
-/// checkpoint either: the refusal is a failed engage, and a failure ends
-/// the checkpoint (WORK-MODEL.md §6.3). A checkpoint left behind would be
-/// resumed into the same withdrawal, and would pin its tree.
+/// A cap-killed engage whose withdrawal the forge refused is kept to
+/// publish: the withdrawal is decided, so its retry is resumed into it
+/// (WITHDRAW.md is still in the tree) instead of starting cold, counted as
+/// a refused publish.
 #[tokio::test]
-async fn a_suspended_engage_whose_withdrawal_failed_keeps_no_checkpoint_and_is_released() {
+async fn a_suspended_engage_whose_withdrawal_was_refused_is_kept_to_withdraw_again() {
     let f = fixture("engage-suspended-withdraw-failed").await;
     let bins = FakeBins::acquire("engage-suspended-withdraw-failed");
     bins.ok_unless_action("gh", "pr comment", PR_VIEW_JSON);
@@ -3127,24 +4077,32 @@ async fn a_suspended_engage_whose_withdrawal_failed_keeps_no_checkpoint_and_is_r
     let (state, killed_reason, _) = f.job_row(job).await;
     assert_eq!(
         (state.as_str(), killed_reason.as_deref()),
-        ("suspended", Some("cap"))
+        ("failed", Some("cap"))
     );
+    let streak = f
+        .store
+        .work_streak(f.fid, hunter::domain::FindingJobKind::Engage)
+        .await
+        .unwrap();
     assert_eq!(
-        f.store
-            .work_streak(f.fid, hunter::domain::FindingJobKind::Engage)
-            .await
-            .unwrap()
-            .streak,
-        1,
-        "counted as a failed engage"
+        (streak.streak, streak.last_failure.as_deref()),
+        (1, Some("publish refused"))
     );
-    assert!(f.store.list_resumable_jobs().await.unwrap().is_empty());
+    let checkpoint = f
+        .store
+        .checkpoint_job(f.fid, hunter::domain::FindingJobKind::Engage)
+        .await
+        .unwrap()
+        .map(|j| j.id);
+    assert_eq!(checkpoint, Some(job), "kept to withdraw again");
     let runs = backend.runs();
     assert_eq!(runs.len(), 1, "no harvest without a close: {runs:?}");
-    assert_eq!(f.jobs().await.len(), 1);
     let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
     assert_eq!(after.status, FindingStatus::PrOpen);
-    assert!(!runs[0].tree.exists(), "the chain's tree must be released");
+    assert!(
+        runs[0].tree.join("WITHDRAW.md").exists(),
+        "its tree is kept"
+    );
 }
 
 /// A cap-killed engage that neither withdrew nor finished is a pause.
@@ -3438,10 +4396,11 @@ async fn a_paused_engage_whose_pr_merged_meanwhile_does_not_resume() {
     assert!(resuming.runs().is_empty(), "no worker ran");
 }
 
-/// The streak counts *identical* failures, by what failed: two refused
-/// pushes are the same failure whatever git says about each (the key drops
-/// the text after the colon), while a push, a reply and an unfinished
-/// worker are three different ones and hold nothing.
+/// The streak counts *identical* failures, by what failed: a refused push
+/// and a refused reply are the same failure, `publish refused`, whatever
+/// git or the forge says about each (a forge failing in an incident
+/// refuses one step on one try and another on the next, which must still
+/// add up to a hold), while an unfinished worker is a different one.
 #[tokio::test]
 async fn engage_failures_count_by_what_failed() {
     let f = fixture("engage-failure-keys").await;
@@ -3469,7 +4428,7 @@ async fn engage_failures_count_by_what_failed() {
     };
 
     let mut seen = Vec::new();
-    for backend in [&pushing, &pushing, &replying, &unfinished] {
+    for backend in [&pushing, &replying, &unfinished] {
         let summary = f.run(backend).await.unwrap();
         let s = streak().await;
         seen.push((summary.outcome, s.streak, s.last_failure));
@@ -3479,9 +4438,8 @@ async fn engage_failures_count_by_what_failed() {
     assert_eq!(
         seen,
         [
-            (Some("retry".into()), 1, failure("push failed")),
-            (Some("retry".into()), 2, failure("push failed")),
-            (Some("retry".into()), 1, failure("PR comment failed")),
+            (Some("retry".into()), 1, failure("publish refused")),
+            (Some("retry".into()), 2, failure("publish refused")),
             (Some("retry".into()), 1, failure("worker failed")),
         ]
     );
@@ -3681,8 +4639,9 @@ async fn a_failed_reply_counts_only_while_the_forge_is_reachable() {
 
 /// A withdrawal the forge cannot be reached to make is the network's
 /// failure: nothing is counted, the withdrawing attempt becomes the
-/// checkpoint, where a refused withdrawal drops it, and the cycle ends
-/// denied for the host (#95).
+/// checkpoint, marked as kept only to publish (so the resume ceiling
+/// spares the decided withdrawal like an offline push or reply), and the
+/// cycle ends denied for the host (#95).
 #[tokio::test]
 async fn a_withdrawal_while_the_forge_is_unreachable_keeps_its_checkpoint() {
     let bins = FakeBins::acquire("engage-withdraw-offline");
@@ -3728,6 +4687,12 @@ async fn a_withdrawal_while_the_forge_is_unreachable_keeps_its_checkpoint() {
     );
     let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
     assert_eq!(after.status, FindingStatus::PrOpen);
+    let (state, _, notes) = f.job_row(summary.job_id.unwrap()).await;
+    assert_eq!(state, "failed");
+    assert_eq!(
+        notes.as_deref(),
+        Some(format!("unpublished while offline: {down}").as_str())
+    );
 }
 
 /// An engage whose backend cannot run its worker, or whose tree cannot be
@@ -4236,15 +5201,61 @@ async fn a_suspended_engage_that_wrote_blocked_is_held_and_pushes_nothing() {
 async fn a_continued_stuck_engage_resumes_with_its_reason() {
     let f = fixture("engage-continue").await;
     let bins = FakeBins::acquire("engage-continue");
+    bins.ok("gh", PR_VIEW_JSON);
+    // A paused attempt, held for failures that are not a refused publish.
+    let paused = f
+        .run(&ScriptedBackend::new(|tree| suspended_by(tree, "cap")))
+        .await
+        .unwrap();
+    assert!(
+        support::scope(&f.store)
+            .store()
+            .hold_work(
+                f.fid,
+                hunter::domain::FindingJobKind::Engage,
+                hunter::domain::HoldReason::Stuck,
+                "worker failed",
+                paused.job_id,
+            )
+            .await
+            .unwrap()
+    );
+    let prompt = continue_held(&f).await;
+
+    assert!(prompt.contains("kept failing the same way"), "{prompt}");
+    assert!(prompt.contains("worker failed"), "{prompt}");
+}
+
+/// The operator's `continue` of an engage held on refused publishes
+/// resumes it with the publish-only prompt for a released hold, not the
+/// stuck one: its work is finished, so it is told to change nothing unless
+/// what the forge kept answering is about the work itself (push
+/// protection, a hook), and is given that answer.
+#[tokio::test]
+async fn a_continued_refused_engage_is_told_what_the_forge_answered() {
+    let f = fixture("engage-continue-refused").await;
+    let bins = FakeBins::acquire("engage-continue-refused");
     bins.ok_unless_action("gh", "pr comment", PR_VIEW_JSON);
-    // Finished, with a transcript to continue, but its reply never lands.
-    let failing = ScriptedBackend::new(|tree| {
+    let refused = ScriptedBackend::new(|tree| {
         std::fs::write(tree.join("PR-REPLY.md"), "answered").unwrap();
         support::done_with_transcript(tree)
     });
-    for _ in 0..3 {
-        f.run(&failing).await.unwrap();
+    for _ in 0..6 {
+        f.run(&refused).await.unwrap();
     }
+    let prompt = continue_held(&f).await;
+
+    assert!(
+        prompt.contains("the forge kept refusing to publish it"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("Otherwise change nothing"), "{prompt}");
+    assert!(prompt.contains("PR comment failed"), "{prompt}");
+}
+
+/// Release the fixture's held engage with `continue`, resume it, and
+/// return the prompt its worker was given.
+async fn continue_held(f: &Fixture) -> String {
     let hold = support::hold_of(&f.store, f.fid, hunter::domain::FindingJobKind::Engage)
         .await
         .expect("held at the limit");
@@ -4264,7 +5275,6 @@ async fn a_continued_stuck_engage_resumes_with_its_reason() {
         panic!("a continued hold resumes its checkpoint");
     };
     let resumed = ScriptedBackend::new(|_| done());
-
     hunter::scheduler::run_engage(
         &support::scope(&f.store),
         f.store.test_lane(),
@@ -4274,8 +5284,5 @@ async fn a_continued_stuck_engage_resumes_with_its_reason() {
     )
     .await
     .unwrap();
-
-    let prompt = &resumed.runs()[0].prompt;
-    assert!(prompt.contains("kept failing the same way"), "{prompt}");
-    assert!(prompt.contains("PR comment failed"), "{prompt}");
+    resumed.runs()[0].prompt.clone()
 }

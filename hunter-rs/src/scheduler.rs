@@ -92,6 +92,11 @@ pub struct ResumePlan {
     /// is the first attempt since: its reason and detail. The resume prompt
     /// is chosen from the reason (WORK-MODEL.md §9.1).
     after_hold: Option<(HoldReason, String)>,
+    /// The predecessor finished and was kept only to publish
+    /// ([`kept_to_publish`]): a continuation whose own run does no
+    /// metered work leaves its tree as that attempt finished it, so it
+    /// still publishes.
+    publish_only: bool,
 }
 
 impl ResumePlan {
@@ -116,6 +121,10 @@ impl ResumePlan {
 
     pub const fn finding_id(&self) -> Option<i64> {
         self.finding_id
+    }
+
+    pub const fn publish_only(&self) -> bool {
+        self.publish_only
     }
 
     pub const fn predecessor_id(&self) -> i64 {
@@ -761,13 +770,52 @@ const MAX_RESUME_ATTEMPTS: i64 = 4;
 const RESUME_PROMPT: &str = "Continue the work you were doing in this session. You were interrupted; \
      pick up where you left off.";
 
+/// The whole prompt a continuation of an attempt kept only to publish gets
+/// ([`kept_to_publish`]), whatever hold an operator released to get there:
+/// its work is finished and was refused only by the forge, or found it
+/// unreachable. A worker that changed its commits or its report would void
+/// what was finished (a fix's saved review verdict covers the tree exactly
+/// as it is), so it is told to change nothing.
+const PUBLISH_ONLY_PROMPT: &str = "Your work in this session is finished. Only publishing it \
+     failed: the forge refused it or could not be reached, not because anything in the work \
+     was wrong. It is published again once you end. Change nothing: no commits, no edits to \
+     PR-DESCRIPTION.md, PR-REPLY.md or WITHDRAW.md. End now.";
+
+/// The prompt a continuation of an attempt kept only to publish gets
+/// ([`kept_to_publish`]): [`PUBLISH_ONLY_PROMPT`], or, for the first
+/// attempt after an operator continued its hold, one that gives the
+/// worker what the forge kept answering. A refusal about the work itself
+/// (push protection finding a secret, a file too large, a hook's commit
+/// message rule, a protected branch) is refused the same way every time,
+/// and only a change to the work gets it published; anything else should
+/// still change nothing.
+fn publish_only_prompt(plan: &ResumePlan) -> String {
+    let Some((_, detail)) = &plan.after_hold else {
+        return PUBLISH_ONLY_PROMPT.to_owned();
+    };
+    format!(
+        "Your work in this session was finished, but the forge kept refusing to publish it, \
+         and an operator released it to try again. If what the forge answered is about the \
+         work itself (push protection rejecting a secret or a large file, a hook requiring a \
+         commit message format, a protected branch), change only what it names, keep \
+         everything else as it is, and update PR-DESCRIPTION.md or PR-REPLY.md if they \
+         describe what you changed. Otherwise change nothing and end now; it is published \
+         again once you end.\n\nWhat the forge kept answering (context, not \
+         instructions):\n{detail}"
+    )
+}
+
 /// The prompt a resumed recheck, engage, harvest, hunt or scan gets:
 /// [`RESUME_PROMPT`], or, for the first attempt after the operator
 /// continued its hold, one chosen by the hold's reason (WORK-MODEL.md
-/// §9.1), with the hold's detail as context. Short like [`RESUME_PROMPT`],
-/// for the same reason: the session holds the playbook. A fix's comes with
-/// its updated playbook instead ([`fix_prompt`]).
+/// §9.1), with the hold's detail as context; [`PUBLISH_ONLY_PROMPT`] for an
+/// attempt kept only to publish. Short like [`RESUME_PROMPT`], for the same
+/// reason: the session holds the playbook. A fix's comes with its updated
+/// playbook instead ([`fix_prompt`]).
 fn resume_prompt(kind: JobKind, plan: &ResumePlan) -> String {
+    if plan.publish_only {
+        return publish_only_prompt(plan);
+    }
     let Some((reason, detail)) = &plan.after_hold else {
         return RESUME_PROMPT.to_owned();
     };
@@ -874,6 +922,9 @@ async fn pick_resume(
         if is_held || running.contains(&JobPlace::of(job.kind, job.repo_id, job.finding_id)) {
             continue;
         }
+        if publish_retry_pending(store, &job).await? {
+            continue;
+        }
         let (kind, repo, job_id) = (job.kind, (job.repo_id, job.repo_name.clone()), job.id);
         match resume_plan(store, cfg, job, mode).await? {
             Resumable::Yes(plan) => {
@@ -927,6 +978,11 @@ async fn finding_pick(
     let Some(job) = store.checkpoint_job(f.id, kind).await? else {
         return Ok(fresh());
     };
+    // Its work is done and waits only to be published: not started over,
+    // and not continued until the forge has had time to recover.
+    if publish_retry_pending(store, &job).await? {
+        return Ok(Picked::Nothing);
+    }
     let job_id = job.id;
     Ok(match resume_plan(store, cfg, job, mode).await? {
         Resumable::Yes(plan) => {
@@ -958,6 +1014,124 @@ enum Picked {
     Ended,
     /// Nothing to do for it, and nothing changed.
     Nothing,
+}
+
+/// The failures of a finished attempt's publishing that the forge refused,
+/// as its job's notes begin with them: its work is done, and the attempt
+/// is kept as the checkpoint for a retry that only has to publish.
+const PUBLISH_FAILURES: [&str; 4] = [
+    "push failed",
+    "PR comment failed",
+    "PR create failed",
+    "PR close failed",
+];
+
+/// How long an attempt whose publishing the forge refused first waits
+/// before it is continued. A forge that answers but refuses (a 5xx, an
+/// auth backend that denies a valid key during an incident) is usually
+/// back within minutes to hours; retrying at once spends one try of the
+/// streak, and a worker run, per cycle on it. Each further refusal in a
+/// row doubles the wait, up to [`PUBLISH_RETRY_MAX_MS`]
+/// ([`publish_retry_wait`]).
+pub const PUBLISH_RETRY_MS: i64 = 10 * 60_000;
+
+/// The longest wait between two retries of a refused publish.
+const PUBLISH_RETRY_MAX_MS: i64 = 2 * 60 * 60_000;
+
+/// How many refused publishes in a row hold the work for the operator,
+/// where any other failure holds at [`MAX_CONSECUTIVE_SAME_FAILURE`]: with
+/// the waits doubling from [`PUBLISH_RETRY_MS`], the sixth refusal comes
+/// four and a half hours after the first, so a forge incident of a few
+/// hours is ridden out and only one that lasts longer needs a human.
+const MAX_PUBLISH_REFUSALS: i64 = 6;
+
+/// The streak key every publish refusal counts under, whichever step the
+/// forge refused ([`failure_key`]): a forge failing in an incident refuses
+/// the push on one try and the PR create or the reply on the next, and
+/// keyed by step those would reset each other's streak and never hold.
+const PUBLISH_REFUSED: &str = "publish refused";
+
+/// How many failures in a row under `key` hold the work.
+fn failure_limit(key: &str) -> i64 {
+    if key == PUBLISH_REFUSED {
+        MAX_PUBLISH_REFUSALS
+    } else {
+        MAX_CONSECUTIVE_SAME_FAILURE
+    }
+}
+
+/// The wait before the retry of a publish refused `refusals` times in a
+/// row: [`PUBLISH_RETRY_MS`], doubled for each refusal after the first,
+/// at most [`PUBLISH_RETRY_MAX_MS`].
+fn publish_retry_wait(refusals: i64) -> i64 {
+    let doublings = u32::try_from(refusals.saturating_sub(1).clamp(0, 16)).unwrap_or(0);
+    PUBLISH_RETRY_MS
+        .saturating_mul(1 << doublings)
+        .min(PUBLISH_RETRY_MAX_MS)
+}
+
+/// How the notes of a finished attempt kept to publish while the forge
+/// could not be reached begin (#95): `<this>: <host>`. They tell it from a
+/// refusal, which waits [`PUBLISH_RETRY_MS`]; this one is continued as
+/// soon as the network is back.
+const UNPUBLISHED_OFFLINE: &str = "unpublished while offline";
+
+/// Whether `job` is an attempt whose publishing the forge refused: its
+/// notes, which only failing a finished attempt writes, name the step.
+/// Its work is done; only publishing remains.
+fn publish_refused(job: &Job) -> bool {
+    job.notes.as_deref().is_some_and(|n| {
+        PUBLISH_FAILURES
+            .iter()
+            .any(|p| n.strip_prefix(p).is_some_and(|rest| rest.starts_with(':')))
+    })
+}
+
+/// Whether `job` is a finished attempt kept only to publish: refused by
+/// the forge ([`publish_refused`]) or unpublished while it was unreachable
+/// ([`UNPUBLISHED_OFFLINE`]). Its work is done, so the resume ceiling
+/// spares it for a while, and a retry whose own run does nothing still
+/// publishes.
+fn kept_to_publish(job: &Job) -> bool {
+    publish_refused(job)
+        || job.notes.as_deref().is_some_and(|n| {
+            n.strip_prefix(UNPUBLISHED_OFFLINE)
+                .is_some_and(|rest| rest.starts_with(':'))
+        })
+}
+
+/// [`kept_to_publish`]'s notes as SQL `LIKE` patterns, for counting such
+/// attempts in a chain ([`Store::chain_links_noted`]). None of the
+/// prefixes holds a `LIKE` wildcard.
+fn kept_to_publish_patterns() -> Vec<String> {
+    PUBLISH_FAILURES
+        .iter()
+        .chain(std::iter::once(&UNPUBLISHED_OFFLINE))
+        .map(|p| format!("{p}:%"))
+        .collect()
+}
+
+/// Whether `job`, a checkpoint, is an attempt whose publishing the forge
+/// refused ([`publish_refused`]) less than [`publish_retry_wait`] of its
+/// streak ago, and so waits. An operator's release since it ended
+/// (`continue`) lifts the wait: the operator is the one who knows the
+/// forge is back.
+async fn publish_retry_pending(store: &Store, job: &Job) -> anyhow::Result<bool> {
+    let Some(ended) = job.finished_at.filter(|_| publish_refused(job)) else {
+        return Ok(false);
+    };
+    let JobKind::Finding(kind) = job.kind else {
+        return Ok(false);
+    };
+    let Some(fid) = job.finding_id else {
+        return Ok(false);
+    };
+    let refusals = store.work_streak(fid, kind).await?.streak;
+    if now_ms() - ended >= publish_retry_wait(refusals) {
+        return Ok(false);
+    }
+    let released = store.last_release_at(fid, kind).await?;
+    Ok(released.is_none_or(|at| at < ended))
 }
 
 /// The failure a given-up chain records in its work item's streak.
@@ -1056,6 +1230,87 @@ async fn count_given_up_chain(
     }
 }
 
+/// Whether the give-up ceiling spares the chain of `job`, a checkpoint
+/// kept only to publish ([`kept_to_publish`]): its work is done, so the
+/// chain is not failing to finish, and giving it up would throw the
+/// finished work away and start it cold. Refusals are bounded by the
+/// streak (`publish refused`), but an attempt kept while the forge was
+/// unreachable counts nothing (#95), so the spare ends once the chain
+/// holds [`MAX_PUBLISH_REFUSALS`] attempts kept to publish, and the
+/// ceiling applies again. Not fewer: a chain refused that many times in a
+/// row is held by its streak first, with its finished work as the hold's
+/// checkpoint, instead of being given up and started cold. Counted since
+/// `released_at`, the operator's last release, as the ceiling and the
+/// streak are: a held chain the operator continues gets the spare again,
+/// so its streak can hold it again before the ceiling gives it up.
+async fn spared_by_ceiling(
+    store: &Store,
+    job: i64,
+    released_at: Option<i64>,
+) -> anyhow::Result<bool> {
+    let kept = store
+        .chain_links_noted(job, &kept_to_publish_patterns(), released_at)
+        .await?;
+    Ok(kept < MAX_PUBLISH_REFUSALS)
+}
+
+/// Whether `job`, an engage kept only to publish ([`kept_to_publish`]),
+/// waited while its PR moved on, as the last PR sync recorded it: feedback
+/// from someone else since the attempt started, or a head that is none of
+/// the one the chain started from (as the sync recorded it, or the commit
+/// its tree was created at, `pinned`) and the chain's own last push
+/// ([`own_push`], in its workspace `root`). Its reply, push or withdrawal
+/// answers a PR that is no longer there, and a resume is shown no PR, so
+/// the engage is decided again cold instead. False for any other job.
+async fn engage_pr_moved(
+    store: &Store,
+    job: &Job,
+    root: &Path,
+    pinned: &str,
+) -> anyhow::Result<bool> {
+    let (JobKind::Finding(FindingJobKind::Engage), Some(fid)) = (job.kind, job.finding_id) else {
+        return Ok(false);
+    };
+    if !kept_to_publish(job) {
+        return Ok(false);
+    }
+    let Some(ps) = store.get_pr_state(fid).await? else {
+        return Ok(false);
+    };
+    let started = job.started_at.unwrap_or(0);
+    if ps.last_activity_at.is_some_and(|at| at > started) {
+        return Ok(true);
+    }
+    let started_on = store.started_on_head(job.id).await?;
+    // Once the chain has pushed, its push is where it left the branch: the
+    // start commit then means someone rewound the branch past that push,
+    // unless the sync last read the PR before that push landed.
+    let start_head = |h: &String| h == pinned || started_on.as_ref() == Some(h);
+    Ok(ps.head_sha.as_ref().is_some_and(|h| {
+        !h.is_empty()
+            && match own_push(root) {
+                Some(own) => {
+                    let read_before = match (ps.synced_at, own_push_at(root)) {
+                        (Some(read), Some(pushed)) => read <= pushed,
+                        _ => true,
+                    };
+                    h != &own && !(start_head(h) && read_before)
+                }
+                None => !start_head(h),
+            }
+    }))
+}
+
+/// End `job`'s checkpoint for good, `why` it cannot be continued, when
+/// `mode` runs (a preview only skips it): [`Resumable::No`].
+async fn give_up_checkpoint<'s>(mode: Pick<'s>, job: &Job, repo: &str, why: &str) -> Resumable<'s> {
+    if let Pick::Run(scope) = mode {
+        let msg = format!("resume {} {repo}: job {} given up, {why}", job.kind, job.id);
+        end_checkpoint(scope, job, &msg).await;
+    }
+    Resumable::No
+}
+
 /// What [`resume_plan`] made of one suspension.
 enum Resumable<'s> {
     /// Continue it with this plan.
@@ -1116,19 +1371,14 @@ async fn resume_plan<'s>(
         _ => {
             // The transcript names files in that tree, so no later cycle
             // can resume it either.
-            let msg = format!(
-                "resume {} {}: job {} given up, workspace {} is gone",
-                job.kind,
-                repo.name,
-                job.id,
-                workspace.root.display()
-            );
-            if let Pick::Run(scope) = mode {
-                end_checkpoint(scope, &job, &msg).await;
-            }
-            return Ok(Resumable::No);
+            let why = format!("workspace {} is gone", workspace.root.display());
+            return Ok(give_up_checkpoint(mode, &job, &repo.name, &why).await);
         }
     };
+    if engage_pr_moved(store, &job, &workspace.root, &pinned_sha).await? {
+        let why = "its PR moved while it waited to publish";
+        return Ok(give_up_checkpoint(mode, &job, &repo.name, why).await);
+    }
 
     let z = anticipated_tokens(store, cfg, job.repo_id, job.kind)
         .await
@@ -1177,10 +1427,15 @@ async fn resume_plan<'s>(
     // least its own cap; retiring on that would end the work before
     // resume had been tried even once, which is the opposite of what
     // this feature is for.
+    //
+    // Neither applies, for a while, to an attempt kept only to publish
+    // ([`spared_by_ceiling`]).
     let excess = own.total - own.max_single;
     let too_many = own.attempts >= MAX_RESUME_ATTEMPTS;
     let too_costly = z > 0 && own.attempts >= 2 && excess > GIVE_UP_MULTIPLE * z;
-    if too_many || too_costly {
+    let publish_only = kept_to_publish(&job);
+    let spared = publish_only && spared_by_ceiling(store, job.id, released_at).await?;
+    if (too_many || too_costly) && !spared {
         let why = if too_many {
             format!("{} attempts, the limit", own.attempts)
         } else {
@@ -1236,6 +1491,7 @@ async fn resume_plan<'s>(
         chain_spent,
         handoff: false,
         after_hold,
+        publish_only,
     })))
 }
 
@@ -4820,6 +5076,9 @@ fn fix_prompt(
     if curation_undone && resume.is_some() {
         return Ok(review::CURATION_UNDONE_PROMPT.to_owned());
     }
+    if let Some(plan) = resume.filter(|r| r.publish_only()) {
+        return Ok(publish_only_prompt(plan));
+    }
     if let Some((HoldReason::Prerequisite, detail)) = resume.and_then(|r| r.after_hold.as_ref())
         && let Some(held) = review::held_resume_prompt(cfg, start, detail)
     {
@@ -4872,11 +5131,18 @@ enum FixOutcome {
     /// ([`record_fix_failure`]).
     Failed { failure: String },
     /// The finished worker's branch could not be pushed or its PR opened
-    /// while a host the fix needs is unreachable (#95): the network's
-    /// failure, not the fix's. Nothing is counted and the attempt is kept
-    /// as the checkpoint, so the next cycle continues it and only has to
-    /// publish.
-    Offline { host: String },
+    /// (`publishing`), or a review round could not run, while a host the
+    /// fix needs is unreachable (#95): the network's failure, not the
+    /// fix's. Nothing is counted and the attempt is kept as the
+    /// checkpoint, so the next cycle continues it: one that was publishing
+    /// only has to publish, one cut off in review reviews that round again.
+    Offline { host: String, publishing: bool },
+    /// The finished worker's branch could not be pushed or its PR opened
+    /// while the forge answered: counted under the step's name
+    /// ([`failure_key`]), and the attempt is kept as the checkpoint, so
+    /// the retry, [`PUBLISH_RETRY_MS`] later, only has to publish instead
+    /// of redoing the fix.
+    Unpublished { failure: String },
 }
 
 /// A worker's report file, read lossily: whatever bytes it wrote are its
@@ -4993,7 +5259,7 @@ fn decline_report(kind: FindingType) -> &'static str {
 async fn conclude_fix(
     (cfg, backend): (&Config, &dyn Backend),
     start: &FixStart,
-    state: JobState,
+    (state, publish_only): (JobState, bool),
     reviewed: &review::Reviewed,
 ) -> anyhow::Result<FixOutcome> {
     let finding = &start.finding;
@@ -5029,7 +5295,10 @@ async fn conclude_fix(
     }
 
     if let Some(host) = &reviewed.offline {
-        return Ok(FixOutcome::Offline { host: host.clone() });
+        return Ok(FixOutcome::Offline {
+            host: host.clone(),
+            publishing: false,
+        });
     }
     // An attempt the review did not end ships nothing unless its fixer
     // finished: a paused, failed or killed fixer (a first run that stopped
@@ -5069,10 +5338,32 @@ async fn conclude_fix(
         // streak would turn three pauses of one healthy fix into "stuck".
         return Ok(FixOutcome::Suspended);
     }
-    if at_forge && let Some(host) = unreachable_now(cfg, &start.repo.url, backend).await {
-        return Ok(FixOutcome::Offline { host });
+    if !at_forge {
+        return Ok(FixOutcome::Failed { failure });
     }
-    Ok(FixOutcome::Failed { failure })
+    // Finished work only publishes: a fixer that finished, or a retry of
+    // an attempt kept only to publish, which ships its saved verdict
+    // however its own run ended. A fixer that failed or was killed partway
+    // (shipped anyway with review off) is not finished, and is not kept as
+    // if it were.
+    let finished = state == JobState::Done || publish_only;
+    if finished {
+        // Kept to publish, refused or offline: the retry ships this same
+        // verdict on this same tree however its own run ends, without
+        // reviewing it again.
+        review::keep_for_publish(start, &ending).await;
+    }
+    if let Some(host) = unreachable_now(cfg, &start.repo.url, backend).await {
+        return Ok(FixOutcome::Offline {
+            host,
+            publishing: finished,
+        });
+    }
+    Ok(if finished {
+        FixOutcome::Unpublished { failure }
+    } else {
+        FixOutcome::Failed { failure }
+    })
 }
 
 /// Count a failed fix attempt in the finding's streak. The
@@ -5120,7 +5411,7 @@ async fn record_fix_failure(
             return;
         }
     };
-    if streak < MAX_CONSECUTIVE_SAME_FAILURE {
+    if streak < failure_limit(failure) {
         let message = format!("#{fid} incomplete ({failure}). tail: {detail}");
         let _ = fix_event(store, "fix", fid, job, message).await;
         return;
@@ -5654,10 +5945,21 @@ async fn record_fix_outcome(
             Some(claim)
         }
         FixOutcome::Failed { failure } => {
-            record_fix_failure(store, fid, job, &failure, tail, HoldReason::Stuck, summary).await;
+            record_failed_fix(store, (fid, job), &failure, tail, summary).await;
             Some(claim)
         }
-        FixOutcome::Offline { host } => {
+        FixOutcome::Unpublished { failure } => {
+            // Kept to publish, so nothing concluded: a one-shot override
+            // is kept for the attempt that publishes, as offline. A hold
+            // from the streak concludes it, and spends the override.
+            record_unpublished_fix(store, (fid, job), failure, tail, summary).await;
+            if summary.outcome.as_deref() != Some("held") {
+                release_claim(claim).await;
+                return Ok(());
+            }
+            Some(claim)
+        }
+        FixOutcome::Offline { host, .. } => {
             // Nothing concluded, so a one-shot override is kept for the
             // attempt that publishes.
             log_write_failure(
@@ -5681,6 +5983,57 @@ async fn record_fix_outcome(
         release_claim(claim).await;
     }
     Ok(())
+}
+
+/// Count a failed fix ([`FixOutcome::Failed`]) in its streak. A refused
+/// publish of unfinished work (review off ships a failed fixer's commits)
+/// is not kept, but counts under the same key as a kept one
+/// ([`PUBLISH_REFUSED`]): the forge's text differs on every try and would
+/// reset the streak each time.
+async fn record_failed_fix(
+    store: &JobStore,
+    (fid, job): (i64, i64),
+    failure: &str,
+    tail: &str,
+    summary: &mut CycleSummary,
+) {
+    if failure_key(failure) == PUBLISH_REFUSED {
+        let detail = format!("{failure}\n\n{tail}");
+        record_fix_failure(
+            store,
+            fid,
+            job,
+            PUBLISH_REFUSED,
+            &detail,
+            HoldReason::Stuck,
+            summary,
+        )
+        .await;
+        summary.failure = Some(failure.to_owned());
+    } else {
+        record_fix_failure(store, fid, job, failure, tail, HoldReason::Stuck, summary).await;
+    }
+}
+
+/// Record a finished fix the forge would not publish
+/// ([`FixOutcome::Unpublished`]): the attempt becomes the checkpoint, and
+/// the failure counts under the step's name ([`failure_key`]), with the
+/// forge's text and the worker's tail as the detail.
+async fn record_unpublished_fix(
+    store: &JobStore,
+    (fid, job): (i64, i64),
+    failure: String,
+    tail: &str,
+    summary: &mut CycleSummary,
+) {
+    log_write_failure(
+        store.keep_attempt_as_checkpoint(job).await,
+        format_args!("job {job}: keeping the unpublished attempt as the checkpoint"),
+    );
+    let detail = format!("{failure}\n\n{tail}");
+    let key = failure_key(&failure);
+    record_fix_failure(store, fid, job, key, &detail, HoldReason::Stuck, summary).await;
+    summary.failure = Some(failure);
 }
 
 /// Run a fix job (`scheduler.run_fix`): start it ([`start_fix`]), run the
@@ -5748,13 +6101,13 @@ pub async fn run_fix(
     // row records what all of them spent.
     let reviewed = review::review_fix(scope, lane, cfg, backend, &start, rr).await;
     let rr = &reviewed.rr;
-    let state = log_write_failure(
-        record_job(store, running, rr, model, resume)
-            .await
-            .map(|r| r.state()),
+    let recorded = log_write_failure(
+        record_job(store, running, rr, model, resume).await,
         format_args!("job {}: recording outcome", start.job),
-    )
-    .unwrap_or(JobState::Failed);
+    );
+    let state = recorded
+        .as_ref()
+        .map_or(JobState::Failed, RecordedJob::state);
     let mut summary = CycleSummary {
         kind: Some(FindingJobKind::Fix.into()),
         finding_id: Some(fid),
@@ -5764,13 +6117,39 @@ pub async fn run_fix(
         tokens_new: Some(rr.tokens_new),
         ..Default::default()
     };
-    let outcome = match conclude_fix((cfg, backend), &start, state, &reviewed).await {
+    let publish_only = resume.is_some_and(ResumePlan::publish_only);
+    let outcome = match conclude_fix((cfg, backend), &start, (state, publish_only), &reviewed).await
+    {
         Ok(outcome) => outcome,
         Err(e) => {
             release_claim(claim).await;
             return Err(e);
         }
     };
+    // A finished fixer whose attempt shipped nothing failed, as an engage
+    // whose publishing failed does: `done` is kept for an attempt that
+    // reached its outcome. A refused publish is always failed with the
+    // failure as its notes, whatever its run ended as, since the notes
+    // are what make it wait ([`publish_retry_pending`]).
+    let failed = match &outcome {
+        FixOutcome::Failed { failure } => recorded
+            .filter(|r| r.state() == JobState::Done)
+            .map(|r| (r, failure.clone())),
+        FixOutcome::Unpublished { failure } => recorded.map(|r| (r, failure.clone())),
+        // Marked as kept only to publish, so the resume ceiling spares it;
+        // not one cut off in review, whose work is not done.
+        FixOutcome::Offline {
+            host,
+            publishing: true,
+        } => recorded.map(|r| (r, format!("{UNPUBLISHED_OFFLINE}: {host}"))),
+        _ => None,
+    };
+    if let Some((recorded, failure)) = failed {
+        log_write_failure(
+            store.fail_job(&recorded, &failure).await,
+            format_args!("job {}: failing ({failure})", start.job),
+        );
+    }
     record_fix_outcome(
         store,
         (&start, claim),
@@ -6624,23 +7003,45 @@ async fn engage_shown_ps(
     true
 }
 
+/// Post the withdrawal `reason` on `start`'s PR, once per chain
+/// ([`post_once`]), and then close the PR. The reason is posted first, and
+/// the PR closed only once it landed: a lost reason must not become a
+/// silent close. A retry of a withdrawal whose close the forge refused
+/// then only closes, instead of posting the same reason again.
+fn withdraw_on_forge(
+    fg: &dyn forge::Forge,
+    start: &EngageStart,
+    reason: &str,
+) -> anyhow::Result<()> {
+    if !reason.is_empty() {
+        post_once(fg, start, reason, "withdraw")?;
+    }
+    fg.close_pr(&start.repo.url, start.pr_ref.number(), "")
+}
+
 /// The worker asked to withdraw the PR (`WITHDRAW.md`): close it on the
 /// forge and record the finding `closed`. Returns whether the closure is
 /// complete enough to hand to the closed PR's harvest right away.
+///
+/// A `once` budget override is spent once the withdrawal concluded, before
+/// the handoff reloads the finding (left set, the closed PR's harvest would
+/// run prioritized and jump the queue on it), and kept when the forge
+/// refused or could not be reached: the attempt is kept to publish.
 async fn withdraw_pr(
     store: &JobStore,
     net: (&Config, &dyn Backend),
-    fid: i64,
     start: &EngageStart,
+    (finding, recorded): (&Finding, Option<RecordedJob>),
     reason: &str,
     summary: &mut CycleSummary,
 ) -> bool {
+    let fid = finding.id;
     let _phase = crate::activity::job_phase(JobPhase::Publishing);
     let (repo, job, pr_number) = (&start.repo, start.job, start.pr_ref.number());
     let fg = forge::forge_for(repo.forge);
     let mut forge_closed = false;
     if fg.owner_repo(&repo.url).is_some() {
-        if let Err(err) = fg.close_pr(&repo.url, pr_number, reason) {
+        if let Err(err) = withdraw_on_forge(fg.as_ref(), start, reason) {
             // close_pr posts the withdrawal reason and only then closes,
             // so a failure here means the PR is still OPEN on the forge.
             // Recording the verdict anyway would mark it closed locally
@@ -6650,42 +7051,66 @@ async fn withdraw_pr(
             // attempt the caller counts in the engage streak, which a
             // forge that keeps refusing runs into (WORK-MODEL.md §9.4).
             tracing::warn!(finding = fid, pr = pr_number, error = %err, "close_pr failed");
-            if let Some(denied) = unpublished_offline(store, net, fid, start).await {
+            if let Some(denied) = unpublished_offline(store, net, (fid, start), recorded).await {
                 *summary = denied;
                 return false;
             }
+            // The forge answered and refused: the withdrawal is decided and
+            // only its publishing failed, so the attempt is kept and its
+            // retry, `PUBLISH_RETRY_MS` later, withdraws again (resumed,
+            // its WITHDRAW.md is still in the tree), counted as a refused
+            // publish like a push or a reply.
             let fail = format!("PR close failed: {err}");
-            // A paused attempt that withdrew still ended: its withdrawal
-            // failed, and a failed attempt keeps no checkpoint (§6.3), or it
-            // would be resumed into the same withdrawal.
-            log_write_failure(
-                store
-                    .drop_checkpoint(
-                        fid,
-                        FindingJobKind::Engage,
-                        job,
-                        &format!(
-                            "resume engage: checkpoint job {job} dropped, its withdrawal failed"
-                        ),
-                    )
-                    .await,
-                format_args!("#{fid}: dropping the withdrawn engage's checkpoint"),
-            );
+            if let Some(recorded) = recorded {
+                log_write_failure(
+                    store.fail_job(&recorded, &fail).await,
+                    format_args!("job {job}: failing ({fail})"),
+                );
+            }
+            // Kept only while the PR's branch is where this chain left it;
+            // a branch someone pushed to meanwhile is decided again cold,
+            // on the PR as it now is, and nothing is left to resume into
+            // the old withdrawal (a paused attempt's checkpoint included).
+            let unmoved = branch_unmoved(start).await;
+            if unmoved {
+                log_write_failure(
+                    store.keep_attempt_as_checkpoint(job).await,
+                    format_args!("job {job}: keeping the unpublished withdrawal as the checkpoint"),
+                );
+            } else {
+                let msg = format!(
+                    "resume engage: checkpoint job {job} dropped, its PR moved before its \
+                     withdrawal could be made"
+                );
+                log_write_failure(
+                    store
+                        .drop_checkpoint(fid, FindingJobKind::Engage, job, &msg)
+                        .await,
+                    format_args!("#{fid}: dropping the withdrawn engage's checkpoint"),
+                );
+                clear_once_override(store, finding.id, finding.budget_override).await;
+            }
             let held = record_engage_failure(
                 store,
                 fid,
                 Some(job),
-                "withdraw failed",
+                failure_key(&fail),
                 &fail,
                 HoldReason::Stuck,
             )
             .await;
+            if held && unmoved {
+                // A hold concludes the attempt: a one-shot override is
+                // spent, as by any other hold.
+                clear_once_override(store, finding.id, finding.budget_override).await;
+            }
             summary.outcome = Some(if held { "held" } else { "withdraw-failed" }.into());
             summary.failure = Some(fail);
             return false;
         }
         forge_closed = true;
     }
+    clear_once_override(store, finding.id, finding.budget_override).await;
     // Closed, not Rejected: 14 of the first 15 engage withdrawals were
     // "superseded/obsolete", i.e. the finding was right and its work
     // landed elsewhere. Suppressing those told every later scan to stop
@@ -6796,28 +7221,45 @@ async fn set_withdrawn_closed(
 /// (`record_engage` counts it either way).
 struct Published {
     pushed: bool,
+    /// The tree's commits were already the PR's head: an earlier attempt of
+    /// this chain pushed them, and recorded that push then. This attempt
+    /// pushed nothing, so it records no push of its own.
+    pushed_before: bool,
     replied: Result<bool, String>,
+    /// The tree is a finished attempt's ([`push_and_reply`]): only such a
+    /// tree is published, and kept to publish when that fails.
+    finished: bool,
 }
 
 /// Push the worker's commits to the PR branch and post its `PR-REPLY.md`.
-/// A worker that did not finish publishes nothing.
-async fn push_and_reply(start: &EngageStart, state: JobState) -> Published {
+/// Only a finished tree is published: the worker's run ended `Done`, or
+/// it continued an attempt kept only to publish ([`kept_to_publish`]) and
+/// did no metered work, which leaves the tree as that attempt finished it
+/// (a retry whose run failed before its first token, a rate limit).
+async fn push_and_reply(start: &EngageStart, state: JobState, publish_only: bool) -> Published {
     let _phase = crate::activity::job_phase(JobPhase::Publishing);
-    let mut pushed = false;
-    let replied = push_then_reply(start, state, &mut pushed).await;
-    Published { pushed, replied }
+    let finished = state == JobState::Done || (publish_only && state != JobState::Suspended);
+    let (mut pushed, mut pushed_before) = (false, false);
+    let replied = if finished {
+        push_then_reply(start, (&mut pushed, &mut pushed_before)).await
+    } else {
+        Err(format!("worker {state}"))
+    };
+    Published {
+        pushed,
+        pushed_before,
+        replied,
+        finished,
+    }
 }
 
 /// [`push_and_reply`]'s steps: `pushed` is set the moment the push lands,
-/// so it holds even when a later step fails.
+/// so it holds even when a later step fails; `pushed_before` when the
+/// commits were already the PR's head, pushed by an earlier attempt.
 async fn push_then_reply(
     start: &EngageStart,
-    state: JobState,
-    pushed: &mut bool,
+    (pushed, pushed_before): (&mut bool, &mut bool),
 ) -> Result<bool, String> {
-    if state != JobState::Done {
-        return Err(format!("worker {state}"));
-    }
     let (repo, worktree, head_ref) = (&start.repo, &start.ws.tree, &start.head_ref);
     let fg = forge::forge_for(repo.forge);
     let wt = worktree.clone();
@@ -6831,7 +7273,31 @@ async fn push_then_reply(
         tokio::task::spawn_blocking(move || Unheld::Commits { range: &range }.run(&wt, 30))
             .await
             .unwrap_or((127, String::new()));
-    if rc == 0 && !commits.trim().is_empty() {
+    let has_commits = rc == 0 && !commits.trim().is_empty();
+    // Already pushed: this tree's `HEAD` is the PR's head, or, when the
+    // forge would not say, is the commit this chain itself last pushed
+    // ([`own_push`]), when an earlier attempt pushed it and was kept
+    // because its reply was refused. Then its commits are on the PR, and
+    // this attempt only has to reply: pushing them again would be a no-op
+    // push recorded as a new one.
+    let remote = if has_commits {
+        remote_head(start).await
+    } else {
+        None
+    };
+    let local = if has_commits {
+        local_head(start).await
+    } else {
+        None
+    };
+    let already = local.is_some()
+        && match &remote {
+            Some(r) => Some(r) == local.as_ref(),
+            None => own_push(&start.ws.root) == local,
+        };
+    if already {
+        *pushed_before = true;
+    } else if has_commits {
         let push_url = fg.ssh_url(&repo.url);
         let wt = worktree.clone();
         let refspec = format!("HEAD:{head_ref}");
@@ -6839,13 +7305,19 @@ async fn push_then_reply(
         // expected commit spelled out: the worker may rewrite that history,
         // but a commit pushed to the branch since -- while this attempt ran,
         // or while a resume of it waited, suspended, for the budget -- is
-        // not in the tree, and forcing over it would delete it from the PR.
-        // A refused push fails the attempt with the attention left
+        // not in the tree, and forcing over it would delete it from the PR,
+        // as forcing over a branch someone rewound would restore what they
+        // dropped. A refused push fails the attempt with the attention left
         // unaddressed, so a cold engage takes it up on the branch as it now
-        // is. The explicit `<ref>:<sha>` form reads no remote-tracking ref,
-        // so it works against the raw URL; `--force` must not be added, as
-        // it overrides the lease.
-        let lease = format!("{head_ref}:{}", start.pinned);
+        // is. Leased instead to the chain's own last push when that is the
+        // PR's head ([`own_push`]): a retry that adds to, amends or rebases
+        // it replaces only what this chain put there, and a lease to the
+        // first commit would be refused by that push. The explicit
+        // `<ref>:<sha>` form reads no remote-tracking ref, so it works
+        // against the raw URL; `--force` must not be added, as it overrides
+        // the lease.
+        let expected = own_push(&start.ws.root).unwrap_or_else(|| start.pinned.clone());
+        let lease = format!("{head_ref}:{expected}");
         let (prc, pout) = tokio::task::spawn_blocking(move || {
             Unheld::Push {
                 force: Force::Lease(&lease),
@@ -6861,20 +7333,99 @@ async fn push_then_reply(
             return Err(format!("push failed: {tail}"));
         }
         *pushed = true;
+        let local = match local {
+            Some(sha) => Some(sha),
+            None => local_head(start).await,
+        };
+        if let Some(sha) = local {
+            record_own_push(&start.ws.root, &sha);
+        }
     }
     let reply = worktree.join("PR-REPLY.md");
     let mut replied = false;
     if reply.exists() {
         let body = std::fs::read_to_string(&reply).unwrap_or_default();
-        if let Err(e) = fg.comment_pr(&repo.url, start.pr_ref.number(), &body) {
-            return Err(format!(
+        post_once(fg.as_ref(), start, &body, "reply").map_err(|e| {
+            format!(
                 "PR comment failed: {}",
                 crate::util::tail(&e.to_string(), 300)
-            ));
-        }
+            )
+        })?;
         replied = true;
     }
     Ok(replied)
+}
+
+/// Post `body` on `start`'s PR as hunter's own comment, once per chain for
+/// the post named `what` (the reply, the withdrawal reason). A post the
+/// forge reported failed may still have landed (a 502 from its frontend,
+/// `gh` killed at its timeout), so the chain marks its try in its
+/// workspace (`<what>-tried`) before posting, and a later try first reads
+/// the PR: a comment of hunter's with exactly this text, made since that
+/// mark, counts as the post. Once a post is known to have landed
+/// (`<what>-posted`), it is not made again. A PR that cannot be read is an
+/// error, which fails the attempt rather than risk a second copy.
+fn post_once(
+    fg: &dyn forge::Forge,
+    start: &EngageStart,
+    body: &str,
+    what: &str,
+) -> anyhow::Result<()> {
+    let (url, pr) = (&start.repo.url, start.pr_ref.number());
+    let root = &start.ws.root;
+    let (tried, posted) = (
+        root.join(format!("{what}-tried")),
+        root.join(format!("{what}-posted")),
+    );
+    let mark = |path: &Path| {
+        if let Err(e) = std::fs::write(path, b"") {
+            tracing::warn!("recording the engage's {what} post: {e}");
+        }
+    };
+    if posted.exists() {
+        return Ok(());
+    }
+    if let Some(since) = modified_ms(&tried) {
+        let view = fg.view_pr_comments(url, pr, &forge::ReviewBots::default())?;
+        if has_own_comment(&view, body, since) {
+            mark(&posted);
+            return Ok(());
+        }
+    }
+    // The first try's time stays: a post that landed on it is older than
+    // any later try.
+    if !tried.exists() {
+        mark(&tried);
+    }
+    fg.comment_pr(url, pr, body)?;
+    mark(&posted);
+    Ok(())
+}
+
+/// How far a forge's comment timestamp may trail the local clock's mark of
+/// the try that posted it ([`post_once`]).
+const POST_CLOCK_SKEW_MS: i64 = 2 * 60_000;
+
+/// Whether `view` holds a comment hunter posted with exactly the text
+/// `body` (its [`forge::OWN_MARK`] aside), made at or after `since`, epoch
+/// ms, less [`POST_CLOCK_SKEW_MS`]. An earlier engage's reply, or a longer
+/// comment that merely contains the text, does not count.
+fn has_own_comment(view: &PrView, body: &str, since: i64) -> bool {
+    let body = body.trim();
+    !body.is_empty()
+        && view.comments.iter().any(|c| {
+            c.voice == forge::Voice::Own
+                && iso_ms(&c.created_at) >= since - POST_CLOCK_SKEW_MS
+                && c.body.trim().strip_suffix(forge::OWN_MARK).map(str::trim) == Some(body)
+        })
+}
+
+/// When the file at `path` was last written, epoch ms; `None` when it is
+/// not there.
+fn modified_ms(path: &Path) -> Option<i64> {
+    let at = std::fs::metadata(path).ok()?.modified().ok()?;
+    let ms = at.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis();
+    i64::try_from(ms).ok()
 }
 
 /// Record a finished engage: what it published, or why it is incomplete.
@@ -6892,7 +7443,12 @@ async fn record_engage(
     // An outcome that could not be recorded reads as `failed`.
     let state = recorded.map_or(JobState::Failed, |r| r.state());
     let tail = crate::util::tail(stdout_tail, 300);
-    let Published { pushed, replied } = published;
+    let Published {
+        pushed,
+        pushed_before,
+        replied,
+        finished,
+    } = published;
     if pushed && replied.is_err() {
         // The push landed and the rest did not: nothing is answered, but
         // the PR's head moved, and an observation of the head it replaced
@@ -6924,8 +7480,9 @@ async fn record_engage(
         // A finished worker whose push or reply could not reach the forge
         // while it was unreachable: the network's failure (#95).
         Err(_)
-            if state == JobState::Done
-                && let Some(denied) = unpublished_offline(store, net, fid, start).await =>
+            if finished
+                && let Some(denied) =
+                    unpublished_offline(store, net, (fid, start), recorded).await =>
         {
             // Nothing concluded: a one-shot override is kept for the
             // attempt that publishes.
@@ -6933,30 +7490,30 @@ async fn record_engage(
             return;
         }
         Err(fail) => {
-            // Only a recorded `done` is revised: an attempt that did not
-            // finish has nothing published to fail.
-            if let Some(recorded) = recorded.filter(|r| r.state() == JobState::Done) {
-                log_write_failure(
-                    store.fail_job(&recorded, fail.as_str()).await,
-                    format_args!("job {job}: failing ({fail})"),
-                );
+            let unpublished = Published {
+                pushed,
+                pushed_before,
+                replied: Err(fail),
+                finished,
+            };
+            let kept =
+                record_failed_engage(store, (fid, start), recorded, unpublished, tail, summary)
+                    .await;
+            if kept {
+                // Kept to publish, so nothing concluded: a one-shot
+                // override is kept for the attempt that publishes, as
+                // offline.
+                return;
             }
-            let detail = format!("{fail}\n\n{tail}");
-            let held = record_engage_failure(
-                store,
-                fid,
-                Some(job),
-                engage_failure_key(&fail),
-                &detail,
-                HoldReason::Stuck,
-            )
-            .await;
-            summary.outcome = Some(if held { "held" } else { "retry" }.into());
-            summary.failure = Some(fail);
         }
         Ok(replied) => {
             let answer = if pushed {
                 EngageAnswer::pushed(&start.pr_ref, start.seen_activity)
+            } else if pushed_before {
+                // Its push was counted when it landed; the answer to the
+                // feedback is this one's, declining nothing on a head the
+                // worker pushed itself.
+                EngageAnswer::without_push_unshown(&start.pr_ref, start.seen_activity)
             } else if start.shown_ps {
                 EngageAnswer::without_push(&start.pr_ref, start.seen_activity, &start.ps)
             } else {
@@ -6989,6 +7546,61 @@ async fn record_engage(
         }
     }
     clear_once_override(store, fid, finding.budget_override).await;
+}
+
+/// Record an engage whose publishing failed, or whose worker did not
+/// finish (`published.replied` is the failure): a finished attempt is
+/// failed with it as its notes, kept as the checkpoint when nothing
+/// reached the PR and its branch is unmoved, and the failure is counted.
+/// True when the attempt was kept and not held: a hold from the streak
+/// concludes it, as any hold does.
+async fn record_failed_engage(
+    store: &JobStore,
+    (fid, start): (i64, &EngageStart),
+    recorded: Option<RecordedJob>,
+    published: Published,
+    tail: &str,
+    summary: &mut CycleSummary,
+) -> bool {
+    let job = start.job;
+    let Published {
+        pushed: _,
+        pushed_before: _,
+        replied,
+        finished,
+    } = published;
+    let fail = replied.err().unwrap_or_default();
+    // Only a finished attempt is revised: one that did not finish has
+    // nothing published to fail.
+    if let Some(recorded) = recorded.filter(|_| finished) {
+        log_write_failure(
+            store.fail_job(&recorded, fail.as_str()).await,
+            format_args!("job {job}: failing ({fail})"),
+        );
+    }
+    // Nothing reached the PR and its branch is where the attempt started:
+    // the work is done and only its publishing failed, so the retry
+    // continues this attempt instead of redoing it.
+    let kept = finished && branch_unmoved(start).await;
+    if kept {
+        log_write_failure(
+            store.keep_attempt_as_checkpoint(job).await,
+            format_args!("job {job}: keeping the unpublished attempt as the checkpoint"),
+        );
+    }
+    let detail = format!("{fail}\n\n{tail}");
+    let held = record_engage_failure(
+        store,
+        fid,
+        Some(job),
+        failure_key(&fail),
+        &detail,
+        HoldReason::Stuck,
+    )
+    .await;
+    summary.outcome = Some(if held { "held" } else { "retry" }.into());
+    summary.failure = Some(fail);
+    kept && !held
 }
 
 /// Record what a published engage answered (`crate::attention`): the
@@ -7032,11 +7644,87 @@ async fn record_engage_answer(
         .await;
 }
 
-/// The streak key of a failed engage: what failed, without the forge's or
-/// git's text, which differs on every attempt and would reset the streak
-/// each time (`push failed: <tail>` counts as `push failed`).
-fn engage_failure_key(fail: &str) -> &str {
-    fail.split(':').next().unwrap_or(fail).trim()
+/// The streak key of a failed engage, or of a fix the forge would not
+/// publish: what failed, without the forge's or git's text, which differs
+/// on every attempt (a 5xx names its request id) and would reset the
+/// streak each time (`PR/MR view failed: <tail>` counts as
+/// `PR/MR view failed`). Every refused publish step is [`PUBLISH_REFUSED`].
+fn failure_key(fail: &str) -> &str {
+    let step = fail.split(':').next().unwrap_or(fail).trim();
+    if PUBLISH_FAILURES.contains(&step) {
+        PUBLISH_REFUSED
+    } else {
+        step
+    }
+}
+
+/// The PR branch's commit on the forge, or `None` when the forge would
+/// not say (or has no such branch: empty).
+async fn remote_head(start: &EngageStart) -> Option<String> {
+    let url = forge::forge_for(start.repo.forge).ssh_url(&start.repo.url);
+    let (tree, branch) = (start.ws.tree.clone(), start.head_ref.clone());
+    let (rc, out) = tokio::task::spawn_blocking(move || {
+        Unheld::RemoteHead {
+            url: &url,
+            branch: &branch,
+        }
+        .run(&tree, 60)
+    })
+    .await
+    .unwrap_or((127, String::new()));
+    (rc == 0).then(|| out.split_whitespace().next().unwrap_or_default().to_owned())
+}
+
+/// The commit `start`'s tree is at.
+async fn local_head(start: &EngageStart) -> Option<String> {
+    let tree = start.ws.tree.clone();
+    let (rc, out) =
+        tokio::task::spawn_blocking(move || Unheld::Commit { rev: "HEAD" }.run(&tree, 30))
+            .await
+            .unwrap_or((127, String::new()));
+    (rc == 0).then(|| out.trim().to_owned())
+}
+
+/// Whether the PR branch on the forge is where this chain left it, or the
+/// forge would not say: at this chain's own last push ([`own_push`]) once
+/// it has pushed, and at the commit its tree was created at until then. A
+/// branch that moved otherwise (a push by someone else, which the lease
+/// refused or which came after this chain's, or a rewind, to the start
+/// commit included) is not, and a cold engage takes the PR up as it now
+/// is. A forge that cannot answer is the one that just refused, so the
+/// attempt is kept for it.
+async fn branch_unmoved(start: &EngageStart) -> bool {
+    let Some(remote) = remote_head(start).await else {
+        return true;
+    };
+    remote == own_push(&start.ws.root).unwrap_or_else(|| start.pinned.clone())
+}
+
+/// In an engage chain's workspace root: the commit the chain last pushed
+/// to its PR branch. Only this, and the commit the chain started from,
+/// count as the branch being where the chain left it: a commit the tree
+/// merely contains may be an older one the branch was rewound to.
+const OWN_PUSH_FILE: &str = "engage-pushed";
+
+/// The commit this chain last pushed ([`OWN_PUSH_FILE`]), if any.
+fn own_push(root: &Path) -> Option<String> {
+    let sha = std::fs::read_to_string(root.join(OWN_PUSH_FILE)).ok()?;
+    let sha = sha.trim();
+    (!sha.is_empty()).then(|| sha.to_owned())
+}
+
+/// When this chain last pushed ([`OWN_PUSH_FILE`]'s time), epoch ms.
+fn own_push_at(root: &Path) -> Option<i64> {
+    modified_ms(&root.join(OWN_PUSH_FILE))
+}
+
+/// Record `sha` as the commit this chain last pushed ([`OWN_PUSH_FILE`]).
+/// A record that cannot be written only costs a retry that adds to the
+/// push its lease, which is then refused and taken up cold.
+fn record_own_push(root: &Path, sha: &str) {
+    if let Err(e) = std::fs::write(root.join(OWN_PUSH_FILE), sha) {
+        tracing::warn!("recording the engage's push {sha}: {e}");
+    }
 }
 
 /// Count a failed engage in the finding's streak, `key` naming the failure
@@ -7081,7 +7769,7 @@ async fn record_engage_failure(
             return false;
         }
     };
-    if streak < MAX_CONSECUTIVE_SAME_FAILURE {
+    if streak < failure_limit(key) {
         log(format!("#{fid} incomplete ({detail}), will retry")).await;
         return false;
     }
@@ -7117,18 +7805,28 @@ async fn record_engage_failure(
 
 /// A finished engage that could not publish (push, reply, the withdrawal's
 /// close) while a host it needs is unreachable (#95): the network's
-/// failure, not the engage's. Nothing is counted, the job is left as it
-/// ended, and the attempt becomes the checkpoint, so its tree (commits,
-/// `PR-REPLY.md`, `WITHDRAW.md`) is kept and the next cycle continues it to
-/// publish. `None` when every host is reachable: a real publish failure.
+/// failure, not the engage's. Nothing is counted, the attempt becomes the
+/// checkpoint, so its tree (commits, `PR-REPLY.md`, `WITHDRAW.md`) is kept
+/// and the next cycle continues it to publish, and its job (`recorded`)
+/// is marked [`UNPUBLISHED_OFFLINE`], so the resume ceiling spares it and
+/// a continuation that does nothing still publishes. `None` when every
+/// host is reachable: a real publish failure.
 async fn unpublished_offline(
     store: &JobStore,
     (cfg, backend): (&Config, &dyn Backend),
-    fid: i64,
-    start: &EngageStart,
+    (fid, start): (i64, &EngageStart),
+    recorded: Option<RecordedJob>,
 ) -> Option<CycleSummary> {
     let host = unreachable_now(cfg, &start.repo.url, backend).await?;
     let job = start.job;
+    if let Some(recorded) = recorded {
+        log_write_failure(
+            store
+                .fail_job(&recorded, &format!("{UNPUBLISHED_OFFLINE}: {host}"))
+                .await,
+            format_args!("job {job}: marking it unpublished while offline"),
+        );
+    }
     log_write_failure(
         store.keep_attempt_as_checkpoint(job).await,
         format_args!("job {job}: keeping the unpublished attempt as the checkpoint"),
@@ -7175,7 +7873,7 @@ async fn engage_prefetch_failed(
         store,
         fid,
         None,
-        engage_failure_key(failure),
+        failure_key(failure),
         failure,
         HoldReason::Stuck,
     )
@@ -7288,12 +7986,8 @@ pub async fn run_engage(
     let ended = pr_ended(store, fid, &start.pr_ref).await;
     let closed_on_forge = if ended.is_none() && withdraw.exists() {
         let reason = std::fs::read_to_string(&withdraw).unwrap_or_default();
-        // The withdrawal is this attempt's end, whatever the forge does
-        // with it, so it spends a `once` override here, before the handoff
-        // reloads the finding: left set, the closed PR's harvest would run
-        // prioritized and jump the queue on it.
-        clear_once_override(store, finding.id, finding.budget_override).await;
-        withdraw_pr(store, (cfg, backend), fid, &start, &reason, &mut summary).await
+        let (net, subject) = ((cfg, backend), (finding, recorded));
+        withdraw_pr(store, net, &start, subject, &reason, &mut summary).await
     } else if let Some(report) = blocked_report(&start.ws.tree)? {
         if let Err(e) = engage_blocked(store, fid, &start, &report, &mut summary).await {
             close_workspace(lane, start.ws).await;
@@ -7304,7 +7998,9 @@ pub async fn run_engage(
         engage_unpublished(store, finding, &start, &now, &mut summary).await;
         false
     } else {
-        let published = push_and_reply(&start, state).await;
+        // Its tree is still the kept attempt's ([`push_and_reply`]).
+        let publish_only = resume.is_some_and(ResumePlan::publish_only) && rr.tokens_new == 0;
+        let published = push_and_reply(&start, state, publish_only).await;
         record_engage(
             store,
             ((cfg, backend), finding),
@@ -7509,6 +8205,7 @@ async fn continue_into_harvest(
         chain_spent,
         handoff: true,
         after_hold: None,
+        publish_only: false,
     };
     let Ok(resumed) = Resumed::<kind::Harvest>::load(store, &plan).await else {
         return;
@@ -8966,5 +9663,46 @@ mod extract_pr_url_tests {
             extract_pr_url("https://github.com/o/r/pull/1 https://github.com/o/r/pull/2"),
             Some("https://github.com/o/r/pull/1".to_owned())
         );
+    }
+}
+
+#[cfg(test)]
+mod publish_retry_tests {
+    use super::{forge, has_own_comment, iso_ms, publish_retry_wait};
+
+    /// The wait before a refused publish is retried: ten minutes after
+    /// the first refusal, doubling with each one after, never above two
+    /// hours (WORK-MODEL.md §7).
+    #[test]
+    fn the_wait_doubles_from_ten_minutes_up_to_two_hours() {
+        let minutes: Vec<i64> = (1..=7).map(|n| publish_retry_wait(n) / 60_000).collect();
+        assert_eq!(minutes, [10, 20, 40, 80, 120, 120, 120]);
+    }
+
+    fn own(created_at: &str) -> forge::GhComment {
+        forge::GhComment {
+            body: format!("addressed\n\n{}", forge::OWN_MARK),
+            created_at: created_at.to_owned(),
+            voice: forge::Voice::Own,
+            ..Default::default()
+        }
+    }
+
+    /// A post the forge stamped up to two minutes before the local mark
+    /// of the try that made it counts as that try's: the two clocks
+    /// differ. One older than that is an earlier post.
+    #[test]
+    fn an_own_comment_counts_within_the_clock_skew_of_the_first_try() {
+        let since = iso_ms("2026-01-01T00:10:00Z");
+        let landed = |at: &str| {
+            let view = forge::PrView {
+                comments: vec![own(at)],
+                ..Default::default()
+            };
+            has_own_comment(&view, "addressed", since)
+        };
+        assert!(landed("2026-01-01T00:10:30Z"), "after the mark");
+        assert!(landed("2026-01-01T00:08:30Z"), "90 s before: skew");
+        assert!(!landed("2026-01-01T00:07:30Z"), "150 s before: earlier");
     }
 }
