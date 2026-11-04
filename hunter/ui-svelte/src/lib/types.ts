@@ -15,6 +15,7 @@ export type { NextCandidate } from "./generated/NextCandidate";
 export type { OpenPrOut } from "./generated/OpenPrOut";
 export type { PrReviewIssueOut } from "./generated/PrReviewIssueOut";
 export type { PrReviewOut } from "./generated/PrReviewOut";
+export type { PrReviewReplyOut } from "./generated/PrReviewReplyOut";
 export type { PrReviewRoundOut } from "./generated/PrReviewRoundOut";
 export type { RepoBrief } from "./generated/RepoBrief";
 export type { RepoNotesResponse } from "./generated/RepoNotesResponse";

@@ -7,8 +7,8 @@ import type { PrReviewIssueOut } from "./PrReviewIssueOut";
 export type PrReviewRoundOut = { id: number, job_id: number | null, base_sha: string, head_sha: string, 
 /**
  * `ok` (the reviewer finished the range, which counts as reviewed),
- * `partial` (it was stopped partway: its issues count, but the range
- * is reviewed again) or `failed` (nothing counts).
+ * `partial` (it was stopped partway: its issues and verdicts count,
+ * but the range is reviewed again) or `failed` (nothing counts).
  */
 verdict: string, 
 /**
@@ -31,4 +31,9 @@ post_error: string | null, posted_at: number | null,
  * sent some of it and failed): it can only be approved again, never
  * discarded.
  */
-landed: boolean, issues: Array<PrReviewIssueOut>, };
+landed: boolean, 
+/**
+ * Earlier issues this round judged addressed or rebutted whose inline
+ * thread its post answers and resolves.
+ */
+resolutions: number, issues: Array<PrReviewIssueOut>, };

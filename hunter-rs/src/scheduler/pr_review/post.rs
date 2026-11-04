@@ -1,15 +1,27 @@
-//! Posting approved review rounds to the forge (future.md §8.8, slice 2),
-//! on the admin lane's PR sync right after the reviews were refreshed
-//! ([`super::sync_pr_reviews`]): a post spends no tokens, only forge calls,
-//! like the rest of that duty.
+//! Posting approved review rounds to the forge (future.md §8.8, slices 2
+//! and 3), on the admin lane's PR review duty right after the reviews
+//! were refreshed ([`super::sync_pr_reviews`]): a post spends no tokens,
+//! only forge calls, like the rest of that duty. Not on the PR sync, whose
+//! passes held engages wait for (`crate::daemon::EngageWaits`).
 //!
 //! A round goes out as one COMMENT review under the operator's forge
 //! login: each issue whose line is in a hunk of the PR's diff
 //! ([`place`](super::place)) as an inline comment, the rest in the body.
 //! The inline comments' forge ids are then read back from the PR: they
-//! are what each issue's thread is found by from then on. Each step is
-//! recorded as it lands, so a post that failed partway retries only what
-//! is missing.
+//! are what each issue's thread is found by from then on. Then every
+//! thread of an issue the round judged or reported is made to show the
+//! issue's newest released judgement
+//! ([`Store::pr_review_round_threads`](crate::store::Store::pr_review_round_threads)):
+//! answered and resolved when it is addressed or rebutted, answered and
+//! unresolved when hunter had settled it and it is open again, and left
+//! alone where it shows that already. Each thread is found afresh,
+//! by its first comment, on one read of every thread of the PR: one a
+//! human deleted is recorded gone and left out, never a reason to fail
+//! the rest. Each step is recorded as it lands, so a post that failed
+//! partway retries only what is missing, and two posts never say the same
+//! thing twice. A step the forge took whose recording failed is held
+//! ([`Landed`]) and recorded on the next sync instead of being taken
+//! again: in memory only, so that holds while the daemon runs.
 //!
 //! A GitLab post is draft notes of the operator's login published one by
 //! one, and a post that failed or was stopped leaves the rest as drafts the
@@ -19,13 +31,17 @@
 //! before it posts anything again, by every sync until that succeeds
 //! ([`delete_left_drafts`]).
 
+use std::collections::HashMap;
+
 use super::EVENT;
 use super::place;
 use crate::config::Config;
 use crate::forge::{self, InlineComment, PostedReview, ReviewPost, Side};
 use crate::store::{
-    AdminStore, ApprovedRound, InlineState, POST_GIVE_UP_AT, PostableIssue, PrReviewRow,
+    AdminStore, ApprovedRound, InlineState, IssueVerdict, POST_GIVE_UP_AT, PostableIssue,
+    PrReviewRow, Reply, ThreadToSettle,
 };
+
 /// Post every approved round of an open review ([`ApprovedRound`]),
 /// oldest first, after deleting the drafts earlier posts left
 /// ([`delete_left_drafts`]). A post that fails counts one attempt; at
@@ -99,8 +115,8 @@ async fn delete_left_drafts(store: &AdminStore, review: &PrReviewRow) {
 }
 
 /// Post one round -- its review unless that is up already, then the read
-/// of its inline comments' ids -- and record it posted; true when all of
-/// it went out. Every outcome is an event.
+/// of its inline comments' ids, then its threads' answers -- and record it
+/// posted; true when all of it went out. Every outcome is an event.
 async fn post_round(store: &AdminStore, cfg: &Config, round: &ApprovedRound) -> bool {
     let review = match store.get_pr_review(round.review_id).await {
         Ok(Some(r)) => r,
@@ -121,10 +137,20 @@ async fn post_round(store: &AdminStore, cfg: &Config, round: &ApprovedRound) -> 
     if review.repo_moved() || review.binding != round.binding {
         return false;
     }
+    if let Some(landed) = take_unrecorded(Step::Comments(round.id))
+        && let Err(e) = record(store, landed).await
+    {
+        let msg = format!(
+            "{label}: round {}: recording its inline comments: {e}",
+            round.id
+        );
+        let _ = store.log_event("error", &msg, None, None).await;
+        return false;
+    }
     let mut issues = match store.pr_review_round_issues(round.id).await {
-        Ok(i) => i,
+        Ok(r) => r,
         Err(e) => {
-            let msg = format!("{label}: reading round {}'s issues: {e}", round.id);
+            let msg = format!("{label}: reading round {}: {e}", round.id);
             let _ = store.log_event("error", &msg, None, None).await;
             return false;
         }
@@ -132,18 +158,23 @@ async fn post_round(store: &AdminStore, cfg: &Config, round: &ApprovedRound) -> 
     let total = issues.len();
     let mut review_ref = round.review_ref.clone();
     let mut inline = 0;
-    if review_ref.is_none() {
-        let Some(review_post) =
-            send_review(store, cfg, (&review, round, &label), &mut issues).await
-        else {
-            return false;
+    if !issues.is_empty() && review_ref.is_none() {
+        let posted = match take_unrecorded(Step::Review(round.id)) {
+            Some(Landed::Review { posted, .. }) => posted,
+            _ => match send_review(store, cfg, (&review, round, &label), &mut issues).await {
+                Some(p) => p,
+                None => return false,
+            },
         };
-        inline += review_post.inline.len();
-        if let Err(e) = store
-            .record_pr_review_review_posted(round.id, &review_post.review_ref, &review_post.inline)
-            .await
-        {
-            // On the forge already: posting it again would repeat it.
+        inline += posted.inline.len();
+        let posted_ref = posted.review_ref.clone();
+        let landed = Landed::Review {
+            round: round.id,
+            posted,
+        };
+        if let Err(e) = record(store, landed).await {
+            // On the forge already, and held for the next sync to record:
+            // the round stays `approved` till then.
             let msg = format!(
                 "{label}: posted round {}'s review; recording it failed: {e}",
                 round.id
@@ -151,7 +182,7 @@ async fn post_round(store: &AdminStore, cfg: &Config, round: &ApprovedRound) -> 
             let _ = store.log_event("error", &msg, None, None).await;
             return true;
         }
-        review_ref = Some(review_post.review_ref);
+        review_ref = Some(posted_ref);
     }
     inline += issues
         .iter()
@@ -162,9 +193,25 @@ async fn post_round(store: &AdminStore, cfg: &Config, round: &ApprovedRound) -> 
     {
         return post_failed(store, cfg, (&review, round, &label), &e).await;
     }
+    // Read after the inline comments' ids are recorded: the threads the
+    // review just opened are among them.
+    let threads = match store.pr_review_round_threads(round.id).await {
+        Ok(t) => t,
+        Err(e) => {
+            let msg = format!("{label}: reading round {}'s threads: {e}", round.id);
+            let _ = store.log_event("error", &msg, None, None).await;
+            return false;
+        }
+    };
+    let mut tally = Tally::default();
+    if let Err(e) = settle_threads(store, cfg, (&review, round, &label), &threads, &mut tally).await
+    {
+        return post_failed(store, cfg, (&review, round, &label), &e).await;
+    }
     let msg = format!(
-        "{label}: posted round {} ({total} issue(s), {inline} inline)",
-        round.id
+        "{label}: posted round {} ({total} issue(s), {inline} inline; {} thread(s) answered, \
+         {} resolved, {} unresolved)",
+        round.id, tally.answered, tally.resolved, tally.unresolved
     );
     if let Err(e) = store.record_pr_review_round_posted(round.id).await {
         let msg = format!("{msg}; recording it failed: {e}");
@@ -175,9 +222,111 @@ async fn post_round(store: &AdminStore, cfg: &Config, round: &ApprovedRound) -> 
     true
 }
 
+/// One step of a post, by what it touches on the forge: the key of a step
+/// that landed but is not recorded yet ([`Landed`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Step {
+    /// Round `.0`'s review.
+    Review(i64),
+    /// The inline comments a failed post of round `.0` put up
+    /// ([`forge::PartlyPosted`]).
+    Comments(i64),
+    /// The answer in issue `.0`'s thread for round `.1`.
+    Answer(i64, i64),
+    /// Resolving or unresolving issue `.0`'s thread.
+    Resolution(i64),
+}
+
+/// A step the forge took, with what recording it writes.
+#[derive(Debug)]
+enum Landed {
+    Review {
+        round: i64,
+        posted: PostedReview,
+    },
+    Comments {
+        round: i64,
+        inline: Vec<i64>,
+    },
+    Answer {
+        issue: i64,
+        round: i64,
+        verdict: IssueVerdict,
+    },
+    Resolution {
+        issue: i64,
+        resolved: bool,
+    },
+}
+
+impl Landed {
+    fn step(&self) -> Step {
+        match *self {
+            Self::Review { round, .. } => Step::Review(round),
+            Self::Comments { round, .. } => Step::Comments(round),
+            Self::Answer { issue, round, .. } => Step::Answer(issue, round),
+            Self::Resolution { issue, .. } => Step::Resolution(issue),
+        }
+    }
+}
+
+/// Steps that landed on the forge but whose recording failed: the next
+/// sync records each ([`take_unrecorded`]) rather than taking it again.
+/// Held in memory only: a recording that fails is the database's trouble,
+/// and after a restart in that window the retry's read finds the step on
+/// the PR by its mark instead ([`send_review`], [`settle_thread`]).
+static UNRECORDED: std::sync::LazyLock<std::sync::Mutex<HashMap<Step, Landed>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn unrecorded() -> std::sync::MutexGuard<'static, HashMap<Step, Landed>> {
+    UNRECORDED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The step `step` that landed earlier without being recorded, if any:
+/// for the caller to [`record`] instead of taking it again.
+fn take_unrecorded(step: Step) -> Option<Landed> {
+    unrecorded().remove(&step)
+}
+
+/// Record `landed`, a step the forge took. When that fails it is held in
+/// [`UNRECORDED`], so the next sync records it rather than taking it again.
+async fn record(store: &AdminStore, landed: Landed) -> anyhow::Result<()> {
+    let done = match &landed {
+        Landed::Review { round, posted } => {
+            store
+                .record_pr_review_review_posted(*round, &posted.review_ref, &posted.inline)
+                .await
+        }
+        Landed::Comments { round, inline } => {
+            store.record_pr_review_comments_posted(*round, inline).await
+        }
+        Landed::Answer {
+            issue,
+            round,
+            verdict,
+        } => {
+            store
+                .record_pr_review_answered((*issue, *round), *verdict)
+                .await
+        }
+        Landed::Resolution { issue, resolved } => {
+            store
+                .record_pr_review_thread_resolution(*issue, *resolved)
+                .await
+        }
+    };
+    if let Err(e) = done {
+        unrecorded().insert(landed.step(), landed);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
 /// Record the inline comments a failed post of `round` already put on the
 /// PR ([`forge::PartlyPosted`]), so its retry leaves them out. A recording
-/// that fails is logged: the retry then posts them a second time.
+/// that fails is logged and held: the next sync records them first.
 async fn keep_partly_posted(
     store: &AdminStore,
     (label, round): (&str, &ApprovedRound),
@@ -186,10 +335,11 @@ async fn keep_partly_posted(
     let Some(partly) = e.downcast_ref::<forge::PartlyPosted>() else {
         return;
     };
-    if let Err(db) = store
-        .record_pr_review_comments_posted(round.id, &partly.inline)
-        .await
-    {
+    let landed = Landed::Comments {
+        round: round.id,
+        inline: partly.inline.clone(),
+    };
+    if let Err(db) = record(store, landed).await {
         let msg = format!(
             "{label}: round {}: {partly}; recording them failed: {db}",
             round.id
@@ -210,6 +360,11 @@ async fn blocking<T: Send + 'static>(
 /// The step mark of round `round_id`'s review ([`forge::step_mark`]).
 fn review_step(round_id: i64) -> String {
     format!("review of round {round_id}")
+}
+
+/// The step mark of round `round_id`'s answer in an issue's thread.
+fn answer_step(round_id: i64) -> String {
+    format!("answer of round {round_id}")
 }
 
 /// Round `round`'s review on the PR: posted now ([`post_marked`]), unless
@@ -265,10 +420,11 @@ async fn send_review(
             });
         }
         if !found.inline.is_empty() {
-            if let Err(e) = store
-                .record_pr_review_comments_posted(round.id, &found.inline)
-                .await
-            {
+            let landed = Landed::Comments {
+                round: round.id,
+                inline: found.inline.clone(),
+            };
+            if let Err(e) = record(store, landed).await {
                 let msg = format!(
                     "{label}: round {}: recording the inline comments an earlier post left: {e}",
                     round.id
@@ -405,6 +561,14 @@ async fn post_review(
     .await
 }
 
+/// What a post did in its threads, for its event.
+#[derive(Debug, Default)]
+struct Tally {
+    answered: usize,
+    resolved: usize,
+    unresolved: usize,
+}
+
 /// Read back the forge ids of round `round`'s inline comments that have
 /// none yet, from its review `review_ref`, and record them: an issue's
 /// thread is found by its comment's id from then on. They are asked for
@@ -452,6 +616,153 @@ async fn read_back_refs(
         let _ = store.log_event(EVENT, &msg, None, None).await;
     }
     Ok(())
+}
+
+/// Make each of `threads` show its judgement ([`settle_thread`]). The
+/// threads with something to do are found on one read of every thread of
+/// the PR, by their first comment: one the read does not hold is gone (a
+/// human deleted it), which is recorded and logged, and the post goes on
+/// without it. A failed read or step fails the post, whose retry takes
+/// only the steps still to do.
+async fn settle_threads(
+    store: &AdminStore,
+    cfg: &Config,
+    (review, round, label): (&PrReviewRow, &ApprovedRound, &str),
+    threads: &[ThreadToSettle],
+    tally: &mut Tally,
+) -> anyhow::Result<()> {
+    let due: Vec<&ThreadToSettle> = threads.iter().filter(|t| !t.steps().is_empty()).collect();
+    if due.is_empty() {
+        return Ok(());
+    }
+    let (name, url, n) = (review.forge, review.repo_url.clone(), review.pr_number);
+    let (refs, author, bots) = (
+        due.iter().map(|t| t.thread_ref.clone()).collect::<Vec<_>>(),
+        review.author.clone(),
+        cfg.review_bots.clone(),
+    );
+    let read = blocking(move || {
+        let refs: Vec<&str> = refs.iter().map(String::as_str).collect();
+        forge::forge_for(name).review_threads(&url, n, &refs, &author, &bots)
+    })
+    .await?;
+    let thread_of = |t: &ThreadToSettle| read.iter().find(|r| r.first_ref == t.thread_ref);
+    let gone: Vec<i64> = due
+        .iter()
+        .filter(|t| thread_of(t).is_none())
+        .map(|t| t.issue_id)
+        .collect();
+    if !gone.is_empty() {
+        store.record_pr_review_threads_gone(&gone).await?;
+        for issue in gone {
+            let msg = format!(
+                "{label}: round {}: the thread of issue {issue} is gone from the PR; not answered",
+                round.id
+            );
+            let _ = store.log_event(EVENT, &msg, None, None).await;
+        }
+    }
+    for t in due {
+        if let Some(found) = thread_of(t) {
+            settle_thread(store, review, (t, found), tally).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Make thread `t`, `found` on the forge, show its judgement
+/// ([`ThreadToSettle::steps`]): answer it, then resolve or unresolve it,
+/// recording each step as it lands. A step that landed on an earlier post
+/// but was not recorded is recorded now, not taken again; so is one the
+/// read of the thread shows taken already -- an answer of this round's
+/// (by its step mark, [`answer_step`]), the resolution wanted -- whose
+/// forge call failed after the forge acted on it (a timeout, a 5xx after
+/// the write). Since a call may act however it ends, each is marked
+/// before it is made: an answer marks its round as possibly on the PR
+/// (never to be discarded), and a resolution marks what hunter sets out
+/// to make the thread show, so a read that finds it so -- one overlapping
+/// the call, or the next after a call or a recording that failed --
+/// takes it for hunter's step, never for a human reopening the thread
+/// ([`AdminStore::mark_pr_review_resolving`]). A failed step
+/// fails the post, whose retry takes only the steps still to do: hunter's
+/// login can push to every repo it tracks, so the forge never refuses it
+/// a thread's resolution for want of access.
+async fn settle_thread(
+    store: &AdminStore,
+    review: &PrReviewRow,
+    (t, found): (&ThreadToSettle, &forge::ReviewThread),
+    tally: &mut Tally,
+) -> anyhow::Result<()> {
+    let steps = t.steps();
+    let (name, url, n) = (review.forge, review.repo_url.clone(), review.pr_number);
+    if let Some(reply) = steps.reply {
+        let landed = if let Some(landed) = take_unrecorded(Step::Answer(t.issue_id, t.round_id)) {
+            landed
+        } else {
+            let step = answer_step(t.round_id);
+            let answered = found
+                .replies
+                .iter()
+                .any(|r| r.own && r.step.as_deref() == Some(step.as_str()));
+            if !answered {
+                store.mark_pr_review_answering(t.round_id).await?;
+                let text = format!("{}\n\n{}", answer_text(reply, t), forge::step_mark(&step));
+                let (url, reply_to) = (url.clone(), found.reply_to.clone());
+                blocking(move || forge::forge_for(name).reply_to_thread(&url, n, &reply_to, &text))
+                    .await?;
+            }
+            Landed::Answer {
+                issue: t.issue_id,
+                round: t.round_id,
+                verdict: t.verdict,
+            }
+        };
+        record(store, landed).await?;
+        tally.answered += 1;
+    }
+    if let Some(resolved) = steps.resolve {
+        // The read is the forge's state, a resolution that landed on an
+        // earlier post unrecorded included: the step is taken only when
+        // the thread shows otherwise, and recorded either way.
+        let _ = take_unrecorded(Step::Resolution(t.issue_id));
+        if found.resolved != resolved {
+            store.mark_pr_review_resolving(t.issue_id, resolved).await?;
+            let thread_id = found.thread_id.clone();
+            blocking(move || {
+                forge::forge_for(name).set_thread_resolved(&url, n, &thread_id, resolved)
+            })
+            .await?;
+        }
+        let landed = Landed::Resolution {
+            issue: t.issue_id,
+            resolved,
+        };
+        record(store, landed).await?;
+        if resolved {
+            tally.resolved += 1;
+        } else {
+            tally.unresolved += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Hunter's answer in thread `t`: its round's verdict and note, the head
+/// it reviewed for an addressed issue.
+fn answer_text(reply: Reply, t: &ThreadToSettle) -> String {
+    let (note, head) = (t.note.trim(), t.head_sha.as_str());
+    let lead = match reply {
+        Reply::Settled if t.verdict == IssueVerdict::RebuttalAccepted => {
+            "Rebuttal accepted".to_owned()
+        }
+        Reply::Settled => format!("Addressed in `{}`", head.get(..7).unwrap_or(head)),
+        Reply::OpenAgain => format!("Open again at `{}`", head.get(..7).unwrap_or(head)),
+    };
+    if note.is_empty() {
+        format!("{lead}.")
+    } else {
+        format!("{lead}: {note}")
+    }
 }
 
 /// Count a failed post of `round` (see [`post_pr_reviews`]); always false,

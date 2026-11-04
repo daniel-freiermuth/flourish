@@ -213,6 +213,27 @@ export function releaseActionLabel(a: string): string {
 }
 
 /**
+ * A PR review issue's status as later rounds judged it. `rebutted` means
+ * the reviewer accepted a reply's rebuttal, not that the issue was
+ * argued against, so it says so.
+ */
+export function reviewIssueStatusLabel(s: string): string {
+  return s === "rebutted" ? "rebuttal accepted" : s || "?";
+}
+
+/**
+ * What posting a review round sends: its issues, and the replies that
+ * resolve earlier issues' threads. A round that only resolves says so
+ * rather than reading as "0 issues", which would suggest nothing posts.
+ */
+export function roundPostTally(issues: number, resolutions: number): string {
+  const issueText = `${issues} ${issues === 1 ? "issue" : "issues"}`;
+  if (resolutions === 0) return issueText;
+  const resText = `${resolutions} ${resolutions === 1 ? "resolution" : "resolutions"}`;
+  return issues === 0 ? resText : `${issueText}, ${resText}`;
+}
+
+/**
  * Is this safe to put in an `href`?
  *
  * Only http(s) navigates somewhere a browser should follow. Anything

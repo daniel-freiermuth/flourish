@@ -211,6 +211,10 @@ pub struct GlNote {
     pub id: Option<i64>,
     #[serde(default, deserialize_with = "nullable")]
     pub body: String,
+    /// Whether the note's thread is resolved; every note of a discussion
+    /// carries it.
+    #[serde(default, deserialize_with = "nullable")]
+    pub resolved: bool,
     #[serde(default)]
     pub author: Option<GlAuthor>,
     #[serde(default, deserialize_with = "nullable")]
@@ -630,6 +634,139 @@ fn refused_outright(out: &str) -> bool {
     out.contains("(HTTP 4")
 }
 
+/// The thread one of hunter's inline review comments opened, as
+/// [`Forge::review_threads`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewThread {
+    /// The forge's id of the thread's first comment, hunter's: what
+    /// [`Forge::inline_comment_refs`] read back for the issue.
+    pub first_ref: String,
+    /// What resolving takes: GitHub's review thread node id, GitLab's
+    /// discussion id.
+    pub thread_id: String,
+    /// What replying takes ([`Forge::reply_to_thread`]): GitHub's database
+    /// id of the thread's first comment (empty if GitHub gave none),
+    /// GitLab's discussion id.
+    pub reply_to: String,
+    pub resolved: bool,
+    /// The replies after hunter's comment, oldest first, screened to the
+    /// authors a review trusts ([`screen_replies`]).
+    pub replies: Vec<ThreadReply>,
+    /// Replies the screen dropped.
+    pub hidden: usize,
+}
+
+/// One screened reply of a [`ReviewThread`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadReply {
+    /// The author's login, as the forge spells it; [`OWN_AUTHOR`] for one
+    /// of hunter's own replies.
+    pub author: String,
+    /// As written; hunter's own without the own-comment mark and the step
+    /// mark.
+    pub body: String,
+    /// Whether it is hunter's own reply. The only way to tell one apart:
+    /// a person's login may be `hunter` too.
+    pub own: bool,
+    /// The step of a post it is ([`step_mark`]), when it is hunter's own
+    /// and carries one.
+    pub step: Option<String>,
+}
+
+/// The author a reply of hunter's own is shown under. Never compared to
+/// tell whose a reply is ([`ThreadReply::own`]).
+pub const OWN_AUTHOR: &str = "hunter";
+
+/// Who may answer in the thread of a reviewed PR besides those who can
+/// push and the configured bots ([`screen_replies`]).
+#[derive(Debug, Clone, Copy)]
+struct ThreadVoices<'a> {
+    /// The PR's author: the request vouched for them, so they may argue
+    /// with the review in their own PR.
+    pr_author: &'a str,
+    /// Who wrote the thread's first comment: hunter's forge login, which
+    /// can push (it must, to every repo it tracks) and is known without
+    /// asking. The only login whose replies can be hunter's own: the
+    /// own-comment mark is text anybody can type.
+    poster: &'a str,
+}
+
+/// Keep the replies in one of hunter's review threads whose author a
+/// review trusts: a configured bot (confirmed by `is_bot`, as in
+/// [`screen_feedback`]), hunter's own login, anyone `can_push` vouches
+/// for, and the PR's author. The rest are only counted. A reply ending in
+/// [`OWN_MARK`] by hunter's login or a pusher is hunter's own
+/// ([`ThreadReply::own`]), shown as [`OWN_AUTHOR`]; everybody else keeps
+/// their login. `can_push` is asked at most once per login; an error
+/// fails the whole read, as guessing either way would.
+fn screen_replies(
+    replies: Vec<GhComment>,
+    voices: ThreadVoices<'_>,
+    bots: &ReviewBots,
+    mut is_bot: impl FnMut(&str, &str) -> anyhow::Result<bool>,
+    mut can_push: impl FnMut(&str) -> anyhow::Result<bool>,
+) -> anyhow::Result<(Vec<ThreadReply>, usize)> {
+    let poster = normalize_login(voices.poster);
+    let pr_author = normalize_login(voices.pr_author);
+    let mut push_access: HashMap<String, bool> = HashMap::new();
+    let mut kept = Vec::with_capacity(replies.len());
+    let mut hidden = 0;
+    for c in replies {
+        let Some(login) = c
+            .author
+            .as_ref()
+            .map(|a| a.login.clone())
+            .filter(|l| !l.is_empty())
+        else {
+            hidden += 1;
+            continue;
+        };
+        let normal = normalize_login(&login);
+        if bots.contains(&login) && is_bot(&c.id, &login)? {
+            kept.push(ThreadReply {
+                author: login,
+                body: c.body,
+                own: false,
+                step: None,
+            });
+            continue;
+        }
+        let poster_wrote = !poster.is_empty() && normal == poster;
+        if poster_wrote && is_own(&c.body) {
+            let body = c.body.trim_end();
+            let body = body.strip_suffix(OWN_MARK).unwrap_or(body).trim_end();
+            let (body, step) = split_step_mark(body);
+            kept.push(ThreadReply {
+                author: OWN_AUTHOR.to_owned(),
+                body: body.to_owned(),
+                own: true,
+                step: step.map(str::to_owned),
+            });
+            continue;
+        }
+        let trusted = poster_wrote || normal == pr_author || {
+            if let Some(&known) = push_access.get(&normal) {
+                known
+            } else {
+                let asked = can_push(&login)?;
+                push_access.insert(normal.clone(), asked);
+                asked
+            }
+        };
+        if trusted {
+            kept.push(ThreadReply {
+                author: login,
+                body: c.body,
+                own: false,
+                step: None,
+            });
+        } else {
+            hidden += 1;
+        }
+    }
+    Ok((kept, hidden))
+}
+
 /// One file of `merge_requests/:iid/diffs`: GitLab returns the hunks
 /// without the file headers, which [`gitlab_unified_diff`] puts back.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -712,7 +849,7 @@ pub fn mark_own(body: &str) -> String {
 /// review, its answer in a thread), put in what the step posts. A forge
 /// call can fail after the forge acted on it (a timeout, a 5xx after the
 /// write): a later read finds the step by this line before taking it again
-/// ([`Forge::find_review`]).
+/// ([`Forge::find_review`], [`ThreadReply::step`]).
 pub fn step_mark(step: &str) -> String {
     format!("{STEP_MARK_OPEN}{step}{STEP_MARK_CLOSE}")
 }
@@ -726,6 +863,20 @@ fn is_step_mark(line: &str, step: &str) -> bool {
         .strip_prefix(STEP_MARK_OPEN)
         .and_then(|rest| rest.strip_suffix(STEP_MARK_CLOSE))
         == Some(step)
+}
+
+/// `body` (hunter's own, without [`OWN_MARK`]) without the step mark on
+/// its last line, and the step it names, if it carries one.
+fn split_step_mark(body: &str) -> (&str, Option<&str>) {
+    let (rest, last) = body.rsplit_once('\n').unwrap_or(("", body));
+    let step = last
+        .trim()
+        .strip_prefix(STEP_MARK_OPEN)
+        .and_then(|s| s.strip_suffix(STEP_MARK_CLOSE));
+    match step {
+        Some(step) => (rest.trim_end(), Some(step)),
+        None => (body, None),
+    }
 }
 
 /// The review bots whose feedback is let through (`feedback.bots`).
@@ -1055,16 +1206,22 @@ fn gitlab_can_push(url: &str, project: &str, user_id: i64) -> anyhow::Result<boo
     Ok(member.access_level >= GITLAB_DEVELOPER)
 }
 
-/// Screen a GitHub PR view: see [`screen_feedback`].
-fn github_screen(url: &str, pr: &mut PrView, bots: &ReviewBots) -> anyhow::Result<()> {
-    let (host, repo) = url_host_path(url).map_or_else(
+/// The lowercase host of the GitHub repo at `url` and `<host>/<path>`:
+/// what the lookup cache keys answers about it by.
+fn github_cache_scope(url: &str) -> (String, String) {
+    url_host_path(url).map_or_else(
         || (String::new(), url.to_owned()),
         |(host, path)| {
             let host = host.to_ascii_lowercase();
             let repo = format!("{host}/{path}");
             (host, repo)
         },
-    );
+    )
+}
+
+/// Screen a GitHub PR view: see [`screen_feedback`].
+fn github_screen(url: &str, pr: &mut PrView, bots: &ReviewBots) -> anyhow::Result<()> {
+    let (host, repo) = github_cache_scope(url);
     // Only items a listed bot's login wrote need their author's type.
     let ids: Vec<&str> = pr
         .comments
@@ -1266,6 +1423,40 @@ pub trait Forge: Send + Sync {
         review_ref: &str,
         comments: &[(i64, &str)],
     ) -> anyhow::Result<Vec<(i64, String)>>;
+    /// The threads of PR `pr_number` whose first comment is one of
+    /// `first_refs` (hunter's inline comments), each with its replies
+    /// screened ([`screen_replies`]): the PR's author `pr_author` is
+    /// trusted besides those who can push and `bots`. Threads others
+    /// opened are not read. An `Ok` answer read every thread of the PR, so
+    /// a thread of `first_refs` it does not hold is gone: one the PR has
+    /// too many threads to read in full is an error.
+    fn review_threads(
+        &self,
+        url: &str,
+        pr_number: i64,
+        first_refs: &[&str],
+        pr_author: &str,
+        bots: &ReviewBots,
+    ) -> anyhow::Result<Vec<ReviewThread>>;
+    /// Reply `body`, marked as hunter's own ([`mark_own`]), in the thread
+    /// `reply_to` ([`ReviewThread::reply_to`]) names on PR `pr_number`,
+    /// published at once: never into a review still pending.
+    fn reply_to_thread(
+        &self,
+        url: &str,
+        pr_number: i64,
+        reply_to: &str,
+        body: &str,
+    ) -> anyhow::Result<()>;
+    /// Resolve thread `thread_id` of PR `pr_number`, or unresolve it
+    /// (`resolved` false).
+    fn set_thread_resolved(
+        &self,
+        url: &str,
+        pr_number: i64,
+        thread_id: &str,
+        resolved: bool,
+    ) -> anyhow::Result<()>;
 }
 
 /// The local ref a PR's head is fetched into ([`Forge::pr_head_refspec`]).
@@ -1382,13 +1573,12 @@ fn is_github_host(host: &str) -> bool {
     labels.contains(&"github") || labels.ends_with(&["ghe", "com"])
 }
 
-/// Parse owner/repo from a GitHub-style URL (HTTPS or SSH).
-///
-/// For an Enterprise host the owner half carries the host, giving
-/// `gh`'s `[HOST/]OWNER/REPO` form — every consumer formats the pair
-/// straight into `-R`, and without the host `gh` would talk to
-/// github.com about a repo that only exists on the internal instance.
-fn github_owner_repo(url: &str) -> Option<(String, String)> {
+/// The `owner/repo` path of the GitHub repo at `url`, as REST paths name
+/// it, with its host apart: `gh api` takes the host as `--hostname`, and a
+/// path that also carried it would name a repo that does not exist. The
+/// one parse of a GitHub URL's owner and repo ([`github_owner_repo`] adds
+/// the host for `gh -R`).
+fn github_repo_path(url: &str) -> Option<(&str, &str)> {
     // Every form `valid_repo_url` accepts, not just the two most common:
     // an `ssh://` or `http://` remote that the add endpoint takes with a
     // 201 must not then be unparseable here, or the repo gets a PR that
@@ -1399,9 +1589,19 @@ fn github_owner_repo(url: &str) -> Option<(String, String)> {
     }
     let path = path.trim_end_matches('/').trim_end_matches(".git");
     let (owner, repo) = path.split_once('/')?;
-    if owner.is_empty() || repo.is_empty() {
-        return None;
-    }
+    (!owner.is_empty() && !repo.is_empty()).then_some((host, path))
+}
+
+/// Parse owner/repo from a GitHub-style URL (HTTPS or SSH).
+///
+/// For an Enterprise host the owner half carries the host, giving
+/// `gh`'s `[HOST/]OWNER/REPO` form — every consumer formats the pair
+/// straight into `-R`, and without the host `gh` would talk to
+/// github.com about a repo that only exists on the internal instance.
+/// Never for an API path: that is [`github_repo_path`]'s.
+fn github_owner_repo(url: &str) -> Option<(String, String)> {
+    let (host, path) = github_repo_path(url)?;
+    let (owner, repo) = path.split_once('/')?;
     let owner = if host.eq_ignore_ascii_case("github.com") {
         owner.to_owned()
     } else {
@@ -1539,6 +1739,14 @@ fn gh_pr_view(slug: &str, pr_number: i64, fields: &str) -> anyhow::Result<PrView
 /// nothing — and a server that ignored `page` would otherwise be asked
 /// forever.
 pub const MAX_DIFF_PAGES: usize = 10;
+
+/// Most pages of 100 a read of a PR's review threads (an MR's
+/// discussions, system notes among them), or of one thread's comments,
+/// walks: 10,000. The read must be whole, since a thread of hunter's it
+/// does not list is taken for deleted, so this is no budget but the
+/// bound on a server that ignores the cursor or `page` and would
+/// otherwise be asked forever; a real PR stays far below it.
+pub const MAX_THREAD_PAGES: usize = 100;
 
 /// Rebuild a unified diff from GitLab's per-file entries.
 fn gitlab_unified_diff(files: &[GlFileDiff]) -> String {
@@ -2057,21 +2265,275 @@ fn github_find_review(
     })
 }
 
+/// The current `owner/repo` of the GitHub repo at `url`. A renamed or
+/// transferred repo answers its old path with a 301 on a GET, which gh
+/// follows, but with a 307 on a POST, which it does not; and GraphQL names
+/// a repository by its current name only. Asked on the repo's own host
+/// ([`github_api_jq`]), by its host-free path ([`github_repo_path`]).
+fn github_full_name(url: &str) -> anyhow::Result<String> {
+    let (_, path) = github_repo_path(url)
+        .ok_or_else(|| anyhow::anyhow!("cannot parse owner/repo from {url}"))?;
+    let (rc, full_name) = github_api_jq(url, &format!("repos/{path}"), ".full_name")?;
+    let full_name = full_name.trim();
+    if rc != 0 || full_name.is_empty() {
+        anyhow::bail!("gh api repos/{path} failed (rc={rc}): {full_name}");
+    }
+    Ok(full_name.to_owned())
+}
+
+/// `gh api graphql` with `query`, string variables `vars` and integer ones
+/// `ints`, on the host of the repo at `url`: the parsed response. One that
+/// carries `errors` is an error, whatever else it holds.
+fn github_graphql(
+    url: &str,
+    query: &str,
+    vars: &[(&str, &str)],
+    ints: &[(&str, i64)],
+) -> anyhow::Result<serde_json::Value> {
+    let (host, _) =
+        url_host_path(url).ok_or_else(|| anyhow::anyhow!("cannot parse host from {url}"))?;
+    let mut args: Vec<String> = vec![
+        "gh".into(),
+        "api".into(),
+        "graphql".into(),
+        "-f".into(),
+        format!("query={query}"),
+    ];
+    // `-f` passes a value verbatim; `-F` would read a body starting with
+    // `@` as a file to upload.
+    for (k, v) in vars {
+        args.extend(["-f".into(), format!("{k}={v}")]);
+    }
+    for (k, v) in ints {
+        args.extend(["-F".into(), format!("{k}={v}")]);
+    }
+    if !host.eq_ignore_ascii_case("github.com") {
+        args.extend(["--hostname".into(), host.into()]);
+    }
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (rc, out) = run_cmd(&refs, 60);
+    if rc != 0 {
+        anyhow::bail!("gh api graphql failed (rc={rc}): {out}");
+    }
+    let v: serde_json::Value = serde_json::from_str(out.trim())
+        .map_err(|e| anyhow::anyhow!("gh api graphql: unparseable response: {e}"))?;
+    if let Some(errors) = v.get("errors").filter(|e| !e.is_null()) {
+        anyhow::bail!("gh api graphql: {errors}");
+    }
+    Ok(v)
+}
+
+/// One page of a GraphQL connection: its `nodes` and where the next page
+/// starts.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlPage<T> {
+    #[serde(default = "Vec::new")]
+    nodes: Vec<T>,
+    #[serde(default)]
+    page_info: GqlPageInfo,
+}
+
+/// A GraphQL connection's `pageInfo`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlPageInfo {
+    #[serde(default)]
+    has_next_page: bool,
+    #[serde(default)]
+    end_cursor: Option<String>,
+}
+
+impl GqlPageInfo {
+    /// The cursor to read the next page after, if there is one.
+    fn next(&self) -> Option<&str> {
+        self.end_cursor.as_deref().filter(|_| self.has_next_page)
+    }
+}
+
+/// One of a PR's `reviewThreads`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlThread {
+    id: String,
+    #[serde(default)]
+    is_resolved: bool,
+    comments: GqlPage<GqlThreadComment>,
+}
+
+/// A comment of a review thread, with GitHub's database id (a `BigInt`,
+/// sent as a string): what its REST API takes to reply under the comment.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlThreadComment {
+    #[serde(flatten)]
+    comment: GhComment,
+    #[serde(default)]
+    full_database_id: Option<String>,
+}
+
+/// Every review thread of GitHub PR `pr_number` in `owner/name`, each with
+/// its first 100 comments, read in pages of 100. Threads come oldest
+/// first: reading only the first page would lose the threads later rounds
+/// open on a busy PR. A PR with more than [`MAX_THREAD_PAGES`] pages is
+/// an error: a read that stopped short would take every thread past it
+/// for gone ([`Forge::review_threads`]).
+fn github_thread_pages(
+    url: &str,
+    (owner, name): (&str, &str),
+    pr_number: i64,
+) -> anyhow::Result<Vec<GqlThread>> {
+    const QUERY: &str = "query($owner: String!, $name: String!, $number: Int!, $after: String) { \
+                         repository(owner: $owner, name: $name) { pullRequest(number: $number) { \
+                         reviewThreads(first: 100, after: $after) { \
+                         pageInfo { hasNextPage endCursor } nodes { id isResolved \
+                         comments(first: 100) { pageInfo { hasNextPage endCursor } \
+                         nodes { id fullDatabaseId author { login } body createdAt } } \
+                         } } } } }";
+    let mut all = Vec::new();
+    let mut after: Option<String> = None;
+    for _ in 0..MAX_THREAD_PAGES {
+        let mut vars = vec![("owner", owner), ("name", name)];
+        if let Some(cursor) = after.as_deref() {
+            vars.push(("after", cursor));
+        }
+        let v = github_graphql(url, QUERY, &vars, &[("number", pr_number)])?;
+        let page = v
+            .pointer("/data/repository/pullRequest/reviewThreads")
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!("gh api graphql: PR #{pr_number} has no review threads")
+            })?;
+        let page: GqlPage<GqlThread> = serde_json::from_value(page)
+            .map_err(|e| anyhow::anyhow!("gh api graphql: unparseable review threads: {e}"))?;
+        after = page.page_info.next().map(str::to_owned);
+        all.extend(page.nodes);
+        if after.is_none() {
+            return Ok(all);
+        }
+    }
+    anyhow::bail!(
+        "PR #{pr_number} has more than {} review threads; not reading them",
+        100 * MAX_THREAD_PAGES
+    )
+}
+
+/// The rest of thread `thread`'s comments past its first page, up to
+/// [`MAX_THREAD_PAGES`] more pages: the newest replies are the last ones.
+fn github_more_comments(url: &str, thread: &mut GqlThread) -> anyhow::Result<()> {
+    const QUERY: &str = "query($thread: ID!, $after: String!) { node(id: $thread) { \
+                         ... on PullRequestReviewThread { comments(first: 100, after: $after) { \
+                         pageInfo { hasNextPage endCursor } \
+                         nodes { id author { login } body createdAt } } } } }";
+    let mut after = thread.comments.page_info.next().map(str::to_owned);
+    for _ in 0..MAX_THREAD_PAGES {
+        let Some(cursor) = after.take() else { break };
+        let v = github_graphql(
+            url,
+            QUERY,
+            &[("thread", &thread.id), ("after", &cursor)],
+            &[],
+        )?;
+        let page = v.pointer("/data/node/comments").cloned().ok_or_else(|| {
+            anyhow::anyhow!("gh api graphql: thread {} has no comments", thread.id)
+        })?;
+        let page: GqlPage<GqlThreadComment> = serde_json::from_value(page)
+            .map_err(|e| anyhow::anyhow!("gh api graphql: unparseable thread comments: {e}"))?;
+        after = page.page_info.next().map(str::to_owned);
+        thread.comments.nodes.extend(page.nodes);
+    }
+    Ok(())
+}
+
+/// The threads of GitHub PR `pr_number` that one of `first_refs` opened:
+/// see [`Forge::review_threads`]. Read page by page
+/// ([`github_thread_pages`], [`github_more_comments`]).
+fn github_review_threads(
+    url: &str,
+    pr_number: i64,
+    first_refs: &[&str],
+    pr_author: &str,
+    bots: &ReviewBots,
+) -> anyhow::Result<Vec<ReviewThread>> {
+    let full_name = github_full_name(url)?;
+    let (owner, name) = full_name
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("unexpected repo name {full_name:?}"))?;
+    let threads = github_thread_pages(url, (owner, name), pr_number)?;
+    let mut ours: Vec<GqlThread> = threads
+        .into_iter()
+        .filter(|t| {
+            t.comments
+                .nodes
+                .first()
+                .is_some_and(|c| first_refs.contains(&c.comment.id.as_str()))
+        })
+        .collect();
+    for t in &mut ours {
+        github_more_comments(url, t)?;
+    }
+    let (host, repo) = github_cache_scope(url);
+    let bot_ids: Vec<&str> = ours
+        .iter()
+        .flat_map(|t| t.comments.nodes.iter().skip(1).map(|c| &c.comment))
+        .filter(|c| !c.id.is_empty() && c.author.as_ref().is_some_and(|a| bots.contains(&a.login)))
+        .map(|c| c.id.as_str())
+        .collect();
+    let bot_authored = if bot_ids.is_empty() {
+        HashSet::new()
+    } else {
+        github_bot_authored(url, &host, &bot_ids)?
+    };
+    ours.into_iter()
+        .map(|t| {
+            let mut comments = t.comments.nodes.into_iter();
+            let first = comments.next().unwrap_or_default();
+            let poster = first.comment.author.map(|a| a.login).unwrap_or_default();
+            let (replies, hidden) = screen_replies(
+                comments.map(|c| c.comment).collect(),
+                ThreadVoices {
+                    pr_author,
+                    poster: &poster,
+                },
+                bots,
+                |id, _| Ok(bot_authored.contains(id)),
+                |login| {
+                    cached_lookup(
+                        format!("github-push:{repo}:{}", normalize_login(login)),
+                        || github_can_push(url, login),
+                    )
+                },
+            )?;
+            Ok(ReviewThread {
+                first_ref: first.comment.id,
+                thread_id: t.id,
+                reply_to: first.full_database_id.unwrap_or_default(),
+                resolved: t.is_resolved,
+                replies,
+                hidden,
+            })
+        })
+        .collect()
+}
+
 /// One of an MR's `discussions`.
 #[derive(Debug, Default, Deserialize)]
 struct GlDiscussion {
+    #[serde(default, deserialize_with = "nullable")]
+    id: String,
     #[serde(default, deserialize_with = "nullable")]
     notes: Vec<GlNote>,
 }
 
 /// Every discussion of MR `pr_number` (project `enc`, URL-encoded), read
-/// in pages of 100. An MR with more than [`MAX_DIFF_PAGES`] full pages is
-/// an error: a read that stopped short would take every discussion past
-/// it for gone ([`Forge::inline_comment_refs`]).
+/// in pages of 100. An MR with more than [`MAX_THREAD_PAGES`] full pages
+/// is an error: a read that stopped short would take every discussion
+/// past it for gone ([`Forge::review_threads`],
+/// [`Forge::inline_comment_refs`]).
 fn gitlab_discussions(url: &str, enc: &str, pr_number: i64) -> anyhow::Result<Vec<GlDiscussion>> {
     const PER_PAGE: usize = 100;
     let mut all = Vec::new();
-    for page in 1..=MAX_DIFF_PAGES {
+    for page in 1..=MAX_THREAD_PAGES {
         let api = format!(
             "projects/{enc}/merge_requests/{pr_number}/discussions?per_page={PER_PAGE}&page={page}"
         );
@@ -2089,7 +2551,7 @@ fn gitlab_discussions(url: &str, enc: &str, pr_number: i64) -> anyhow::Result<Ve
     }
     anyhow::bail!(
         "MR !{pr_number} has at least {} discussions; not reading them",
-        PER_PAGE * MAX_DIFF_PAGES
+        PER_PAGE * MAX_THREAD_PAGES
     )
 }
 
@@ -2146,6 +2608,85 @@ fn gitlab_find_review(
         .map(|(issue, _)| issue)
         .collect();
     FoundReview { review_ref, inline }
+}
+
+/// The threads of GitLab MR `pr_number` that one of `first_refs` opened:
+/// see [`Forge::review_threads`]. Membership is looked up by user id, as
+/// in [`gitlab_feedback`], and a configured bot needs no confirmation.
+fn gitlab_review_threads(
+    url: &str,
+    pr_number: i64,
+    first_refs: &[&str],
+    pr_author: &str,
+    bots: &ReviewBots,
+) -> anyhow::Result<Vec<ReviewThread>> {
+    let (host, project) =
+        gitlab_host_path(url).ok_or_else(|| anyhow::anyhow!("cannot parse GitLab URL: {url}"))?;
+    let enc = project.replace('/', "%2F");
+    let host = host.to_ascii_lowercase();
+    gitlab_discussions(url, &enc, pr_number)?
+        .into_iter()
+        .filter_map(|d| {
+            let first = d.notes.first()?.id?.to_string();
+            first_refs.contains(&first.as_str()).then_some((first, d))
+        })
+        .map(|(first_ref, d)| {
+            let resolved = d.notes.first().is_some_and(|n| n.resolved);
+            let poster = d
+                .notes
+                .first()
+                .and_then(|n| n.author.as_ref())
+                .map(|a| a.username.clone())
+                .unwrap_or_default();
+            let ids: HashMap<String, i64> = d
+                .notes
+                .iter()
+                .filter_map(|n| n.author.as_ref())
+                .filter_map(|a| Some((normalize_login(&a.username), a.id?)))
+                .collect();
+            let replies = d
+                .notes
+                .iter()
+                .skip(1)
+                .filter(|n| !n.system)
+                .map(|n| GhComment {
+                    id: n.id.map(|id| id.to_string()).unwrap_or_default(),
+                    author: n.author.as_ref().map(|a| GhAuthor {
+                        login: a.username.clone(),
+                    }),
+                    body: n.body.clone(),
+                    created_at: n.created_at.clone(),
+                    location: None,
+                    voice: Voice::default(),
+                })
+                .collect();
+            let (replies, hidden) = screen_replies(
+                replies,
+                ThreadVoices {
+                    pr_author,
+                    poster: &poster,
+                },
+                bots,
+                |_, _| Ok(true),
+                |login| {
+                    let Some(&id) = ids.get(&normalize_login(login)) else {
+                        anyhow::bail!("GitLab note by {login:?} carries no author id");
+                    };
+                    cached_lookup(format!("gitlab-push:{host}/{project}:{id}"), || {
+                        gitlab_can_push(url, project, id)
+                    })
+                },
+            )?;
+            Ok(ReviewThread {
+                first_ref,
+                reply_to: d.id.clone(),
+                thread_id: d.id,
+                resolved,
+                replies,
+                hidden,
+            })
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -2488,20 +3029,7 @@ impl Forge for GitHubForge {
         let before = |e: anyhow::Error| e.context(NothingPosted);
         let (host, _) = url_host_path(url)
             .ok_or_else(|| before(anyhow::anyhow!("cannot parse owner/repo from {url}")))?;
-        // A renamed or transferred repo answers its old path with a 301 on
-        // a GET, which gh follows, but with a 307 on a POST, which it does
-        // not: ask for the repo's current name first.
-        let (owner, repo) = self
-            .owner_repo(url)
-            .ok_or_else(|| before(anyhow::anyhow!("cannot parse owner/repo from {url}")))?;
-        let (rc, full_name) =
-            github_api_jq(url, &format!("repos/{owner}/{repo}"), ".full_name").map_err(before)?;
-        let full_name = full_name.trim();
-        if rc != 0 || full_name.is_empty() {
-            return Err(before(anyhow::anyhow!(
-                "gh api repos/{owner}/{repo} failed (rc={rc}): {full_name}"
-            )));
-        }
+        let full_name = github_full_name(url).map_err(before)?;
         let api = format!("repos/{full_name}/pulls/{pr_number}/reviews");
         let comments: Vec<serde_json::Value> = post
             .comments
@@ -2566,6 +3094,68 @@ impl Forge for GitHubForge {
         comments: &[(i64, &str)],
     ) -> anyhow::Result<Vec<(i64, String)>> {
         github_inline_refs(url, pr_number, review_ref, comments)
+    }
+
+    fn review_threads(
+        &self,
+        url: &str,
+        pr_number: i64,
+        first_refs: &[&str],
+        pr_author: &str,
+        bots: &ReviewBots,
+    ) -> anyhow::Result<Vec<ReviewThread>> {
+        github_review_threads(url, pr_number, first_refs, pr_author, bots)
+    }
+
+    /// By REST, under the thread's first comment: a reply published at
+    /// once. GraphQL's `addPullRequestReviewThreadReply` would put it in
+    /// the login's pending review whenever the operator has one open on
+    /// the PR, unseen until they submit it while hunter takes it as said
+    /// and resolves the thread. With such a review open GitHub refuses
+    /// this call instead (one pending review per login and PR), so the
+    /// post fails, and is retried, rather than answering unseen.
+    fn reply_to_thread(
+        &self,
+        url: &str,
+        pr_number: i64,
+        reply_to: &str,
+        body: &str,
+    ) -> anyhow::Result<()> {
+        if reply_to.is_empty() || !reply_to.bytes().all(|b| b.is_ascii_digit()) {
+            anyhow::bail!(
+                "the thread's first comment has no database id to reply to: {reply_to:?}"
+            );
+        }
+        let (host, _) = url_host_path(url)
+            .ok_or_else(|| anyhow::anyhow!("cannot parse owner/repo from {url}"))?;
+        let full_name = github_full_name(url)?;
+        let api = format!("repos/{full_name}/pulls/{pr_number}/comments/{reply_to}/replies");
+        let field = format!("body={}", mark_own(body));
+        let mut argv = vec!["gh", "api", "-X", "POST", &api, "-f", &field];
+        if !host.eq_ignore_ascii_case("github.com") {
+            argv.extend(["--hostname", host]);
+        }
+        let (rc, out) = run_cmd(&argv, 60);
+        if rc != 0 {
+            anyhow::bail!("gh api POST {api} failed (rc={rc}): {out}");
+        }
+        Ok(())
+    }
+
+    fn set_thread_resolved(
+        &self,
+        url: &str,
+        _pr_number: i64,
+        thread_id: &str,
+        resolved: bool,
+    ) -> anyhow::Result<()> {
+        const RESOLVE: &str = "mutation($thread: ID!) { resolveReviewThread(input: \
+                               {threadId: $thread}) { thread { isResolved } } }";
+        const UNRESOLVE: &str = "mutation($thread: ID!) { unresolveReviewThread(input: \
+                                 {threadId: $thread}) { thread { isResolved } } }";
+        let query = if resolved { RESOLVE } else { UNRESOLVE };
+        github_graphql(url, query, &[("thread", thread_id)], &[])?;
+        Ok(())
     }
 }
 
@@ -2964,6 +3554,56 @@ impl Forge for GitLabForge {
         let discussions = gitlab_discussions(url, &enc, pr_number)?;
         Ok(gitlab_published_refs(&discussions, own_id, comments))
     }
+
+    fn review_threads(
+        &self,
+        url: &str,
+        pr_number: i64,
+        first_refs: &[&str],
+        pr_author: &str,
+        bots: &ReviewBots,
+    ) -> anyhow::Result<Vec<ReviewThread>> {
+        gitlab_review_threads(url, pr_number, first_refs, pr_author, bots)
+    }
+
+    fn reply_to_thread(
+        &self,
+        url: &str,
+        pr_number: i64,
+        reply_to: &str,
+        body: &str,
+    ) -> anyhow::Result<()> {
+        let (_, path) = gitlab_host_path(url)
+            .ok_or_else(|| anyhow::anyhow!("cannot parse GitLab URL: {url}"))?;
+        let enc = path.replace('/', "%2F");
+        let api = format!("projects/{enc}/merge_requests/{pr_number}/discussions/{reply_to}/notes");
+        let body = gitlab_text(&mark_own(body));
+        let (rc, out) = gitlab_api(url, &api, Some("POST"), &[("body", &body)]);
+        if rc != 0 {
+            anyhow::bail!("glab api POST {api} failed (rc={rc}): {out}");
+        }
+        Ok(())
+    }
+
+    fn set_thread_resolved(
+        &self,
+        url: &str,
+        pr_number: i64,
+        thread_id: &str,
+        resolved: bool,
+    ) -> anyhow::Result<()> {
+        let (_, path) = gitlab_host_path(url)
+            .ok_or_else(|| anyhow::anyhow!("cannot parse GitLab URL: {url}"))?;
+        let enc = path.replace('/', "%2F");
+        let api = format!(
+            "projects/{enc}/merge_requests/{pr_number}/discussions/{thread_id}?resolved={resolved}"
+        );
+        let (rc, out) = gitlab_api(url, &api, Some("PUT"), &[]);
+        if rc != 0 {
+            anyhow::bail!("glab api PUT {api} failed (rc={rc}): {out}");
+        }
+        Ok(())
+    }
 }
 
 /// GitLab's [`Forge::view_pr_sync`], with its notes required when
@@ -3244,6 +3884,7 @@ mod read_back_tests {
     /// A discussion opened by note `id` of user `author`, on the diff.
     fn thread(id: i64, author: i64, body: &str) -> GlDiscussion {
         GlDiscussion {
+            id: format!("d{id}"),
             notes: vec![GlNote {
                 id: Some(id),
                 body: body.to_owned(),
