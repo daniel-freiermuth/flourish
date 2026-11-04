@@ -206,7 +206,9 @@ export function isEventList(v: unknown): v is Event[] {
 /**
  * `/api/pr-reviews`. `ReviewsPage` keys reviews by `review.id` and each
  * review's rounds by `round.id`, and per round slices both shas for the
- * `base..head` label and reads `issues.length` — all without a `?.`.
+ * `base..head` label and reads `issues.length` — all without a `?.`. A
+ * round's `post_state` decides which posting controls it shows; anything
+ * but a string or null would show none, silently.
  *
  * A review's `due_at` decides whether it shows as waiting for a round and
  * is compared with the clock: anything but a number or null would show a
@@ -218,6 +220,7 @@ export function isPrReviewList(v: unknown): v is PrReviewOut[] {
       && isKeyedList(r.rounds, "id", "number")
       && r.rounds.every((round) => typeof round.base_sha === "string"
         && typeof round.head_sha === "string"
+        && (round.post_state === null || typeof round.post_state === "string")
         && isObjectArray(round.issues)));
 }
 

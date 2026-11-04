@@ -36,8 +36,8 @@ use crate::domain::{
 };
 use crate::forge;
 use crate::store::{
-    AdminStore, FindingFilter, HoldRelease, NewPrReview, PrReviewRow, RepoUpdate, Store,
-    StoreWriteError, Trust,
+    AdminStore, FindingFilter, HoldRelease, NewPrReview, PostDecided, PostDecision, PrReviewRow,
+    RepoUpdate, Store, StoreWriteError, Trust,
 };
 use crate::transition::{Moved, OperatorVerdict, Transition, VerdictRefused};
 use crate::types::{
@@ -69,7 +69,8 @@ pub struct SchedulerHandle {
     /// are read now. Held as a permit while a sync runs, like `wake`.
     pub pr_sync_wake: Arc<tokio::sync::Notify>,
     /// Interrupts the sleep of the admin lane's PR review duty, so open PR
-    /// reviews are read now. Held as a permit, like `wake`.
+    /// reviews are read and approved rounds posted now. Held as a permit,
+    /// like `wake`.
     pub pr_review_wake: Arc<tokio::sync::Notify>,
     /// Interrupts the sleep of the admin lane's reaper duty, so a repo
     /// just deleted has its files removed now. Held as a permit, like
@@ -299,6 +300,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/pr-review", post(request_pr_review))
         .route("/api/pr-review/watch", post(set_pr_review_watch))
         .route("/api/pr-review/retry", post(retry_pr_review))
+        .route("/api/pr-review/auto-post", post(set_pr_review_auto_post))
+        .route("/api/pr-review/post", post(approve_pr_review_post))
+        .route("/api/pr-review/discard", post(discard_pr_review_post))
         .route("/api/events", get(events))
         .route("/api/stats", get(stats))
         .route("/api/verdict", post(verdict))
@@ -2142,6 +2146,7 @@ async fn pr_reviews(State(state): State<AppState>) -> Result<Json<Vec<PrReviewOu
             author: r.author,
             cross_repo: r.cross_repo,
             watch: r.watch,
+            auto_post: r.auto_post,
             state: r.state,
             head_sha: r.head_sha,
             last_reviewed_sha: r.last_reviewed_sha,
@@ -2205,36 +2210,39 @@ async fn forge_call<T: Send + 'static>(
     tokio::task::spawn_blocking(f).await?
 }
 
-/// POST /api/pr-review {`repo_id`, pr, watch, vouch?}: request a review of
-/// a PR hunter did not open: a round at the head the PR has now, watched
-/// or not. Reviewing runs the head's code with the daemon's credentials,
-/// and that code is the repository's the head lives in: a head in the
-/// repo itself was pushed by somebody who can push, a fork's by its owner
-/// and whoever they let push there. So the author and, for a head in a
-/// fork, the fork's owner must each be able to push to the repo (an owner
-/// who is the author is decided about as the author; one the forge does
-/// not name cannot) or the request needs `vouch: true`, which vouches for
-/// each who cannot. A maintainer opening a PR from a stranger's fork is no
-/// vouch for the stranger. A `reviewBots` login is no exception: a login
-/// is just a name a human may hold too (`forge::screen_feedback` confirms
-/// a bot by its author type, which a PR's metadata does not carry).
-/// Without the vouch the answer is a 409 carrying `needs_vouch` and whom it
-/// is for, so the UI can ask. A PR already under review is read again too:
-/// its `watch` is set, and a round is asked for unless one already
-/// reviewed its head; one whose review ended with the PR's close is read
-/// again and, reopened on the forge, reviewed again (its review follows
-/// the PR; a merged PR's has ended for good). It keeps what its request
-/// decided about its author and fork owner, unless its fork changed hands
-/// since ([`PrReviewRow::fork_changed_hands`]): then both are decided
-/// afresh. A review requested before the repo's URL changed is bound to
-/// the new URL like a new one is requested, whatever its state (merged,
-/// closed or own said so of the PR at the earlier URL): the PR is read
-/// there, refused unless open, and its author and fork owner pass the push
-/// check or are vouched for afresh; the review starts over, none of its
-/// rounds at the earlier URL counting again ([`Store::request_pr_review`]).
-/// The answer's `outcome` says which: `requested` (a new review, or a round
-/// asked of one that follows the open PR), `updated` (only `watch`: a round
-/// already reviewed the head), `reopened` or `rebound`.
+/// POST /api/pr-review {`repo_id`, pr, watch, `auto_post`?, vouch?}: request
+/// a review of a PR hunter did not open: a round at the head the PR has
+/// now, watched or not. Reviewing runs the head's code with the daemon's
+/// credentials, and that code is the repository's the head lives in: a
+/// head in the repo itself was pushed by somebody who can push, a fork's
+/// by its owner and whoever they let push there. So the author and, for a
+/// head in a fork, the fork's owner must each be able to push to the repo
+/// (an owner who is the author is decided about as the author; one the
+/// forge does not name cannot) or the request needs `vouch: true`, which
+/// vouches for each who cannot. A maintainer opening a PR from a
+/// stranger's fork is no vouch for the stranger. A `reviewBots` login is
+/// no exception: a login is just a name a human may hold too
+/// (`forge::screen_feedback` confirms a bot by its author type, which a
+/// PR's metadata does not carry). Without the vouch the answer is a 409
+/// carrying `needs_vouch` and whom it is for, so the UI can ask. A PR
+/// already under review is read again too: its `watch` and `auto_post`
+/// are set, and a round is asked for unless one already reviewed its
+/// head; one whose review ended with the PR's close is read again and,
+/// reopened on the forge, reviewed again (its review follows the PR; a
+/// merged PR's has ended for good). It keeps
+/// what its request decided about its author and fork owner, unless its
+/// fork changed hands since ([`PrReviewRow::fork_changed_hands`]): then
+/// both are decided afresh. A review requested before the repo's URL
+/// changed is bound to the new URL like a new one is requested, merged or
+/// closed though the PR at the earlier URL was: the PR is read there,
+/// refused unless open, and its author and fork
+/// owner pass the push check or are vouched for afresh; the review starts
+/// over, none of its rounds at the earlier URL counting again
+/// ([`Store::request_pr_review`]). `auto_post` (default false) posts each
+/// round with issues without waiting for approval. The answer's `outcome`
+/// says which: `requested` (a new review, or a round asked of one that
+/// follows the open PR), `updated` (only the toggles: a round already
+/// reviewed the head), `reopened` or `rebound`.
 async fn request_pr_review(
     State(state): State<AppState>,
     Extension(user): Extension<CurrentUser>,
@@ -2248,11 +2256,8 @@ async fn request_pr_review(
         return Err(ApiError::BadRequest("watch must be a boolean".to_owned()));
     };
     let watch = *watch;
-    let vouch = match body.get("vouch") {
-        None | Some(Value::Null) => false,
-        Some(Value::Bool(b)) => *b,
-        Some(_) => return Err(ApiError::BadRequest("vouch must be a boolean".to_owned())),
-    };
+    let vouch = optional_bool(&body, "vouch")?;
+    let auto_post = optional_bool(&body, "auto_post")?;
     let repo = fetch_repo(&state.store, rid).await?;
     let n = pr_number_of(&repo, body.get("pr").unwrap_or(&Value::Null))?;
     if state.store.is_hunter_pr(repo.id, n).await? {
@@ -2332,6 +2337,7 @@ async fn request_pr_review(
             cross_repo: pr.cross_repo,
             head_sha: &pr.head_sha,
             watch,
+            auto_post,
             head_owner: fork_owner,
             trust,
             requested_by: &user.username,
@@ -2344,7 +2350,7 @@ async fn request_pr_review(
         // A new review, or a round asked of one that follows the open PR.
         _ => "requested",
     };
-    let msg = request_event(&repo, n, outcome, trust);
+    let msg = request_event(&repo, n, outcome, auto_post, trust);
     state
         .store
         .log_user_event(&user, "pr_review", &msg, None)
@@ -2356,10 +2362,19 @@ async fn request_pr_review(
 /// How a message names a fork's owner the forge does not name.
 const UNNAMED_OWNER: &str = "the fork's unnamed owner";
 
-/// The event a request of `repo`'s PR #`n` logs: its `outcome` and whom
-/// its trust decision vouched for.
-fn request_event(repo: &Repo, n: i64, outcome: &str, trust: Option<Trust<'_>>) -> String {
+/// The event a request of `repo`'s PR #`n` logs: its `outcome`, whether
+/// it posts automatically and whom its trust decision vouched for.
+fn request_event(
+    repo: &Repo,
+    n: i64,
+    outcome: &str,
+    auto_post: bool,
+    trust: Option<Trust<'_>>,
+) -> String {
     let mut msg = format!("review of {} PR #{n} {outcome}", repo.name);
+    if auto_post {
+        msg.push_str(" (auto-post)");
+    }
     let vouched: Vec<&str> = trust
         .iter()
         .flat_map(|t| [t.vouched_author, t.vouched_head_owner])
@@ -2477,6 +2492,106 @@ async fn retry_pr_review(
         .log_user_event(&user, "pr_review", &format!("PR review {id}: retry"), None)
         .await?;
     state.scheduler.wake.notify_one();
+    Ok(Json(json!({ "ok": true })).into_response())
+}
+
+/// An optional boolean field of a request body: absent or null is false.
+fn optional_bool(body: &serde_json::Map<String, Value>, key: &str) -> Result<bool, ApiError> {
+    match body.get(key) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => Err(ApiError::BadRequest(format!("{key} must be a boolean"))),
+    }
+}
+
+/// POST /api/pr-review/auto-post {id, `auto_post`}: whether rounds recorded
+/// from now on are posted without waiting for approval. Rounds already
+/// pending stay so.
+async fn set_pr_review_auto_post(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> Result<Response, ApiError> {
+    post_gate(&headers)?;
+    let body = parse_object(&raw)?;
+    let id = require_int(&body, "id", "id must be an integer")?;
+    let Some(Value::Bool(auto_post)) = body.get("auto_post") else {
+        return Err(ApiError::BadRequest(
+            "auto_post must be a boolean".to_owned(),
+        ));
+    };
+    if !state.store.set_pr_review_auto_post(id, *auto_post).await? {
+        return Err(ApiError::NotFound(format!("no PR review {id}")));
+    }
+    let msg = format!(
+        "PR review {id}: auto-post {}",
+        if *auto_post { "on" } else { "off" }
+    );
+    state
+        .store
+        .log_user_event(&user, "pr_review", &msg, None)
+        .await?;
+    Ok(Json(json!({ "ok": true })).into_response())
+}
+
+/// POST /api/pr-review/post {`round_id`}: approve a pending round for
+/// posting (also a round that fell back after failed posts: its error is
+/// cleared). The PR review duty is woken to post it now. 409 unless the
+/// round is pending and its PR open.
+async fn approve_pr_review_post(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> Result<Response, ApiError> {
+    decide_pr_review_post(state, user, &headers, &raw, PostDecision::Approve).await
+}
+
+/// POST /api/pr-review/discard {`round_id`}: never post a pending round.
+/// 409 unless the round is pending.
+async fn discard_pr_review_post(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> Result<Response, ApiError> {
+    decide_pr_review_post(state, user, &headers, &raw, PostDecision::Discard).await
+}
+
+async fn decide_pr_review_post(
+    state: AppState,
+    user: CurrentUser,
+    headers: &HeaderMap,
+    raw: &Bytes,
+    decision: PostDecision,
+) -> Result<Response, ApiError> {
+    post_gate(headers)?;
+    let body = parse_object(raw)?;
+    let round = require_int(&body, "round_id", "round_id must be an integer")?;
+    let review = match state.store.decide_pr_review_post(round, decision).await? {
+        PostDecided::Moved { review_id } => review_id,
+        PostDecided::NoSuchRound => {
+            return Err(ApiError::NotFound(format!("no PR review round {round}")));
+        }
+        PostDecided::Refused(why) => return Err(ApiError::Conflict(why)),
+    };
+    let what = match decision {
+        PostDecision::Approve => "approved for posting",
+        PostDecision::Discard => "discarded",
+    };
+    state
+        .store
+        .log_user_event(
+            &user,
+            "pr_review",
+            &format!("PR review {review}: round {round} {what}"),
+            None,
+        )
+        .await?;
+    if decision == PostDecision::Approve {
+        state.scheduler.pr_review_wake.notify_one();
+    }
     Ok(Json(json!({ "ok": true })).into_response())
 }
 

@@ -14,4 +14,21 @@ verdict: string,
 /**
  * Why the round failed, or stopped partway.
  */
-failure: string | null, finished_at: number, issues: Array<PrReviewIssueOut>, };
+failure: string | null, finished_at: number, 
+/**
+ * Null when there is nothing to post (failed, or no issues);
+ * otherwise `pending` (awaiting a user), `approved` (posted on the next
+ * PR sync), `posted` or `discarded`.
+ */
+post_state: string | null, 
+/**
+ * The newest failed post's reason; kept after the round fell back to
+ * `pending`, cleared once it is approved again.
+ */
+post_error: string | null, posted_at: number | null, 
+/**
+ * Part of the round's post is, or may be, on the PR already (a post
+ * sent some of it and failed): it can only be approved again, never
+ * discarded.
+ */
+landed: boolean, issues: Array<PrReviewIssueOut>, };

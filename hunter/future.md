@@ -784,8 +784,10 @@ It blocks nothing; it would remove recurring review noise and a class of
 bug the current gates cannot see.
 
 ### 8.8 PR reviews: Watch on PRs hunter did not open
-**Status:** designed 2026-11-04; slice 1 built (manual request, Watch,
-review rounds, results in the UI; no forge posting yet).
+**Status:** designed 2026-11-04; slices 1–2 built (manual request, Watch,
+review rounds, results in the UI; inline COMMENT posting with per-review
+auto-post or per-round approval). Not yet: thread replies and resolution
+(slice 3), issues still open at merge becoming findings (slice 4).
 
 Reviews are enabled by hand, per PR, never by repo-wide discovery: the
 open PRs that are not hunter's own were, when designed, the operator's
@@ -860,11 +862,14 @@ for review traffic. Approving a round wakes the duty.
   the ones outside it go into the review body. An issue on removed code is
   `side: LEFT`, so the reviewer's output gains a side (or old line).
   GitLab: `position{base_sha, start_sha, head_sha, old/new path and line}`
-  from the MR's `diff_refs`, posted as draft notes and published in bulk
+  from the MR's `diff_refs`, posted as draft notes and published one by one
+  (`bulk_publish` would take the operator's own drafts along)
   (verify against the instance's API version). `GlPosition` /
   `CodeLocation` already map positions for reading; posting is the inverse.
-- Only new issues are posted. Each posted issue keeps its fingerprint and
-  thread id; a round that finds nothing new posts nothing.
+- Only new issues are posted. Each posted issue keeps the forge id of its
+  inline comment, read back after the post, by which its thread is found
+  on every read; one a complete read no longer finds was deleted and is
+  recorded gone. A round that finds nothing new posts nothing.
 - A thread hunter opened whose issue a later round no longer raises (or
   whose rebuttal it accepts) gets a reply naming the commit and is
   resolved by hunter (GitHub `resolveReviewThread`, GitLab discussion
@@ -874,7 +879,7 @@ for review traffic. Approving a round wakes the duty.
 **Data.** `pr_reviews(repo_id, pr_number, watch, auto_post, vouched_author,
 vouched_by, last_reviewed_sha, head_stable_since, state)` and
 `pr_review_issues(review_id, fingerprint, file, line, side, blocking,
-thread_id, status: open|addressed|rebutted)`.
+thread_ref, status: open|addressed|rebutted)`.
 
 **Order of work.** (1) request + watch + review job, reviews visible in the
 UI; (2) inline posting and auto-post; (3) incremental rounds, replies and

@@ -547,7 +547,80 @@ leaves nothing to review), with the trust decision the first request made
 toward a hold at 3 in a row (a reviewer whose cap never lets it finish
 the range is held, not run forever); a finished round, turning Watch on
 or **Retry** clears it. Budget and offline denials count
-nothing. Results stay in hunter: nothing is posted to the forge.
+nothing.
+
+A round with issues is posted to the PR as one review, under the
+operator's `gh`/`glab` login and therefore always a plain COMMENT review
+(never an approval or a change request). Nothing goes out without a
+decision: a round waits as *pending* until a user clicks **Post to PR**
+(or **Discard**, which is final), unless the review was requested with
+**Post automatically** (`auto_post`, toggleable per review), in which case
+a new round starts out approved. Toggling it touches only rounds recorded
+afterwards. A round without issues, or a failed one, has nothing to post.
+A round of the review's earlier URL is never posted: a
+request that binds the review to a new URL discards its rounds still to
+post (one part of which already landed on the earlier PR stays as it
+is), and only a round of the review's current binding is posted or
+approved.
+The admin lane's PR sync posts every approved round of an open review
+right after refreshing the reviews; a round recorded approved wakes it at
+once. Each issue whose line lies inside a
+hunk of the PR's diff (the reviewer's `side`: `RIGHT` numbers the head,
+`LEFT` the base, for removed code) becomes an inline comment; the rest —
+no file or line, or outside every hunk — go into the review's body under
+a header naming the round's `base..head`, and the body carries the
+`<!-- posted by hunter -->` mark. The body stays within 65,536 characters,
+GitHub's limit (GitLab takes 1,000,000 in a note), which a longer one
+would fail on every attempt: its issues go in, in order, while they fit,
+a line counts those left out, and the marks close it whatever was left
+out; an issue's text past half that limit is cut, saying so, inline
+too. GitHub gets one `pulls/N/reviews` call
+at the round's head commit; GitLab gets one draft note per inline issue
+(positioned on the MR's `diff_refs`) plus one for the body, each marked
+and then published on its own, the body last (not `bulk_publish`, which
+would also publish the operator's own drafts on the MR). GitLab runs a line that
+begins with `/` and a command's name (`/merge`, `/approve`, ...) as a
+quick action under the operator's login, and the reviewer's text quotes
+the PR: every text hunter posts to GitLab, an MR's description included,
+goes out with each such line escaped as `\/`, which Markdown shows as `/`
+and GitLab runs nothing for. The inline comments' ids are
+then read back from the PR, each found by its text as posted (GitHub: the
+review's comments; GitLab: the MR's discussions opened by the login `glab`
+acts as, since publishing gives a note a new id; anybody can copy hunter's
+text, so a note somebody else wrote is never hunter's thread). Comments of
+one text are told apart by the order the post created them in, which the
+forge's ids follow: the newest comments of a text are the post's own, in
+its order, and one an earlier round left with the same text is older. They
+are recorded: a thread is found by its first
+comment's id from then on. A read that fails leaves the review up and the
+round approved with the error, and the next sync reads the ids again
+without posting the review again; a comment the read does not find (it
+lists every one) was deleted, and its thread is recorded *gone*. A round
+counts as posted only once each of its inline comments has its id or is
+gone. A round whose head the PR
+has since moved past is posted with every issue in the body: its lines
+would land on other code; it names the PR's current head, since after a
+force-push the round's own is no commit of the PR and GitHub refuses it.
+So are an incremental round's `LEFT` issues
+(they number the previous round's head, the PR's diff the merge-base), and
+every issue when the forge will not serve the diff (GitHub refuses one past
+its size limits). A GitLab post that failed after publishing some of its
+inline notes records those, and its retry posts only the rest (the
+header still counts every issue). The drafts a GitLab post did not
+publish — it failed, or the daemon stopped mid-post — are the operator
+login's, and their next review by hand would publish them under their
+name: a post marks its review before it creates any, and the sync deletes
+every draft of the login on the MR that carries the mark (the operator's
+own are left alone), right after the failure and on every sync until
+that succeeds; until then the review posts nothing new. A failed
+post keeps its error and is retried on the next sync; after 3 failures
+the round falls back to pending with the error shown, for a user to
+approve again or discard — but once any part of it is on the PR (its
+review, an inline note) it is shown *partly posted* and can only be
+approved again: what is on the PR stays said. A review send the forge
+refused outright (a 4xx answer: none of it is on the PR) is no part of
+it. A post that failed while the forge host was unreachable (network
+gate) counts nothing.
 
 ## Web UI
 
@@ -560,7 +633,7 @@ Served at `http://localhost:8377` (configurable). Left-nav pages:
 | **Kanban / Pipeline** | Findings in flight in foldable columns (folds remembered per browser), a **Held** column with held findings (why each is held, the report, and its Continue/Restart/... controls), a Held scans section for repos with held work, suppressed (rejected/wontfix), and informational (note) findings |
 | **All Findings** | Every finding, filterable by repo/type/status/severity, with full detail (jobs, PR state, timeline) on expand, and the actions its status allows (verdicts on new/note/closed, releases of held work, Recheck on new, Unqueue on queued, budget override while something will still pick it) |
 | **Repos** | Add/remove/pause repos; each repo's held scans and failing sync with why and the way out (**Continue**, **Restart**; **Retry now** for a held sync), and the scans failing without a hold yet; queue a full re-hunt (the next hunt reviews the repo's complete history instead of only new commits — the same scope as the periodic `hunt.rehuntDays` re-hunt — and the request stays pending until such a hunt finishes cleanly); per-repo notes (free-text context injected into every prompt for that repo — coding conventions, known false positives, anything worth a hunter remembering across runs) |
-| **Reviews** | Reviews of PRs hunter did not open: request one by URL or number, or pick from the repo's open PRs (with **Watch**, every new head is reviewed again once it has been stable for 10 minutes); an author or fork owner who cannot push needs a vouch, the dialog naming them and the fork whose code would run; a review whose fork changed hands since says so and waits for a request; each review's state, rounds (base..head, verdict) and issues, with **Retry** for one held after 3 failed rounds |
+| **Reviews** | Reviews of PRs hunter did not open: request one by URL or number, or pick from the repo's open PRs (with **Watch**, every new head is reviewed again once it has been stable for 10 minutes; with **Post automatically**, rounds go to the PR without approval); an author or fork owner who cannot push needs a vouch, the dialog naming them and the fork whose code would run; a review whose fork changed hands since says so and waits for a request; each review's state, auto-post toggle, rounds (base..head, verdict, post state with **Post to PR** / **Discard** for a pending one and the last post error) and issues (marked *inline* once posted as a diff comment), with **Retry** for one held after 3 failed rounds |
 | **Stats** | Aggregate totals by kind and by finding type |
 | **Log** | Full job and event history |
 
@@ -654,9 +727,12 @@ answers `401 {"error": "login required"}` without a live session cookie.
 | POST | `/api/repo/notes` | Append a note to a repo |
 | GET | `/api/repo/open-prs` | A repo's open PRs from its forge (`id`), marked when hunter opened them or a review exists |
 | GET | `/api/pr-reviews` | Requested PR reviews with their rounds and issues, newest request first |
-| POST | `/api/pr-review` | Request a review (`{"repo_id", "pr": URL or number, "watch", "vouch"?}`); 409 `needs_vouch` (with `vouch_for` and the fork's `head_owner`) when the author or the owner of the fork the head lives in cannot push, 409 for hunter's own PR; for an existing review, sets its `watch` and asks for a round at the PR's head unless a round already reviewed it (`outcome`: `requested`, `updated`, `reopened` or `rebound`) |
+| POST | `/api/pr-review` | Request a review (`{"repo_id", "pr": URL or number, "watch", "auto_post"?, "vouch"?}`); 409 `needs_vouch` (with `vouch_for` and the fork's `head_owner`) when the author or the owner of the fork the head lives in cannot push, 409 for hunter's own PR; for an existing review, sets its `watch` and `auto_post` and asks for a round at the PR's head unless a round already reviewed it (`outcome`: `requested`, `updated`, `reopened` or `rebound`) |
 | POST | `/api/pr-review/watch` | Turn a review's Watch on or off (`{"id", "watch"}`); on also clears a hold |
 | POST | `/api/pr-review/retry` | Clear a review's failures and hold (`{"id"}`) |
+| POST | `/api/pr-review/auto-post` | Post a review's future rounds without approval, or stop (`{"id", "auto_post"}`) |
+| POST | `/api/pr-review/post` | Approve a pending round for posting (`{"round_id"}`), also after failed posts (clears the error); wakes the PR sync; 409 unless pending and the PR open |
+| POST | `/api/pr-review/discard` | Never post a pending round (`{"round_id"}`); 409 unless pending, or once part of it is on the PR |
 
 ## Architecture
 
@@ -718,13 +794,16 @@ for the schema — most columns carry comments explaining *why*, not just *what*
   attention fingerprint + suppression marker (state-based, see § PR
   follow-up loop), harvest tracking.
 - **`pr_reviews`**, **`pr_review_rounds`**, **`pr_review_issues`** —
-  requested reviews of PRs hunter did not open (PR, author, Watch, the
-  trust decision (vouches, the fork owner decided about) and the fork
-  owner read last, newest and last reviewed head, the request still
-  awaiting its round (when, and the head it read), failure streak and
-  hold), each attempt's
-  `base..head` and verdict (`ok`, `partial`: stopped before it finished,
-  or `failed`), and the issues a round reported.
+  requested reviews of PRs hunter did not open (PR, author, Watch,
+  auto-post, the trust decision (vouches, the fork owner decided about)
+  and the fork owner read last, newest and last reviewed head, the
+  request still awaiting its round (when, and the head it read), failure
+  streak and hold, and whether a post may have left drafts on the PR), each attempt's `base..head`, verdict (`ok`, `partial`: stopped
+  before it finished, or `failed`) and post state (`pending`, `approved`,
+  `posted`, `discarded`; error, attempts, posted time, the forge's review
+  id), and the issues a round reported (with the `side` their line
+  numbers and, once posted inline, the comment's forge id once read back
+  and when it was found gone).
   `jobs.pr_review_id` names the review a `pr_review` job ran for.
 - **`window_log`** — mirror of budget observations at decision time.
 - **`calibration_samples`** — empirical tokens-spent → used-fraction-moved

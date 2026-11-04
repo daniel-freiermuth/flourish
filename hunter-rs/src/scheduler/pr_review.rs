@@ -1,7 +1,8 @@
-//! Reviews of pull requests hunter did not open (future.md §8.8, slice 1):
-//! one round per due review ([`run_pr_review`]) on the job lane, and the
-//! PR sync's refresh of every open review ([`sync_pr_reviews`]) on the
-//! admin lane.
+//! Reviews of pull requests hunter did not open (future.md §8.8): one
+//! round per due review ([`run_pr_review`]) on the job lane, and on the
+//! admin lane the PR review duty's refresh of every open review
+//! ([`sync_pr_reviews`]) followed by the posting of approved rounds
+//! ([`post_pr_reviews`]).
 //!
 //! A round reviews `base..head` of the PR's head commit in a detached tree:
 //! the first round from the merge-base with the PR's base branch, every
@@ -9,7 +10,13 @@
 //! stopped partway keeps what it wrote, but its head is reviewed again),
 //! so a watched PR is reviewed incrementally as its author pushes. The
 //! results are the reviewer's issues, recorded per round
-//! (`pr_review_rounds`); nothing is posted to the forge.
+//! (`pr_review_rounds`); a round with issues is posted to the PR once a
+//! user approved it, or at once when the review posts automatically.
+
+mod place;
+mod post;
+
+pub use post::post_pr_reviews;
 
 use std::fmt::Write as _;
 use std::ops::ControlFlow;
@@ -231,10 +238,12 @@ pub(super) async fn run_pr_review(
             // hold every upstream commit the merge brought in.
             let from_last = last.filter(|last| descends(last, &head) && descends(merge_base, last));
             let base = from_last.unwrap_or_else(|| merge_base.to_owned());
-            Some((base, head))
+            // Recorded with the round: whether its base is the merge-base
+            // decides where its LEFT issues can go ([`post`]).
+            Some((base, head, merge_base.to_owned()))
         })
         .await?;
-    let Some((base, head)) = resolved else {
+    let Some((base, head, merge_base)) = resolved else {
         drop(permit);
         let why = "the PR head or its merge-base does not resolve in the clone";
         let ctx = (cfg, backend, &repo);
@@ -380,6 +389,7 @@ pub(super) async fn run_pr_review(
         (state, _) => Err(format!("worker {state}")),
     };
     close_workspace(lane, ws).await;
+    let mut posts_approved = false;
     let (outcome, failure) = match &verdict {
         Ok(issues) => {
             // Only a reviewer that finished reviewed `base..head`: one
@@ -396,6 +406,7 @@ pub(super) async fn run_pr_review(
                     (review_id, review.binding),
                     Some(job),
                     (&base, &head),
+                    Some(&merge_base),
                     round,
                 )
                 .await;
@@ -430,6 +441,12 @@ pub(super) async fn run_pr_review(
                 };
             }
             let _ = store.log_event(EVENT, &msg, Some(job), None).await;
+            // An auto-posted round goes up on the PR review duty's next
+            // run; the daemon wakes it rather than leaving it for the tick.
+            posts_approved = store
+                .approved_pr_review_rounds()
+                .await
+                .is_ok_and(|r| r.iter().any(|r| r.review_id == review_id));
             match stop {
                 None => ("reviewed", None),
                 Some(why) => (if on_hold { "held" } else { "retry" }, Some(why)),
@@ -450,6 +467,7 @@ pub(super) async fn run_pr_review(
         diff_range: Some(format!("{base}..{head}")),
         failure,
         outcome: Some(outcome.into()),
+        posts_approved,
         ..Default::default()
     })
 }
@@ -470,8 +488,13 @@ fn issue_out(v: &serde_json::Value) -> PrReviewIssueOut {
         confidence: v.get("confidence").and_then(serde_json::Value::as_f64),
         file: s("file"),
         line: v.get("line").and_then(serde_json::Value::as_i64),
+        // The store keeps only RIGHT or LEFT; anything else is no side.
+        side: s("side")
+            .map(|side| side.to_ascii_uppercase())
+            .filter(|side| side == "RIGHT" || side == "LEFT"),
         summary: s("summary").unwrap_or_default(),
         detail: s("detail").unwrap_or_default(),
+        posted_inline: false,
     }
 }
 
@@ -520,6 +543,7 @@ pub(super) async fn count_failure(
             (review.id, review.binding),
             job,
             range,
+            None,
             PrReviewRound::Failed(why),
         )
         .await

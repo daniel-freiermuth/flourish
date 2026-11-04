@@ -5,7 +5,12 @@ import type { PrReviewState } from "./PrReviewState";
 /**
  * GET /api/pr-reviews: one requested review, rounds newest first.
  */
-export type PrReviewOut = { id: number, repo_id: number, repo_name: string, pr_number: number, pr_url: string, title: string, author: string, cross_repo: boolean, watch: boolean, state: PrReviewState, head_sha: string | null, last_reviewed_sha: string | null, vouched_author: string | null, 
+export type PrReviewOut = { id: number, repo_id: number, repo_name: string, pr_number: number, pr_url: string, title: string, author: string, cross_repo: boolean, watch: boolean, 
+/**
+ * Whether a new round with issues is posted without waiting for a
+ * user's approval.
+ */
+auto_post: boolean, state: PrReviewState, head_sha: string | null, last_reviewed_sha: string | null, vouched_author: string | null, 
 /**
  * The owner of the fork the PR's head lives in, as the newest read
  * reported it: a round runs their repository's code. Null for a head
