@@ -17,7 +17,19 @@
 //! reported, against the new commits and the replies in the threads their
 //! inline comments opened, which it reads first ([`read_threads`]). An
 //! issue it finds addressed, or rebutted by a reply it checked, is answered
-//! and its thread resolved when the round is posted.
+//! and its thread resolved when the round is posted; one it finds still
+//! open is answered too where somebody replied after hunter last spoke.
+//!
+//! Replies and reopens alone make a watched review due as well: the PR
+//! sync reads the threads ([`sync_pr_reviews`]), and news in one that no
+//! standing verdict was given over -- a trusted reply newer than any its
+//! issue's verdict saw, or a reopen -- brings a round at the unchanged
+//! head (`base == head`), which has no commits to review and judges the
+//! earlier issues against the replies. An unwatched review's threads are
+//! read by a request ([`read_posted_threads`]), which asks for that round
+//! when news awaits. A round at the reviewed head that, reading the
+//! threads, finds nothing awaiting judgment records nothing, and answers
+//! the request it took ([`JobStore::answer_pr_review_request`]).
 
 mod place;
 mod post;
@@ -172,14 +184,11 @@ pub(super) async fn run_pr_review(
     if pr.head_sha.is_empty() {
         return Ok(skipped("the forge reports no head commit yet".to_owned()));
     }
-    if review.last_reviewed_sha.as_deref() == Some(pr.head_sha.as_str()) {
-        return Ok(skipped("PR head already reviewed".to_owned()));
-    }
     // The PR moved since the pick, which went by the head the sync last
     // saw: the new head waits out its stability window like any other
     // (the read above restarted it), so a burst of pushes is still one
-    // round. A round a request asked for waits for no stability and runs
-    // at the next pick.
+    // round, which reads any pending replies too. A round a request asked
+    // for waits for no stability and runs at the next pick.
     if review.round_requested_at.is_none()
         && review.head_sha.as_deref() != Some(pr.head_sha.as_str())
     {
@@ -199,6 +208,31 @@ pub(super) async fn run_pr_review(
     // Before the permit, as every forge read: the threads of every issue
     // posted so far (a review with none reads nothing).
     read_threads(store, cfg, &review, &pr.author).await;
+    // Why the round runs: at the head the last round reviewed, only news
+    // in a thread no verdict was given over (a reply, a reopen) is worth a
+    // round, and it runs for that alone; at any other head (a first round,
+    // a push, a force-push) it is that head's round, even when the head
+    // has no commits past its base. Incremental or after a force-push, the
+    // round judges what is still open
+    // ([`JobStore::earlier_pr_review_issues`]).
+    let replies_only = review.last_reviewed_sha.as_deref() == Some(pr.head_sha.as_str());
+    let earlier = store.earlier_pr_review_issues(review_id).await?;
+    if replies_only && !earlier.iter().any(EarlierIssue::awaits_judgment) {
+        // Nothing new at all: the read above found no news, or found the
+        // news the pick went by gone (a thread resolved or deleted since).
+        // Nothing is left for a round to judge or record, so the request
+        // the round took is answered here, as a request that asks for
+        // nothing is: left waiting, it would bring a round nobody asked
+        // for at the next push. The next pick, which goes by the same
+        // issues, finds the review not due.
+        store
+            .answer_pr_review_request((review_id, review.binding), &pr.head_sha, read_at)
+            .await?;
+        return Ok(skipped(format!(
+            "nothing awaits judgment at {}",
+            short(&pr.head_sha)
+        )));
+    }
 
     // The permit only now, after every forge read.
     let permit = lane.lock_clone(repo.id).await?;
@@ -266,8 +300,9 @@ pub(super) async fn run_pr_review(
     // The round is the head's the forge reported, the one recorded above:
     // the forge updates the PR's head ref only some time after a push, and
     // a fetch of a ref that still names another commit fetched the wrong
-    // head. Reviewing it would record that commit as reviewed; the fetch
-    // failed instead, and is tried again after the error backoff.
+    // head. Reviewing it would record that commit as reviewed, and at the
+    // reviewed head it would loop on empty rounds until the ref caught up;
+    // the fetch failed instead, and is tried again after the error backoff.
     if head != pr.head_sha {
         drop(permit);
         let why = format!(
@@ -277,6 +312,49 @@ pub(super) async fn run_pr_review(
         );
         let ctx = (cfg, backend, &repo);
         return prefetch_failed(store, ctx, &review, "fetch", &why).await;
+    }
+    if base == head && !replies_only {
+        // Nothing for a reviewer to do: a head's round at a head with no
+        // commits past its base (the first round of a PR without any,
+        // GitLab's draft MR from an issue, or a force-push back to the
+        // merge-base) has no code to review, and its earlier issues wait
+        // for a push that brings code, a reply or a reopen. Recorded as an
+        // empty round, so the head counts as reviewed: a skip alone would
+        // leave the review at the top of the job lane's picks, retried at
+        // once forever. News awaiting judgment stays so, and with the head
+        // reviewed brings a round for it alone.
+        drop(permit);
+        let waiting = earlier.iter().filter(|i| !i.settled()).count();
+        let why = if waiting == 0 {
+            format!("nothing to review or judge at {}", short(&head))
+        } else {
+            format!(
+                "no commits to review at {}; {waiting} earlier issue(s) wait for a push or a reply",
+                short(&head),
+            )
+        };
+        let recorded = store
+            .record_pr_review_round(
+                (review_id, review.binding),
+                None,
+                (&base, &head),
+                Some(&merge_base),
+                PrReviewRound::Ok {
+                    issues: &[],
+                    verdicts: &[],
+                    read_at,
+                },
+            )
+            .await;
+        if let Err(e) = recorded {
+            let msg = format!("{label}: {why}; recording it failed: {e}");
+            let _ = store.log_event("error", &msg, None, None).await;
+            return Err(e.into());
+        }
+        let _ = store
+            .log_event(EVENT, &format!("{label}: {why}"), None, None)
+            .await;
+        return Ok(skipped(why));
     }
 
     let created = match scope
@@ -314,9 +392,6 @@ pub(super) async fn run_pr_review(
         }
     };
 
-    // Incremental or after a force-push, the round judges what is still
-    // open ([`JobStore::earlier_pr_review_issues`]).
-    let earlier = store.earlier_pr_review_issues(review_id).await?;
     let out = ws.root.join("pr-review.json");
     let earlier_out = ws.root.join("pr-review-earlier.json");
     let _ = std::fs::remove_file(&out);
@@ -338,6 +413,7 @@ pub(super) async fn run_pr_review(
             earlier: &earlier_out,
         },
         &earlier,
+        !replies_only,
     );
     let prompt = match prompt {
         Ok(p) => p,
@@ -413,8 +489,9 @@ pub(super) async fn run_pr_review(
     // clean only when the reviewer finished on the tree it was shown. One
     // stopped before it wrote anything gave nothing; one that changed the
     // tree may have changed what it should have reported. Either fails.
-    // An issue or a verdict it wrote stands either way: a push round that
-    // only confirms fixes reports no issue.
+    // An issue or a verdict it wrote stands either way: a replies-only
+    // round's whole output is verdicts, and a push round that only
+    // confirms fixes reports no issue.
     let gave = |issues: &[ReportedIssue]| {
         !issues.is_empty() || matches!(&judged, Some(Ok(v)) if !v.is_empty())
     };
@@ -423,6 +500,24 @@ pub(super) async fn run_pr_review(
         Ok(issues) if changed && !gave(&issues) => {
             Err("the reviewer changed the worktree and reported nothing".to_owned())
         }
+        verdict => verdict,
+    };
+    // A round for replies alone has nothing but its verdicts to give: one
+    // that leaves none to read failed, and is tried again.
+    let verdict = match (verdict, &judged) {
+        (Ok(_), Some(Err(why))) if replies_only => Err(why.clone()),
+        (verdict, _) => verdict,
+    };
+    // A round for replies alone runs for the issues awaiting judgment, and
+    // only a verdict on one of them is progress: it was given over the
+    // thread's news, which no longer awaits. One that judged none of them,
+    // finished or stopped, kept would leave the review due again at once
+    // with the same prompt, forever. It fails instead, and counts toward
+    // the hold.
+    let verdict = match verdict {
+        Ok(_) if replies_only && !judged_news(&earlier, judged.as_ref()) => Err(format!(
+            "worker {state} without judging an issue awaiting judgment"
+        )),
         verdict => verdict,
     };
     close_workspace(lane, ws).await;
@@ -436,9 +531,10 @@ pub(super) async fn run_pr_review(
             };
             // Only a reviewer that finished reviewed `base..head`: one
             // stopped partway keeps what it wrote, and the next round
-            // reviews the same commits again.
-            let stop = (state == JobState::Suspended)
-                .then(|| format!("worker {state} before it finished"));
+            // reviews the same commits again. A round for replies alone
+            // has no range to finish: kept, it judged news (above), which
+            // is progress, and ends the streak.
+            let stop = stopped.then(|| format!("worker {state} before it finished"));
             let round = match &stop {
                 None => PrReviewRound::Ok {
                     issues,
@@ -449,6 +545,7 @@ pub(super) async fn run_pr_review(
                     issues,
                     verdicts: &verdicts,
                     why,
+                    progressed: replies_only,
                 },
             };
             let recorded = store
@@ -460,10 +557,15 @@ pub(super) async fn run_pr_review(
                     round,
                 )
                 .await;
-            let range = format!("{}..{}", short(&base), short(&head));
-            let mut msg = match &stop {
-                None => format!("{label}: reviewed {range}: {} issue(s)", issues.len()),
-                Some(why) => format!(
+            let range = if replies_only {
+                format!("the replies at {}", short(&head))
+            } else {
+                format!("{}..{}", short(&base), short(&head))
+            };
+            let mut msg = match (&stop, replies_only) {
+                (None, true) => format!("{label}: judged {range}: {} issue(s)", issues.len()),
+                (None, false) => format!("{label}: reviewed {range}: {} issue(s)", issues.len()),
+                (Some(why), _) => format!(
                     "{label}: stopped partway through {range} ({why}): {} issue(s) kept",
                     issues.len()
                 ),
@@ -489,7 +591,7 @@ pub(super) async fn run_pr_review(
                 }
             };
             let on_hold = streak >= PR_REVIEW_HOLD_AT;
-            if stop.is_some() {
+            if stop.is_some() && !replies_only {
                 let _ = if on_hold {
                     write!(msg, "; held after {streak} unfinished rounds in a row")
                 } else {
@@ -609,10 +711,27 @@ fn parse_verdicts(path: &Path, earlier: &[EarlierIssue]) -> Result<Vec<Verdict>,
             issue_id: id,
             verdict,
             note: note.chars().take(NOTE_CAP_CHARS).collect(),
+            answers_reply_at: issue.awaited_reply(),
             seen_reopened_at: issue.reopened_at,
+            seen_reply_at: issue.newest_reply_at(),
         });
     }
     Ok(verdicts)
+}
+
+/// Whether `judged`, the verdicts read from a round's file (if any), holds
+/// one on an `earlier` issue awaiting judgment
+/// ([`EarlierIssue::awaits_judgment`]): given over its thread's news,
+/// which no longer awaits once the round is kept.
+fn judged_news(earlier: &[EarlierIssue], judged: Option<&Result<Vec<Verdict>, String>>) -> bool {
+    let Some(Ok(verdicts)) = judged else {
+        return false;
+    };
+    verdicts.iter().any(|v| {
+        earlier
+            .iter()
+            .any(|i| i.id == v.issue_id && i.awaits_judgment())
+    })
 }
 
 /// How a round judged the `shown` earlier issues, for its event.
@@ -648,7 +767,43 @@ async fn read_threads(store: &JobStore, cfg: &Config, review: &PrReviewRow, pr_a
         return;
     }
     let read_at = crate::util::now_ms();
-    // On a blocking thread: the read is a run of forge subprocesses.
+    let seen = match read_posted_threads(cfg, review, pr_author, &posted).await {
+        Ok(seen) => seen,
+        Err(e) => {
+            let msg = format!(
+                "{label}: reading the review's threads failed, judging without replies: {e:#}"
+            );
+            let _ = store.log_event(EVENT, &msg, None, None).await;
+            return;
+        }
+    };
+    match store.observe_pr_review_threads(&seen, read_at).await {
+        Ok(0) => {}
+        Ok(reopened) => {
+            let msg = format!("{label}: {reopened} resolved thread(s) reopened on the PR");
+            let _ = store.log_event(EVENT, &msg, None, None).await;
+        }
+        Err(e) => {
+            let msg = format!("{label}: recording the review's threads: {e}");
+            let _ = store.log_event("error", &msg, None, None).await;
+        }
+    }
+}
+
+/// Read the threads the issues of `review` posted inline opened (`posted`:
+/// issue id, the inline comment's forge id; [`Store::posted_pr_review_issues`])
+/// in one forge call ([`forge::Forge::review_threads`]), replies screened
+/// with `pr_author` trusted, as the store records them
+/// ([`seen_threads`]). What a round ([`read_threads`]), the PR review
+/// duty ([`sync_replies`]) and a request (`server::request_pr_review`)
+/// read; each records it with its own lane's write. On a blocking thread:
+/// the read is a run of forge subprocesses.
+pub async fn read_posted_threads(
+    cfg: &Config,
+    review: &PrReviewRow,
+    pr_author: &str,
+    posted: &[(i64, String)],
+) -> anyhow::Result<ThreadsRead> {
     let (kind, url, n, author, bots) = (
         review.forge,
         review.repo_url.clone(),
@@ -662,29 +817,8 @@ async fn read_threads(store: &JobStore, cfg: &Config, review: &PrReviewRow, pr_a
         forge::forge_for(kind).review_threads(&url, n, &refs, &author, &bots)
     })
     .await
-    .unwrap_or_else(|e| Err(anyhow::anyhow!("forge task: {e}")));
-    let threads = match threads {
-        Ok(t) => t,
-        Err(e) => {
-            let msg = format!(
-                "{label}: reading the review's threads failed, judging without replies: {e:#}"
-            );
-            let _ = store.log_event(EVENT, &msg, None, None).await;
-            return;
-        }
-    };
-    let seen = seen_threads(&posted, threads);
-    match store.observe_pr_review_threads(&seen, read_at).await {
-        Ok(0) => {}
-        Ok(reopened) => {
-            let msg = format!("{label}: {reopened} resolved thread(s) reopened on the PR");
-            let _ = store.log_event(EVENT, &msg, None, None).await;
-        }
-        Err(e) => {
-            let msg = format!("{label}: recording the review's threads: {e}");
-            let _ = store.log_event("error", &msg, None, None).await;
-        }
-    }
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("forge task: {e}")))?;
+    Ok(seen_threads(posted, threads))
 }
 
 /// What a read of the threads hunter's issues `posted` (issue id, the
@@ -702,23 +836,36 @@ fn seen_threads(posted: &[(i64, String)], threads: Vec<forge::ReviewThread>) -> 
         .into_iter()
         .filter_map(|t| {
             let (issue_id, _) = posted.iter().find(|(_, r)| *r == t.first_ref)?;
-            Some(ThreadSeen {
-                issue_id: *issue_id,
-                resolved: t.resolved,
-                replies: t
-                    .replies
-                    .into_iter()
-                    .map(|r| PrReviewReplyOut {
-                        author: r.author,
-                        body: capped_reply(r.body),
-                        own: r.own,
-                    })
-                    .collect(),
-                hidden: i64::try_from(t.hidden).unwrap_or(i64::MAX),
-            })
+            Some(thread_seen(*issue_id, t))
         })
         .collect();
     ThreadsRead { seen, gone }
+}
+
+/// Thread `t` of issue `issue_id` as the store records it: replies capped
+/// and dated, in order of publication.
+fn thread_seen(issue_id: i64, t: forge::ReviewThread) -> ThreadSeen {
+    // The forge lists a thread's comments in creation order, but a reply
+    // drafted in a pending review goes out when it is submitted: ordered by
+    // publication, the thread's last reply is its newest word, for the
+    // prompt and for who spoke last.
+    let mut replies: Vec<PrReviewReplyOut> = t
+        .replies
+        .into_iter()
+        .map(|r| PrReviewReplyOut {
+            at: super::iso_ms(&r.published_at),
+            author: r.author,
+            body: capped_reply(r.body),
+            own: r.own,
+        })
+        .collect();
+    replies.sort_by_key(|r| r.at);
+    ThreadSeen {
+        issue_id,
+        resolved: t.resolved,
+        replies,
+        hidden: i64::try_from(t.hidden).unwrap_or(i64::MAX),
+    }
 }
 
 fn short(sha: &str) -> &str {
@@ -829,17 +976,25 @@ fn fork_changed_hands(pr: &forge::PrMeta) -> String {
     )
 }
 
-/// The PR sync's part of PR reviews: read every open review's PR and
+/// The PR review duty's refresh: read every open review's PR and
 /// record its head, the owner of the fork it lives in, title and state
-/// ([`AdminStore::observe_pr_review`]). A fork that changed hands since the
-/// request stops the review until a request decides about its new owner,
-/// logged once ([`PrReviewRow::fork_changed_hands`]). A merged or closed PR
-/// ends its review, and so does a PR that turned
-/// out to be one hunter opened ([`AdminStore::end_own_pr_review`]),
-/// unread. A forge error is logged and counts against nothing: the next
-/// pass reads the PR again. Stops at the next PR once `stopping` says so.
-/// Returns how many reviews were read.
-pub async fn sync_pr_reviews(store: &AdminStore, stopping: impl Fn() -> bool) -> usize {
+/// ([`AdminStore::observe_pr_review`]), then a watched review's threads
+/// ([`sync_replies`]; an unwatched one's news makes no round due, and a
+/// request reads them itself). A fork that changed hands since the request stops
+/// the review until a request decides about its new owner, logged once
+/// ([`PrReviewRow::fork_changed_hands`]). A merged or
+/// closed PR ends its review, and so does a PR that turned out to be one
+/// hunter opened ([`AdminStore::end_own_pr_review`]), unread. A review
+/// whose repo's URL changed since its request is not read
+/// ([`PrReviewRow::repo_moved`]): the number may name another PR there. A
+/// forge error is logged and counts against nothing: the next pass reads
+/// the PR again. Stops at the next PR once `stopping` says so. Returns how
+/// many reviews were read.
+pub async fn sync_pr_reviews(
+    store: &AdminStore,
+    cfg: &Config,
+    stopping: impl Fn() -> bool,
+) -> usize {
     let reviews = match store.open_pr_reviews().await {
         Ok(r) => r,
         Err(e) => {
@@ -926,7 +1081,167 @@ pub async fn sync_pr_reviews(store: &AdminStore, stopping: impl Fn() -> bool) ->
                     None,
                 )
                 .await;
+            continue;
+        }
+        if review.watch {
+            sync_replies(store, cfg, &review, &pr.author).await;
         }
     }
     read
+}
+
+/// Read the threads of watched review `review` and record what they hold
+/// ([`AdminStore::observe_pr_review_threads`]): the threads of every issue
+/// hunter posted inline ([`Store::posted_pr_review_issues`]), settled ones
+/// too, so one hunter resolved that a human reopened reopens its issue
+/// without waiting for a push, in one forge call as a round reads them
+/// ([`read_posted_threads`]), screened with `pr_author` trusted. A reply newer
+/// than any its issue's verdict saw, or a reopen, leaves the issue
+/// awaiting judgment, which makes the next round due
+/// ([`PrReviewRow::due_at`]). A review without a posted issue has no
+/// thread to read. A forge error is logged and changes nothing.
+async fn sync_replies(store: &AdminStore, cfg: &Config, review: &PrReviewRow, pr_author: &str) {
+    let label = format!("pr_review {} #{}", review.repo_name, review.pr_number);
+    let posted = match store.posted_pr_review_issues(review.id).await {
+        Ok(posted) => posted,
+        Err(e) => {
+            let msg = format!("{label}: sync: reading the posted issues: {e}");
+            let _ = store.log_event("error", &msg, None, None).await;
+            return;
+        }
+    };
+    if posted.is_empty() {
+        return;
+    }
+    let read_at = crate::util::now_ms();
+    let read = match read_posted_threads(cfg, review, pr_author, &posted).await {
+        Ok(read) => read,
+        Err(e) => {
+            let msg = format!("{label}: sync: reading the review's threads: {e:#}");
+            let _ = store.log_event("error", &msg, None, None).await;
+            return;
+        }
+    };
+    if let Err(e) = store.observe_pr_review_threads(&read, read_at).await {
+        let msg = format!("{label}: sync: recording the review's threads: {e}");
+        let _ = store.log_event("error", &msg, None, None).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Earlier issue `id`, its thread holding `replies` as (author, at),
+    /// those by [`OWN`] hunter's own.
+    fn issue(id: i64, replies: &[(&str, i64)]) -> EarlierIssue {
+        EarlierIssue {
+            id,
+            kind: "bug".into(),
+            blocking: false,
+            severity: None,
+            file: None,
+            line: None,
+            side: None,
+            summary: String::new(),
+            detail: String::new(),
+            status: "open".into(),
+            replies: replies
+                .iter()
+                .map(|&(author, at)| PrReviewReplyOut {
+                    author: author.into(),
+                    body: String::new(),
+                    own: author == OWN,
+                    at,
+                })
+                .collect(),
+            thread_ref: Some(format!("C{id}")),
+            reopened_at: None,
+            awaits_since: None,
+        }
+    }
+
+    fn open(ids: &[i64]) -> Vec<Verdict> {
+        ids.iter()
+            .map(|&issue_id| Verdict {
+                issue_id,
+                verdict: IssueVerdict::Open,
+                note: String::new(),
+                answers_reply_at: None,
+                seen_reopened_at: None,
+                seen_reply_at: None,
+            })
+            .collect()
+    }
+
+    const OWN: &str = forge::OWN_AUTHOR;
+
+    /// A round for replies alone made progress only by judging an issue
+    /// whose thread's news no verdict was given over yet: a verdict on any
+    /// other issue, or no readable verdicts at all, leaves the review due
+    /// for the same news.
+    #[test]
+    fn only_a_verdict_on_an_issue_awaiting_judgment_is_progress() {
+        let mut waiting = issue(1, &[("dev", 30)]);
+        waiting.awaits_since = Some(30);
+        let earlier = [waiting, issue(2, &[("dev", 20)])];
+        assert!(judged_news(&earlier, Some(&Ok(open(&[2, 1])))));
+        assert!(!judged_news(&earlier, Some(&Ok(open(&[2])))));
+        assert!(!judged_news(&earlier, Some(&Ok(Vec::new()))));
+        assert!(!judged_news(&earlier, Some(&Err("no verdict file".into()))));
+        assert!(!judged_news(&earlier, None));
+    }
+
+    /// The reply a verdict is given over is the newest by somebody other
+    /// than hunter: hunter's own answers are no news, and a person whose
+    /// login is `hunter` is somebody else.
+    #[test]
+    fn only_somebody_elses_replies_are_seen() {
+        assert_eq!(
+            issue(1, &[("dev", 30), (OWN, 50)]).newest_reply_at(),
+            Some(30)
+        );
+        assert_eq!(issue(2, &[(OWN, 20)]).newest_reply_at(), None);
+        let mut person = issue(2, &[(OWN, 20)]);
+        person.replies[0].own = false;
+        assert_eq!(person.newest_reply_at(), Some(20));
+        // A reply without a readable date is none: the sync never counts
+        // it either.
+        assert_eq!(issue(3, &[("dev", 0)]).newest_reply_at(), None);
+    }
+
+    /// A rebuttal drafted in a pending review before hunter answered, and
+    /// submitted after, is listed before hunter's answer (creation order)
+    /// but published after it: read in publication order, it is the
+    /// thread's last word, and the thread awaits an answer.
+    #[test]
+    fn a_thread_reads_in_order_of_publication() {
+        let reply = |author: &str, at: &str, own: bool| forge::ThreadReply {
+            author: author.into(),
+            body: String::new(),
+            published_at: at.into(),
+            own,
+            step: None,
+        };
+        let read = seen_threads(
+            &[(1, "C1".into())],
+            vec![forge::ReviewThread {
+                first_ref: "C1".into(),
+                thread_id: "T1".into(),
+                reply_to: "1".into(),
+                resolved: false,
+                replies: vec![
+                    reply("author", "2026-11-01T10:10:00Z", false),
+                    reply(OWN, "2026-11-01T10:05:00Z", true),
+                ],
+                hidden: 0,
+            }],
+        );
+        let order: Vec<bool> = read.seen[0].replies.iter().map(|r| r.own).collect();
+        assert_eq!(order, [true, false]);
+        let mut earlier = issue(1, &[]);
+        earlier.replies.clone_from(&read.seen[0].replies);
+        earlier.thread_ref = Some("C1".into());
+        assert_eq!(earlier.awaited_reply(), Some(earlier.replies[1].at));
+    }
 }

@@ -210,9 +210,10 @@ export function isEventList(v: unknown): v is Event[] {
  * `?.`. A round's `post_state` decides which posting controls it shows;
  * anything but a string or null would show none, silently. Its
  * `resolutions` and each issue's `hidden_replies` are counted into labels,
- * where anything but a number reads as nonsense, and each issue's
- * `replies` are iterated for their author, body and whether they are
- * hunter's own.
+ * where anything but a number reads as nonsense, as is each issue's
+ * `awaits_judgment`, where anything but a boolean miscounts, and each
+ * issue's `replies` are iterated for their author, body and whether they
+ * are hunter's own.
  *
  * A review's `due_at` decides whether it shows as waiting for a round and
  * is compared with the clock: anything but a number or null would show a
@@ -228,6 +229,7 @@ export function isPrReviewList(v: unknown): v is PrReviewOut[] {
         && typeof round.resolutions === "number"
         && isKeyedList(round.issues, "id", "number")
         && round.issues.every((issue) => typeof issue.hidden_replies === "number"
+          && typeof issue.awaits_judgment === "boolean"
           && isObjectArray(issue.replies)
           && issue.replies.every((reply) => typeof reply.author === "string" && typeof reply.body === "string"
             && typeof reply.own === "boolean"))));

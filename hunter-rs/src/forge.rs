@@ -665,12 +665,52 @@ pub struct ThreadReply {
     /// As written; hunter's own without the own-comment mark and the step
     /// mark.
     pub body: String,
+    /// When it went out on the forge, as the forge spells it (RFC 3339;
+    /// [`ThreadComment::published`]): a reply newer than any round has
+    /// seen makes a watched review due.
+    pub published_at: String,
     /// Whether it is hunter's own reply. The only way to tell one apart:
     /// a person's login may be `hunter` too.
     pub own: bool,
     /// The step of a post it is ([`step_mark`]), when it is hunter's own
     /// and carries one.
     pub step: Option<String>,
+}
+
+/// A comment in one of hunter's review threads, as the forge lists it, for
+/// [`screen_replies`].
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadComment {
+    #[serde(default)]
+    id: String,
+    /// GitHub's database id (a `BigInt`, sent as a string): what its REST
+    /// API takes to reply under the comment. `None` for GitLab's notes.
+    #[serde(default)]
+    full_database_id: Option<String>,
+    #[serde(default)]
+    author: Option<GhAuthor>,
+    #[serde(default)]
+    body: String,
+    /// When the comment was published: a comment written in a pending
+    /// review is created when drafted, and published only when the review
+    /// is submitted, any time later. GitHub's `publishedAt`, null for a
+    /// comment still in a pending review; for GitLab, whose draft notes
+    /// become notes only as they are published, the note's creation.
+    #[serde(default)]
+    published_at: Option<String>,
+}
+
+impl ThreadComment {
+    /// When the comment became visible on the PR; `None` while it is a
+    /// draft nobody else can see (only the viewer's own drafts are
+    /// returned, i.e. the operator's). A draft is no reply yet: counting
+    /// it would make a review due, and get it answered, before anyone
+    /// could read it, and again once it is submitted. Dating a reply by
+    /// its drafting could also put it behind a watermark set meanwhile.
+    fn published(&self) -> Option<&str> {
+        self.published_at.as_deref()
+    }
 }
 
 /// The author a reply of hunter's own is shown under. Never compared to
@@ -695,12 +735,15 @@ struct ThreadVoices<'a> {
 /// review trusts: a configured bot (confirmed by `is_bot`, as in
 /// [`screen_feedback`]), hunter's own login, anyone `can_push` vouches
 /// for, and the PR's author. The rest are only counted. A reply ending in
-/// [`OWN_MARK`] by hunter's login or a pusher is hunter's own
+/// [`OWN_MARK`] by hunter's login (the thread's poster) is hunter's own
 /// ([`ThreadReply::own`]), shown as [`OWN_AUTHOR`]; everybody else keeps
-/// their login. `can_push` is asked at most once per login; an error
-/// fails the whole read, as guessing either way would.
+/// their login, a pusher who typed the mark included: a reply passed off
+/// as hunter's would be read as hunter's answer, not as a claim to check.
+/// Each is dated by when it went out ([`ThreadComment::published`]).
+/// `can_push` is asked at most once per login; an error fails the whole
+/// read, as guessing either way would.
 fn screen_replies(
-    replies: Vec<GhComment>,
+    replies: Vec<ThreadComment>,
     voices: ThreadVoices<'_>,
     bots: &ReviewBots,
     mut is_bot: impl FnMut(&str, &str) -> anyhow::Result<bool>,
@@ -712,6 +755,10 @@ fn screen_replies(
     let mut kept = Vec::with_capacity(replies.len());
     let mut hidden = 0;
     for c in replies {
+        // A draft is nobody's reply yet: not kept, and not hidden either.
+        let Some(published_at) = c.published().map(str::to_owned) else {
+            continue;
+        };
         let Some(login) = c
             .author
             .as_ref()
@@ -726,6 +773,7 @@ fn screen_replies(
             kept.push(ThreadReply {
                 author: login,
                 body: c.body,
+                published_at,
                 own: false,
                 step: None,
             });
@@ -739,6 +787,7 @@ fn screen_replies(
             kept.push(ThreadReply {
                 author: OWN_AUTHOR.to_owned(),
                 body: body.to_owned(),
+                published_at,
                 own: true,
                 step: step.map(str::to_owned),
             });
@@ -757,6 +806,7 @@ fn screen_replies(
             kept.push(ThreadReply {
                 author: login,
                 body: c.body,
+                published_at,
                 own: false,
                 step: None,
             });
@@ -1357,8 +1407,10 @@ pub trait Forge: Send + Sync {
     /// The repo's open PRs (one page of up to 100).
     fn list_open_prs(&self, url: &str) -> anyhow::Result<Vec<OpenPr>>;
     /// Whether `login` can push to the repo at `url`: the one definition
-    /// of a trusted author. Cached like feedback screening's lookups. On
-    /// GitHub only a login that can push may ask, which hunter's must.
+    /// of a trusted author. Cached like feedback screening's lookups. Only
+    /// a login that can push may ask, which hunter's must: GitHub answers
+    /// nobody else, and on GitLab, which answers any member, hunter's own
+    /// access is checked first, so a request fails saying so on either.
     fn can_push(&self, url: &str, login: &str) -> anyhow::Result<bool>;
     /// The web URL of PR `pr_number` of the repo at `url`.
     fn pr_web_url(&self, url: &str, pr_number: i64) -> String;
@@ -2358,18 +2410,7 @@ struct GqlThread {
     id: String,
     #[serde(default)]
     is_resolved: bool,
-    comments: GqlPage<GqlThreadComment>,
-}
-
-/// A comment of a review thread, with GitHub's database id (a `BigInt`,
-/// sent as a string): what its REST API takes to reply under the comment.
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GqlThreadComment {
-    #[serde(flatten)]
-    comment: GhComment,
-    #[serde(default)]
-    full_database_id: Option<String>,
+    comments: GqlPage<ThreadComment>,
 }
 
 /// Every review thread of GitHub PR `pr_number` in `owner/name`, each with
@@ -2388,7 +2429,7 @@ fn github_thread_pages(
                          reviewThreads(first: 100, after: $after) { \
                          pageInfo { hasNextPage endCursor } nodes { id isResolved \
                          comments(first: 100) { pageInfo { hasNextPage endCursor } \
-                         nodes { id fullDatabaseId author { login } body createdAt } } \
+                         nodes { id fullDatabaseId author { login } body publishedAt } } \
                          } } } } }";
     let mut all = Vec::new();
     let mut after: Option<String> = None;
@@ -2424,7 +2465,7 @@ fn github_more_comments(url: &str, thread: &mut GqlThread) -> anyhow::Result<()>
     const QUERY: &str = "query($thread: ID!, $after: String!) { node(id: $thread) { \
                          ... on PullRequestReviewThread { comments(first: 100, after: $after) { \
                          pageInfo { hasNextPage endCursor } \
-                         nodes { id author { login } body createdAt } } } } }";
+                         nodes { id author { login } body publishedAt } } } } }";
     let mut after = thread.comments.page_info.next().map(str::to_owned);
     for _ in 0..MAX_THREAD_PAGES {
         let Some(cursor) = after.take() else { break };
@@ -2437,7 +2478,7 @@ fn github_more_comments(url: &str, thread: &mut GqlThread) -> anyhow::Result<()>
         let page = v.pointer("/data/node/comments").cloned().ok_or_else(|| {
             anyhow::anyhow!("gh api graphql: thread {} has no comments", thread.id)
         })?;
-        let page: GqlPage<GqlThreadComment> = serde_json::from_value(page)
+        let page: GqlPage<ThreadComment> = serde_json::from_value(page)
             .map_err(|e| anyhow::anyhow!("gh api graphql: unparseable thread comments: {e}"))?;
         after = page.page_info.next().map(str::to_owned);
         thread.comments.nodes.extend(page.nodes);
@@ -2466,7 +2507,7 @@ fn github_review_threads(
             t.comments
                 .nodes
                 .first()
-                .is_some_and(|c| first_refs.contains(&c.comment.id.as_str()))
+                .is_some_and(|c| first_refs.contains(&c.id.as_str()))
         })
         .collect();
     for t in &mut ours {
@@ -2475,7 +2516,7 @@ fn github_review_threads(
     let (host, repo) = github_cache_scope(url);
     let bot_ids: Vec<&str> = ours
         .iter()
-        .flat_map(|t| t.comments.nodes.iter().skip(1).map(|c| &c.comment))
+        .flat_map(|t| t.comments.nodes.iter().skip(1))
         .filter(|c| !c.id.is_empty() && c.author.as_ref().is_some_and(|a| bots.contains(&a.login)))
         .map(|c| c.id.as_str())
         .collect();
@@ -2488,9 +2529,9 @@ fn github_review_threads(
         .map(|t| {
             let mut comments = t.comments.nodes.into_iter();
             let first = comments.next().unwrap_or_default();
-            let poster = first.comment.author.map(|a| a.login).unwrap_or_default();
+            let poster = first.author.map(|a| a.login).unwrap_or_default();
             let (replies, hidden) = screen_replies(
-                comments.map(|c| c.comment).collect(),
+                comments.collect(),
                 ThreadVoices {
                     pr_author,
                     poster: &poster,
@@ -2505,7 +2546,7 @@ fn github_review_threads(
                 },
             )?;
             Ok(ReviewThread {
-                first_ref: first.comment.id,
+                first_ref: first.id,
                 thread_id: t.id,
                 reply_to: first.full_database_id.unwrap_or_default(),
                 resolved: t.is_resolved,
@@ -2649,15 +2690,14 @@ fn gitlab_review_threads(
                 .iter()
                 .skip(1)
                 .filter(|n| !n.system)
-                .map(|n| GhComment {
+                .map(|n| ThreadComment {
                     id: n.id.map(|id| id.to_string()).unwrap_or_default(),
+                    full_database_id: None,
                     author: n.author.as_ref().map(|a| GhAuthor {
                         login: a.username.clone(),
                     }),
                     body: n.body.clone(),
-                    created_at: n.created_at.clone(),
-                    location: None,
-                    voice: Voice::default(),
+                    published_at: Some(n.created_at.clone()),
                 })
                 .collect();
             let (replies, hidden) = screen_replies(
@@ -3458,11 +3498,20 @@ impl Forge for GitLabForge {
     fn can_push(&self, url: &str, login: &str) -> anyhow::Result<bool> {
         let (host, project) = gitlab_host_path(url)
             .ok_or_else(|| anyhow::anyhow!("cannot parse GitLab URL: {url}"))?;
-        let key = format!(
-            "gitlab-push-login:{}/{project}:{}",
-            host.to_ascii_lowercase(),
-            login.to_ascii_lowercase()
-        );
+        let scope = format!("{}/{project}", host.to_ascii_lowercase());
+        // GitLab tells any member who can push, so this is the only check
+        // of hunter's own: without push access it cannot resolve the
+        // threads of the reviews it posts, and every post would fail.
+        let own = cached_lookup(format!("gitlab-push-self:{scope}"), || {
+            gitlab_can_push(url, project, gitlab_own_id(url)?)
+        })?;
+        if !own {
+            anyhow::bail!(
+                "hunter's forge login cannot push to {project}: hunter needs push access \
+                 to every repo it tracks, reviewed ones included"
+            );
+        }
+        let key = format!("gitlab-push-login:{scope}:{}", login.to_ascii_lowercase());
         cached_lookup(key, || match gitlab_user_id(url, login)? {
             Some(id) => gitlab_can_push(url, project, id),
             None => Ok(false),

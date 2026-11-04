@@ -1,21 +1,24 @@
 //! Requested reviews of pull requests hunter did not open (migration 035,
-//! future.md §8.8): the operator's requests, the PR sync's view of each
+//! future.md §8.8): the operator's requests, the admin lane's view of each
 //! PR, the rounds the job lane ran, and the threads their posts opened.
 //!
 //! Who writes what: the operator requests, watches and retries (on
-//! [`Store`]); the admin lane's PR sync records the PR's head, title and end
-//! and what its posts left on the forge, drafts of hunter's a post may have
-//! left there too ([`AdminStore`](super::AdminStore));
-//! the job lane records rounds, their verdicts on earlier issues and what a
-//! round read of the issues' threads ([`JobStore`](super::JobStore)). The
-//! columns each writes are disjoint but for `failures`/`held`, which a
-//! round counts and the operator clears; a review's head, title and state,
-//! which every read of the PR records (a round's too), a request that
-//! finds a closed PR reopened sets, and either lane ends as `own` once the
-//! PR turns out to be hunter's; what hunter said in an issue's thread (its
-//! answer and resolution), which the admin lane sets and a round's read
-//! clears when a human reopened the thread; and whether an issue's thread
-//! is gone from the PR, which any complete read of the PR finds.
+//! [`Store`]); the admin lane's PR review duty records the PR's head, title and end,
+//! what its posts left on the forge (drafts of hunter's a post may have
+//! left there too), and the replies it reads in the open
+//! threads of watched reviews ([`AdminStore`](super::AdminStore)); the job
+//! lane records rounds, their verdicts on earlier issues and what a round
+//! read of the issues' threads ([`JobStore`](super::JobStore)). The columns
+//! each writes are disjoint but for `failures`/`held`, which a round counts
+//! and the operator clears; a review's head, title and state, which every
+//! read of the PR records (a round's too), a request that finds a closed
+//! PR reopened sets, and either lane ends as `own` once the PR turns out to
+//! be hunter's; what hunter said in an issue's thread (its answer and
+//! resolution), which the admin lane sets and a round's read clears when a
+//! human reopened the thread, or records as hunter's step when it finds
+//! the thread as hunter set out to make it; and an issue's replies, which
+//! both lanes' reads replace with what the forge returned, and whether its
+//! thread is gone from the PR, which any complete read of the PR finds.
 //!
 //! An issue's state is derived, never kept (migration 037's
 //! `pr_review_issue_state`): its status is the newest verdict of a round
@@ -25,11 +28,14 @@
 //! human reopened it counting as none. What is recorded besides the
 //! verdicts is only what hunter has said in each thread ([`Said`]). A post
 //! makes every thread it touches show the released judgement
-//! ([`Said::steps`]), so it is idempotent and order-free: an older round
-//! posted after a newer one says the newer one's, a judgement is never
-//! said twice, and discarding a round takes its verdicts back without a
-//! write to undo. A round of which any part reached the PR is released for
-//! good: it can no longer be discarded.
+//! ([`Said::steps`]), so it is idempotent and order-free: two rounds
+//! posting the same judgement say it once, an older round posted after a
+//! newer one says the newer one's, and discarding a round takes its
+//! verdicts back without a write to undo. A round of which any part may
+//! have reached the PR (`landed_at`, marked before each call that may put
+//! it there, and unmarked only when the forge refused its review outright
+//! with nothing of it on the PR) is released for good: it can no longer
+//! be discarded.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -45,6 +51,11 @@ use crate::util::now_ms;
 /// How long a watched PR's head must stay unchanged before it is reviewed
 /// again: a burst of pushes ("fix typo", "address review") is one round.
 pub const HEAD_STABLE_MS: i64 = Duration::from_mins(10).as_millis() as i64;
+
+/// How long the newest reply in hunter's threads must be quiet before the
+/// replies alone make a round due: somebody answering three threads in a
+/// row is one round, not three.
+pub const REPLY_QUIET_MS: i64 = Duration::from_mins(2).as_millis() as i64;
 
 /// Consecutive failed rounds after which a review is held for the
 /// operator: something about the PR (or the forge) keeps failing, and
@@ -116,6 +127,8 @@ pub struct Said {
     /// its comment alone speaks, which says the issue stands, and once a
     /// human reopened the thread ([`Self::reopened`]).
     pub answer: Option<IssueVerdict>,
+    /// The newest reply hunter's answers answered (epoch ms).
+    pub answered_through: Option<i64>,
     /// Hunter resolved the thread, and nobody unresolved it since.
     pub resolved: bool,
     /// A human reopened the thread hunter resolved, and hunter has not
@@ -133,6 +146,8 @@ pub struct Said {
 pub enum Reply {
     /// The issue is addressed or rebutted.
     Settled,
+    /// It still stands, as hunter's comment said: an answer to a reply.
+    StillOpen,
     /// It stands again, though hunter's last answer settled it.
     OpenAgain,
 }
@@ -152,17 +167,24 @@ impl ThreadSteps {
 }
 
 impl Said {
-    /// What makes a thread where hunter said this show `verdict`: a reply
-    /// where hunter's standing answer says otherwise, or where a human's
-    /// reopen has none ([`Self::reopened`]); a settled issue's thread
-    /// resolved and an open one's not. Nothing once the thread shows it:
-    /// posting the same judgement again is a no-op.
-    pub fn steps(&self, verdict: IssueVerdict) -> ThreadSteps {
+    /// What makes a thread where hunter said this show `verdict`, reached
+    /// over the reply at `answers_reply_at` (the thread ended in it): a
+    /// reply where hunter's standing answer says otherwise, where that
+    /// reply has no answer yet, or where a human's reopen has none
+    /// ([`Self::reopened`]); a settled issue's thread resolved and an open
+    /// one's not. Nothing once the thread shows it: posting the same
+    /// judgement again is a no-op.
+    pub fn steps(&self, verdict: IssueVerdict, answers_reply_at: Option<i64>) -> ThreadSteps {
         let standing = self.answer.unwrap_or(IssueVerdict::Open);
-        // A reopen voided an answer that settled the issue, the thread's
-        // last word: any verdict over it answers.
-        let reply = (standing != verdict || self.reopened).then_some(match verdict {
-            IssueVerdict::Open => Reply::OpenAgain,
+        let unanswered = self.reopened
+            || answers_reply_at
+                .is_some_and(|at| self.answered_through.is_none_or(|seen| at > seen));
+        // The thread's last word settles the issue where hunter's standing
+        // answer does, and where a reopen voided one that did.
+        let last_settled = standing != IssueVerdict::Open || self.reopened;
+        let reply = (standing != verdict || unanswered).then_some(match verdict {
+            IssueVerdict::Open if last_settled => Reply::OpenAgain,
+            IssueVerdict::Open => Reply::StillOpen,
             IssueVerdict::Addressed | IssueVerdict::RebuttalAccepted => Reply::Settled,
         });
         let settled = verdict != IssueVerdict::Open;
@@ -188,11 +210,30 @@ pub struct ThreadToSettle {
     pub note: String,
     /// The head that round reviewed: where the issue was addressed.
     pub head_sha: String,
+    /// The reply that verdict answers (epoch ms), when the thread ended in
+    /// one.
+    pub answers_reply_at: Option<i64>,
+    /// The newest reply by somebody other than hunter the verdict's round
+    /// was shown in the thread ([`Verdict::seen_reply_at`]).
+    pub seen_reply_at: Option<i64>,
 }
 
 impl ThreadToSettle {
     pub fn steps(&self) -> ThreadSteps {
-        self.said.steps(self.verdict)
+        self.said.steps(self.verdict, self.answers_reply_at)
+    }
+
+    /// Whether the verdict was given over `thread` as a read at post time
+    /// found it: the thread holds no news the verdict was not shown
+    /// ([`ThreadSeen::news_at`], the rule that makes a round due). A
+    /// verdict counts over the replies it saw, and only those: a thread
+    /// with news is left for the round that news makes due, never answered
+    /// or resolved over it; a reply under hunter's standing resolution is
+    /// no news, and keeps nothing from the thread.
+    pub fn saw(&self, thread: &ThreadSeen) -> bool {
+        thread
+            .news_at(self.seen_reply_at, self.said.resolved)
+            .is_none()
     }
 }
 
@@ -256,6 +297,11 @@ pub struct NewPrReview<'a> {
     /// about the same fork owner ([`PrReviewRow::decided_about`]).
     pub trust: Option<Trust<'a>>,
     pub requested_by: &'a str,
+    /// What the request read in the threads of the review's posted issues
+    /// just before, and when that read began
+    /// ([`Store::request_pr_review`]); `None` for a review with none
+    /// posted, which has no thread to read.
+    pub threads: Option<(&'a ThreadsRead, i64)>,
 }
 
 /// A request's decision about running a PR's head: whoever wrote the code
@@ -276,8 +322,9 @@ pub struct Trust<'a> {
 pub struct Requested {
     pub id: i64,
     /// Whether the request waits for a round: no round reviewed the head
-    /// it read yet. `false` for a review that is not open (a merged or own
-    /// one at its URL), and for one whose head a round reviewed.
+    /// it read yet, or news in a thread awaits judgment. `false` for a
+    /// review that is not open (a merged or own one at its URL), and for
+    /// one whose head a round reviewed with nothing to judge.
     pub asks_round: bool,
 }
 
@@ -345,6 +392,120 @@ pub struct PrReviewRow {
     pub drafts_left_at: Option<i64>,
     /// The `running` `pr_review` job of this review, if any.
     pub running_job_id: Option<i64>,
+    /// When the newest news in the review's threads that no standing
+    /// verdict was given over arrived (epoch ms; migration 038's
+    /// `awaits_since`, the greatest of its issues'): a trusted reply newer
+    /// than any its issue's verdict saw, or a reopen. `None` while every
+    /// thread's news was judged.
+    pub awaiting_since: Option<i64>,
+}
+
+impl PrReviewRow {
+    /// Whether the repo's URL no longer names the repository the review
+    /// was requested under: the request decided whether the PR's author
+    /// can push (or a user vouched for them) against that URL, and its PR
+    /// number named a PR there. At another URL the number may name another
+    /// PR, by an author nobody decided about, so a moved review does
+    /// nothing -- no round, no read of the PR, no post -- until a request
+    /// binds it to the new URL, deciding afresh. An edit of the URL's form
+    /// alone ([`crate::forge::same_repo`]) moves nothing.
+    pub fn repo_moved(&self) -> bool {
+        !self.bound_to(&self.repo_url)
+    }
+
+    /// Whether the review was requested under `url`, the repo's URL as a
+    /// caller read it, or another form of it ([`Self::repo_moved`]).
+    pub fn bound_to(&self, url: &str) -> bool {
+        crate::forge::same_repo(&self.bound_url, url)
+    }
+
+    /// Whether the review's request decided about running code from a
+    /// head in `fork_owner`'s fork (`None`: a head in the repo itself), as
+    /// a read of the PR reports it ([`crate::forge::PrMeta::fork_owner`]):
+    /// a round runs the code of the repository the head lives in, so it
+    /// runs only what somebody decided about. A head in the repo itself was
+    /// pushed by somebody who can push; a fork's owner, and whoever they
+    /// let push to it, was decided about by the request -- they can push,
+    /// are the author, or a user vouched for them. Logins compare as the
+    /// forges do, ignoring case.
+    pub fn decided_about(&self, fork_owner: Option<&str>) -> bool {
+        match (self.decided_head_owner.as_deref(), fork_owner) {
+            (None, None) => true,
+            (Some(decided), Some(owner)) => decided.eq_ignore_ascii_case(owner),
+            _ => false,
+        }
+    }
+
+    /// Whether the fork the head lives in changed hands since the request
+    /// decided about its owner, as the newest read reported it
+    /// ([`Self::decided_about`]): such a review does nothing -- no round
+    /// runs the new owner's code -- until a request decides about them.
+    pub fn fork_changed_hands(&self) -> bool {
+        !self.decided_about(self.head_owner.as_deref())
+    }
+
+    /// When the review's next round is due (epoch ms), the one definition
+    /// both the pick ([`Store::list_due_pr_reviews`]) and the job lane's
+    /// sleep ([`Store::next_pr_review_due_at`]) read; `None` while nothing
+    /// makes one due. Only an open review not held, at the URL it was
+    /// requested under ([`Self::repo_moved`]), whose fork did not change
+    /// hands ([`Self::fork_changed_hands`]), with a known head, has a round
+    /// due: at once while a request waits for one
+    /// ([`Self::round_requested_at`]), whatever `watch` says (a request
+    /// is the operator asking for a round now) -- one at the reviewed
+    /// head with nothing awaiting judgment (the news it was asked for
+    /// judged by a round that stopped, deleted, or the PR force-pushed
+    /// back to that head) records nothing and answers the request, from
+    /// threads it reads afresh; and, watched, once
+    /// a head other than the reviewed one has stayed put for
+    /// [`HEAD_STABLE_MS`], or, still at the reviewed head, once news in a
+    /// thread that no standing verdict was given over
+    /// ([`Self::awaiting_since`]: a reply, a reopen) has been quiet for
+    /// [`REPLY_QUIET_MS`]. A new head and new replies together are one
+    /// round, the head's, which reads the replies as well. Unwatched, news
+    /// alone makes no round due: a request asks for the round that judges
+    /// it ([`Store::request_pr_review`]). Whatever makes it due, a round
+    /// after a failed one waits for [`Self::retry_at`]: the request a
+    /// failed round leaves waiting, or the head and news it failed on,
+    /// would make the review due again at once.
+    pub fn due_at(&self) -> Option<i64> {
+        let due = self.wanted_at()?;
+        Some(self.retry_at().map_or(due, |retry| due.max(retry)))
+    }
+
+    /// When a request or the PR wants the review's next round
+    /// ([`Self::due_at`], before any backoff).
+    fn wanted_at(&self) -> Option<i64> {
+        if self.state != PrReviewState::Open
+            || self.held
+            || self.repo_moved()
+            || self.fork_changed_hands()
+        {
+            return None;
+        }
+        let head = self.head_sha.as_deref()?;
+        if self.round_requested_at.is_some() {
+            return Some(0);
+        }
+        let reviewed = self.last_reviewed_sha.as_deref() == Some(head);
+        if !self.watch {
+            return None;
+        }
+        if !reviewed {
+            return self.head_seen_at.map(|at| at + HEAD_STABLE_MS);
+        }
+        self.awaiting_since.map(|at| at + REPLY_QUIET_MS)
+    }
+
+    /// When a review whose last rounds failed may run the next: the
+    /// newest failure's end plus [`PR_REVIEW_RETRY_MS`], doubled for each
+    /// failure in a row after the first. `None` while no failure counts:
+    /// a finished round, a request, Retry and turning watch on clear them.
+    pub fn retry_at(&self) -> Option<i64> {
+        let failed_at = self.failed_at.filter(|_| self.failures > 0)?;
+        let doublings = u32::try_from((self.failures - 1).clamp(0, 16)).unwrap_or(0);
+        Some(failed_at.saturating_add(PR_REVIEW_RETRY_MS.saturating_mul(1 << doublings)))
+    }
 }
 
 /// An issue as the reviewer reported it, for [`PrReviewRound::Ok`].
@@ -401,102 +562,19 @@ pub struct Verdict {
     pub issue_id: i64,
     pub verdict: IssueVerdict,
     pub note: String,
+    /// The reply the issue's thread ended in as the round was shown it,
+    /// somebody's other than hunter's (epoch ms): the verdict is posted
+    /// there as hunter's answer to it, even when it changes nothing.
+    pub answers_reply_at: Option<i64>,
     /// The issue's `reopened_at` as the round read it
     /// ([`EarlierIssue::reopened_at`]): the verdict counts only while no
     /// later reopen is recorded.
     pub seen_reopened_at: Option<i64>,
-}
-
-impl PrReviewRow {
-    /// Whether the repo's URL no longer names the repository the review
-    /// was requested under: the request decided whether the PR's author
-    /// can push (or a user vouched for them) against that URL, and its PR
-    /// number named a PR there. At another URL the number may name another
-    /// PR, by an author nobody decided about, so a moved review does
-    /// nothing -- no round, no read of the PR, no post -- until a request
-    /// binds it to the new URL, deciding afresh. An edit of the URL's form
-    /// alone ([`crate::forge::same_repo`]) moves nothing.
-    pub fn repo_moved(&self) -> bool {
-        !self.bound_to(&self.repo_url)
-    }
-
-    /// Whether the review was requested under `url`, the repo's URL as a
-    /// caller read it, or another form of it ([`Self::repo_moved`]).
-    pub fn bound_to(&self, url: &str) -> bool {
-        crate::forge::same_repo(&self.bound_url, url)
-    }
-
-    /// Whether the review's request decided about running code from a
-    /// head in `fork_owner`'s fork (`None`: a head in the repo itself), as
-    /// a read of the PR reports it ([`crate::forge::PrMeta::fork_owner`]):
-    /// a round runs the code of the repository the head lives in, so it
-    /// runs only what somebody decided about. A head in the repo itself was
-    /// pushed by somebody who can push; a fork's owner, and whoever they
-    /// let push to it, was decided about by the request -- they can push,
-    /// are the author, or a user vouched for them. Logins compare as the
-    /// forges do, ignoring case.
-    pub fn decided_about(&self, fork_owner: Option<&str>) -> bool {
-        match (self.decided_head_owner.as_deref(), fork_owner) {
-            (None, None) => true,
-            (Some(decided), Some(owner)) => decided.eq_ignore_ascii_case(owner),
-            _ => false,
-        }
-    }
-
-    /// Whether the fork the head lives in changed hands since the request
-    /// decided about its owner, as the newest read reported it
-    /// ([`Self::decided_about`]): such a review does nothing -- no round
-    /// runs the new owner's code -- until a request decides about them.
-    pub fn fork_changed_hands(&self) -> bool {
-        !self.decided_about(self.head_owner.as_deref())
-    }
-
-    /// When the review's next round is due (epoch ms), the one definition
-    /// both the pick ([`Store::list_due_pr_reviews`]) and the job lane's
-    /// sleep ([`Store::next_pr_review_due_at`]) read; `None` while nothing
-    /// makes one due. Only an open review not held, at the URL it was
-    /// requested under ([`Self::repo_moved`]), whose fork did not change
-    /// hands ([`Self::fork_changed_hands`]), with a known head, has a round
-    /// due: at once while a request waits for one
-    /// ([`Self::round_requested_at`]) and the head is not the reviewed one,
-    /// whatever `watch` says (a request is the operator asking for a round
-    /// now); and, watched, once a head other than the reviewed one has
-    /// stayed put for [`HEAD_STABLE_MS`].
-    pub fn due_at(&self) -> Option<i64> {
-        let due = self.wanted_at()?;
-        Some(self.retry_at().map_or(due, |retry| due.max(retry)))
-    }
-
-    /// When a request or the PR wants the review's next round
-    /// ([`Self::due_at`], before any backoff).
-    fn wanted_at(&self) -> Option<i64> {
-        if self.state != PrReviewState::Open
-            || self.held
-            || self.repo_moved()
-            || self.fork_changed_hands()
-        {
-            return None;
-        }
-        let head = self.head_sha.as_deref()?;
-        let reviewed = self.last_reviewed_sha.as_deref() == Some(head);
-        if self.round_requested_at.is_some() && !reviewed {
-            return Some(0);
-        }
-        if !self.watch || reviewed {
-            return None;
-        }
-        self.head_seen_at.map(|at| at + HEAD_STABLE_MS)
-    }
-
-    /// When a review whose last rounds failed may run the next: the
-    /// newest failure's end plus [`PR_REVIEW_RETRY_MS`], doubled for each
-    /// failure in a row after the first. `None` while no failure counts:
-    /// a finished round, a request, Retry and turning watch on clear them.
-    pub fn retry_at(&self) -> Option<i64> {
-        let failed_at = self.failed_at.filter(|_| self.failures > 0)?;
-        let doublings = u32::try_from((self.failures - 1).clamp(0, 16)).unwrap_or(0);
-        Some(failed_at.saturating_add(PR_REVIEW_RETRY_MS.saturating_mul(1 << doublings)))
-    }
+    /// The newest reply by somebody other than hunter in the thread as the
+    /// round was shown it ([`EarlierIssue::newest_reply_at`], epoch ms): a
+    /// newer one leaves the issue awaiting judgment, and its thread is not
+    /// answered or resolved with this verdict.
+    pub seen_reply_at: Option<i64>,
 }
 
 /// How a round ended, as [`JobStore::record_pr_review_round`] records it.
@@ -520,6 +598,12 @@ pub enum PrReviewRound<'a> {
         issues: &'a [ReportedIssue],
         verdicts: &'a [Verdict],
         why: &'a str,
+        /// Whether it made progress all the same: a round for replies
+        /// alone, which has no range to finish, that judged news awaiting
+        /// judgment (that news no longer awaits). It ends the streak as
+        /// a finished round does; a stopped round that reviews `base..head`
+        /// again next made none, and counts toward the hold.
+        progressed: bool,
     },
     /// No usable review came out of the attempt, for this reason.
     Failed(&'a str),
@@ -542,7 +626,9 @@ pub struct EarlierIssue {
     /// `open`, `addressed`, `rebutted`, or `reopened` (a human reopened the
     /// thread hunter had resolved, and no round judged it since).
     pub status: String,
-    /// The thread's screened replies, as the newest read saw them.
+    /// The thread's screened replies, as the newest read saw them; in the
+    /// prompt without their times, which say nothing the order does not.
+    #[serde(serialize_with = "replies_for_prompt")]
     pub replies: Vec<PrReviewReplyOut>,
     /// The forge's id of the inline comment it was posted as; `None` when
     /// it went into a review's body or was never posted.
@@ -553,9 +639,70 @@ pub struct EarlierIssue {
     /// ([`Verdict::seen_reopened_at`]).
     #[serde(skip)]
     pub reopened_at: Option<i64>,
+    /// The news in its thread no verdict was given over yet (epoch ms;
+    /// migration 038's `awaits_since`): a reopen, or a reply newer than
+    /// any its newest verdict saw.
+    #[serde(skip)]
+    pub awaits_since: Option<i64>,
 }
 
-/// What a round's read found in the thread of posted issue `issue_id`
+/// The newest of `replies` by somebody other than hunter (epoch ms); one
+/// without a readable date counts as none.
+fn newest_reply_at(replies: &[PrReviewReplyOut]) -> Option<i64> {
+    replies
+        .iter()
+        .filter(|r| !r.own && r.at > 0)
+        .map(|r| r.at)
+        .max()
+}
+
+impl EarlierIssue {
+    /// The newest reply in the thread by somebody other than hunter, as
+    /// shown (epoch ms).
+    pub fn newest_reply_at(&self) -> Option<i64> {
+        newest_reply_at(&self.replies)
+    }
+
+    /// The reply the thread ends in, when it is somebody's other than
+    /// hunter's: hunter has not answered the newest word in it (epoch ms).
+    /// The replies are in order of publication ([`ThreadSeen`] as read).
+    pub fn awaited_reply(&self) -> Option<i64> {
+        self.thread_ref.as_ref()?;
+        self.replies.last().filter(|r| !r.own).map(|r| r.at)
+    }
+
+    /// Whether a verdict settled it (`addressed`, `rebutted`).
+    pub fn settled(&self) -> bool {
+        matches!(self.status.as_str(), "addressed" | "rebutted")
+    }
+
+    /// Whether its thread holds news no verdict was given over
+    /// ([`Self::awaits_since`]): what a round with no new commits judges.
+    pub const fn awaits_judgment(&self) -> bool {
+        self.awaits_since.is_some()
+    }
+}
+
+/// `replies` as a prompt shows them: who said what, in order, and which
+/// are hunter's own (a person's login may be `hunter` too).
+fn replies_for_prompt<S: serde::Serializer>(
+    replies: &[PrReviewReplyOut],
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    #[derive(Serialize)]
+    struct Shown<'a> {
+        author: &'a str,
+        own: bool,
+        body: &'a str,
+    }
+    s.collect_seq(replies.iter().map(|r| Shown {
+        author: &r.author,
+        own: r.own,
+        body: &r.body,
+    }))
+}
+
+/// What a read found in the thread of posted issue `issue_id`
 /// ([`JobStore::observe_pr_review_threads`](super::JobStore::observe_pr_review_threads)).
 #[derive(Debug, Clone)]
 pub struct ThreadSeen {
@@ -563,6 +710,31 @@ pub struct ThreadSeen {
     pub resolved: bool,
     pub replies: Vec<PrReviewReplyOut>,
     pub hidden: i64,
+}
+
+impl ThreadSeen {
+    /// The newest reply in the thread by somebody other than hunter
+    /// (epoch ms); one without a readable date counts as none.
+    pub fn newest_reply_at(&self) -> Option<i64> {
+        newest_reply_at(&self.replies)
+    }
+
+    /// The newest reply in the thread that is news to a verdict shown the
+    /// replies up to `seen` (epoch ms): newer than that, unless hunter's
+    /// resolution of the thread stands -- hunter resolved it
+    /// (`resolved_by_hunter`, as recorded) and the forge still shows it
+    /// resolved. A reply under hunter's resolution asks for nothing (one
+    /// that disagrees reopens the thread); any other one is news, whoever
+    /// resolved the thread on the forge: GitLab's "Comment & resolve
+    /// thread" is a rebuttal and a resolution in one action. Migration
+    /// 038's `awaits_since` is the same rule over the stored read.
+    pub fn news_at(&self, seen: Option<i64>, resolved_by_hunter: bool) -> Option<i64> {
+        if self.resolved && resolved_by_hunter {
+            return None;
+        }
+        self.newest_reply_at()
+            .filter(|&at| seen.is_none_or(|seen| at > seen))
+    }
 }
 
 /// What one read of every thread of a PR found of the threads of a
@@ -595,7 +767,12 @@ macro_rules! select_reviews {
                    p.failures AS "failures!: i64", p.last_failure, p.failed_at,
                    p.held AS "held!: bool", p.drafts_left_at,
                    (SELECT j.id FROM jobs j
-                    WHERE j.pr_review_id = p.id AND j.state = 'running') AS "running_job_id: i64"
+                    WHERE j.pr_review_id = p.id AND j.state = 'running') AS "running_job_id?: i64",
+                   (SELECT MAX(s.awaits_since) FROM pr_review_issues i
+                    JOIN pr_review_rounds rr ON rr.id = i.round_id
+                    JOIN pr_review_issue_state s ON s.issue_id = i.id
+                    WHERE rr.review_id = p.id
+                      AND rr.binding = p.binding) AS "awaiting_since?: i64"
             FROM pr_reviews p
             JOIN repos r ON r.id = p.repo_id
             WHERE r.deleted_at IS NULL
@@ -642,6 +819,7 @@ macro_rules! review_row {
             held: r.held,
             drafts_left_at: r.drafts_left_at,
             running_job_id: r.running_job_id,
+            awaiting_since: r.awaiting_since,
         }
     }};
 }
@@ -656,11 +834,20 @@ impl Store {
     /// restarting the stability wait), and the request waits for a round
     /// as a new review's does, watched or not, without the failures and
     /// the hold of the rounds before, unless a round already reviewed that
-    /// head. The request waiting is recorded with its time and the head it
-    /// read ([`PrReviewRow::round_requested_at`]), which tell the rounds
-    /// that answer it ([`Self::record_pr_review_round`]) from one that read
-    /// the PR before it; a request that asks for nothing answers one still
-    /// waiting, the PR being at a reviewed head. A `closed` review follows its PR again: the PR
+    /// head and no news in a thread awaits judgment
+    /// ([`PrReviewRow::awaiting_since`]; an unwatched review's news makes
+    /// no round due by itself, so a request is what asks for the round
+    /// that judges it). That is decided on the threads as they are now:
+    /// what the request read in them (`new.threads`) is recorded first, in
+    /// the same transaction, as a round's or the sync's read is
+    /// ([`observe_threads`]) -- nothing else reads an unwatched review's
+    /// threads after its post, so a reply since would otherwise ask for
+    /// nothing. The request waiting is recorded with its time and
+    /// the head it read ([`PrReviewRow::round_requested_at`]), which tell
+    /// the rounds that answer it ([`Self::record_pr_review_round`]) from
+    /// one that read the PR before it; a request that asks for nothing
+    /// answers one still waiting, the PR being at a reviewed head with
+    /// nothing to judge. A `closed` review follows its PR again: the PR
     /// was reopened, so the review is too, without the failures of its old
     /// life. A review requested under another URL
     /// ([`PrReviewRow::repo_moved`]: another repository, not another form
@@ -779,6 +966,9 @@ impl Store {
         )
         .execute(&mut *tx)
         .await?;
+        if let Some((read, read_at)) = new.threads {
+            observe_threads(&mut tx, read, read_at).await?;
+        }
         let asks_round = record_request(&mut tx, id, now).await?;
         tx.commit().await?;
         Ok(Requested { id, asks_round })
@@ -833,10 +1023,15 @@ impl Store {
     /// tried afresh; it is refused once the PR ended, since only an open
     /// review's rounds are posted, and for a round of an earlier binding
     /// than the review's ([`PrReviewRow::binding`]), which is about another
-    /// PR. Discarding is final, and refused once any part of the round
-    /// reached the PR (`landed_at`, unmarked when the forge refused its
-    /// review outright, [`Self::unmark_pr_review_sent`]): what is on the PR
-    /// stays said, and only posting the rest makes the round whole.
+    /// PR. Discarding is final, and refused once any part of the round may
+    /// have reached the PR (`landed_at`, marked before the call that may
+    /// put it there, so a send that failed after the forge took the review
+    /// counts, and unmarked when the forge refused it outright,
+    /// [`Self::unmark_pr_review_sent`]): what may be on the PR stays said,
+    /// and only posting the rest, which first looks for what an earlier
+    /// post sent, makes the round whole and its issues the threads' to
+    /// answer. Discarding writes nothing else: an issue's status is
+    /// derived from the rounds not discarded (see the module docs).
     pub async fn decide_pr_review_post(
         &self,
         round_id: i64,
@@ -988,10 +1183,11 @@ impl Store {
     ) -> sqlx::Result<Vec<ThreadToSettle>> {
         let rows = sqlx::query!(
             r#"SELECT i.id AS "issue_id!: i64", i.thread_ref AS "thread_ref!",
-                      i.answer,
+                      i.answer, i.answered_through,
                       i.resolved_at IS NOT NULL AS "resolved!: bool",
                       i.answer IS NULL AND i.reopened_at IS NOT NULL AS "reopened!: bool",
-                      v.round_id AS "round_id!: i64", v.verdict, v.note, r.head_sha
+                      v.round_id AS "round_id!: i64", v.verdict, v.note, v.answers_reply_at,
+                      v.seen_reply_at, r.head_sha
                FROM pr_review_issues i
                JOIN pr_review_issue_state s ON s.issue_id = i.id
                JOIN pr_review_verdicts v ON v.round_id = s.target_round_id
@@ -1014,6 +1210,7 @@ impl Store {
                     thread_ref: r.thread_ref,
                     said: Said {
                         answer: r.answer.as_deref().and_then(IssueVerdict::parse),
+                        answered_through: r.answered_through,
                         resolved: r.resolved,
                         reopened: r.reopened,
                     },
@@ -1021,27 +1218,39 @@ impl Store {
                     verdict: IssueVerdict::parse(&r.verdict)?,
                     note: r.note,
                     head_sha: r.head_sha,
+                    answers_reply_at: r.answers_reply_at,
+                    seen_reply_at: r.seen_reply_at,
                 })
             })
             .collect())
     }
 
-    /// Record that hunter's answer giving round `round_id`'s `verdict`
-    /// landed in issue `issue_id`'s thread: hunter's standing answer there,
-    /// and the round landed (whichever round's post said it). The admin
-    /// lane's write
+    /// Record that hunter's answer giving round `round_id`'s `verdict`,
+    /// answering the reply at `answers_reply_at` if any, landed in issue
+    /// `issue_id`'s thread: hunter's standing answer there, and the round
+    /// landed (whichever round's post said it). A resolution hunter set
+    /// out to make before ([`Self::mark_pr_review_resolving`]) and never
+    /// recorded is no longer what it wants the thread to show: a post
+    /// answers before it resolves, so that one was an earlier post's whose
+    /// call failed, and a post that wants it still marks it again. The
+    /// admin lane's write
     /// ([`AdminStore::record_pr_review_answered`](super::AdminStore::record_pr_review_answered)).
     pub(super) async fn record_pr_review_answered(
         &self,
         (issue_id, round_id): (i64, i64),
         verdict: IssueVerdict,
+        answers_reply_at: Option<i64>,
     ) -> sqlx::Result<()> {
         let mut tx = ImmediateTx::begin(&self.pool).await?;
         let word = verdict.as_str();
         sqlx::query!(
-            "UPDATE pr_review_issues SET answer = ?2 WHERE id = ?1",
+            "UPDATE pr_review_issues SET answer = ?2, resolving = NULL, \
+                 answered_through = CASE WHEN ?3 IS NULL THEN answered_through \
+                                         ELSE MAX(COALESCE(answered_through, ?3), ?3) END \
+             WHERE id = ?1",
             issue_id,
-            word
+            word,
+            answers_reply_at
         )
         .execute(&mut *tx)
         .await?;
@@ -1431,7 +1640,13 @@ impl Store {
                    (SELECT COUNT(*) FROM pr_review_verdicts v
                     JOIN pr_review_issues i ON i.id = v.issue_id
                     WHERE v.round_id = r.id AND v.verdict != 'open'
-                      AND i.inline AND i.thread_gone_at IS NULL) AS "resolutions!: i64"
+                      AND i.inline AND i.thread_gone_at IS NULL) AS "resolutions!: i64",
+                   (SELECT COUNT(*) FROM pr_review_verdicts v
+                    JOIN pr_review_issues i ON i.id = v.issue_id
+                    WHERE v.round_id = r.id AND v.verdict = 'open'
+                      AND i.inline AND i.thread_gone_at IS NULL
+                      AND (v.answers_reply_at IS NOT NULL
+                           OR i.answer IN ('addressed', 'rebuttal-accepted'))) AS "answers!: i64"
             FROM pr_review_rounds r
             ORDER BY r.finished_at DESC, r.id DESC
             "#
@@ -1449,8 +1664,12 @@ impl Store {
                    (SELECT NULLIF(v.note, '') FROM pr_review_verdicts v
                     WHERE v.round_id = s.judged_round_id AND v.issue_id = i.id)
                      AS "verdict_note: String",
-                   i.replies_json, i.hidden_replies AS "hidden_replies!: i64"
+                   i.replies_json, i.hidden_replies AS "hidden_replies!: i64",
+                   s.awaits_since IS NOT NULL AND r.binding = p.binding
+                     AS "awaits_judgment!: bool"
             FROM pr_review_issues i JOIN pr_review_issue_state s ON s.issue_id = i.id
+            JOIN pr_review_rounds r ON r.id = i.round_id
+            JOIN pr_reviews p ON p.id = r.review_id
             ORDER BY i.round_id, i.blocking DESC, i.id
             "#
         )
@@ -1479,6 +1698,7 @@ impl Store {
                     verdict_note: i.verdict_note,
                     replies: replies_of(&i.replies_json),
                     hidden_replies: i.hidden_replies,
+                    awaits_judgment: i.awaits_judgment,
                 });
         }
         Ok(rounds
@@ -1499,6 +1719,7 @@ impl Store {
                         posted_at: r.posted_at,
                         landed: r.landed,
                         resolutions: r.resolutions,
+                        answers: r.answers,
                         issues: by_round.remove(&r.id).unwrap_or_default(),
                     },
                 )
@@ -1559,7 +1780,8 @@ impl Store {
             SELECT i.id AS "id!: i64", i.round_id AS "round_id!: i64", i.kind,
                    i.blocking AS "blocking!: bool", i.severity, i.file, i.line, i.side,
                    i.summary, i.detail, i.thread_ref, i.reopened_at,
-                   s.status AS "status!: String", i.replies_json,
+                   s.status AS "status!: String", s.awaits_since AS "awaits_since: i64",
+                   i.replies_json,
                    i.resolved_at IS NULL AS "unresolved!: bool",
                    i.thread_gone_at IS NOT NULL AS "gone!: bool",
                    r.post_state IS NOT NULL AND r.post_state = 'discarded' AS "discarded!: bool"
@@ -1595,6 +1817,7 @@ impl Store {
                 replies: replies_of(&i.replies_json),
                 thread_ref: i.thread_ref.filter(|_| !i.gone),
                 reopened_at: i.reopened_at,
+                awaits_since: i.awaits_since,
             })
             .collect())
     }
@@ -1620,72 +1843,22 @@ impl Store {
         Ok(rows.into_iter().map(|r| (r.id, r.thread_ref)).collect())
     }
 
-    /// Record what a round's read found in the threads of review issues
-    /// (`read`): each one's screened replies, and the issues whose thread
-    /// it found gone. A thread hunter resolved that the read found
-    /// unresolved was reopened by a human: the issue is open again (every
-    /// verdict before it void), and hunter's answer and resolution are
-    /// undone so a later verdict answers the reopen, open or settled
-    /// ([`Said::reopened`]). Only somebody other than hunter reopens: a
-    /// thread found as hunter set out to make it (`resolving`,
-    /// [`Self::mark_pr_review_resolving`]) shows hunter's step, recorded
-    /// here as the post records it, whether the read overlapped the call
-    /// or the call failed after the forge acted. And only a resolution
-    /// recorded before the read began (`read_at`) counts as undone: one that landed
-    /// while the forge was being read is simply not in what it returned.
-    /// Returns how many issues were reopened. The job lane's write
-    /// ([`JobStore::observe_pr_review_threads`](super::JobStore::observe_pr_review_threads)).
+    /// Record what a read -- a round's, or the PR review duty's of a
+    /// watched review -- found in the threads of review issues (`read`),
+    /// as [`observe_threads`] does, in a transaction of its own. Returns
+    /// how many issues were reopened. The job lane's write and the admin
+    /// lane's
+    /// ([`JobStore::observe_pr_review_threads`](super::JobStore::observe_pr_review_threads),
+    /// [`AdminStore::observe_pr_review_threads`](super::AdminStore::observe_pr_review_threads));
+    /// a request records its own read with the request
+    /// ([`Self::request_pr_review`]).
     pub(super) async fn observe_pr_review_threads(
         &self,
         read: &ThreadsRead,
         read_at: i64,
     ) -> sqlx::Result<u64> {
-        let now = now_ms();
-        let mut reopened = 0;
         let mut tx = ImmediateTx::begin(&self.pool).await?;
-        mark_gone(&mut tx, &read.gone).await?;
-        for t in &read.seen {
-            let replies = serde_json::to_string(&t.replies).unwrap_or_else(|_| "[]".to_owned());
-            sqlx::query!(
-                "UPDATE pr_review_issues SET replies_json = ?2, hidden_replies = ?3 WHERE id = ?1",
-                t.issue_id,
-                replies,
-                t.hidden
-            )
-            .execute(&mut *tx)
-            .await?;
-            if !t.resolved {
-                // The human's word voids hunter's standing answer and every
-                // verdict given over the thread as it stood before: each
-                // reopen gets a `reopened_at` past the last one's, so no
-                // verdict's `seen_reopened_at` names it.
-                reopened += sqlx::query!(
-                    "UPDATE pr_review_issues SET answer = NULL, resolved_at = NULL, \
-                         reopened_at = MAX(?2, COALESCE(reopened_at + 1, ?2)) \
-                     WHERE id = ?1 AND resolved_at IS NOT NULL AND resolved_at <= ?3 \
-                       AND resolving IS NOT 0",
-                    t.issue_id,
-                    now,
-                    read_at
-                )
-                .execute(&mut *tx)
-                .await?
-                .rows_affected();
-            }
-            // Hunter's own step, found taken: recorded as
-            // `record_pr_review_thread_resolution` records it.
-            sqlx::query!(
-                "UPDATE pr_review_issues \
-                 SET resolved_at = CASE WHEN ?2 THEN COALESCE(resolved_at, ?3) END, \
-                     resolving = NULL \
-                 WHERE id = ?1 AND resolving = ?2",
-                t.issue_id,
-                t.resolved,
-                now
-            )
-            .execute(&mut *tx)
-            .await?;
-        }
+        let reopened = observe_threads(&mut tx, read, read_at).await?;
         tx.commit().await?;
         Ok(reopened)
     }
@@ -1697,7 +1870,8 @@ impl Store {
     /// [`PrReviewRow::fork_changed_hands`]), title and state. Only an open
     /// review is touched, the only kind the sync and a round read: a
     /// `closed` one follows its PR again once a request finds it reopened
-    /// ([`Self::request_pr_review`]), and `merged` and `own` are final. A
+    /// ([`Self::request_pr_review`]), and `merged` and `own` are final for
+    /// the review's binding (a request at the repo's new URL rebinds it). A
     /// read made under another binding than the review's now (`binding`,
     /// as the reader read the review) was of another PR, and changes
     /// nothing. A head read is no request: what a request waits for stays
@@ -1757,19 +1931,26 @@ impl Store {
     /// was about the PR at the earlier one, and is kept as history only: it
     /// moves nothing of the review below. A finished round (`Ok`)
     /// moves `last_reviewed_sha` to `head`, answers the request waiting
-    /// ([`PrReviewRow::round_requested_at`]) when it is for `head` -- one
-    /// the round took as it read the PR ([`Self::take_pr_review_request`]),
-    /// or one made since that read the head the round reviewed -- and ends
-    /// the streak: only a reviewer that finished reviewed `base..head`. A
-    /// request made while the round ran, for a newer head, waits for that
-    /// head's round; a head the PR sync read while the round ran is no
-    /// request, and makes nothing wait. A `Partial` one keeps
-    /// what it wrote, as a finished one does, but counts toward the hold
+    /// ([`PrReviewRow::round_requested_at`]) when it was made before the
+    /// round began reading the PR (`read_at`) and is for `head` -- the one
+    /// the round took as it read the PR ([`Self::take_pr_review_request`])
+    /// -- and ends the streak: only a reviewer that finished reviewed
+    /// `base..head`. A request made since that read waits, whatever head it
+    /// read: it read the PR, and maybe threads with news, the round did not
+    /// (one at the reviewed head with nothing to judge is answered by the
+    /// next round, without a reviewer); a head the PR review duty read
+    /// while the round ran is no request, and makes nothing wait. A
+    /// `Partial` one keeps what it wrote, as a finished one does, but
+    /// counts toward the hold
     /// as a failure does and leaves `last_reviewed_sha` where it was, so
     /// the next round reviews the same commits again; a reviewer whose
-    /// budget never lets it finish them is held rather than run forever. A
-    /// failure counts one and holds the review at [`PR_REVIEW_HOLD_AT`],
-    /// and records no verdict. A verdict naming an issue of another review
+    /// budget never lets it finish them is held rather than run forever.
+    /// One that progressed all the same (a round for replies alone that
+    /// judged news) ends the streak instead, answering no request: what
+    /// news it left unjudged still awaits a round. A failure counts one,
+    /// from when it ended ([`PrReviewRow::retry_at`]: the next round waits
+    /// out a backoff), holds the review at [`PR_REVIEW_HOLD_AT`], and
+    /// records no verdict. A verdict naming an issue of another review
     /// or binding is dropped; the rest are the issues' newest judgement
     /// from now on (see the module docs). A kept round with something to
     /// post -- issues, or a verdict that would change what an issue's
@@ -1842,6 +2023,19 @@ impl Store {
                 .await?;
                 0
             }
+            PrReviewRound::Partial {
+                progressed: true, ..
+            } => {
+                sqlx::query!(
+                    "UPDATE pr_reviews SET failures = 0, last_failure = NULL \
+                     WHERE id = ?1 AND binding = ?2",
+                    id,
+                    binding
+                )
+                .execute(&mut *tx)
+                .await?;
+                0
+            }
             PrReviewRound::Partial { why, .. } | PrReviewRound::Failed(why) => sqlx::query_scalar!(
                 r#"UPDATE pr_reviews SET failures = failures + 1, last_failure = ?2,
                            failed_at = ?5, held = (failures + 1 >= ?3)
@@ -1890,18 +2084,56 @@ impl Store {
         .await?;
         Ok(())
     }
+
+    /// End the request the round of review `id` (under `binding`) that
+    /// began reading the PR at `read_at` and found `head` took
+    /// ([`Self::take_pr_review_request`]), when the round records nothing:
+    /// at the reviewed head it read the threads and found nothing awaiting
+    /// judgment, so the request is answered as one that asks for nothing
+    /// is (`record_request`), the PR being at a reviewed head with nothing
+    /// to judge. A taken request left waiting would bring a round nobody
+    /// asked for at the next push -- on an unwatched review, a round at
+    /// all -- and spare a watched one's new head its stability wait. A
+    /// request made since the read began keeps waiting: it read the PR,
+    /// and maybe threads, the round did not. The job lane's write
+    /// ([`JobStore::answer_pr_review_request`](super::JobStore::answer_pr_review_request)).
+    pub(super) async fn answer_pr_review_request(
+        &self,
+        (id, binding): (i64, i64),
+        head: &str,
+        read_at: i64,
+    ) -> sqlx::Result<()> {
+        sqlx::query!(
+            "UPDATE pr_reviews SET round_requested_at = NULL, requested_head_sha = NULL \
+             WHERE id = ?1 AND binding = ?2 AND round_requested_at < ?4 \
+               AND requested_head_sha IS ?3",
+            id,
+            binding,
+            head,
+            read_at
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 /// Record what the request made at `now` of open review `id`, as it now
 /// stands, waits for ([`Store::request_pr_review`]): a round, unless one
-/// reviewed its head. A request asking for one waits with the head it
-/// read, without the failures and the hold of the rounds before; one
-/// asking for none answers any request still waiting. A review that is not
-/// open (merged or own at its URL) is over, and its request asks for
-/// nothing. Returns whether it asks for a round.
+/// reviewed its head and no news in a thread of its binding awaits
+/// judgment. A request asking for one waits with the head it read, without
+/// the failures and the hold of the rounds before; one asking for none
+/// answers any request still waiting. A review that is not open (merged
+/// or own at its URL) is over, and its request asks for nothing. Returns
+/// whether it asks for a round.
 async fn record_request(tx: &mut sqlx::SqliteConnection, id: i64, now: i64) -> sqlx::Result<bool> {
     let asks = sqlx::query_scalar!(
-        r#"SELECT (p.head_sha IS NULL OR p.head_sha IS NOT p.last_reviewed_sha) AS "asks!: bool"
+        r#"SELECT (p.head_sha IS NULL OR p.head_sha IS NOT p.last_reviewed_sha
+                   OR EXISTS (SELECT 1 FROM pr_review_issues i
+                              JOIN pr_review_rounds rr ON rr.id = i.round_id
+                              JOIN pr_review_issue_state s ON s.issue_id = i.id
+                              WHERE rr.review_id = p.id AND rr.binding = p.binding
+                                AND s.awaits_since IS NOT NULL)) AS "asks!: bool"
            FROM pr_reviews p WHERE p.id = ?1 AND p.state = 'open'"#,
         id
     )
@@ -1923,6 +2155,82 @@ async fn record_request(tx: &mut sqlx::SqliteConnection, id: i64, now: i64) -> s
     .execute(&mut *tx)
     .await?;
     Ok(asks)
+}
+
+/// Record in `tx` what a read that began at `read_at` found in the threads
+/// of review issues (`read`): each one's screened replies, with the newest
+/// trusted one by somebody other than hunter (`newest_reply_at`: news
+/// unless hunter's resolution of the thread stands,
+/// [`ThreadSeen::news_at`]), and the issues whose thread it found gone. A
+/// thread hunter resolved that the read found unresolved was reopened by a
+/// human: the issue is open again (every verdict before it void), and
+/// hunter's answer and resolution are undone so a later verdict answers
+/// the reopen, open or settled ([`Said::reopened`]). Only somebody other
+/// than hunter reopens: hunter marks a resolution it sets out to make
+/// before its forge call (`resolving`,
+/// [`Store::mark_pr_review_resolving`]), and a thread found as hunter set
+/// out to make it -- unresolved while hunter is unresolving it, resolved
+/// while it is resolving it -- shows hunter's step, recorded here as the
+/// post records it, whether the read overlapped the call or the call
+/// failed after the forge acted. And only a resolution recorded before
+/// the read began counts as undone: one that landed while the forge was
+/// being read is simply not in what it returned. Returns how many issues
+/// were reopened.
+async fn observe_threads(
+    tx: &mut sqlx::SqliteConnection,
+    read: &ThreadsRead,
+    read_at: i64,
+) -> sqlx::Result<u64> {
+    let now = now_ms();
+    let mut reopened = 0;
+    mark_gone(&mut *tx, &read.gone).await?;
+    for t in &read.seen {
+        let replies = serde_json::to_string(&t.replies).unwrap_or_else(|_| "[]".to_owned());
+        let newest_reply_at = t.newest_reply_at();
+        sqlx::query!(
+            "UPDATE pr_review_issues SET replies_json = ?2, hidden_replies = ?3, \
+                 newest_reply_at = ?4 \
+             WHERE id = ?1",
+            t.issue_id,
+            replies,
+            t.hidden,
+            newest_reply_at
+        )
+        .execute(&mut *tx)
+        .await?;
+        if !t.resolved {
+            // The human's word voids hunter's standing answer and every
+            // verdict given over the thread as it stood before: each
+            // reopen gets a `reopened_at` past the last one's, so no
+            // verdict's `seen_reopened_at` names it.
+            reopened += sqlx::query!(
+                "UPDATE pr_review_issues SET answer = NULL, resolved_at = NULL, \
+                     reopened_at = MAX(?2, COALESCE(reopened_at + 1, ?2)) \
+                 WHERE id = ?1 AND resolved_at IS NOT NULL AND resolved_at <= ?3 \
+                   AND resolving IS NOT 0",
+                t.issue_id,
+                now,
+                read_at
+            )
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        }
+        // Hunter's own step, found taken: recorded as
+        // `record_pr_review_thread_resolution` records it.
+        sqlx::query!(
+            "UPDATE pr_review_issues \
+             SET resolved_at = CASE WHEN ?2 THEN COALESCE(resolved_at, ?3) END, \
+                 resolving = NULL \
+             WHERE id = ?1 AND resolving = ?2",
+            t.issue_id,
+            t.resolved,
+            now
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+    Ok(reopened)
 }
 
 /// Record what kept round `round_id` of review `review_id` wrote: its
@@ -2016,20 +2324,6 @@ async fn mark_gone(tx: &mut sqlx::SqliteConnection, gone: &[i64]) -> sqlx::Resul
     Ok(())
 }
 
-/// Mark round `round_id` landed: part of it is on the PR, so it can no
-/// longer be discarded.
-async fn mark_landed(tx: &mut sqlx::SqliteConnection, round_id: i64) -> sqlx::Result<()> {
-    let now = now_ms();
-    sqlx::query!(
-        "UPDATE pr_review_rounds SET landed_at = COALESCE(landed_at, ?2) WHERE id = ?1",
-        round_id,
-        now
-    )
-    .execute(&mut *tx)
-    .await?;
-    Ok(())
-}
-
 /// Record round `round_id`'s `verdicts` on earlier issues of review
 /// `review_id`. A verdict on an issue of another review or another
 /// binding, or of this very round, is dropped: the reviewer was never
@@ -2042,8 +2336,10 @@ async fn record_verdicts(
     for v in verdicts {
         let word = v.verdict.as_str();
         sqlx::query!(
-            "INSERT INTO pr_review_verdicts (round_id, issue_id, verdict, note, seen_reopened_at) \
-             SELECT ?1, i.id, ?3, ?4, ?6 FROM pr_review_issues i \
+            "INSERT INTO pr_review_verdicts \
+                 (round_id, issue_id, verdict, note, answers_reply_at, seen_reopened_at, \
+                  seen_reply_at) \
+             SELECT ?1, i.id, ?3, ?4, ?6, ?7, ?8 FROM pr_review_issues i \
              JOIN pr_review_rounds r ON r.id = i.round_id \
              WHERE i.id = ?2 AND r.review_id = ?5 AND r.id != ?1 \
                AND r.binding = (SELECT binding FROM pr_review_rounds WHERE id = ?1) \
@@ -2053,7 +2349,9 @@ async fn record_verdicts(
             word,
             v.note,
             review_id,
-            v.seen_reopened_at
+            v.answers_reply_at,
+            v.seen_reopened_at,
+            v.seen_reply_at
         )
         .execute(&mut *tx)
         .await?;
@@ -2071,7 +2369,7 @@ async fn verdicts_say_something(
     round_id: i64,
 ) -> sqlx::Result<bool> {
     let rows = sqlx::query!(
-        r#"SELECT v.verdict, i.answer,
+        r#"SELECT v.verdict, v.answers_reply_at, i.answer, i.answered_through,
                   i.resolved_at IS NOT NULL AS "resolved!: bool",
                   i.answer IS NULL AND i.reopened_at IS NOT NULL AS "reopened!: bool"
            FROM pr_review_verdicts v
@@ -2087,11 +2385,28 @@ async fn verdicts_say_something(
     Ok(rows.into_iter().any(|r| {
         let said = Said {
             answer: r.answer.as_deref().and_then(IssueVerdict::parse),
+            answered_through: r.answered_through,
             resolved: r.resolved,
             reopened: r.reopened,
         };
-        IssueVerdict::parse(&r.verdict).is_some_and(|v| !said.steps(v).is_empty())
+        IssueVerdict::parse(&r.verdict)
+            .is_some_and(|v| !said.steps(v, r.answers_reply_at).is_empty())
     }))
+}
+
+/// Mark round `round_id` landed: part of it is on the PR, or may be, a
+/// call that may put it there having been made, so it is released for
+/// good and can no longer be discarded.
+async fn mark_landed(tx: &mut sqlx::SqliteConnection, round_id: i64) -> sqlx::Result<()> {
+    let now = now_ms();
+    sqlx::query!(
+        "UPDATE pr_review_rounds SET landed_at = COALESCE(landed_at, ?2) WHERE id = ?1",
+        round_id,
+        now
+    )
+    .execute(&mut *tx)
+    .await?;
+    Ok(())
 }
 
 /// A `replies_json` column as the replies it holds; a value this code did
@@ -2115,31 +2430,43 @@ mod tests {
     fn a_settled_issue_is_answered_and_resolved_once() {
         let fresh = Said::default();
         assert_eq!(
-            fresh.steps(ADDRESSED),
+            fresh.steps(ADDRESSED, None),
             steps(Some(Reply::Settled), Some(true))
         );
         let answered = Said {
             answer: Some(ADDRESSED),
             ..Said::default()
         };
-        assert_eq!(answered.steps(ADDRESSED), steps(None, Some(true)));
+        assert_eq!(answered.steps(ADDRESSED, None), steps(None, Some(true)));
         let done = Said {
             resolved: true,
             ..answered
         };
-        assert!(done.steps(ADDRESSED).is_empty());
+        assert!(done.steps(ADDRESSED, None).is_empty());
         // Rebutted after it was addressed: a new answer, resolved already.
         assert_eq!(
-            done.steps(IssueVerdict::RebuttalAccepted),
+            done.steps(IssueVerdict::RebuttalAccepted, None),
             steps(Some(Reply::Settled), None)
         );
     }
 
     #[test]
-    fn an_open_issue_is_answered_only_where_hunter_settled_it() {
-        assert!(
-            Said::default().steps(OPEN).is_empty(),
-            "the comment says it"
+    fn an_open_issue_is_answered_only_over_a_new_reply_or_a_settled_answer() {
+        let fresh = Said::default();
+        assert!(fresh.steps(OPEN, None).is_empty(), "the comment says it");
+        assert_eq!(
+            fresh.steps(OPEN, Some(5)),
+            steps(Some(Reply::StillOpen), None)
+        );
+        let answered = Said {
+            answer: Some(OPEN),
+            answered_through: Some(5),
+            ..Said::default()
+        };
+        assert!(answered.steps(OPEN, Some(5)).is_empty(), "answered once");
+        assert_eq!(
+            answered.steps(OPEN, Some(6)),
+            steps(Some(Reply::StillOpen), None)
         );
         let settled = Said {
             answer: Some(ADDRESSED),
@@ -2147,7 +2474,7 @@ mod tests {
             ..Said::default()
         };
         assert_eq!(
-            settled.steps(OPEN),
+            settled.steps(OPEN, None),
             steps(Some(Reply::OpenAgain), Some(false))
         );
     }
@@ -2161,10 +2488,18 @@ mod tests {
             reopened: true,
             ..Said::default()
         };
-        assert_eq!(reopened.steps(OPEN), steps(Some(Reply::OpenAgain), None));
         assert_eq!(
-            reopened.steps(ADDRESSED),
+            reopened.steps(OPEN, None),
+            steps(Some(Reply::OpenAgain), None)
+        );
+        assert_eq!(
+            reopened.steps(ADDRESSED, None),
             steps(Some(Reply::Settled), Some(true))
+        );
+        assert_eq!(
+            reopened.steps(OPEN, Some(5)),
+            steps(Some(Reply::OpenAgain), None),
+            "a reply under the reopen too"
         );
     }
 }

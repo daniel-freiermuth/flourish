@@ -37,7 +37,7 @@ use crate::domain::{
 use crate::forge;
 use crate::store::{
     AdminStore, FindingFilter, HoldRelease, NewPrReview, PostDecided, PostDecision, PrReviewRow,
-    RepoUpdate, Store, StoreWriteError, Trust,
+    RepoUpdate, Store, StoreWriteError, ThreadsRead, Trust,
 };
 use crate::transition::{Moved, OperatorVerdict, Transition, VerdictRefused};
 use crate::types::{
@@ -2138,6 +2138,7 @@ async fn pr_reviews(State(state): State<AppState>) -> Result<Json<Vec<PrReviewOu
             due_at: r.due_at(),
             repo_moved: r.repo_moved(),
             fork_changed_hands: r.fork_changed_hands(),
+            awaiting_since: r.awaiting_since,
             id: r.id,
             repo_id: r.repo_id,
             repo_name: r.repo_name,
@@ -2226,10 +2227,14 @@ async fn forge_call<T: Send + 'static>(
 /// PR's metadata does not carry). Without the vouch the answer is a 409
 /// carrying `needs_vouch` and whom it is for, so the UI can ask. A PR
 /// already under review is read again too: its `watch` and `auto_post`
-/// are set, and a round is asked for unless one already reviewed its
-/// head; one whose review ended with the PR's close is read again and,
-/// reopened on the forge, reviewed again (its review follows the PR; a
-/// merged PR's has ended for good). It keeps
+/// are set, and a round is asked for unless one already reviewed its head
+/// and no news in a thread awaits judgment -- the threads of its posted
+/// issues read now, in one forge call, as the PR is: a reply since its
+/// last read (an unwatched review's are read by nothing else) asks for
+/// the round that judges it, and a failed read fails the request, as a
+/// failed read of the PR does; one whose review ended with
+/// the PR's close is read again and, reopened on the forge, reviewed again
+/// (its review follows the PR; a merged PR's has ended for good). It keeps
 /// what its request decided about its author and fork owner, unless its
 /// fork changed hands since ([`PrReviewRow::fork_changed_hands`]): then
 /// both are decided afresh. A review requested before the repo's URL
@@ -2242,7 +2247,7 @@ async fn forge_call<T: Send + 'static>(
 /// round with issues without waiting for approval. The answer's `outcome`
 /// says which: `requested` (a new review, or a round asked of one that
 /// follows the open PR), `updated` (only the toggles: a round already
-/// reviewed the head), `reopened` or `rebound`.
+/// reviewed the head, with nothing to judge), `reopened` or `rebound`.
 async fn request_pr_review(
     State(state): State<AppState>,
     Extension(user): Extension<CurrentUser>,
@@ -2325,6 +2330,9 @@ async fn request_pr_review(
                 .filter(|owner| !owner_pushes && !owner.eq_ignore_ascii_case(&pr.author)),
         })
     };
+    // A review bound to another URL has its threads on the PR there, and
+    // starts afresh here.
+    let threads = request_threads(&state, existing.as_ref().filter(|_| !moved), &pr.author).await?;
     let requested = state
         .store
         .request_pr_review(&NewPrReview {
@@ -2341,6 +2349,7 @@ async fn request_pr_review(
             head_owner: fork_owner,
             trust,
             requested_by: &user.username,
+            threads: threads.as_ref().map(|(read, at)| (read, *at)),
         })
         .await?;
     let outcome = match &existing {
@@ -2357,6 +2366,39 @@ async fn request_pr_review(
         .await?;
     state.scheduler.wake.notify_one();
     Ok(Json(json!({ "ok": true, "id": requested.id, "outcome": outcome })).into_response())
+}
+
+/// What a request of existing review `review` (`None` for a new one) read
+/// in the threads of its posted issues, screened with `pr_author` trusted,
+/// and when the read began ([`crate::scheduler::read_posted_threads`]):
+/// whether a round at a reviewed head is asked for depends on news there,
+/// and nothing else reads an unwatched review's threads after its post, so
+/// the request reads them, as it read the PR, and records what it found
+/// with the request ([`Store::request_pr_review`]). `None` for a review
+/// without a posted issue, which has no thread to read. A failed read
+/// fails the request, as a failed read of the PR does.
+async fn request_threads(
+    state: &AppState,
+    review: Option<&PrReviewRow>,
+    pr_author: &str,
+) -> Result<Option<(ThreadsRead, i64)>, ApiError> {
+    let Some(review) = review else {
+        return Ok(None);
+    };
+    let posted = state.store.posted_pr_review_issues(review.id).await?;
+    if posted.is_empty() {
+        return Ok(None);
+    }
+    let read_at = crate::util::now_ms();
+    let read = crate::scheduler::read_posted_threads(&state.config, review, pr_author, &posted)
+        .await
+        .map_err(|e| {
+            ApiError::BadRequest(format!(
+                "cannot read PR #{}'s review threads: {e:#}",
+                review.pr_number
+            ))
+        })?;
+    Ok(Some((read, read_at)))
 }
 
 /// How a message names a fork's owner the forge does not name.
@@ -2549,7 +2591,7 @@ async fn approve_pr_review_post(
 }
 
 /// POST /api/pr-review/discard {`round_id`}: never post a pending round.
-/// 409 unless the round is pending.
+/// 409 unless the round is pending, or once part of it is on the PR.
 async fn discard_pr_review_post(
     State(state): State<AppState>,
     Extension(user): Extension<CurrentUser>,

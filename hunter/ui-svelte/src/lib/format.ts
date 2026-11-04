@@ -178,10 +178,21 @@ export interface RoundWait {
  * (`due_at`, the rule its scheduler picks by), never worked out here: an
  * unwatched review a request asked a round of is due, one whose repo
  * moved or whose fork changed hands never is. A round due later waits for
- * the head to stay unchanged.
+ * the head to stay unchanged. At the reviewed head only news in the
+ * review's threads makes a round due: the issues it judges again, once
+ * the newest news has been quiet a while, or at once when a request asked.
  */
 export function roundWait(review: PrReviewOut, now: number): RoundWait | null {
   if (review.due_at === null || review.running_job_id !== null) return null;
+  if (review.head_sha === review.last_reviewed_sha) {
+    const n = issuesAwaitingJudgment(review);
+    return {
+      label: `${n === 1 ? "1 issue" : `${n} issues`} to judge again \u2014 review queued`,
+      title: review.due_at <= now
+        ? "Replies or reopened threads that no round has judged: waiting for the scheduler"
+        : "Replies or reopened threads that no round has judged: a round judges them once the newest has been quiet for two minutes",
+    };
+  }
   return {
     label: "pending",
     title: review.due_at <= now
@@ -222,15 +233,33 @@ export function reviewIssueStatusLabel(s: string): string {
 }
 
 /**
- * What posting a review round sends: its issues, and the replies that
- * resolve earlier issues' threads. A round that only resolves says so
- * rather than reading as "0 issues", which would suggest nothing posts.
+ * What posting a review round sends: its issues, the replies that resolve
+ * earlier issues' threads, and the answers to replies in the threads of
+ * issues it found still open. A round without new issues names only what
+ * it does post rather than reading as "0 issues", which would suggest
+ * nothing posts.
  */
-export function roundPostTally(issues: number, resolutions: number): string {
-  const issueText = `${issues} ${issues === 1 ? "issue" : "issues"}`;
-  if (resolutions === 0) return issueText;
-  const resText = `${resolutions} ${resolutions === 1 ? "resolution" : "resolutions"}`;
-  return issues === 0 ? resText : `${issueText}, ${resText}`;
+export function roundPostTally(issues: number, resolutions: number, answers: number): string {
+  const parts: string[] = [];
+  if (issues > 0 || (resolutions === 0 && answers === 0)) {
+    parts.push(`${issues} ${issues === 1 ? "issue" : "issues"}`);
+  }
+  if (resolutions > 0) parts.push(`${resolutions} ${resolutions === 1 ? "resolution" : "resolutions"}`);
+  if (answers > 0) parts.push(`${answers} ${answers === 1 ? "answer" : "answers"}`);
+  return parts.join(", ");
+}
+
+/**
+ * How many issues of a review await judgment: their thread holds a reply
+ * newer than any their newest verdict was shown, or a human reopened it
+ * since. What makes a watched review due without new commits.
+ */
+export function issuesAwaitingJudgment(review: PrReviewOut): number {
+  let n = 0;
+  for (const round of review.rounds) {
+    n += round.issues.filter((i) => i.awaits_judgment).length;
+  }
+  return n;
 }
 
 /**

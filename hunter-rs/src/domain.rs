@@ -743,9 +743,12 @@ impl std::str::FromStr for PrJobKind {
 }
 
 /// `pr_reviews.state` (migration 035): a requested review follows its PR
-/// while it is open. `merged` is final; `closed` lasts until a request
-/// finds the PR reopened; `own` ends a review whose PR turned out to be
-/// one hunter opened, which only its own tiers work on.
+/// while it is open. `merged` is final for the review's current binding;
+/// `closed` lasts until a request finds the PR reopened; `own` ends a
+/// review whose PR turned out to be one hunter opened, which only its own
+/// tiers work on, final for the binding too. A request that binds the
+/// review to the repo's new URL opens it again: its number names another
+/// PR there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type, TS)]
 #[serde(rename_all = "snake_case")]
 #[sqlx(rename_all = "snake_case")]
