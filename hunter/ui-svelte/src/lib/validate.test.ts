@@ -356,11 +356,11 @@ describe("isSummary repo work", () => {
 });
 
 // ReviewsPage renders `{#each reviews as review (review.id)}`, per review
-// `{#each rounds as round (round.id)}`, and per round slices both shas
-// and iterates `issues`.
+// `{#each rounds as round (round.id)}`, and per round slices both shas,
+// iterates `issues` and picks its posting controls by `post_state`.
 describe("isPrReviewList", () => {
   const round = (extra: Record<string, unknown> = {}) => ({
-    id: 1, base_sha: "a".repeat(40), head_sha: "b".repeat(40), issues: [], ...extra,
+    id: 1, base_sha: "a".repeat(40), head_sha: "b".repeat(40), post_state: null, issues: [], ...extra,
   });
   const review = (id: unknown, rounds: unknown, due_at: unknown = null) => ({ id, rounds, due_at });
 
@@ -368,7 +368,7 @@ describe("isPrReviewList", () => {
     expect(isPrReviewList([])).toBe(true);
     expect(isPrReviewList([review(1, []), review(2, [round()])])).toBe(true);
     expect(
-      isPrReviewList([review(1, [round({ id: 2, issues: [{ summary: "x" }] }), round()])]),
+      isPrReviewList([review(1, [round({ id: 2, issues: [{ summary: "x" }], post_state: "pending" }), round()])]),
     ).toBe(true);
   });
 
@@ -395,6 +395,11 @@ describe("isPrReviewList", () => {
     expect(isPrReviewList([review(1, [round({ head_sha: undefined })])])).toBe(false);
     expect(isPrReviewList([review(1, [round({ issues: null })])])).toBe(false);
     expect(isPrReviewList([review(1, [round({ issues: ["nope"] })])])).toBe(false);
+  });
+
+  it("rejects a round whose post state is missing or not a word", () => {
+    expect(isPrReviewList([review(1, [round({ post_state: undefined })])])).toBe(false);
+    expect(isPrReviewList([review(1, [round({ post_state: 1 })])])).toBe(false);
   });
 });
 

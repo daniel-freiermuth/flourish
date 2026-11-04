@@ -14,7 +14,7 @@
 //!   reviews, reaping deleted repos, fetch-ahead, the Renovate dependency
 //!   scans, the workspace sweep. Each is its own task on its own timer
 //!   ([`spawn_admin_lane`]), so a slow one -- a Renovate scan, the fetch
-//!   of a large repo, many open PR reviews -- delays none of the
+//!   of a large repo, a backlog of review posts -- delays none of the
 //!   others, and PR sync above all records a merge within its interval
 //!   whatever else the lane is doing.
 //!   Each run is its own task too ([`supervise_duty`]): a run that panics
@@ -181,7 +181,7 @@ async fn sweep_workspaces(admin: &AdminAuthority, work_root: &Path) {
 pub enum DutyRun {
     /// The PR sync's counts; `None` when another sync pass was live.
     Synced(Option<SyncResult>),
-    /// The PR reviews' refresh: whether it brought a
+    /// The PR reviews' refresh and posts: whether the refresh brought a
     /// review's next round forward ([`refresh_pr_reviews`]).
     Reviewed {
         due_sooner: bool,
@@ -227,7 +227,7 @@ pub async fn admin_duty(
     match task {
         AdminTask::PrSync => DutyRun::Synced(sync_open_prs(admin, cfg, shutdown).await),
         AdminTask::PrReviews => DutyRun::Reviewed {
-            due_sooner: refresh_pr_reviews(admin, shutdown).await,
+            due_sooner: refresh_pr_reviews(admin, cfg, shutdown).await,
         },
         AdminTask::Reap => DutyRun::Reaped(
             crate::server::reap_deleted_repos(admin, &cfg.work_root, notes_lock).await,
@@ -273,7 +273,9 @@ async fn sync_open_prs(
 }
 
 /// The PR review duty: the refresh of every open PR review
-/// ([`crate::scheduler::sync_pr_reviews`]). Returns whether the refresh
+/// ([`crate::scheduler::sync_pr_reviews`]), then the posting of every
+/// approved review round ([`crate::scheduler::post_pr_reviews`]), which
+/// reads the heads the refresh just recorded. Returns whether the refresh
 /// brought a review's round forward (a new head): work for
 /// the job lane, which planned its sleep without it. Its failures are
 /// already events of their own, one per PR (`pr_review <repo> #<n>: ...`).
@@ -281,16 +283,24 @@ async fn sync_open_prs(
 /// Its own duty, never part of the PR sync: a sync pass is what held
 /// engages wait for ([`EngageWaits`]), and the job lane is woken for a
 /// PR's end once the sync's run returns ([`supervise_duty`]). Neither may
-/// wait for review traffic, a forge read per open review, which grows
-/// with the reviews open.
-async fn refresh_pr_reviews(admin: &AdminAuthority, shutdown: &watch::Receiver<bool>) -> bool {
+/// wait for review traffic, a forge read per open review and every
+/// approved round's sends, reads, replies and resolves, which grows with
+/// the reviews open.
+async fn refresh_pr_reviews(
+    admin: &AdminAuthority,
+    cfg: &Config,
+    shutdown: &watch::Receiver<bool>,
+) -> bool {
+    let stopping = || *shutdown.borrow();
     let before = review_due_times(admin.store()).await;
-    crate::scheduler::sync_pr_reviews(admin.store(), || *shutdown.borrow()).await;
+    crate::scheduler::sync_pr_reviews(admin.store(), stopping).await;
     let after = review_due_times(admin.store()).await;
-    after.iter().any(|&(id, due)| {
+    let due_sooner = after.iter().any(|&(id, due)| {
         let was = before.iter().find(|&&(b, _)| b == id).and_then(|&(_, d)| d);
         due.is_some_and(|due| was.is_none_or(|was| due < was))
-    })
+    });
+    crate::scheduler::post_pr_reviews(admin.store(), cfg, stopping).await;
+    due_sooner
 }
 
 /// Each open PR review's id and when its next round is due
@@ -459,7 +469,7 @@ pub struct AdminLane {
     /// trigger.
     pub pr_sync_wake: Arc<Notify>,
     /// The PR review duty's wake (`SchedulerHandle::pr_review_wake`): a
-    /// trigger.
+    /// round approved for posting, or a trigger.
     pub pr_review_wake: Arc<Notify>,
     /// The reaper duty's wake (`SchedulerHandle::reap_wake`): a repo was
     /// deleted.
@@ -476,15 +486,15 @@ pub struct AdminLane {
 /// is, the reaper whenever `reap_wake` is. Pausing
 /// the scheduler does not stop them: a
 /// pause stops new jobs, which spend tokens, while these spend none, and a
-/// paused daemon still records merges, closes and review comments and
-/// sweeps finished trees. The tasks end at shutdown, once their run in
-/// progress has ([`admin_duty`]).
+/// paused daemon still records merges, closes and review comments, posts
+/// approved reviews and sweeps finished trees. The tasks end at shutdown,
+/// once their run in progress has ([`admin_duty`]).
 ///
 /// One task per duty, never one shared pass: a pass ran PR sync, reaping,
 /// fetch-ahead, the Renovate scans and the sweep in turn, so a merge or a
 /// review comment waited for every Renovate scan due. The PR reviews are
 /// apart from the PR sync for the same reason: the engages held for a
-/// sync pass would wait for every review read. See the module
+/// sync pass would wait for every review read and post. See the module
 /// docs for why the lanes have no queue type.
 pub fn spawn_admin_lane(lane: AdminLane, shutdown: &watch::Receiver<bool>) -> Vec<JoinHandle<()>> {
     let lane = Arc::new(lane);
@@ -985,6 +995,9 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         if summary.awaits_pr_sync {
             engage_waits.ended(&summary, &pr_sync_passes);
             scheduler.pr_sync_wake.notify_one();
+        }
+        if summary.posts_approved {
+            scheduler.pr_review_wake.notify_one();
         }
         let sleep_s = compute_sleep_s(&store, &summary).await;
         let (state_label, detail) = cycle_state(&summary, &mut last_job);

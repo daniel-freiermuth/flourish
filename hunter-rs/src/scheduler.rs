@@ -33,7 +33,7 @@ mod pr_review;
 mod review;
 pub use attempt::{Attempt, Kind, Resumed, kind};
 use pr_review::run_pr_review;
-pub use pr_review::sync_pr_reviews;
+pub use pr_review::{post_pr_reviews, sync_pr_reviews};
 
 /// Everything a resumed attempt needs and a cold one does not.
 ///
@@ -1870,6 +1870,11 @@ pub struct CycleSummary {
     /// ([`crate::daemon::EngageWaits`]).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub awaits_pr_sync: bool,
+    /// The cycle recorded a PR review round that is to be posted now
+    /// (auto-post): the daemon wakes the PR review duty, which posts it,
+    /// instead of leaving it for the next tick.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub posts_approved: bool,
 }
 
 /// Maximum consecutive identical failures before giving up (`scheduler.MAX_CONSECUTIVE_SAME_FAILURE`).

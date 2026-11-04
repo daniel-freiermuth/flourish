@@ -20,8 +20,8 @@ use hunter::domain::{ForgeName, JobKind, PrJobKind, PrReviewState};
 use hunter::scheduler::{Candidate, pick_next, run_cycle};
 use hunter::server::{AppState, router};
 use hunter::store::{
-    FindingInsert, HEAD_STABLE_MS, NewPrReview, PR_REVIEW_HOLD_AT, PR_REVIEW_RETRY_MS,
-    PrReviewRound, Store, Trust,
+    FindingInsert, HEAD_STABLE_MS, NewPrReview, PR_REVIEW_HOLD_AT, PR_REVIEW_RETRY_MS, PostDecided,
+    PostDecision, PrReviewRound, Store, Trust,
 };
 use serde_json::{Value, json};
 use support::{FakeBins, GitRepo, ScriptedBackend, TempDir, fresh_store, git};
@@ -172,6 +172,7 @@ fn new_review(head: &str) -> NewPrReview<'_> {
         cross_repo: true,
         head_sha: head,
         watch: true,
+        auto_post: false,
         head_owner: FORK,
         trust: Some(Trust::default()),
         requested_by: "tester",
@@ -225,9 +226,15 @@ async fn due_reviews_follow_watch_head_stability_and_hold() {
 
     let scope = support::scope(&f.store);
     let jobs = scope.store();
-    jobs.record_pr_review_round((id, BINDING), None, ("base", "aaa"), PrReviewRound::Ok(&[]))
-        .await
-        .unwrap();
+    jobs.record_pr_review_round(
+        (id, BINDING),
+        None,
+        ("base", "aaa"),
+        None,
+        PrReviewRound::Ok(&[]),
+    )
+    .await
+    .unwrap();
     assert!(due(now).await.is_empty(), "reviewed head: nothing due");
 
     jobs.observe_pr_review((id, BINDING), ("bbb", FORK), "t", PrReviewState::Open)
@@ -271,6 +278,7 @@ async fn due_reviews_follow_watch_head_stability_and_hold() {
             (id, BINDING),
             None,
             ("aaa", "bbb"),
+            None,
             PrReviewRound::Failed("boom"),
         )
         .await
@@ -323,9 +331,15 @@ async fn a_round_answers_the_requests_it_read_the_pr_after() {
     jobs.take_pr_review_request((id, BINDING), "ccc", read)
         .await
         .unwrap();
-    jobs.record_pr_review_round((id, BINDING), None, ("base", "ccc"), PrReviewRound::Ok(&[]))
-        .await
-        .unwrap();
+    jobs.record_pr_review_round(
+        (id, BINDING),
+        None,
+        ("base", "ccc"),
+        None,
+        PrReviewRound::Ok(&[]),
+    )
+    .await
+    .unwrap();
     let answered = row().await;
     assert_eq!(
         (answered.round_requested_at, answered.due_at()),
@@ -341,9 +355,15 @@ async fn a_round_answers_the_requests_it_read_the_pr_after() {
     jobs.take_pr_review_request((id, BINDING), "ddd", read)
         .await
         .unwrap();
-    jobs.record_pr_review_round((id, BINDING), None, ("ccc", "ddd"), PrReviewRound::Ok(&[]))
-        .await
-        .unwrap();
+    jobs.record_pr_review_round(
+        (id, BINDING),
+        None,
+        ("ccc", "ddd"),
+        None,
+        PrReviewRound::Ok(&[]),
+    )
+    .await
+    .unwrap();
     let waiting = row().await;
     assert_eq!(
         waiting.last_reviewed_sha.as_deref(),
@@ -369,9 +389,15 @@ async fn a_round_answers_the_requests_it_read_the_pr_after() {
         .await
         .unwrap();
     assert_eq!(request(&f, "eee", false).await, id);
-    jobs.record_pr_review_round((id, BINDING), None, ("ddd", "eee"), PrReviewRound::Ok(&[]))
-        .await
-        .unwrap();
+    jobs.record_pr_review_round(
+        (id, BINDING),
+        None,
+        ("ddd", "eee"),
+        None,
+        PrReviewRound::Ok(&[]),
+    )
+    .await
+    .unwrap();
     let answered = row().await;
     assert_eq!(answered.round_requested_at, None, "{answered:?}");
     assert_eq!(answered.due_at(), None, "{answered:?}");
@@ -403,7 +429,13 @@ async fn a_head_read_while_a_round_runs_asks_for_no_round() {
             .unwrap();
         scope
             .store()
-            .record_pr_review_round((id, BINDING), None, ("base", "aaa"), PrReviewRound::Ok(&[]))
+            .record_pr_review_round(
+                (id, BINDING),
+                None,
+                ("base", "aaa"),
+                None,
+                PrReviewRound::Ok(&[]),
+            )
             .await
             .unwrap();
         let row = f.store.get_pr_review(id).await.unwrap().unwrap();
@@ -558,6 +590,7 @@ async fn a_due_review_ranks_between_engage_and_harvest() {
             (review, BINDING),
             None,
             ("x", "aaa"),
+            None,
             PrReviewRound::Ok(&[]),
         )
         .await
@@ -627,7 +660,7 @@ async fn a_review_is_picked_for_its_own_repo_and_never_beside_its_running_round(
     );
 }
 
-const ISSUES: &str = r#"[{"kind":"introduced","blocking":true,"file":"CHANGE.md","line":1,"severity":"high","confidence":0.9,"summary":"breaks the widget","detail":"CHANGE.md:1"},{"kind":"follow-up","blocking":false,"summary":"old debt"}]"#;
+const ISSUES: &str = r#"[{"kind":"introduced","blocking":true,"file":"CHANGE.md","line":1,"severity":"high","confidence":0.9,"summary":"breaks the widget","detail":"CHANGE.md:1"},{"kind":"follow-up","blocking":false,"file":"OLD.md","line":3,"side":"left","summary":"old debt"}]"#;
 
 /// A reviewer that reports `ISSUES` where the playbook names its output.
 fn reporting() -> ScriptedBackend {
@@ -691,6 +724,10 @@ async fn rounds_review_from_the_merge_base_then_incrementally() {
     assert_eq!((round.verdict.as_str(), round.job_id), ("ok", Some(job)));
     assert_eq!(round.issues.len(), 2);
     assert!(round.issues[0].blocking && round.issues[0].summary == "breaks the widget");
+    // The side as the forge spells it; none given reads as the head's.
+    let sides: Vec<_> = round.issues.iter().map(|i| i.side.as_deref()).collect();
+    assert_eq!(sides, [None, Some("LEFT")]);
+    assert_eq!(round.post_state.as_deref(), Some("pending"));
 
     let second_head = push_to_pr(&f, "MORE.md");
     set_view(&f, "OPEN", &second_head, "outsider");
@@ -858,8 +895,10 @@ async fn earlier_issues_span_the_incremental_chain() {
         confidence: None,
         file: None,
         line: None,
+        side: None,
         summary: summary.into(),
         detail: String::new(),
+        posted_inline: false,
     };
     let jobs = support::scope(&f.store);
     let store = jobs.store();
@@ -874,7 +913,7 @@ async fn earlier_issues_span_the_incremental_chain() {
     };
     let round = |range: (&'static str, &'static str), issues: Vec<_>| async move {
         store
-            .record_pr_review_round((id, BINDING), None, range, PrReviewRound::Ok(&issues))
+            .record_pr_review_round((id, BINDING), None, range, None, PrReviewRound::Ok(&issues))
             .await
             .unwrap();
     };
@@ -886,6 +925,7 @@ async fn earlier_issues_span_the_incremental_chain() {
             (id, BINDING),
             None,
             ("bbb", "ccc"),
+            None,
             PrReviewRound::Failed("worker killed"),
         )
         .await
@@ -914,16 +954,6 @@ async fn earlier_issues_span_the_incremental_chain() {
 async fn a_partial_round_keeps_the_chain_at_its_base() {
     let f = fixture("prr-chain-partial").await;
     let id = request(&f, "aaa", true).await;
-    let issue = |summary: &str| hunter::types::PrReviewIssueOut {
-        kind: "introduced".into(),
-        blocking: true,
-        severity: None,
-        confidence: None,
-        file: None,
-        line: None,
-        summary: summary.into(),
-        detail: String::new(),
-    };
     let jobs = support::scope(&f.store);
     let store = jobs.store();
     store
@@ -931,7 +961,8 @@ async fn a_partial_round_keeps_the_chain_at_its_base() {
             (id, BINDING),
             None,
             ("base", "aaa"),
-            PrReviewRound::Ok(&[issue("first")]),
+            None,
+            PrReviewRound::Ok(&[issue("first", None, None)]),
         )
         .await
         .unwrap();
@@ -940,8 +971,9 @@ async fn a_partial_round_keeps_the_chain_at_its_base() {
             (id, BINDING),
             None,
             ("aaa", "bbb"),
+            None,
             PrReviewRound::Partial {
-                issues: &[issue("stopped")],
+                issues: &[issue("stopped", None, None)],
                 why: "worker suspended before it finished",
             },
         )
@@ -953,11 +985,23 @@ async fn a_partial_round_keeps_the_chain_at_its_base() {
         (Some("aaa"), 1)
     );
     store
-        .record_pr_review_round((id, BINDING), None, ("aaa", "bbb"), PrReviewRound::Ok(&[]))
+        .record_pr_review_round(
+            (id, BINDING),
+            None,
+            ("aaa", "bbb"),
+            None,
+            PrReviewRound::Ok(&[]),
+        )
         .await
         .unwrap();
     store
-        .record_pr_review_round((id, BINDING), None, ("bbb", "ccc"), PrReviewRound::Ok(&[]))
+        .record_pr_review_round(
+            (id, BINDING),
+            None,
+            ("bbb", "ccc"),
+            None,
+            PrReviewRound::Ok(&[]),
+        )
         .await
         .unwrap();
     let review = f.store.get_pr_review(id).await.unwrap().unwrap();
@@ -991,7 +1035,13 @@ async fn a_rebound_review_starts_afresh() {
     let jobs = support::scope(&f.store);
     let store = jobs.store();
     store
-        .record_pr_review_round((id, BINDING), None, ("base", "aaa"), PrReviewRound::Ok(&[]))
+        .record_pr_review_round(
+            (id, BINDING),
+            None,
+            ("base", "aaa"),
+            None,
+            PrReviewRound::Ok(&[]),
+        )
         .await
         .unwrap();
 
@@ -1016,7 +1066,13 @@ async fn a_rebound_review_starts_afresh() {
     );
 
     store
-        .record_pr_review_round((id, BINDING), None, ("aaa", "ccc"), PrReviewRound::Ok(&[]))
+        .record_pr_review_round(
+            (id, BINDING),
+            None,
+            ("aaa", "ccc"),
+            None,
+            PrReviewRound::Ok(&[]),
+        )
         .await
         .unwrap();
     store
@@ -1024,6 +1080,7 @@ async fn a_rebound_review_starts_afresh() {
             (id, BINDING),
             None,
             ("aaa", "ccc"),
+            None,
             PrReviewRound::Failed("boom"),
         )
         .await
@@ -1287,6 +1344,7 @@ async fn a_failed_round_waits_out_its_backoff() {
             (id, BINDING),
             None,
             ("base", "aaa"),
+            None,
             PrReviewRound::Failed("the backend is overloaded"),
         )
         .await
@@ -1386,6 +1444,31 @@ async fn a_reviewer_stopped_by_its_cap_keeps_the_issues_it_wrote() {
     assert!(
         !rounds[1].contains("unfinished"),
         "a finished round counts nothing: {rounds:?}"
+    );
+}
+
+/// A review file whose every entry lacks a summary is no review: the round
+/// fails, saying so, rather than passing for a clean one.
+#[tokio::test]
+async fn a_review_of_entries_without_a_summary_fails() {
+    let bins = FakeBins::acquire("prr-no-summary");
+    let f = fixture("prr-no-summary").await;
+    gh(&bins, &f, true);
+    let head = rev(&f.origin_work, "HEAD");
+    set_view(&f, "OPEN", &head, "outsider");
+    request(&f, &head, true).await;
+    let backend = ScriptedBackend::seeing(|run| {
+        let out = run.tree.parent().unwrap().join("pr-review.json");
+        std::fs::write(out, r#"[{"title":"no summary"}]"#).unwrap();
+        support::done()
+    });
+
+    let summary = run_cycle(&mut support::jobs(&f.store), &f.cfg, &backend, None).await;
+    assert_eq!(summary.outcome.as_deref(), Some("retry"), "{summary:?}");
+    let round = newest_round(&f).await;
+    assert_eq!(
+        (round.verdict.as_str(), round.failure.as_deref()),
+        ("failed", Some("1 review entries had no summary"))
     );
 }
 
@@ -1491,6 +1574,7 @@ async fn the_sync_keeps_a_gitlab_mr_being_merged_open() {
             cross_repo: false,
             head_sha: "aaa",
             watch: true,
+            auto_post: false,
             head_owner: None,
             trust: Some(Trust::default()),
             requested_by: "tester",
@@ -1537,7 +1621,13 @@ async fn a_round_due_by_the_clock_wakes_and_bounds_the_job_lane() {
     let id = request(&f, "aaa", true).await;
     support::scope(&f.store)
         .store()
-        .record_pr_review_round((id, BINDING), None, ("base", "aaa"), PrReviewRound::Ok(&[]))
+        .record_pr_review_round(
+            (id, BINDING),
+            None,
+            ("base", "aaa"),
+            None,
+            PrReviewRound::Ok(&[]),
+        )
         .await
         .unwrap();
     let admin = support::admin(&f.store);
@@ -2252,19 +2342,19 @@ async fn a_requests_vouches_are_recorded_and_a_forks_new_owner_logged_once() {
     gh_maintainer_pushes(&bins, &f);
     let head = rev(&f.origin_work, "HEAD");
     let state = app_state(&f);
-    let ask = |pr: i64| {
+    let ask = |pr: i64, auto_post: bool| {
         let state = state.clone();
         async move {
-            let req = json!({ "repo_id": f.rid, "pr": pr, "watch": true, "vouch": true });
+            let req = json!({ "repo_id": f.rid, "pr": pr, "watch": true, "vouch": true, "auto_post": auto_post });
             let (status, body) = post(&state, "/api/pr-review", req).await;
             assert_eq!(status, StatusCode::OK, "{body}");
             body["id"].as_i64().unwrap()
         }
     };
     set_fork_view(&f, "OPEN", (&head, "maintainer"), "stranger");
-    ask(7).await;
+    ask(7, false).await;
     set_fork_view(&f, "OPEN", (&head, "newcomer"), "newcomer");
-    let own_fork = f.store.get_pr_review(ask(8).await).await.unwrap();
+    let own_fork = f.store.get_pr_review(ask(8, true).await).await.unwrap();
     let own_fork = own_fork.unwrap();
     assert_eq!(
         (
@@ -2284,7 +2374,7 @@ async fn a_requests_vouches_are_recorded_and_a_forks_new_owner_logged_once() {
         requests,
         [
             "review of widget PR #7 requested (vouched for stranger)",
-            "review of widget PR #8 requested (vouched for newcomer)",
+            "review of widget PR #8 requested (auto-post) (vouched for newcomer)",
         ]
     );
 
@@ -2481,6 +2571,169 @@ async fn the_reviews_api_lists_reviews_and_a_repos_open_prs() {
         })
         .collect();
     assert_eq!(open, [(7, true, Some(id)), (9, false, None)]);
+}
+
+/// A review is bound to the repo URL it was requested under: its number
+/// and its trust decision are about the PR there. Once the repo's URL
+/// changes the review is not due, the sync does not read it and its
+/// approved round is not posted. A new request rebinds it to the new URL,
+/// deciding about the author afresh: the vouch the first request gave
+/// counts for nothing there.
+#[tokio::test]
+async fn a_review_whose_repo_url_changed_waits_for_a_request_there() {
+    let bins = FakeBins::acquire("prr-repo-moved");
+    let f = fixture("prr-repo-moved").await;
+    gh(&bins, &f, false);
+    set_view(&f, "OPEN", "aaa", "outsider");
+    let state = app_state(&f);
+    let ask = |vouch: bool| {
+        let state = state.clone();
+        let rid = f.rid;
+        async move {
+            post(
+                &state,
+                "/api/pr-review",
+                json!({ "repo_id": rid, "pr": 7, "watch": true, "vouch": vouch }),
+            )
+            .await
+        }
+    };
+    let due = || async {
+        due_ids(
+            &f.store
+                .list_due_pr_reviews(hunter::util::now_ms())
+                .await
+                .unwrap(),
+        )
+    };
+    let admin = support::admin(&f.store);
+
+    let (status, body) = ask(true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id = body["id"].as_i64().unwrap();
+    assert_eq!(due().await, vec![id]);
+    f.store.set_pr_review_auto_post(id, true).await.unwrap();
+    record_round(&f, id, ("base", "aaa"), &[issue("x", None, None)]).await;
+    assert_eq!(
+        newest_round(&f).await.post_state.as_deref(),
+        Some("approved")
+    );
+    set_view(&f, "OPEN", "bbb", "outsider");
+
+    let moved = "https://github.com/someone-else/widget";
+    sqlx::query("UPDATE repos SET url = ?1 WHERE id = ?2")
+        .bind(moved)
+        .bind(f.rid)
+        .execute(&f.pool().await)
+        .await
+        .unwrap();
+    let calls = bins.calls_to("gh").len();
+    assert!(due().await.is_empty(), "not due at the new URL");
+    let read = hunter::scheduler::sync_pr_reviews(admin.store(), || false).await;
+    let posted = hunter::scheduler::post_pr_reviews(admin.store(), &f.cfg, || false).await;
+    assert_eq!((read, posted), (0, 0));
+    assert_eq!(bins.calls_to("gh").len(), calls, "the forge was not asked");
+    let review = f.store.get_pr_review(id).await.unwrap().unwrap();
+    assert!(review.repo_moved(), "{review:?}");
+    assert_eq!(review.head_sha.as_deref(), Some("aaa"), "not synced");
+    let round = newest_round(&f).await;
+    assert_eq!(
+        (round.post_state.as_deref(), round.posted_at),
+        (Some("approved"), None)
+    );
+
+    let (status, body) = ask(false).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        body["needs_vouch"],
+        json!(true),
+        "the old vouch is not reused"
+    );
+    assert!(
+        f.store
+            .get_pr_review(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .repo_moved()
+    );
+
+    let (status, body) = ask(true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        (body["id"].as_i64(), &body["outcome"]),
+        (Some(id), &json!("rebound"))
+    );
+    let review = f.store.get_pr_review(id).await.unwrap().unwrap();
+    assert!(!review.repo_moved());
+    assert_eq!(review.bound_url, moved);
+    assert_eq!(review.head_sha.as_deref(), Some("bbb"));
+    assert_eq!(review.vouched_author.as_deref(), Some("outsider"));
+    assert_eq!(due().await, vec![id], "due at its new head");
+}
+
+/// An edit of the repo's URL that changes only its form -- `.git`, the
+/// host's case, `http` -- names the same repository and the same PRs:
+/// the review is not moved, keeps working (due, read and posted as
+/// before), and a request keeps its rounds, issues and trust decision
+/// rather than starting it over at the merge-base.
+#[tokio::test]
+async fn an_edit_of_the_repo_urls_form_moves_no_review() {
+    let bins = FakeBins::acquire("prr-repo-url-form");
+    let f = fixture("prr-repo-url-form").await;
+    gh(&bins, &f, false);
+    set_view(&f, "OPEN", "aaa", "outsider");
+    let state = app_state(&f);
+    let (status, body) = post(
+        &state,
+        "/api/pr-review",
+        json!({ "repo_id": f.rid, "pr": 7, "watch": true, "vouch": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id = body["id"].as_i64().unwrap();
+    record_round(&f, id, ("base", "aaa"), &[issue("x", None, None)]).await;
+
+    let restyled = "http://GitHub.com/acme/widget.git/";
+    assert!(hunter::forge::same_repo(REPO_URL, restyled));
+    assert!(!hunter::forge::same_repo(
+        REPO_URL,
+        "https://github.com/someone-else/widget"
+    ));
+    sqlx::query("UPDATE repos SET url = ?1 WHERE id = ?2")
+        .bind(restyled)
+        .bind(f.rid)
+        .execute(&f.pool().await)
+        .await
+        .unwrap();
+    let review = f.store.get_pr_review(id).await.unwrap().unwrap();
+    assert!(!review.repo_moved(), "{review:?}");
+    set_view(&f, "OPEN", "bbb", "outsider");
+    let admin = support::admin(&f.store);
+    let read = hunter::scheduler::sync_pr_reviews(admin.store(), || false).await;
+    assert_eq!(read, 1, "read as before");
+
+    let (status, body) = post(
+        &state,
+        "/api/pr-review",
+        json!({ "repo_id": f.rid, "pr": 7, "watch": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["outcome"], json!("requested"), "{body}");
+    let review = f.store.get_pr_review(id).await.unwrap().unwrap();
+    assert_eq!(
+        (
+            review.binding,
+            review.last_reviewed_sha.as_deref(),
+            review.vouched_author.as_deref(),
+        ),
+        (1, Some("aaa"), Some("outsider")),
+        "{review:?}"
+    );
+    assert_eq!(review.bound_url, restyled);
+    let earlier = f.store.chain_pr_review_issues(id, "aaa").await.unwrap();
+    assert_eq!(earlier.len(), 1, "{earlier:?}");
 }
 
 /// A PR hunter opened for a finding is its own work, never reviewed.
@@ -2808,7 +3061,13 @@ async fn a_reopened_review_is_due_for_its_new_head_watched_or_not() {
         let store = jobs.store();
         async move {
             store
-                .record_pr_review_round((id, BINDING), None, ("base", head), PrReviewRound::Ok(&[]))
+                .record_pr_review_round(
+                    (id, BINDING),
+                    None,
+                    ("base", head),
+                    None,
+                    PrReviewRound::Ok(&[]),
+                )
                 .await
                 .unwrap();
         }
@@ -2984,4 +3243,2026 @@ async fn a_request_where_hunter_cannot_push_says_it_needs_to() {
         "{body}"
     );
     assert!(f.store.list_pr_reviews().await.unwrap().is_empty());
+}
+
+// -- Posting (slice 2) -------------------------------------------------------
+
+/// The PR's diff as the forge returns it: `CHANGE.md` added with 2 lines.
+const PR_DIFF: &str = "\
+diff --git a/CHANGE.md b/CHANGE.md
+new file mode 100644
+--- /dev/null
++++ b/CHANGE.md
+@@ -0,0 +1,2 @@
++change
++more
+";
+
+/// What hunter's inline comment for `issue("breaks the widget", ..)` reads
+/// as on the forge.
+const INLINE_BODY: &str =
+    "**high · introduced** · blocking: breaks the widget\n\nwhy breaks the widget";
+
+fn issue(summary: &str, file: Option<&str>, line: Option<i64>) -> hunter::types::PrReviewIssueOut {
+    hunter::types::PrReviewIssueOut {
+        kind: "introduced".into(),
+        blocking: file.is_some(),
+        severity: Some("high".into()),
+        confidence: None,
+        file: file.map(str::to_owned),
+        line,
+        side: None,
+        summary: summary.into(),
+        detail: format!("why {summary}"),
+        posted_inline: false,
+    }
+}
+
+/// Record an ok round of review `id` over `base..head` with `issues`; the
+/// round's id.
+async fn record_round(
+    f: &Fixture,
+    id: i64,
+    range: (&str, &str),
+    issues: &[hunter::types::PrReviewIssueOut],
+) -> i64 {
+    record_round_over(f, id, range, None, issues).await
+}
+
+/// [`record_round`], the round having resolved `merge_base`.
+async fn record_round_over(
+    f: &Fixture,
+    id: i64,
+    range: (&str, &str),
+    merge_base: Option<&str>,
+    issues: &[hunter::types::PrReviewIssueOut],
+) -> i64 {
+    let jobs = support::scope(&f.store);
+    jobs.store()
+        .record_pr_review_round(
+            (id, BINDING),
+            None,
+            range,
+            merge_base,
+            PrReviewRound::Ok(issues),
+        )
+        .await
+        .unwrap();
+    newest_round(f).await.id
+}
+
+async fn newest_round(f: &Fixture) -> hunter::types::PrReviewRoundOut {
+    f.store.list_pr_review_rounds().await.unwrap().remove(0).1
+}
+
+/// Write the inline comments GitHub lists for review 99 to
+/// `review-comments.json`, one JSON object per line as `gh --jq` prints
+/// them: hunter's `C1` on `CHANGE.md:1` with [`INLINE_BODY`], unless
+/// `comments` says otherwise. Returns the file.
+fn review_comments(f: &Fixture, comments: &[Value]) -> std::path::PathBuf {
+    let path = f.dir.join("review-comments.json");
+    let default = [json!({ "node_id": "C1", "path": "CHANGE.md", "line": 1, "body": INLINE_BODY })];
+    let comments = if comments.is_empty() {
+        &default[..]
+    } else {
+        comments
+    };
+    let lines: Vec<String> = comments.iter().map(Value::to_string).collect();
+    std::fs::write(&path, lines.join("\n")).unwrap();
+    path
+}
+
+/// `gh` for posting: `pr diff` answers [`PR_DIFF`]; the repo was renamed,
+/// so the review POST only goes through at its current name (GitHub
+/// answers a POST to the old one with a 307 that gh does not follow), and
+/// it keeps its input in `posted.json` and answers review 99 (or, with
+/// `refuse`, fails: refused with a 422, or with a 502 that says nothing of
+/// what GitHub did while `review-502` exists); review 99's comments list
+/// [`review_comments`], or fail with a 502 while `comments-fail` exists. A
+/// retry's look for the review an earlier post sent finds none.
+fn gh_posting(bins: &FakeBins, f: &Fixture, refuse: bool) {
+    let diff = f.dir.join("pr.diff");
+    std::fs::write(&diff, PR_DIFF).unwrap();
+    let posted = f.dir.join("posted.json");
+    let review = if refuse {
+        format!(
+            "if [ -e '{}' ]; then echo 'gh: Bad Gateway (HTTP 502)'; \
+             else echo 'gh: Unprocessable Entity (HTTP 422)'; fi >&2; exit 1",
+            f.dir.join("review-502").display()
+        )
+    } else {
+        format!("cat > '{}'; echo '{{\"id\":99}}'", posted.display())
+    };
+    let comments = review_comments(f, &[]);
+    let fails = f.dir.join("comments-fail");
+    bins.script(
+        "gh",
+        &format!(
+            "case \"$*\" in\n\
+             'pr diff'*) cat '{}';;\n\
+             'api repos/acme/widget --jq .full_name') echo acme/widget-renamed;;\n\
+             'api user --jq .login') echo operator;;\n\
+             *'pulls/7/reviews?per_page=100'*) ;;\n\
+             *'repos/acme/widget-renamed/pulls/7/reviews --input -'*) {review};;\n\
+             *'pulls/7/comments'*'pull_request_review_id == 99'*) if [ -e '{}' ]; then \
+                echo 'HTTP 502: Bad Gateway' >&2; exit 1; fi; cat '{}';;\n\
+             *) echo \"unexpected gh $*\" >&2; exit 1;;\n\
+             esac",
+            diff.display(),
+            fails.display(),
+            comments.display()
+        ),
+    );
+}
+
+/// What the scripted forge was sent for review posts.
+fn review_posts(bins: &FakeBins) -> usize {
+    bins.calls_to("gh")
+        .iter()
+        .filter(|c| c.iter().any(|a| a.ends_with("/reviews")))
+        .count()
+}
+
+/// A round waits for approval unless the review posts automatically; an
+/// approved round goes out as one COMMENT review at the head it read, with
+/// inline comments only for issues on a line of the PR's diff and the rest
+/// in the marked body, and is then recorded as posted.
+#[tokio::test]
+async fn an_approved_round_posts_placeable_issues_inline_and_the_rest_in_the_body() {
+    let bins = FakeBins::acquire("prr-post");
+    let f = fixture("prr-post").await;
+    gh_posting(&bins, &f, false);
+    let head = "a".repeat(40);
+    let id = request(&f, &head, true).await;
+    let round = record_round(
+        &f,
+        id,
+        ("b".repeat(40).as_str(), head.as_str()),
+        &[
+            issue("breaks the widget", Some("CHANGE.md"), Some(1)),
+            issue("far away", Some("CHANGE.md"), Some(50)),
+            issue("old debt", None, None),
+        ],
+    )
+    .await;
+    assert_eq!(
+        newest_round(&f).await.post_state.as_deref(),
+        Some("pending")
+    );
+
+    let admin = support::admin(&f.store);
+    let posted = hunter::scheduler::post_pr_reviews(admin.store(), &f.cfg, || false).await;
+    assert_eq!((posted, review_posts(&bins)), (0, 0), "pending waits");
+
+    let decided = f
+        .store
+        .decide_pr_review_post(round, PostDecision::Approve)
+        .await
+        .unwrap();
+    assert_eq!(decided, PostDecided::Moved { review_id: id });
+    let posted = hunter::scheduler::post_pr_reviews(admin.store(), &f.cfg, || false).await;
+    assert_eq!((posted, review_posts(&bins)), (1, 1));
+    let logged = events(&f, "pr_review").await;
+    assert!(
+        logged
+            .iter()
+            .any(|m| m.contains(&format!("posted round {round} (3 issue(s), 1 inline"))),
+        "{logged:?}"
+    );
+
+    let sent: Value =
+        serde_json::from_str(&std::fs::read_to_string(f.dir.join("posted.json")).unwrap()).unwrap();
+    assert_eq!(sent["commit_id"], json!(head));
+    assert_eq!(sent["event"], json!("COMMENT"));
+    assert_eq!(
+        sent["comments"],
+        json!([{
+            "path": "CHANGE.md",
+            "line": 1,
+            "side": "RIGHT",
+            "body": "**high · introduced** · blocking: breaks the widget\n\nwhy breaks the widget",
+        }])
+    );
+    let body = sent["body"].as_str().unwrap();
+    assert!(
+        body.starts_with(
+            "**Automated review by hunter** (round of `bbbbbbb..aaaaaaa`): 3 issue(s)."
+        ),
+        "{body}"
+    );
+    assert!(
+        body.contains("`CHANGE.md:50`") && body.contains("far away"),
+        "{body}"
+    );
+    assert!(body.contains("old debt"), "{body}");
+    assert!(!body.contains("breaks the widget"), "inline only: {body}");
+    assert!(body.ends_with(hunter::forge::OWN_MARK), "{body}");
+
+    let round = newest_round(&f).await;
+    assert_eq!(round.post_state.as_deref(), Some("posted"));
+    assert!(round.posted_at.is_some() && round.post_error.is_none());
+    let inline: Vec<_> = round
+        .issues
+        .iter()
+        .map(|i| (i.summary.as_str(), i.posted_inline))
+        .collect();
+    assert_eq!(
+        inline,
+        [
+            ("breaks the widget", true),
+            ("far away", false),
+            ("old debt", false)
+        ]
+    );
+    // Posted is final: the next sync sends nothing.
+    hunter::scheduler::post_pr_reviews(admin.store(), &f.cfg, || false).await;
+    assert_eq!(review_posts(&bins), 1);
+}
+
+/// A round whose head the PR has moved past is posted with every issue in
+/// the body: its lines number a diff the PR no longer has. It names the
+/// PR's current head: after a force-push the round's own is no commit of
+/// the PR, and GitHub refuses a review naming it.
+#[tokio::test]
+async fn a_round_the_pr_moved_past_is_posted_in_the_body() {
+    let bins = FakeBins::acquire("prr-moved");
+    let f = fixture("prr-moved").await;
+    gh_posting(&bins, &f, false);
+    let id = request(&f, "newer", true).await;
+    f.store.set_pr_review_auto_post(id, true).await.unwrap();
+    record_round(
+        &f,
+        id,
+        ("base", "older"),
+        &[issue("breaks the widget", Some("CHANGE.md"), Some(1))],
+    )
+    .await;
+
+    let admin = support::admin(&f.store);
+    hunter::scheduler::post_pr_reviews(admin.store(), &f.cfg, || false).await;
+
+    let sent: Value =
+        serde_json::from_str(&std::fs::read_to_string(f.dir.join("posted.json")).unwrap()).unwrap();
+    assert_eq!(sent["commit_id"], json!("newer"));
+    assert_eq!(sent["comments"], json!([]));
+    assert!(sent["body"].as_str().unwrap().contains("breaks the widget"));
+    assert!(
+        !bins
+            .calls_to("gh")
+            .iter()
+            .any(|c| c.get(1).is_some_and(|a| a == "pr")),
+        "no diff is read for a round that cannot go inline"
+    );
+}
+
+/// A round recorded `approved` (auto-post) asks the daemon to wake the PR
+/// sync, which posts it now; one waiting for approval does not.
+#[tokio::test]
+async fn an_auto_posted_round_wakes_the_pr_sync() {
+    let bins = FakeBins::acquire("prr-wake");
+    let f = fixture("prr-wake").await;
+    gh(&bins, &f, true);
+    let head = rev(&f.origin_work, "HEAD");
+    set_view(&f, "OPEN", &head, "outsider");
+    let id = request(&f, &head, true).await;
+    f.store.set_pr_review_auto_post(id, true).await.unwrap();
+    let summary = run_cycle(&mut support::jobs(&f.store), &f.cfg, &reporting(), None).await;
+    assert_eq!(summary.outcome.as_deref(), Some("reviewed"), "{summary:?}");
+    assert!(summary.posts_approved, "{summary:?}");
+
+    let next = push_to_pr(&f, "MORE.md");
+    set_view(&f, "OPEN", &next, "outsider");
+    f.store.set_pr_review_auto_post(id, false).await.unwrap();
+    // The posted round is out of the way, and the new head is stable.
+    let pool = f.pool().await;
+    sqlx::query("UPDATE pr_review_rounds SET post_state = 'posted'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE pr_reviews SET head_sha = ?1, head_seen_at = 0")
+        .bind(&next)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let summary = run_cycle(&mut support::jobs(&f.store), &f.cfg, &reporting(), None).await;
+    assert_eq!(summary.outcome.as_deref(), Some("reviewed"), "{summary:?}");
+    assert!(!summary.posts_approved, "{summary:?}");
+}
+
+/// The posted review's input as the scripted forge kept it.
+fn sent_review(f: &Fixture) -> Value {
+    serde_json::from_str(&std::fs::read_to_string(f.dir.join("posted.json")).unwrap()).unwrap()
+}
+
+/// A LEFT line numbers the round's base. The PR's diff numbers its old
+/// side from the merge-base: a round from there places a LEFT issue
+/// inline, one from another base (an earlier round's head) puts it in the
+/// body, where it cannot land on other code; its RIGHT issues go inline
+/// either way, also from a round holding no LEFT one. What decides is the
+/// round's own base against the merge-base it resolved: an earlier empty
+/// round that ended at the merge-base (a PR without commits yet) leaves
+/// the next round, from the merge-base, placing its LEFT issues inline.
+#[tokio::test]
+async fn only_a_round_from_another_base_than_the_merge_base_puts_left_issues_in_the_body() {
+    let bins = FakeBins::acquire("prr-left");
+    let f = fixture("prr-left").await;
+    gh_posting(&bins, &f, false);
+    std::fs::write(
+        f.dir.join("pr.diff"),
+        "diff --git a/OLD.md b/OLD.md\n--- a/OLD.md\n+++ b/OLD.md\n@@ -1,2 +1,1 @@\n keep\n-gone\n",
+    )
+    .unwrap();
+    let head = "a".repeat(40);
+    let id = request(&f, &head, true).await;
+    f.store.set_pr_review_auto_post(id, true).await.unwrap();
+    let mut removed = issue("removed the guard", Some("OLD.md"), Some(2));
+    removed.side = Some("LEFT".into());
+    let admin = support::admin(&f.store);
+
+    // The PR had no commits: an empty round at the merge-base.
+    record_round_over(&f, id, ("base", "base"), Some("base"), &[]).await;
+    record_round_over(
+        &f,
+        id,
+        ("base", head.as_str()),
+        Some("base"),
+        &[removed.clone()],
+    )
+    .await;
+    hunter::scheduler::post_pr_reviews(admin.store(), &f.cfg, || false).await;
+    let sent = sent_review(&f);
+    assert_eq!(sent["comments"][0]["side"], json!("LEFT"), "{sent}");
+
+    let kept = issue("keeps the rest", Some("OLD.md"), Some(1));
+    record_round_over(
+        &f,
+        id,
+        (head.as_str(), head.as_str()),
+        Some("base"),
+        &[removed, kept],
+    )
+    .await;
+    hunter::scheduler::post_pr_reviews(admin.store(), &f.cfg, || false).await;
+    let sent = sent_review(&f);
+    let inline: Vec<(&Value, &Value)> = sent["comments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| (&c["side"], &c["line"]))
+        .collect();
+    assert_eq!(inline, [(&json!("RIGHT"), &json!(1))], "{sent}");
+    let body = sent["body"].as_str().unwrap();
+    assert!(
+        body.contains("`OLD.md:2 (base)`") && body.contains("removed the guard"),
+        "{body}"
+    );
+
+    let added = issue("adds a check", Some("OLD.md"), Some(1));
+    record_round_over(
+        &f,
+        id,
+        (head.as_str(), head.as_str()),
+        Some("base"),
+        &[added],
+    )
+    .await;
+    hunter::scheduler::post_pr_reviews(admin.store(), &f.cfg, || false).await;
+    let sent = sent_review(&f);
+    let inline: Vec<(&Value, &Value)> = sent["comments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| (&c["side"], &c["line"]))
+        .collect();
+    assert_eq!(inline, [(&json!("RIGHT"), &json!(1))], "{sent}");
+}
+
+/// A diff the forge will not serve (GitHub's 406 past its size limits)
+/// does not fail the post: every issue goes into the body.
+#[tokio::test]
+async fn a_diff_the_forge_refuses_puts_every_issue_in_the_body() {
+    let bins = FakeBins::acquire("prr-nodiff");
+    let f = fixture("prr-nodiff").await;
+    gh_posting(&bins, &f, false);
+    std::fs::remove_file(f.dir.join("pr.diff")).unwrap();
+    let head = "a".repeat(40);
+    let id = request(&f, &head, true).await;
+    f.store.set_pr_review_auto_post(id, true).await.unwrap();
+    record_round(
+        &f,
+        id,
+        ("base", head.as_str()),
+        &[issue("breaks the widget", Some("CHANGE.md"), Some(1))],
+    )
+    .await;
+
+    let admin = support::admin(&f.store);
+    let posted = hunter::scheduler::post_pr_reviews(admin.store(), &f.cfg, || false).await;
+    assert_eq!(posted, 1);
+    let sent = sent_review(&f);
+    assert_eq!(sent["comments"], json!([]));
+    assert!(sent["body"].as_str().unwrap().contains("breaks the widget"));
+    assert_eq!(newest_round(&f).await.post_state.as_deref(), Some("posted"));
+}
+
+/// A round none of whose issues names a line to go on -- a file without a
+/// line, or nothing at all -- goes all into the body, without the PR's
+/// diff being read.
+#[tokio::test]
+async fn a_round_without_a_placeable_issue_reads_no_diff() {
+    let bins = FakeBins::acquire("prr-unplaceable");
+    let f = fixture("prr-unplaceable").await;
+    gh_posting(&bins, &f, false);
+    let head = "a".repeat(40);
+    let id = request(&f, &head, true).await;
+    f.store.set_pr_review_auto_post(id, true).await.unwrap();
+    record_round(
+        &f,
+        id,
+        ("base", head.as_str()),
+        &[
+            issue("somewhere in it", Some("CHANGE.md"), None),
+            issue("old debt", None, None),
+        ],
+    )
+    .await;
+
+    let admin = support::admin(&f.store);
+    let posted = hunter::scheduler::post_pr_reviews(admin.store(), &f.cfg, || false).await;
+    assert_eq!(posted, 1);
+    assert_eq!(sent_review(&f)["comments"], json!([]));
+    assert!(
+        !bins
+            .calls_to("gh")
+            .iter()
+            .any(|c| c.get(1).is_some_and(|a| a == "pr")),
+        "no diff is read: {:?}",
+        bins.calls()
+    );
+}
+
+/// A request that binds a review to the repo's new URL starts it afresh
+/// ([`Store::request_pr_review`]): its rounds were about the PR at the
+/// earlier URL, and none goes out at the new one, where the number may
+/// name another PR. One still to post is discarded; one part of which
+/// landed on the earlier PR stays as it is, but is never posted here, nor
+/// approved again once it fell back to pending.
+#[tokio::test]
+async fn a_rebound_review_posts_nothing_of_its_earlier_url() {
+    let bins = FakeBins::acquire("prr-rebound-post");
+    let f = fixture("prr-rebound-post").await;
+    gh_posting(&bins, &f, false);
+    let id = request(&f, "aaa", true).await;
+    f.store.set_pr_review_auto_post(id, true).await.unwrap();
+    let landed = record_round(
+        &f,
+        id,
+        ("base", "aaa"),
+        &[issue("landed", Some("CHANGE.md"), Some(1))],
+    )
+    .await;
+    let waiting = record_round(&f, id, ("aaa", "bbb"), &[issue("waiting", None, None)]).await;
+    let pool = f.pool().await;
+    // Part of the first went up on the earlier PR before its post failed.
+    sqlx::query("UPDATE pr_review_rounds SET landed_at = 1 WHERE id = ?1")
+        .bind(landed)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let moved = "https://github.com/someone-else/widget";
+    sqlx::query("UPDATE repos SET url = ?1 WHERE id = ?2")
+        .bind(moved)
+        .bind(f.rid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    f.store
+        .request_pr_review(&NewPrReview {
+            repo_id: f.rid,
+            repo_url: moved,
+            ..new_review("bbb")
+        })
+        .await
+        .unwrap();
+    let review = f.store.get_pr_review(id).await.unwrap().unwrap();
+    assert!(!review.repo_moved(), "{review:?}");
+
+    let admin = support::admin(&f.store);
+    let posted = hunter::scheduler::post_pr_reviews(admin.store(), &f.cfg, || false).await;
+    assert_eq!((posted, review_posts(&bins)), (0, 0));
+    let states: Vec<(i64, Option<String>)> = f
+        .store
+        .list_pr_review_rounds()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(_, r)| (r.id, r.post_state))
+        .collect();
+    assert_eq!(
+        states,
+        [
+            (waiting, Some("discarded".to_owned())),
+            (landed, Some("approved".to_owned()))
+        ]
+    );
+
+    sqlx::query("UPDATE pr_review_rounds SET post_state = 'pending' WHERE id = ?1")
+        .bind(landed)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let decided = f
+        .store
+        .decide_pr_review_post(landed, PostDecision::Approve)
+        .await
+        .unwrap();
+    assert!(matches!(decided, PostDecided::Refused(_)), "{decided:?}");
+}
+
+/// A post the forge refuses stays approved with its error and is tried
+/// again on the next sync; the third failure hands it back to a user as
+/// pending, error kept. Approving it again clears the error.
+#[tokio::test]
+async fn three_refused_posts_return_the_round_to_pending() {
+    let bins = FakeBins::acquire("prr-refused");
+    let f = fixture("prr-refused").await;
+    gh_posting(&bins, &f, true);
+    let id = request(&f, "head", true).await;
+    f.store.set_pr_review_auto_post(id, true).await.unwrap();
+    let round = record_round(&f, id, ("base", "head"), &[issue("x", None, None)]).await;
+    assert_eq!(
+        newest_round(&f).await.post_state.as_deref(),
+        Some("approved"),
+        "auto-post approves at once"
+    );
+
+    let admin = support::admin(&f.store);
+    for attempt in 1..=3 {
+        let posted = hunter::scheduler::post_pr_reviews(admin.store(), &f.cfg, || false).await;
+        assert_eq!(posted, 0);
+        let r = newest_round(&f).await;
+        let want = if attempt < 3 { "approved" } else { "pending" };
+        assert_eq!(r.post_state.as_deref(), Some(want), "attempt {attempt}");
+        assert!(r.post_error.as_deref().unwrap().contains("422"), "{r:?}");
+    }
+    // Pending now: the sync leaves it alone.
+    hunter::scheduler::post_pr_reviews(admin.store(), &f.cfg, || false).await;
+    assert_eq!(review_posts(&bins), 3);
+    let failed = events(&f, "error").await;
+    assert_eq!(failed.len(), 3, "{failed:?}");
+    assert!(
+        failed[0].ends_with("; attempt 1") && failed[1].ends_with("; attempt 2"),
+        "{failed:?}"
+    );
+    assert!(
+        failed[2].ends_with("; back to pending after 3 attempts"),
+        "{failed:?}"
+    );
+    assert!(
+        !events(&f, "pr_review")
+            .await
+            .iter()
+            .any(|m| m.contains("draft(s)")),
+        "a GitHub post leaves no draft to delete"
+    );
+
+    f.store
+        .decide_pr_review_post(round, PostDecision::Approve)
+        .await
+        .unwrap();
+    let r = newest_round(&f).await;
+    assert_eq!(
+        (r.post_state.as_deref(), r.post_error),
+        (Some("approved"), None)
+    );
+}
+
+/// Only a round with issues has anything to post: one without issues and a
+/// failed one have no post state at all.
+#[tokio::test]
+async fn only_a_round_with_issues_is_ever_posted() {
+    let f = fixture("prr-nothing").await;
+    let id = request(&f, "head", true).await;
+    f.store.set_pr_review_auto_post(id, true).await.unwrap();
+
+    record_round(&f, id, ("base", "head"), &[]).await;
+    assert_eq!(newest_round(&f).await.post_state, None);
+    support::scope(&f.store)
+        .store()
+        .record_pr_review_round(
+            (id, BINDING),
+            None,
+            ("head", "next"),
+            None,
+            PrReviewRound::Failed("killed"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(newest_round(&f).await.post_state, None);
+    assert!(
+        f.store
+            .approved_pr_review_rounds()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// The API moves only a pending round: approving or discarding anything
+/// else is a 409, an unknown round a 404. An approval wakes the PR review
+/// duty, which posts. The auto-post toggle is the review's.
+#[tokio::test]
+async fn post_and_discard_move_only_pending_rounds() {
+    let f = fixture("prr-api-post").await;
+    let state = app_state(&f);
+    let id = request(&f, "head", true).await;
+    let first = record_round(&f, id, ("base", "head"), &[issue("x", None, None)]).await;
+    let second = record_round(&f, id, ("head", "next"), &[issue("y", None, None)]).await;
+    let empty = record_round(&f, id, ("next", "last"), &[]).await;
+
+    let (status, body) = post(&state, "/api/pr-review/post", json!({ "round_id": first })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        state.scheduler.pr_review_wake.notified(),
+    )
+    .await
+    .expect("approving wakes the PR review duty, which posts the round");
+    let (status, _) = post(&state, "/api/pr-review/post", json!({ "round_id": first })).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _) = post(
+        &state,
+        "/api/pr-review/discard",
+        json!({ "round_id": first }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "an approved round is not discarded"
+    );
+
+    let (status, _) = post(
+        &state,
+        "/api/pr-review/discard",
+        json!({ "round_id": second }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = post(&state, "/api/pr-review/post", json!({ "round_id": second })).await;
+    assert_eq!(status, StatusCode::CONFLICT, "discarded is final");
+
+    let (status, _) = post(&state, "/api/pr-review/post", json!({ "round_id": empty })).await;
+    assert_eq!(status, StatusCode::CONFLICT, "nothing to post");
+    let (status, _) = post(&state, "/api/pr-review/post", json!({ "round_id": 9999 })).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let post_states: Vec<_> = f
+        .store
+        .list_pr_review_rounds()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(_, r)| (r.id, r.post_state))
+        .collect();
+    assert_eq!(
+        post_states,
+        [
+            (empty, None),
+            (second, Some("discarded".to_owned())),
+            (first, Some("approved".to_owned()))
+        ]
+    );
+
+    let (status, _) = post(
+        &state,
+        "/api/pr-review/auto-post",
+        json!({ "id": id, "auto_post": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(f.store.get_pr_review(id).await.unwrap().unwrap().auto_post);
+    let third = record_round(&f, id, ("last", "more"), &[issue("z", None, None)]).await;
+    assert_eq!(newest_round(&f).await.id, third);
+    assert_eq!(
+        newest_round(&f).await.post_state.as_deref(),
+        Some("approved")
+    );
+}
+
+/// A request for a review already following the open PR reads the PR and
+/// sets its toggles; at a head a round already reviewed that is all it
+/// does ([`requesting_an_open_review_again_reviews_its_new_head`]). Watch,
+/// retry and auto-post act on an existing review and answer 404 for a
+/// missing one.
+#[tokio::test]
+async fn the_reviews_api_sets_a_reviews_toggles() {
+    let bins = FakeBins::acquire("prr-api-toggles");
+    let f = fixture("prr-api-toggles").await;
+    gh(&bins, &f, false);
+    set_view(&f, "OPEN", "aaa", "outsider");
+    let id = request(&f, "aaa", true).await;
+    sqlx::query(
+        "UPDATE pr_reviews SET last_reviewed_sha = 'aaa', round_requested_at = NULL, \
+             requested_head_sha = NULL",
+    )
+    .execute(&f.pool().await)
+    .await
+    .unwrap();
+    let state = app_state(&f);
+
+    let (status, body) = post(
+        &state,
+        "/api/pr-review",
+        json!({ "repo_id": f.rid, "pr": 7, "watch": false, "auto_post": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        (body["id"].as_i64(), &body["outcome"]),
+        (Some(id), &json!("updated"))
+    );
+    let review = f.store.get_pr_review(id).await.unwrap().unwrap();
+    assert!(!review.watch && review.auto_post, "{review:?}");
+
+    for (path, field) in [
+        ("/api/pr-review/watch", Some(("watch", true))),
+        ("/api/pr-review/retry", None),
+        ("/api/pr-review/auto-post", Some(("auto_post", false))),
+    ] {
+        for (target, want) in [(id, StatusCode::OK), (id + 100, StatusCode::NOT_FOUND)] {
+            let mut req = json!({ "id": target });
+            if let Some((key, value)) = field {
+                req[key] = json!(value);
+            }
+            let (status, body) = post(&state, path, req).await;
+            assert_eq!(status, want, "{path} {target}: {body}");
+        }
+    }
+    let review = f.store.get_pr_review(id).await.unwrap().unwrap();
+    assert!(review.watch && !review.auto_post, "{review:?}");
+}
+
+/// Approving is refused once the PR ended: only an open PR's rounds are
+/// posted, so the round would wait forever.
+#[tokio::test]
+async fn a_round_of_an_ended_pr_is_not_approved() {
+    let f = fixture("prr-ended").await;
+    let id = request(&f, "head", true).await;
+    let round = record_round(&f, id, ("base", "head"), &[issue("x", None, None)]).await;
+    support::admin(&f.store)
+        .store()
+        .observe_pr_review((id, BINDING), ("head", FORK), "t", PrReviewState::Merged)
+        .await
+        .unwrap();
+
+    let decided = f
+        .store
+        .decide_pr_review_post(round, PostDecision::Approve)
+        .await
+        .unwrap();
+    assert!(matches!(decided, PostDecided::Refused(_)), "{decided:?}");
+    let decided = f
+        .store
+        .decide_pr_review_post(round, PostDecision::Discard)
+        .await
+        .unwrap();
+    assert_eq!(decided, PostDecided::Moved { review_id: id });
+}
+
+/// A GitLab review on its own repo: `gitlab.com/acme/widget`, MR !7.
+async fn gitlab_review(f: &Fixture, head: &str) -> i64 {
+    let repos_root = f.dir.subdir("gl-repos");
+    let rid = f
+        .store
+        .add_repo(
+            "gl-widget",
+            "https://gitlab.com/acme/widget",
+            &repos_root,
+            "main",
+            ForgeName::Gitlab,
+        )
+        .await
+        .unwrap();
+    f.store
+        .request_pr_review(&NewPrReview {
+            repo_id: rid,
+            pr_number: 7,
+            repo_url: "https://gitlab.com/acme/widget",
+            title: "t",
+            author: "outsider",
+            base_ref: "main",
+            cross_repo: false,
+            head_sha: head,
+            watch: true,
+            auto_post: true,
+            head_owner: None,
+            trust: Some(Trust::default()),
+            requested_by: "tester",
+        })
+        .await
+        .unwrap()
+        .id
+}
+
+/// `glab` for posting: the MR's `diff_refs` name `mr_head`, its diffs are
+/// [`PR_DIFF`]'s, and the login's draft notes on it are the files of
+/// [`LIVE_DRAFTS`], each named by its id and holding the draft as listed.
+/// A new draft's input is appended to `drafts.jsonl` too and answered with
+/// the next id; publishing or deleting one takes it away. Publishing fails
+/// for the draft `publish-fails` names (a 502) and for every draft (a 400)
+/// while `publish-refused` exists, and deleting for every draft while
+/// `delete-fails` does. The login is `operator`, GitLab user 41 (no
+/// default an id could fall back to).
+fn glab_posting(bins: &FakeBins, f: &Fixture, mr_head: &str) {
+    let drafts = f.dir.join("drafts.jsonl");
+    let counter = f.dir.join("draft-id");
+    let live = f.dir.join(LIVE_DRAFTS);
+    std::fs::create_dir_all(&live).unwrap();
+    let mr = json!({
+        "diff_refs": { "base_sha": "B", "start_sha": "S", "head_sha": mr_head }
+    });
+    let diffs = json!([{
+        "old_path": "CHANGE.md",
+        "new_path": "CHANGE.md",
+        "new_file": true,
+        "diff": "@@ -0,0 +1,2 @@\n+change\n+more\n",
+    }]);
+    let discussions = f.dir.join("discussions.json");
+    bins.script(
+        "glab",
+        &format!(
+            r#"case "$2" in
+  */draft_notes/*/publish)
+    if [ -e '{fails}' ] && printf '%s' "$2" | grep -q "/draft_notes/$(cat '{fails}')/publish$"; then
+      echo 'HTTP 502: Bad Gateway' >&2; exit 1
+    fi
+    if [ -e '{refused}' ]; then echo 'glab: 400 Bad request (HTTP 400)' >&2; exit 1; fi
+    rm '{live}'/"$(basename "$(dirname "$2")")" || exit 1; echo '{{}}';;
+  */draft_notes/*)
+    if [ -e '{delete_fails}' ]; then echo 'HTTP 502: Bad Gateway' >&2; exit 1; fi
+    rm '{live}'/"$(basename "$2")" || exit 1; echo;;
+  */draft_notes)
+    if [ "$4" = POST ]; then
+      body=$(cat); printf '%s\n' "$body" >> '{drafts}'
+      n=$(( $(cat '{counter}' 2>/dev/null || echo 0) + 1 )); echo $n > '{counter}'
+      printf '{{"id":%s,%s' "$n" "${{body#?}}" > '{live}'/$n
+      echo "{{\"id\":$n}}"
+    else
+      printf '['; sep=''
+      for d in $(ls '{live}' | sort -n); do printf '%s' "$sep"; cat '{live}'/$d; sep=','; done
+      echo ']'
+    fi;;
+  */discussions\?*) cat '{discussions}' 2>/dev/null || echo '[]';;
+  */diffs*) printf '%s\n' '{diffs}';;
+  */merge_requests/7) printf '%s\n' '{mr}';;
+  user) echo '{{"id":41,"username":"operator"}}';;
+  *) echo "unexpected glab $*" >&2; exit 1;;
+esac"#,
+            drafts = drafts.display(),
+            counter = counter.display(),
+            live = live.display(),
+            discussions = discussions.display(),
+            fails = f.dir.join("publish-fails").display(),
+            refused = f.dir.join("publish-refused").display(),
+            delete_fails = f.dir.join("delete-fails").display(),
+        ),
+    );
+}
+
+/// Where [`glab_posting`] keeps the login's draft notes on the MR.
+const LIVE_DRAFTS: &str = "live-drafts";
+
+/// The ids of the login's draft notes on the MR ([`glab_posting`]).
+fn live_drafts(f: &Fixture) -> Vec<i64> {
+    let mut ids: Vec<i64> = std::fs::read_dir(f.dir.join(LIVE_DRAFTS))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_str().unwrap().parse().unwrap())
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+fn drafts(f: &Fixture) -> Vec<Value> {
+    std::fs::read_to_string(f.dir.join("drafts.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+/// GitLab: each placeable issue becomes a positioned draft note on the
+/// MR's current diff, the body a plain one, and hunter's drafts are
+/// published one by one, the body last: never `bulk_publish`, which would
+/// take the operator's own drafts on the MR along.
+#[tokio::test]
+async fn gitlab_posts_draft_notes_then_publishes_them() {
+    let bins = FakeBins::acquire("prr-gl");
+    let f = fixture("prr-gl").await;
+    glab_posting(&bins, &f, "head");
+    let id = gitlab_review(&f, "head").await;
+    record_round(
+        &f,
+        id,
+        ("base", "head"),
+        &[
+            issue("breaks the widget", Some("CHANGE.md"), Some(2)),
+            issue("old debt", None, None),
+        ],
+    )
+    .await;
+
+    let admin = support::admin(&f.store);
+    let posted = hunter::scheduler::post_pr_reviews(admin.store(), &f.cfg, || false).await;
+    assert_eq!(posted, 1);
+
+    let notes = drafts(&f);
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    assert_eq!(
+        notes[0]["position"],
+        json!({
+            "position_type": "text",
+            "base_sha": "B",
+            "start_sha": "S",
+            "head_sha": "head",
+            "old_path": "CHANGE.md",
+            "new_path": "CHANGE.md",
+            "new_line": 2,
+        })
+    );
+    assert!(notes[1].get("position").is_none());
+    let body = notes[1]["note"].as_str().unwrap();
+    assert!(
+        body.contains("old debt") && body.ends_with(hunter::forge::OWN_MARK),
+        "{body}"
+    );
+    let inline = notes[0]["note"].as_str().unwrap();
+    assert!(
+        inline.ends_with(hunter::forge::OWN_MARK),
+        "every draft carries hunter's mark: {inline}"
+    );
+    let calls = bins.calls_to("glab");
+    let published: Vec<&str> = calls
+        .iter()
+        .filter(|c| c[2].contains("/draft_notes/"))
+        .map(|c| c[2].rsplit("merge_requests/7/").next().unwrap())
+        .collect();
+    assert_eq!(
+        published,
+        ["draft_notes/1/publish", "draft_notes/2/publish"],
+        "{calls:?}"
+    );
+    let first_publish = calls
+        .iter()
+        .position(|c| c[2].ends_with("/publish"))
+        .unwrap();
+    let last_draft = calls
+        .iter()
+        .rposition(|c| c[2].ends_with("/draft_notes"))
+        .unwrap();
+    assert!(last_draft < first_publish, "{calls:?}");
+    let round = newest_round(&f).await;
+    assert_eq!(round.post_state.as_deref(), Some("posted"));
+    assert!(round.issues.iter().any(|i| i.posted_inline));
+}
+
+/// GitLab positions name the MR's current version: when that is not the
+/// head the round read, every issue goes into the body.
+#[tokio::test]
+async fn gitlab_posts_only_the_body_when_the_mr_moved_on() {
+    let bins = FakeBins::acquire("prr-gl-moved");
+    let f = fixture("prr-gl-moved").await;
+    glab_posting(&bins, &f, "newer");
+    let id = gitlab_review(&f, "head").await;
+    record_round(
+        &f,
+        id,
+        ("base", "head"),
+        &[issue("breaks the widget", Some("CHANGE.md"), Some(2))],
+    )
+    .await;
+
+    let admin = support::admin(&f.store);
+    let posted = hunter::scheduler::post_pr_reviews(admin.store(), &f.cfg, || false).await;
+    assert_eq!(posted, 1);
+
+    let notes = drafts(&f);
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].get("position").is_none());
+    let body = notes[0]["note"].as_str().unwrap();
+    assert!(
+        body.contains("`CHANGE.md:2`") && body.contains("breaks the widget"),
+        "{body}"
+    );
+    assert!(!newest_round(&f).await.issues[0].posted_inline);
+}
+
+/// The reviewer's text quotes the PR, and GitLab runs a line that begins
+/// with a quick action (`/merge`, `/approve`) as the operator once the
+/// note is published: every draft, inline or the body, goes out with such
+/// lines escaped. Reading back the inline note's id matches what GitLab
+/// lists, the text as posted.
+#[tokio::test]
+async fn gitlab_review_text_never_starts_a_quick_action() {
+    use hunter::forge::Forge as _;
+    use hunter::types::PrReviewIssueOut as ReportedIssue;
+    let bins = FakeBins::acquire("prr-gl-quick");
+    let f = fixture("prr-gl-quick").await;
+    glab_posting(&bins, &f, "head");
+    let id = gitlab_review(&f, "head").await;
+    let quoting = |summary: &str, file: Option<&str>, line: Option<i64>| ReportedIssue {
+        detail: "the PR body says:\n/merge\n/approve".to_owned(),
+        ..issue(summary, file, line)
+    };
+    record_round(
+        &f,
+        id,
+        ("base", "head"),
+        &[
+            quoting("breaks the widget", Some("CHANGE.md"), Some(2)),
+            quoting("old debt", None, None),
+        ],
+    )
+    .await;
+
+    let admin = support::admin(&f.store);
+    let posted = hunter::scheduler::post_pr_reviews(admin.store(), &f.cfg, || false).await;
+    assert_eq!(posted, 1);
+    let notes = drafts(&f);
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    for note in &notes {
+        let text = note["note"].as_str().unwrap();
+        assert!(text.contains("says:\n\\/merge\n\\/approve"), "{text}");
+        assert!(!text.lines().any(|l| l.starts_with('/')), "{text}");
+    }
+
+    let inline = notes[0]["note"].as_str().unwrap();
+    let discussions = json!([{ "id": "d1", "notes": [{
+        "id": 501, "body": inline, "author": { "id": 41, "username": "operator" },
+        "system": false, "resolved": false,
+        "position": { "new_path": "CHANGE.md", "old_path": "CHANGE.md", "new_line": 2 },
+    }] }]);
+    std::fs::write(f.dir.join("discussions.json"), discussions.to_string()).unwrap();
+    // The issue's text as the round wrote it: the forge escapes and marks
+    // it the same way to match.
+    let written = "**high · introduced** · blocking: breaks the widget\n\n\
+                   the PR body says:\n/merge\n/approve";
+    let issue_id: i64 = sqlx::query_scalar(
+        "SELECT MIN(id) FROM pr_review_issues WHERE round_id = (SELECT MAX(id) FROM pr_review_rounds)",
+    )
+    .fetch_one(&f.pool().await)
+    .await
+    .unwrap();
+    let refs = hunter::forge::GitLabForge
+        .inline_comment_refs(
+            "https://gitlab.com/acme/widget",
+            7,
+            "",
+            &[(issue_id, written)],
+        )
+        .unwrap();
+    assert_eq!(refs, [(issue_id, "501".to_owned())]);
+}
+
+/// A self-hosted GitLab's review goes to its own host: every call of the
+/// post names it, the draft notes' JSON bodies included.
+#[tokio::test]
+async fn a_self_hosted_gitlabs_review_is_posted_on_its_host() {
+    use hunter::forge::Forge as _;
+    let bins = FakeBins::acquire("prr-gl-selfhosted");
+    let f = fixture("prr-gl-selfhosted").await;
+    glab_posting(&bins, &f, "head");
+    let post = hunter::forge::ReviewPost {
+        commit_id: "head".into(),
+        header: "b".into(),
+        unplaced: Vec::new(),
+        mark: String::new(),
+        comments: Vec::new(),
+    };
+    hunter::forge::GitLabForge
+        .post_review("https://gitlab.example.org/acme/widget", 7, &post)
+        .unwrap();
+
+    let calls = bins.calls_to("glab");
+    assert!(
+        calls.iter().any(|c| c.iter().any(|a| a == "POST")),
+        "{calls:?}"
+    );
+    for call in &calls {
+        let host = call
+            .iter()
+            .position(|a| a == "--hostname")
+            .and_then(|i| call.get(i + 1));
+        assert_eq!(
+            host.map(String::as_str),
+            Some("gitlab.example.org"),
+            "{call:?}"
+        );
+    }
+}
+
+/// Hunter's note is readable, own mark and all, by anybody who can see the
+/// MR, and a copy of it on the diff, however new, is somebody else's
+/// discussion: the read-back takes only a note hunter's own account (the
+/// login `glab` acts as) wrote for the issue's thread, never the copy.
+#[tokio::test]
+async fn gitlab_reads_back_only_hunters_own_note() {
+    use hunter::forge::Forge as _;
+    let bins = FakeBins::acquire("prr-gl-copy");
+    let f = fixture("prr-gl-copy").await;
+    glab_posting(&bins, &f, "head");
+    let id = gitlab_review(&f, "head").await;
+    record_round(
+        &f,
+        id,
+        ("base", "head"),
+        &[issue("breaks the widget", Some("CHANGE.md"), Some(2))],
+    )
+    .await;
+    let admin = support::admin(&f.store);
+    hunter::scheduler::post_pr_reviews(admin.store(), &f.cfg, || false).await;
+    let notes = drafts(&f);
+    let inline = notes[0]["note"].as_str().unwrap();
+    let note = |id: i64, author: Value| {
+        json!({ "id": format!("d{id}"), "notes": [{
+            "id": id, "body": inline, "author": author, "system": false, "resolved": false,
+            "position": { "new_path": "CHANGE.md", "old_path": "CHANGE.md", "new_line": 2 },
+        }] })
+    };
+    let hunters_note = note(501, json!({ "id": 41, "username": "operator" }));
+    let copy = note(502, json!({ "id": 2, "username": "copycat" }));
+    // The round's issue and its text as written: the forge marks the note
+    // with the issue and as hunter's own.
+    let issue_id: i64 = sqlx::query_scalar(
+        "SELECT MIN(id) FROM pr_review_issues WHERE round_id = (SELECT MAX(id) FROM pr_review_rounds)",
+    )
+    .fetch_one(&f.pool().await)
+    .await
+    .unwrap();
+    let read = |discussions: Value| {
+        std::fs::write(f.dir.join("discussions.json"), discussions.to_string()).unwrap();
+        hunter::forge::GitLabForge
+            .inline_comment_refs(
+                "https://gitlab.com/acme/widget",
+                7,
+                "",
+                &[(issue_id, INLINE_BODY)],
+            )
+            .unwrap()
+    };
+
+    assert_eq!(
+        read(json!([hunters_note, copy])),
+        [(issue_id, "501".to_owned())],
+        "the newer copy is not hunter's"
+    );
+    assert_eq!(
+        read(json!([copy])),
+        Vec::<(i64, String)>::new(),
+        "a copy alone: hunter's note is gone"
+    );
+}
+
+/// A review POST that failed after GitHub took it (a timeout, a 5xx after
+/// the write) is not posted again: the round was marked sent, so the
+/// retry looks for the review by its step mark among the operator's
+/// reviews on the PR, finds it, and records it, inline comments and all.
+#[tokio::test]
+async fn a_review_whose_post_failed_after_it_landed_is_found_not_posted_again() {
+    let bins = FakeBins::acquire("prr-post-landed");
+    let f = fixture("prr-post-landed").await;
+    let diff = f.dir.join("pr.diff");
+    std::fs::write(&diff, PR_DIFF).unwrap();
+    let posted = f.dir.join("posted.json");
+    let reviews = f.dir.join("reviews.json");
+    let comments = review_comments(&f, &[]);
+    bins.script(
+        "gh",
+        &format!(
+            "case \"$*\" in\n\
+             'pr diff'*) cat '{diff}';;\n\
+             'api repos/acme/widget --jq .full_name') echo acme/widget;;\n\
+             'api user --jq .login') echo operator;;\n\
+             *'repos/acme/widget/pulls/7/reviews --input -'*) cat > '{posted}'; \
+                echo 'HTTP 504: Gateway Timeout' >&2; exit 1;;\n\
+             *'pulls/7/reviews?per_page=100'*) cat '{reviews}' 2>/dev/null;;\n\
+             *'pulls/7/comments'*'pull_request_review_id == 99'*) cat '{comments}';;\n\
+             *) echo \"unexpected gh $*\" >&2; exit 1;;\n\
+             esac",
+            diff = diff.display(),
+            posted = posted.display(),
+            reviews = reviews.display(),
+            comments = comments.display(),
+        ),
+    );
+    let head = "a".repeat(40);
+    let id = request(&f, &head, true).await;
+    f.store.set_pr_review_auto_post(id, true).await.unwrap();
+    record_round(
+        &f,
+        id,
+        ("b".repeat(40).as_str(), head.as_str()),
+        &[issue("breaks the widget", Some("CHANGE.md"), Some(1))],
+    )
+    .await;
+    let admin = support::admin(&f.store);
+    let post = || hunter::scheduler::post_pr_reviews(admin.store(), &f.cfg, || false);
+    assert_eq!(post().await, 0, "the POST failed");
+    assert_eq!(review_posts(&bins), 1);
+
+    // GitHub took it all the same.
+    let sent = sent_review(&f);
+    let listed = json!({ "id": 99, "body": sent["body"], "login": "operator" });
+    std::fs::write(&reviews, listed.to_string()).unwrap();
+    assert_eq!(post().await, 1);
+    assert_eq!(review_posts(&bins), 1, "found, not posted again");
+    let round = newest_round(&f).await;
+    assert_eq!(round.post_state.as_deref(), Some("posted"));
+
+    // The next round's POST fails before GitHub takes it: the earlier
+    // round's review on the PR is not this one's, and it is sent again.
+    record_round(
+        &f,
+        id,
+        (head.as_str(), head.as_str()),
+        &[issue("breaks the gadget", Some("CHANGE.md"), Some(2))],
+    )
+    .await;
+    assert_eq!(post().await, 0);
+    assert_eq!(review_posts(&bins), 2);
+    assert_eq!(post().await, 0, "the POST failed again");
+    assert_eq!(
+        review_posts(&bins),
+        3,
+        "sent again, not taken for the earlier round's review"
+    );
+}
+
+/// A GitLab body publish that failed after GitLab took it is not posted
+/// again: the retry finds the body among the discussions, by hunter's own
+/// account and the round's step mark, and records the round posted; a
+/// copy of the body by somebody else is no such find.
+#[tokio::test]
+async fn a_gitlab_review_whose_publish_failed_after_it_landed_is_found() {
+    let bins = FakeBins::acquire("prr-gl-landed");
+    let f = fixture("prr-gl-landed").await;
+    glab_posting(&bins, &f, "head");
+    let id = gitlab_review(&f, "head").await;
+    record_round(
+        &f,
+        id,
+        ("base", "head"),
+        &[issue("breaks the widget", Some("CHANGE.md"), Some(2))],
+    )
+    .await;
+    let admin = support::admin(&f.store);
+    let post = || hunter::scheduler::post_pr_reviews(admin.store(), &f.cfg, || false);
+
+    // Draft 1 is the inline note, 2 the body: its publish fails.
+    std::fs::write(f.dir.join("publish-fails"), "2").unwrap();
+    assert_eq!(post().await, 0);
+    std::fs::remove_file(f.dir.join("publish-fails")).unwrap();
+    let notes = drafts(&f);
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    let (inline, body) = (
+        notes[0]["note"].as_str().unwrap(),
+        notes[1]["note"].as_str().unwrap(),
+    );
+    let note = |id: i64, body: &str, author: Value, position: Value| {
+        json!({ "id": format!("d{id}"), "notes": [{
+            "id": id, "body": body, "author": author, "system": false, "resolved": false,
+            "position": position,
+        }] })
+    };
+    let on_line = json!({ "new_path": "CHANGE.md", "old_path": "CHANGE.md", "new_line": 2 });
+    let operator = json!({ "id": 41, "username": "operator" });
+    let inline_note = note(501, inline, operator.clone(), on_line);
+
+    // Only a copy of the body, by somebody else: not hunter's review.
+    let copy = note(
+        502,
+        body,
+        json!({ "id": 2, "username": "copycat" }),
+        Value::Null,
+    );
+    let discussions = json!([inline_note, copy]);
+    std::fs::write(f.dir.join("discussions.json"), discussions.to_string()).unwrap();
+    let found = hunter::forge::forge_for(ForgeName::Gitlab)
+        .find_review(
+            "https://gitlab.com/acme/widget",
+            7,
+            &format!("review of round {}", newest_round(&f).await.id),
+            &[],
+        )
+        .unwrap();
+    assert_eq!(found.review_ref, None, "{found:?}");
+
+    // GitLab took the body all the same.
+    let landed = note(503, body, operator, Value::Null);
+    let discussions = json!([inline_note, copy, landed]);
+    std::fs::write(f.dir.join("discussions.json"), discussions.to_string()).unwrap();
+    assert_eq!(post().await, 1);
+    assert_eq!(drafts(&f).len(), 2, "found, not posted again");
+    let round = newest_round(&f).await;
+    assert_eq!(round.post_state.as_deref(), Some("posted"));
+    assert!(round.issues[0].posted_inline);
+}
+
+/// A GitLab inline note whose publish failed after GitLab took it is on
+/// the MR, though the failed post recorded none out: the retry finds it,
+/// by hunter's account and its text, records it, and posts only the rest.
+#[tokio::test]
+async fn a_gitlab_note_whose_publish_failed_after_it_landed_is_not_posted_again() {
+    let bins = FakeBins::acquire("prr-gl-note-landed");
+    let f = fixture("prr-gl-note-landed").await;
+    glab_posting(&bins, &f, "head");
+    let id = gitlab_review(&f, "head").await;
+    record_round(
+        &f,
+        id,
+        ("base", "head"),
+        &[
+            issue("breaks the widget", Some("CHANGE.md"), Some(1)),
+            issue("old debt", None, None),
+        ],
+    )
+    .await;
+    let admin = support::admin(&f.store);
+    let post = || hunter::scheduler::post_pr_reviews(admin.store(), &f.cfg, || false);
+
+    // Draft 1 is the inline note: its publish fails, though GitLab took it.
+    std::fs::write(f.dir.join("publish-fails"), "1").unwrap();
+    assert_eq!(post().await, 0);
+    std::fs::remove_file(f.dir.join("publish-fails")).unwrap();
+    let inline = drafts(&f)[0]["note"].as_str().unwrap().to_owned();
+    let landed = json!([{ "id": "d1", "notes": [{
+        "id": 501, "body": inline, "author": { "id": 41, "username": "operator" },
+        "system": false, "resolved": false,
+        "position": { "new_path": "CHANGE.md", "old_path": "CHANGE.md", "new_line": 1 },
+    }] }]);
+    std::fs::write(f.dir.join("discussions.json"), landed.to_string()).unwrap();
+
+    assert_eq!(post().await, 1);
+    let notes = drafts(&f);
+    assert_eq!(notes.len(), 3, "only the body again: {notes:?}");
+    assert!(notes[2]["note"].as_str().unwrap().contains("old debt"));
+    let round = newest_round(&f).await;
+    assert_eq!(round.post_state.as_deref(), Some("posted"));
+    assert!(round.issues[0].posted_inline);
+}
+
+/// A post that fails while the forge cannot be reached is the machine's
+/// failure: it counts no attempt and keeps no error, so an approved round
+/// is never sent back to `pending` for being posted offline. The same
+/// failure with the forge reachable (the network gate off) counts.
+#[tokio::test]
+async fn a_post_failing_while_the_forge_is_unreachable_counts_nothing() {
+    let bins = FakeBins::acquire("prr-post-offline");
+    let mut f = fixture("prr-post-offline").await;
+    glab_posting(&bins, &f, "head");
+    std::fs::write(f.dir.join("publish-fails"), "1").unwrap();
+    // A forge host nothing listens on: the probe finds it unreachable.
+    let rid = f
+        .store
+        .add_repo(
+            "gl-down",
+            "https://127.0.0.1:1/acme/widget",
+            &f.dir.subdir("gl-repos"),
+            "main",
+            ForgeName::Gitlab,
+        )
+        .await
+        .unwrap();
+    let id = f
+        .store
+        .request_pr_review(&NewPrReview {
+            repo_id: rid,
+            auto_post: true,
+            repo_url: "https://127.0.0.1:1/acme/widget",
+            ..new_review("head")
+        })
+        .await
+        .unwrap()
+        .id;
+    record_round(
+        &f,
+        id,
+        ("base", "head"),
+        &[issue("breaks the widget", Some("CHANGE.md"), Some(2))],
+    )
+    .await;
+    let admin = support::admin(&f.store);
+
+    f.cfg.network_gate = true;
+    let posted = hunter::scheduler::post_pr_reviews(admin.store(), &f.cfg, || false).await;
+    assert_eq!(posted, 0);
+    let round = newest_round(&f).await;
+    assert_eq!(
+        (round.post_state.as_deref(), round.post_error.as_deref()),
+        (Some("approved"), None),
+        "nothing counted"
+    );
+
+    // The retry deletes the drafts the failed post left (1, the inline
+    // note, and 2, the body) and posts afresh: its inline note is 3.
+    std::fs::write(f.dir.join("publish-fails"), "3").unwrap();
+    f.cfg.network_gate = false;
+    let posted = hunter::scheduler::post_pr_reviews(admin.store(), &f.cfg, || false).await;
+    assert_eq!(posted, 0);
+    let round = newest_round(&f).await;
+    assert_eq!(round.post_state.as_deref(), Some("approved"));
+    assert!(round.post_error.is_some(), "counted: {round:?}");
+}
+
+/// GitLab publishes a review's notes one by one. A publish that fails
+/// after some inline notes went out records those and deletes the drafts
+/// it left; the retry posts only the rest, never an inline comment twice,
+/// under a header that still counts every issue.
+#[tokio::test]
+async fn a_gitlab_post_that_failed_partway_retries_only_the_rest() {
+    let bins = FakeBins::acquire("prr-gl-partial");
+    let f = fixture("prr-gl-partial").await;
+    glab_posting(&bins, &f, "head");
+    let id = gitlab_review(&f, "head").await;
+    record_round(
+        &f,
+        id,
+        ("base", "head"),
+        &[
+            issue("breaks the widget", Some("CHANGE.md"), Some(1)),
+            issue("breaks the gadget", Some("CHANGE.md"), Some(2)),
+            issue("old debt", None, None),
+        ],
+    )
+    .await;
+    let admin = support::admin(&f.store);
+    let post = || hunter::scheduler::post_pr_reviews(admin.store(), &f.cfg, || false);
+    let inline = |f: &Fixture| {
+        let f = f.store.clone();
+        async move {
+            let rounds = f.list_pr_review_rounds().await.unwrap();
+            rounds[0]
+                .1
+                .issues
+                .iter()
+                .map(|i| (i.summary.clone(), i.posted_inline))
+                .collect::<Vec<_>>()
+        }
+    };
+
+    // Drafts 1 and 2 are the inline notes, 3 the body: the second fails.
+    std::fs::write(f.dir.join("publish-fails"), "2").unwrap();
+    assert_eq!(post().await, 0);
+    assert_eq!(
+        newest_round(&f).await.post_state.as_deref(),
+        Some("approved")
+    );
+    assert_eq!(
+        inline(&f).await,
+        [
+            ("breaks the widget".to_owned(), true),
+            ("breaks the gadget".to_owned(), false),
+            ("old debt".to_owned(), false),
+        ]
+    );
+    let deleted: Vec<String> = bins
+        .calls_to("glab")
+        .into_iter()
+        .filter(|c| c.iter().any(|a| a == "DELETE"))
+        .map(|c| c[2].rsplit("merge_requests/7/").next().unwrap().to_owned())
+        .collect();
+    assert_eq!(deleted, ["draft_notes/2", "draft_notes/3"]);
+
+    std::fs::remove_file(f.dir.join("publish-fails")).unwrap();
+    assert_eq!(post().await, 1);
+    let notes = drafts(&f);
+    let texts: Vec<&str> = notes.iter().map(|n| n["note"].as_str().unwrap()).collect();
+    assert_eq!(texts.len(), 5, "{texts:?}");
+    assert!(
+        texts[3..].iter().all(|t| !t.contains("breaks the widget")),
+        "the published note is not posted again: {texts:?}"
+    );
+    assert_eq!(notes[3]["position"]["new_line"], json!(2));
+    assert!(
+        texts[4].contains("3 issue(s)") && texts[4].contains("old debt"),
+        "{}",
+        texts[4]
+    );
+    let published: Vec<String> = bins
+        .calls_to("glab")
+        .into_iter()
+        .filter(|c| c[2].ends_with("/publish"))
+        .map(|c| c[2].rsplit("merge_requests/7/").next().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        published,
+        [
+            "draft_notes/1/publish",
+            "draft_notes/2/publish",
+            "draft_notes/4/publish",
+            "draft_notes/5/publish",
+        ]
+    );
+    assert_eq!(newest_round(&f).await.post_state.as_deref(), Some("posted"));
+    assert!(inline(&f).await[..2].iter().all(|(_, out)| *out));
+    assert!(live_drafts(&f).is_empty(), "{:?}", live_drafts(&f));
+}
+
+/// An inline note a GitLab post published before it failed is on the MR:
+/// a later send the forge refuses outright (a 400 on its first publish)
+/// leaves the round landed, so once its posts give up it is pending,
+/// partly posted, and never discarded.
+#[tokio::test]
+async fn a_gitlab_round_with_a_published_note_stays_landed_when_refused() {
+    let bins = FakeBins::acquire("prr-gl-refused");
+    let f = fixture("prr-gl-refused").await;
+    glab_posting(&bins, &f, "head");
+    let id = gitlab_review(&f, "head").await;
+    let round = record_round(
+        &f,
+        id,
+        ("base", "head"),
+        &[
+            issue("breaks the widget", Some("CHANGE.md"), Some(1)),
+            issue("breaks the gadget", Some("CHANGE.md"), Some(2)),
+        ],
+    )
+    .await;
+    let admin = support::admin(&f.store);
+    let post = || hunter::scheduler::post_pr_reviews(admin.store(), &f.cfg, || false);
+
+    // Drafts 1 and 2 are the inline notes, 3 the body: the second fails,
+    // the first is out.
+    std::fs::write(f.dir.join("publish-fails"), "2").unwrap();
+    assert_eq!(post().await, 0);
+    std::fs::remove_file(f.dir.join("publish-fails")).unwrap();
+    std::fs::write(f.dir.join("publish-refused"), "").unwrap();
+    assert_eq!(post().await, 0);
+    assert_eq!(post().await, 0);
+    let refused = bins
+        .calls_to("glab")
+        .iter()
+        .filter(|c| c[2].ends_with("/draft_notes/4/publish"))
+        .count();
+    assert_eq!(refused, 1, "the retry's first publish was refused");
+
+    let pending = newest_round(&f).await;
+    assert_eq!(
+        (pending.post_state.as_deref(), pending.landed),
+        (Some("pending"), true),
+        "{pending:?}"
+    );
+    let decided = f
+        .store
+        .decide_pr_review_post(round, PostDecision::Discard)
+        .await
+        .unwrap();
+    assert!(
+        matches!(&decided, PostDecided::Refused(why) if why.contains("partly on the PR")),
+        "{decided:?}"
+    );
+}
+
+/// Two issues of one round may read the same (a comment carries no file
+/// or line). A GitLab post that published the first one's note and failed
+/// on the second's is retried looking for what the failed send left; the
+/// first one's note, published already, is not the second's: each note
+/// carries its issue's hidden mark, and the retry publishes the second.
+#[tokio::test]
+async fn a_gitlab_retry_never_takes_another_issues_note_of_the_same_text() {
+    let bins = FakeBins::acquire("prr-gl-same-text");
+    let f = fixture("prr-gl-same-text").await;
+    glab_posting(&bins, &f, "head");
+    let id = gitlab_review(&f, "head").await;
+    record_round(
+        &f,
+        id,
+        ("base", "head"),
+        &[
+            issue("breaks the widget", Some("CHANGE.md"), Some(1)),
+            issue("breaks the widget", Some("CHANGE.md"), Some(2)),
+        ],
+    )
+    .await;
+    let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM pr_review_issues ORDER BY id")
+        .fetch_all(&f.pool().await)
+        .await
+        .unwrap();
+    let (first, second) = (ids[0], ids[1]);
+    let admin = support::admin(&f.store);
+    let post = || hunter::scheduler::post_pr_reviews(admin.store(), &f.cfg, || false);
+
+    // Drafts 1 and 2 are the inline notes, 3 the body: the second fails.
+    std::fs::write(f.dir.join("publish-fails"), "2").unwrap();
+    assert_eq!(post().await, 0);
+    std::fs::remove_file(f.dir.join("publish-fails")).unwrap();
+    let published = drafts(&f)[0]["note"].as_str().unwrap().to_owned();
+    assert!(
+        published.contains(&format!("comment of issue {first}")),
+        "{published}"
+    );
+    let landed = json!([{ "id": "d1", "notes": [{
+        "id": 501, "body": published, "author": { "id": 41, "username": "operator" },
+        "system": false, "resolved": false,
+        "position": { "new_path": "CHANGE.md", "old_path": "CHANGE.md", "new_line": 1 },
+    }] }]);
+    std::fs::write(f.dir.join("discussions.json"), landed.to_string()).unwrap();
+
+    assert_eq!(post().await, 1);
+    let notes = drafts(&f);
+    let retried: Vec<&Value> = notes[3..].iter().collect();
+    assert_eq!(
+        retried.len(),
+        2,
+        "the second issue's note and the body: {notes:?}"
+    );
+    assert_eq!(retried[0]["position"]["new_line"], json!(2));
+    let second_note = retried[0]["note"].as_str().unwrap();
+    assert!(
+        second_note.contains(&format!("comment of issue {second}")),
+        "{second_note}"
+    );
+    let published: Vec<String> = bins
+        .calls_to("glab")
+        .into_iter()
+        .filter(|c| c[2].ends_with("/publish"))
+        .map(|c| c[2].rsplit("merge_requests/7/").next().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        published,
+        [
+            "draft_notes/1/publish",
+            "draft_notes/2/publish",
+            "draft_notes/4/publish",
+            "draft_notes/5/publish",
+        ]
+    );
+    let round = newest_round(&f).await;
+    assert_eq!(round.post_state.as_deref(), Some("posted"));
+}
+
+/// The drafts a failed GitLab post did not publish are the operator
+/// login's, and the operator's next review by hand would publish them
+/// under their name: they are deleted, found by hunter's mark, the
+/// operator's own draft left alone. A delete that fails is tried again by
+/// every sync, and until one succeeds the round is not posted again, which
+/// would leave a second set.
+#[tokio::test]
+async fn a_failed_gitlab_posts_drafts_are_deleted_before_it_posts_again() {
+    let bins = FakeBins::acquire("prr-gl-leftover");
+    let f = fixture("prr-gl-leftover").await;
+    glab_posting(&bins, &f, "head");
+    std::fs::write(
+        f.dir.join(LIVE_DRAFTS).join("100"),
+        json!({ "id": 100, "note": "the operator's own, started by hand" }).to_string(),
+    )
+    .unwrap();
+    let id = gitlab_review(&f, "head").await;
+    record_round(
+        &f,
+        id,
+        ("base", "head"),
+        &[
+            issue("breaks the widget", Some("CHANGE.md"), Some(1)),
+            issue("old debt", None, None),
+        ],
+    )
+    .await;
+    let admin = support::admin(&f.store);
+    let post = || hunter::scheduler::post_pr_reviews(admin.store(), &f.cfg, || false);
+    let marked = || async {
+        f.store
+            .get_pr_review(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .drafts_left_at
+            .is_some()
+    };
+
+    // Draft 1 is the inline note, 2 the body: publishing fails, and so does
+    // deleting them.
+    std::fs::write(f.dir.join("publish-fails"), "1").unwrap();
+    std::fs::write(f.dir.join("delete-fails"), "").unwrap();
+    assert_eq!(post().await, 0);
+    assert_eq!(live_drafts(&f), [1, 2, 100]);
+    assert!(marked().await);
+
+    // The forge publishes again, but hunter's drafts are still there.
+    std::fs::remove_file(f.dir.join("publish-fails")).unwrap();
+    assert_eq!(post().await, 0);
+    assert_eq!(drafts(&f).len(), 2, "no second set");
+    assert_eq!(live_drafts(&f), [1, 2, 100]);
+
+    std::fs::remove_file(f.dir.join("delete-fails")).unwrap();
+    assert_eq!(post().await, 1);
+    assert_eq!(live_drafts(&f), [100], "the operator's own is left");
+    assert_eq!(drafts(&f).len(), 4);
+    assert!(!marked().await);
+    assert_eq!(newest_round(&f).await.post_state.as_deref(), Some("posted"));
+    let deleted: Vec<String> = events(&f, "pr_review")
+        .await
+        .into_iter()
+        .filter(|m| m.contains("draft(s)"))
+        .collect();
+    assert_eq!(deleted.len(), 1, "{deleted:?}");
+    assert!(
+        deleted[0].ends_with("deleted 2 draft(s) a failed post left on the PR"),
+        "{deleted:?}"
+    );
+}
+
+/// A round its review's left drafts keep from posting cannot post, and
+/// every sync that finds it so counts a failed post: once deleting them
+/// has failed for as long as a failing post may, the round falls back to
+/// pending with the reason shown, rather than staying approved and never
+/// posting.
+#[tokio::test]
+async fn a_round_whose_left_drafts_cannot_be_deleted_falls_back_to_pending() {
+    let bins = FakeBins::acquire("prr-gl-leftover-stuck");
+    let f = fixture("prr-gl-leftover-stuck").await;
+    glab_posting(&bins, &f, "head");
+    let id = gitlab_review(&f, "head").await;
+    record_round(
+        &f,
+        id,
+        ("base", "head"),
+        &[issue("breaks the widget", Some("CHANGE.md"), Some(1))],
+    )
+    .await;
+    let admin = support::admin(&f.store);
+    let post = || hunter::scheduler::post_pr_reviews(admin.store(), &f.cfg, || false);
+
+    std::fs::write(f.dir.join("publish-fails"), "1").unwrap();
+    std::fs::write(f.dir.join("delete-fails"), "").unwrap();
+    for attempt in 1..=hunter::store::POST_GIVE_UP_AT {
+        assert_eq!(post().await, 0);
+        let round = newest_round(&f).await;
+        let want = if attempt < hunter::store::POST_GIVE_UP_AT {
+            "approved"
+        } else {
+            "pending"
+        };
+        assert_eq!(
+            round.post_state.as_deref(),
+            Some(want),
+            "attempt {attempt}: {round:?}"
+        );
+    }
+    let round = newest_round(&f).await;
+    assert!(
+        round
+            .post_error
+            .as_deref()
+            .unwrap()
+            .contains("drafts an earlier post left on the PR are not deleted yet"),
+        "{round:?}"
+    );
+    assert_eq!(drafts(&f).len(), 2, "no second set");
+}
+
+/// A round part of whose post is on the PR (an inline note published
+/// before the failure) falls back to pending after its failed posts like
+/// any other, but can no longer be discarded: what is on the PR stays
+/// said, and approving it again posts the rest.
+#[tokio::test]
+async fn a_round_partly_on_the_pr_cannot_be_discarded() {
+    let bins = FakeBins::acquire("prr-gl-landed");
+    let f = fixture("prr-gl-landed").await;
+    glab_posting(&bins, &f, "head");
+    let id = gitlab_review(&f, "head").await;
+    record_round(
+        &f,
+        id,
+        ("base", "head"),
+        &[
+            issue("breaks the widget", Some("CHANGE.md"), Some(1)),
+            issue("breaks the gadget", Some("CHANGE.md"), Some(2)),
+        ],
+    )
+    .await;
+    let admin = support::admin(&f.store);
+    let post = || hunter::scheduler::post_pr_reviews(admin.store(), &f.cfg, || false);
+    assert!(!newest_round(&f).await.landed);
+
+    // Drafts 1 and 2 are the inline notes, 3 the body: 1 goes out and 2
+    // fails; each retry then fails on its first draft, the gadget again
+    // (4, then 6).
+    for fails in ["2", "4", "6"] {
+        std::fs::write(f.dir.join("publish-fails"), fails).unwrap();
+        assert_eq!(post().await, 0);
+    }
+    let round = newest_round(&f).await;
+    assert_eq!(
+        (round.post_state.as_deref(), round.landed),
+        (Some("pending"), true),
+        "{round:?}"
+    );
+    let decided = f
+        .store
+        .decide_pr_review_post(round.id, PostDecision::Discard)
+        .await
+        .unwrap();
+    assert!(
+        matches!(&decided, PostDecided::Refused(why) if why.contains("partly on the PR")),
+        "{decided:?}"
+    );
+
+    std::fs::remove_file(f.dir.join("publish-fails")).unwrap();
+    f.store
+        .decide_pr_review_post(round.id, PostDecision::Approve)
+        .await
+        .unwrap();
+    assert_eq!(post().await, 1);
+    assert_eq!(newest_round(&f).await.post_state.as_deref(), Some("posted"));
+}
+
+/// A review whose send failed may be on the PR all the same (a timeout,
+/// a 5xx after GitHub created it), so a round whose post sent it is
+/// released for good from the send on: after its posts give up it is
+/// pending and shown partly posted, refuses a discard, and is only ever
+/// approved again, whose post looks for the review before sending it.
+#[tokio::test]
+async fn a_round_whose_review_was_sent_cannot_be_discarded() {
+    let bins = FakeBins::acquire("prr-sent-kept");
+    let f = fixture("prr-sent-kept").await;
+    gh_posting(&bins, &f, true);
+    std::fs::write(f.dir.join("review-502"), "").unwrap();
+    let id = request(&f, "head", true).await;
+    f.store.set_pr_review_auto_post(id, true).await.unwrap();
+    let round = record_round(&f, id, ("base", "head"), &[issue("x", None, None)]).await;
+    let admin = support::admin(&f.store);
+    for _ in 0..3 {
+        assert_eq!(
+            hunter::scheduler::post_pr_reviews(admin.store(), &f.cfg, || false).await,
+            0
+        );
+    }
+    let pending = newest_round(&f).await;
+    assert_eq!(
+        (pending.post_state.as_deref(), pending.landed),
+        (Some("pending"), true),
+        "{pending:?}"
+    );
+    let decided = f
+        .store
+        .decide_pr_review_post(round, PostDecision::Discard)
+        .await
+        .unwrap();
+    assert!(
+        matches!(&decided, PostDecided::Refused(why) if why.contains("partly on the PR")),
+        "{decided:?}"
+    );
+
+    gh_posting(&bins, &f, false);
+    f.store
+        .decide_pr_review_post(round, PostDecision::Approve)
+        .await
+        .unwrap();
+    assert_eq!(
+        hunter::scheduler::post_pr_reviews(admin.store(), &f.cfg, || false).await,
+        1
+    );
+    assert_eq!(newest_round(&f).await.post_state.as_deref(), Some("posted"));
+    assert!(
+        bins.calls_to("gh")
+            .iter()
+            .any(|c| c.iter().any(|a| a.contains("reviews?per_page=100"))),
+        "the post looked for the review first"
+    );
+}
+
+/// A review send the forge refused outright (a 4xx: GitHub creates the
+/// review and its comments in the one call it refused) put nothing on the
+/// PR. Its mark is undone: the round is not landed, the next post sends
+/// the review without looking for it, and once its posts give up it is
+/// pending and can be discarded. A send whose call failed with a 502 may
+/// have landed, until the next post's look for it finds nothing and the
+/// forge refuses that post's send.
+#[tokio::test]
+async fn a_round_whose_review_the_forge_refused_can_be_discarded() {
+    let bins = FakeBins::acquire("prr-refused-discard");
+    let f = fixture("prr-refused-discard").await;
+    gh_posting(&bins, &f, true);
+    let id = request(&f, "head", true).await;
+    f.store.set_pr_review_auto_post(id, true).await.unwrap();
+    let round = record_round(&f, id, ("base", "head"), &[issue("x", None, None)]).await;
+    let admin = support::admin(&f.store);
+    let post = || hunter::scheduler::post_pr_reviews(admin.store(), &f.cfg, || false);
+    let looked = || {
+        bins.calls_to("gh")
+            .iter()
+            .filter(|c| c.iter().any(|a| a.contains("reviews?per_page=100")))
+            .count()
+    };
+
+    let gateway = f.dir.join("review-502");
+    std::fs::write(&gateway, "").unwrap();
+    assert_eq!(post().await, 0);
+    assert!(newest_round(&f).await.landed, "a 502 says nothing");
+    std::fs::remove_file(&gateway).unwrap();
+    assert_eq!(post().await, 0);
+    assert_eq!(looked(), 1, "the second post looked for the first's review");
+    assert!(
+        !newest_round(&f).await.landed,
+        "refused, and none was found"
+    );
+    assert_eq!(post().await, 0);
+    assert_eq!(looked(), 1, "nothing to look for after a refusal");
+    assert_eq!(review_posts(&bins), 3);
+
+    let pending = newest_round(&f).await;
+    assert_eq!(
+        (pending.post_state.as_deref(), pending.landed),
+        (Some("pending"), false),
+        "{pending:?}"
+    );
+    let why = pending.post_error.as_deref().unwrap();
+    assert!(
+        why.starts_with("nothing of the review was posted: ") && why.contains("HTTP 422"),
+        "{why}"
+    );
+    let decided = f
+        .store
+        .decide_pr_review_post(round, PostDecision::Discard)
+        .await
+        .unwrap();
+    assert!(matches!(decided, PostDecided::Moved { .. }), "{decided:?}");
+    assert_eq!(
+        newest_round(&f).await.post_state.as_deref(),
+        Some("discarded")
+    );
+}
+
+/// GitHub gives a review's inline comments their ids only on a read after
+/// the post. One that fails leaves the review up but the round approved,
+/// with the error: the next sync reads the ids again, never posting the
+/// review twice, and only then is the round posted.
+#[tokio::test]
+async fn inline_comment_ids_a_failed_read_missed_are_read_on_the_retry() {
+    let bins = FakeBins::acquire("prr-refs-retry");
+    let f = fixture("prr-refs-retry").await;
+    gh_posting(&bins, &f, false);
+    let head = "a".repeat(40);
+    let id = request(&f, &head, true).await;
+    f.store.set_pr_review_auto_post(id, true).await.unwrap();
+    record_round(
+        &f,
+        id,
+        ("base", head.as_str()),
+        &[issue("breaks the widget", Some("CHANGE.md"), Some(1))],
+    )
+    .await;
+    std::fs::write(f.dir.join("comments-fail"), "").unwrap();
+    let admin = support::admin(&f.store);
+    let post = || hunter::scheduler::post_pr_reviews(admin.store(), &f.cfg, || false);
+
+    assert_eq!(post().await, 0);
+    let round = newest_round(&f).await;
+    assert_eq!(round.post_state.as_deref(), Some("approved"));
+    assert!(
+        round.post_error.as_deref().unwrap().contains("502"),
+        "{round:?}"
+    );
+    assert!(round.issues[0].posted_inline);
+
+    std::fs::remove_file(f.dir.join("comments-fail")).unwrap();
+    assert_eq!(post().await, 1);
+    assert_eq!(review_posts(&bins), 1, "the review went up once");
+    let round = newest_round(&f).await;
+    assert_eq!(round.post_state.as_deref(), Some("posted"));
+}
+
+/// An inline comment the read of its review does not list was deleted
+/// before hunter learned its id: the read lists every comment of the
+/// review, so it is gone, which is recorded, and the round is posted
+/// without it.
+#[tokio::test]
+async fn an_inline_comment_deleted_before_its_id_was_read_is_gone() {
+    let bins = FakeBins::acquire("prr-refs-gone");
+    let f = fixture("prr-refs-gone").await;
+    gh_posting(&bins, &f, false);
+    review_comments(
+        &f,
+        &[json!({ "node_id": "C9", "path": "CHANGE.md", "line": 1, "body": "somebody else's" })],
+    );
+    let head = "a".repeat(40);
+    let id = request(&f, &head, true).await;
+    f.store.set_pr_review_auto_post(id, true).await.unwrap();
+    record_round(
+        &f,
+        id,
+        ("base", head.as_str()),
+        &[issue("breaks the widget", Some("CHANGE.md"), Some(1))],
+    )
+    .await;
+
+    let admin = support::admin(&f.store);
+    let posted = hunter::scheduler::post_pr_reviews(admin.store(), &f.cfg, || false).await;
+    assert_eq!(posted, 1);
+    let round = newest_round(&f).await;
+    assert_eq!(round.post_state.as_deref(), Some("posted"));
+    assert!(round.issues[0].posted_inline);
 }

@@ -1471,6 +1471,23 @@ fn gitlab_host_path(url: &str) -> Option<(&str, &str)> {
     (!path.is_empty()).then_some((host, path))
 }
 
+/// Whether `a` and `b` name the same repository: the same host (any case,
+/// any scheme, user or port) and path, a trailing `/` or `.git` aside. An
+/// edit of a repo's URL that changes only its form (adding `.git`, `http`
+/// to `https`, an `ssh` remote) names the same PRs; the path is compared
+/// as given, the slug being case-sensitive here. A URL with no host
+/// (a local path) compares as text, but for the same suffixes.
+pub fn same_repo(a: &str, b: &str) -> bool {
+    let trim = |p: &str| -> String { p.trim_end_matches('/').trim_end_matches(".git").to_owned() };
+    let key = |url: &str| {
+        url_host_path(url).map_or_else(
+            || (String::new(), trim(url)),
+            |(host, path)| (host.to_ascii_lowercase(), trim(path)),
+        )
+    };
+    key(a) == key(b)
+}
+
 /// Build a `gh pr view --json` call and parse the `PrView` from JSON.
 fn gh_pr_view(slug: &str, pr_number: i64, fields: &str) -> anyhow::Result<PrView> {
     let num = pr_number.to_string();
