@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  isEventList, isFindingDetail, isFindingList, isJobList, isStats, isSummary,
+  isEventList, isFindingDetail, isFindingList, isJobList, isOpenPrList, isPrReviewList, isStats,
+  isSummary,
 } from "./validate";
 
 // A body shaped like what the daemon actually serves, trimmed to the
@@ -351,5 +352,57 @@ describe("isSummary repo work", () => {
     expect(isSummary({ ...summary, repos: [repo({ holds: [hold("hunt", ["restart", "restart"])] })] })).toBe(false);
     expect(isSummary({ ...summary, repos: [repo({ holds: [{ kind: "hunt" }] })] })).toBe(false);
     expect(isSummary({ ...summary, repos: [repo({ failing: [{ kind: "hunt" }, { kind: "hunt" }] })] })).toBe(false);
+  });
+});
+
+// ReviewsPage renders `{#each reviews as review (review.id)}`, per review
+// `{#each rounds as round (round.id)}`, and per round slices both shas
+// and iterates `issues`.
+describe("isPrReviewList", () => {
+  const round = (extra: Record<string, unknown> = {}) => ({
+    id: 1, base_sha: "a".repeat(40), head_sha: "b".repeat(40), issues: [], ...extra,
+  });
+  const review = (id: unknown, rounds: unknown) => ({ id, rounds });
+
+  it("accepts empty lists and reviews with rounds and issues", () => {
+    expect(isPrReviewList([])).toBe(true);
+    expect(isPrReviewList([review(1, []), review(2, [round()])])).toBe(true);
+    expect(
+      isPrReviewList([review(1, [round({ id: 2, issues: [{ summary: "x" }] }), round()])]),
+    ).toBe(true);
+  });
+
+  it("rejects reviews the page cannot key by id", () => {
+    expect(isPrReviewList([review(1, []), review(1, [])])).toBe(false);
+    expect(isPrReviewList([{ rounds: [] }])).toBe(false);
+    expect(isPrReviewList({})).toBe(false);
+  });
+
+  it("rejects absent, repeated or unkeyed rounds", () => {
+    expect(isPrReviewList([{ id: 1 }])).toBe(false);
+    expect(isPrReviewList([review(1, [round(), round()])])).toBe(false);
+    expect(isPrReviewList([review(1, [round({ id: "1" })])])).toBe(false);
+  });
+
+  it("rejects a round whose shas or issues the page cannot render", () => {
+    expect(isPrReviewList([review(1, [round({ base_sha: null })])])).toBe(false);
+    expect(isPrReviewList([review(1, [round({ head_sha: undefined })])])).toBe(false);
+    expect(isPrReviewList([review(1, [round({ issues: null })])])).toBe(false);
+    expect(isPrReviewList([review(1, [round({ issues: ["nope"] })])])).toBe(false);
+  });
+});
+
+// The open-PR picker renders `{#each prs as pr (pr.number)}`.
+describe("isOpenPrList", () => {
+  it("accepts an empty list and distinct PR numbers", () => {
+    expect(isOpenPrList([])).toBe(true);
+    expect(isOpenPrList([{ number: 3 }, { number: 4 }])).toBe(true);
+  });
+
+  it("rejects repeated, missing or non-numeric numbers and an error body", () => {
+    expect(isOpenPrList([{ number: 3 }, { number: 3 }])).toBe(false);
+    expect(isOpenPrList([{ title: "x" }])).toBe(false);
+    expect(isOpenPrList([{ number: "3" }])).toBe(false);
+    expect(isOpenPrList({ error: "gh failed" })).toBe(false);
   });
 });

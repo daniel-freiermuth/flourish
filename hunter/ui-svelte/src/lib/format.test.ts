@@ -1,6 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { clock, datetime, isHttpUrl, ktok, ts } from "./format";
+import { clock, datetime, isHttpUrl, ktok, reviewStateLabel, ts } from "./format";
+
+describe("reviewStateLabel", () => {
+  it("names a review that ended on hunter's own PR", () => {
+    expect(reviewStateLabel("own")).toBe("hunter's own PR");
+  });
+
+  it.each(["open", "merged", "closed"])("shows %s as is", (s) => {
+    expect(reviewStateLabel(s)).toBe(s);
+  });
+});
 
 /**
  * Repo URLs are operator-supplied and rendered as links. Only http(s)

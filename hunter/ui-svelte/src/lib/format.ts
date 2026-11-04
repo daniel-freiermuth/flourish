@@ -146,6 +146,24 @@ export function repoWorkLabel(k: string): string {
   return k === "sync" ? "sync (clone, fetch, branch)" : k || "?";
 }
 
+/**
+ * A job kind where the status panel names it. Kind strings read as words
+ * except the PR review's, whose snake_case string would be the only one
+ * on the panel that does not.
+ */
+export function jobKindLabel(kind: string): string {
+  return kind === "pr_review" ? "PR review" : kind;
+}
+
+/**
+ * A PR review's state on its badge: its PR's while the review follows it
+ * (open, merged, closed). `own` is a review that ended because hunter
+ * opened the PR itself, which is engaged, never reviewed.
+ */
+export function reviewStateLabel(s: string): string {
+  return s === "own" ? "hunter's own PR" : s || "?";
+}
+
 /** The button for a way to release a hold (`ReleaseAction`). */
 export function releaseActionLabel(a: string): string {
   switch (a) {

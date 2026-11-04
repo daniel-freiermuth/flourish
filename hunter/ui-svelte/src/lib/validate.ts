@@ -20,8 +20,9 @@
 // file is the same rule that put each line in it — something renders it
 // unconditionally, and a `{#each}` key is rendered unconditionally even
 // when nothing dereferences it.
-
-import type { Event, FindingDetail, FindingOut, JobListEntry, Stats, Summary } from "./types";
+import type {
+  Event, FindingDetail, FindingOut, JobListEntry, OpenPrOut, PrReviewOut, Stats, Summary,
+} from "./types";
 
 function isObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -200,4 +201,25 @@ export function isJobList(v: unknown): v is JobListEntry[] {
 /** `/api/events`. `LogPage` keys the event table by `ev.id`. */
 export function isEventList(v: unknown): v is Event[] {
   return isKeyedList(v, "id", "number");
+}
+
+/**
+ * `/api/pr-reviews`. `ReviewsPage` keys reviews by `review.id` and each
+ * review's rounds by `round.id`, and per round slices both shas for the
+ * `base..head` label and reads `issues.length` — all without a `?.`.
+ */
+export function isPrReviewList(v: unknown): v is PrReviewOut[] {
+  return isKeyedList(v, "id", "number")
+    && v.every((r) => isKeyedList(r.rounds, "id", "number")
+      && r.rounds.every((round) => typeof round.base_sha === "string"
+        && typeof round.head_sha === "string"
+        && isObjectArray(round.issues)));
+}
+
+/**
+ * `/api/repo/open-prs`. The picker keys a repo's open PRs by `pr.number`,
+ * which the forge guarantees distinct within one repo.
+ */
+export function isOpenPrList(v: unknown): v is OpenPrOut[] {
+  return isKeyedList(v, "number", "number");
 }

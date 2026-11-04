@@ -480,6 +480,53 @@ login, so its own comments are recognised by the hidden
 from someone who can push, such a comment is never new activity, and
 engage prompts show it in the thread as hunter's own earlier reply.
 
+### PR reviews
+
+Hunter can also review pull requests it did not open (future.md §8.8).
+A review is requested by hand on the Reviews page. Hunter's own PRs are
+refused: they are engaged, not reviewed. A finding's PR is hunter's from
+the moment it is opened (its `pr_url`, not only once the PR sync recorded
+its number), and a review requested before hunter opened its PR ends as
+*hunter's own PR* at its next round or PR sync. Reviewing runs the PR's code with
+the daemon's credentials, so an author who cannot push to the repo needs
+the requester's vouch, even one whose login is a `reviewBots` entry: a
+login is only a name, and a human may hold a bot's. A fork's author
+also stands in for everyone who can push to that fork. Hunter's forge
+login must be able to push to a repo whose PRs it reviews, as to every
+repo it tracks: GitHub tells who can push only to those who can, and
+every trust check here rests on that; a request where hunter's login
+cannot push fails saying so.
+
+Each round fetches the PR's head (`refs/pull/N/head` or
+`refs/merge-requests/N/head`) and runs a reviewer (`playbooks/pr_review.md`;
+it may build and run targeted tests, but must leave the tree as it found
+it) in a tree detached at that head. The first round reviews from the
+merge-base with the PR's base branch. Later rounds review only from the
+head the last round that finished reviewed, as long as the PR still descends
+from it, and are shown every issue reported since the last round that
+reviewed from the merge-base. With **Watch** on, every new head is
+reviewed once it has stayed unchanged for 10 minutes; with it off, only
+the round a request asks for runs. A round due by the clock alone (a
+head settling) starts when it comes due: the job lane's idle sleep
+ends then, and a PR sync that brings a round forward wakes the lane to
+sleep until it instead. A paused (disabled) repo's reviews still run:
+pausing stops scans, not work a human asked for; a repo no job has cloned
+yet is cloned first. A reviewer stopped by its token cap or the wall
+clock keeps the issues it already wrote (the playbook has it rewrite its
+file after each verified one), but did not review the whole range:
+its round is *partial*, the head stays unreviewed, and the next round
+reviews the same commits again, shown what the stopped one wrote. The PR sync refreshes
+each open review's head, title and state. A merged PR ends its review for
+good; a closed one ends it until the PR is reopened: requesting the
+review again then reads the PR and, open again, reviews it again at the
+head it has now, watched or not (a round that already reviewed that head
+leaves nothing to review), with the vouch the first request gave (while
+the PR is still closed the request is refused). A failed or partial round counts
+toward a hold at 3 in a row (a reviewer whose cap never lets it finish
+the range is held, not run forever); a finished round, turning Watch on
+or **Retry** clears it. Budget and offline denials count
+nothing. Results stay in hunter: nothing is posted to the forge.
+
 ## Web UI
 
 Served at `http://localhost:8377` (configurable). Left-nav pages:
@@ -491,6 +538,7 @@ Served at `http://localhost:8377` (configurable). Left-nav pages:
 | **Kanban / Pipeline** | Findings in flight in foldable columns (folds remembered per browser), a **Held** column with held findings (why each is held, the report, and its Continue/Restart/... controls), a Held scans section for repos with held work, suppressed (rejected/wontfix), and informational (note) findings |
 | **All Findings** | Every finding, filterable by repo/type/status/severity, with full detail (jobs, PR state, timeline) on expand, and the actions its status allows (verdicts on new/note/closed, releases of held work, Recheck on new, Unqueue on queued, budget override while something will still pick it) |
 | **Repos** | Add/remove/pause repos; each repo's held scans and failing sync with why and the way out (**Continue**, **Restart**; **Retry now** for a held sync), and the scans failing without a hold yet; queue a full re-hunt (the next hunt reviews the repo's complete history instead of only new commits — the same scope as the periodic `hunt.rehuntDays` re-hunt — and the request stays pending until such a hunt finishes cleanly); per-repo notes (free-text context injected into every prompt for that repo — coding conventions, known false positives, anything worth a hunter remembering across runs) |
+| **Reviews** | Reviews of PRs hunter did not open: request one by URL or number, or pick from the repo's open PRs (with **Watch**, every new head is reviewed again once it has been stable for 10 minutes); authors who cannot push need a vouch; each review's state, rounds (base..head, verdict) and issues, with **Retry** for one held after 3 failed rounds |
 | **Stats** | Aggregate totals by kind and by finding type |
 | **Log** | Full job and event history |
 
