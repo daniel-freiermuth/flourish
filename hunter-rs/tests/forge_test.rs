@@ -566,3 +566,101 @@ fn web_host_is_where_the_forge_api_answers() {
         assert_eq!(web_host(url).as_deref(), want, "web_host({url})");
     }
 }
+
+// ============================================================
+// ReviewPost::body — the forge's limit on a review's body
+// ============================================================
+
+/// A review of round 7 with `header`, and the body issues `unplaced`.
+fn review_post(header: String, unplaced: Vec<String>) -> ReviewPost {
+    ReviewPost {
+        commit_id: "abc".into(),
+        header,
+        unplaced,
+        mark: step_mark("review of round 7"),
+        comments: Vec::new(),
+    }
+}
+
+/// What a post sends as the review's body ([`mark_own`] of
+/// [`ReviewPost::body`]), in characters.
+fn sent_chars(post: &ReviewPost) -> usize {
+    mark_own(&post.body()).chars().count()
+}
+
+/// A review with a header of `header` characters and five issues: one of
+/// `a` characters, one of `b`, and three that never fit.
+fn capped_post(header: usize, a: usize, b: usize) -> ReviewPost {
+    let mut unplaced = vec!["a".repeat(a), "b".repeat(b)];
+    unplaced.extend((0..3).map(|_| "c".repeat(REVIEW_TEXT_MAX_CHARS)));
+    review_post("h".repeat(header), unplaced)
+}
+
+/// The characters a capped body spends on what is not its header or
+/// issues: the line counting those left out, the step mark and hunter's
+/// own mark. Read off a body that leaves every issue out.
+fn capped_overhead() -> usize {
+    sent_chars(&capped_post(
+        0,
+        REVIEW_TEXT_MAX_CHARS,
+        REVIEW_TEXT_MAX_CHARS,
+    ))
+}
+
+/// Issues that fill the body to exactly the forge's limit all go in:
+/// what is sent is 65,536 characters, not one fewer issue.
+#[test]
+fn a_review_body_holds_issues_up_to_exactly_the_limit() {
+    let (a, b) = (10, 300);
+    let header = REVIEW_TEXT_MAX_CHARS - capped_overhead() - a - b;
+    let post = capped_post(header, a, b);
+    let body = post.body();
+    assert_eq!(sent_chars(&post), REVIEW_TEXT_MAX_CHARS);
+    assert!(body.contains(&"a".repeat(a)));
+    assert!(
+        body.contains(&"b".repeat(b)),
+        "the second issue fits exactly"
+    );
+    assert!(
+        body.contains("_3 more issue(s) left out: "),
+        "the three that do not fit are counted: {}",
+        &body[header..]
+    );
+    assert!(body.ends_with(&format!("\n\n{}", step_mark("review of round 7"))));
+}
+
+/// An issue one character past the limit is left out, and counted: what
+/// is sent stays within the limit.
+#[test]
+fn a_review_body_leaves_out_an_issue_one_character_over_the_limit() {
+    let (a, b) = (10, 300);
+    let header = REVIEW_TEXT_MAX_CHARS - capped_overhead() - a - b + 1;
+    let post = capped_post(header, a, b);
+    let body = post.body();
+    assert!(
+        sent_chars(&post) <= REVIEW_TEXT_MAX_CHARS,
+        "{}",
+        sent_chars(&post)
+    );
+    assert!(body.contains(&"a".repeat(a)));
+    assert!(
+        !body.contains(&"b".repeat(b)),
+        "the second issue is one over"
+    );
+    assert!(
+        body.contains("_4 more issue(s) left out: "),
+        "{}",
+        &body[header..]
+    );
+}
+
+/// A body every issue fits in is the header, the issues and the step
+/// mark: no line about issues left out.
+#[test]
+fn a_review_body_that_fits_counts_nothing_left_out() {
+    let post = review_post("head".into(), vec!["one".into(), "two".into()]);
+    assert_eq!(
+        post.body(),
+        format!("headonetwo\n\n{}", step_mark("review of round 7"))
+    );
+}
