@@ -35,10 +35,12 @@ CREATE TABLE pr_reviews (
     -- 1: review every new head once it is stable; 0: only the round a
     -- request asks for.
     watch INTEGER NOT NULL,
-    -- Only an 'open' review is worked on. The sync sets 'merged', which is
-    -- final, and 'closed', which a request that finds the PR reopened
-    -- undoes; 'own' (final) ends a review whose PR turned out to be one
-    -- hunter opened.
+    -- Only an 'open' review is worked on. The sync sets 'merged', and
+    -- 'closed', which a request that finds the PR reopened undoes; 'own'
+    -- ends a review whose PR turned out to be one hunter opened. 'merged'
+    -- and 'own' are final for the review's current binding: a request that
+    -- binds it to the repo's new URL opens it again, its number naming
+    -- another PR there.
     state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'merged', 'closed', 'own')),
     -- Newest head the forge reported, and when it was first seen. A watched
     -- review waits for the head to stay unchanged a while so a burst of

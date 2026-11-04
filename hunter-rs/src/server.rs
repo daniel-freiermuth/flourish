@@ -2096,7 +2096,9 @@ async fn pr_reviews(State(state): State<AppState>) -> Result<Json<Vec<PrReviewOu
         .map(|r| PrReviewOut {
             pr_url: forge::forge_for(r.forge).pr_web_url(&r.repo_url, r.pr_number),
             rounds: rounds.remove(&r.id).unwrap_or_default(),
+            judgment_pending: r.judgment_pending(),
             repo_moved: r.repo_moved(),
+            awaiting_since: r.awaiting_since,
             id: r.id,
             repo_id: r.repo_id,
             repo_name: r.repo_name,
@@ -2446,7 +2448,7 @@ async fn approve_pr_review_post(
 }
 
 /// POST /api/pr-review/discard {`round_id`}: never post a pending round.
-/// 409 unless the round is pending.
+/// 409 unless the round is pending, or once part of it is on the PR.
 async fn discard_pr_review_post(
     State(state): State<AppState>,
     Extension(user): Extension<CurrentUser>,

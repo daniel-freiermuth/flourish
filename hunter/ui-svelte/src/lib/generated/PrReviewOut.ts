@@ -16,4 +16,17 @@ auto_post: boolean, state: PrReviewState, head_sha: string | null, last_reviewed
  * review does nothing until a request binds it to the new URL,
  * deciding about the author afresh.
  */
-repo_moved: boolean, running_job_id: number | null, rounds: Array<PrReviewRoundOut>, };
+repo_moved: boolean, running_job_id: number | null, 
+/**
+ * When the newest news in hunter's threads that no round judged yet
+ * arrived (epoch ms): a trusted reply newer than any its issue's
+ * newest verdict was shown, or a reopen; null when there is none
+ * ([`PrReviewIssueOut::awaits_judgment`] marks the issues).
+ */
+awaiting_since: number | null, 
+/**
+ * Whether that news makes the review's next round due: watched, open
+ * and not held. The round waits until the newest news has been quiet
+ * for two minutes, so a burst of replies costs one.
+ */
+judgment_pending: boolean, rounds: Array<PrReviewRoundOut>, };

@@ -634,6 +634,10 @@ impl StatsHorizon {
 /// later rounds and the PR's thread made of it.
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the issue's independent flags, as the UI reads them"
+)]
 pub struct PrReviewIssueOut {
     pub id: i64,
     pub kind: String,
@@ -664,6 +668,10 @@ pub struct PrReviewIssueOut {
     pub replies: Vec<PrReviewReplyOut>,
     /// Replies the screen dropped: counted, never shown.
     pub hidden_replies: i64,
+    /// Whether its thread holds news no round judged yet: a reply newer
+    /// than any its newest verdict was shown, or a reopen. A watched
+    /// review's next round judges it once the news is quiet.
+    pub awaits_judgment: bool,
 }
 
 /// One reply in the thread of a posted issue.
@@ -677,6 +685,10 @@ pub struct PrReviewReplyOut {
     /// and came from hunter's login or a pusher). The only way to tell
     /// one apart: a person's login may be `hunter` too.
     pub own: bool,
+    /// When it was written (epoch ms, as the forge dates it); 0 for a
+    /// reply read before reply times were kept.
+    #[serde(default)]
+    pub at: i64,
 }
 
 /// One review attempt of the range `base_sha..head_sha`.
@@ -686,6 +698,8 @@ pub struct PrReviewRoundOut {
     pub id: i64,
     pub job_id: Option<i64>,
     pub base_sha: String,
+    /// `base_sha` too for a round that reviewed no new commits: one that
+    /// ran for replies and reopens alone.
     pub head_sha: String,
     /// `ok` (the reviewer finished the range, which counts as reviewed),
     /// `partial` (it was stopped partway: its issues and verdicts count,
@@ -694,9 +708,10 @@ pub struct PrReviewRoundOut {
     /// Why the round failed, or stopped partway.
     pub failure: Option<String>,
     pub finished_at: i64,
-    /// Null when there is nothing to post (failed, or no issues);
-    /// otherwise `pending` (awaiting a user), `approved` (posted on the next
-    /// PR sync), `posted` or `discarded`.
+    /// Null when there is nothing to post (failed, or no issues and no
+    /// verdict that changes what a thread shows); otherwise `pending`
+    /// (awaiting a user), `approved` (posted on the PR review duty's next
+    /// run), `posted` or `discarded`.
     pub post_state: Option<String>,
     /// The newest failed post's reason; kept after the round fell back to
     /// `pending`, cleared once it is approved again.
@@ -706,8 +721,14 @@ pub struct PrReviewRoundOut {
     /// partway): it can only be approved again, never discarded.
     pub landed: bool,
     /// Earlier issues this round judged addressed or rebutted whose inline
-    /// thread its post answers and resolves.
+    /// thread its post answers and resolves, unless a newer judgement of
+    /// the issue stands by then.
     pub resolutions: i64,
+    /// Earlier issues this round judged still open whose thread waits for
+    /// an answer: somebody replied, or hunter's last answer there settled
+    /// the issue. Its post answers each one ("Still open", "Open again")
+    /// and unresolves a thread hunter had resolved.
+    pub answers: i64,
     pub issues: Vec<PrReviewIssueOut>,
 }
 
@@ -745,6 +766,15 @@ pub struct PrReviewOut {
     /// deciding about the author afresh.
     pub repo_moved: bool,
     pub running_job_id: Option<i64>,
+    /// When the newest news in hunter's threads that no round judged yet
+    /// arrived (epoch ms): a trusted reply newer than any its issue's
+    /// newest verdict was shown, or a reopen; null when there is none
+    /// ([`PrReviewIssueOut::awaits_judgment`] marks the issues).
+    pub awaiting_since: Option<i64>,
+    /// Whether that news makes the review's next round due: watched, open
+    /// and not held. The round waits until the newest news has been quiet
+    /// for two minutes, so a burst of replies costs one.
+    pub judgment_pending: bool,
     pub rounds: Vec<PrReviewRoundOut>,
 }
 

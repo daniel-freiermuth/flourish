@@ -276,7 +276,7 @@ async fn sync_open_prs(
 /// ([`crate::scheduler::sync_pr_reviews`]), then the posting of every
 /// approved review round ([`crate::scheduler::post_pr_reviews`]), which
 /// reads the heads the refresh just recorded. Returns whether the refresh
-/// brought a review's round forward (a new head): work for
+/// brought a review's round forward (a new head, a new reply): work for
 /// the job lane, which planned its sleep without it. Its failures are
 /// already events of their own, one per PR (`pr_review <repo> #<n>: ...`).
 ///
@@ -293,7 +293,7 @@ async fn refresh_pr_reviews(
 ) -> bool {
     let stopping = || *shutdown.borrow();
     let before = review_due_times(admin.store()).await;
-    crate::scheduler::sync_pr_reviews(admin.store(), stopping).await;
+    crate::scheduler::sync_pr_reviews(admin.store(), cfg, stopping).await;
     let after = review_due_times(admin.store()).await;
     let due_sooner = after.iter().any(|&(id, due)| {
         let was = before.iter().find(|&&(b, _)| b == id).and_then(|&(_, d)| d);
@@ -718,7 +718,7 @@ pub async fn compute_sleep_s(store: &Store, summary: &CycleSummary) -> f64 {
         sleep_s = sleep_s.min(ADMIN_INTERVAL.as_secs_f64());
     }
     // Nor past the moment a PR review becomes due by the clock alone (a
-    // watched head settling): nothing else wakes this
+    // watched head settling, a reply going quiet): nothing else wakes this
     // lane then. One due already is the pick's, which just passed it by.
     let now = crate::util::now_ms();
     if let Ok(Some(due)) = store.next_pr_review_due_at(now).await {

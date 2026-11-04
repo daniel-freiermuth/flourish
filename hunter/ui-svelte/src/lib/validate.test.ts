@@ -362,7 +362,7 @@ describe("isSummary repo work", () => {
 // `hidden_replies`.
 describe("isPrReviewList", () => {
   const issue = (extra: Record<string, unknown> = {}) => ({
-    id: 1, summary: "x", status: "open", replies: [], hidden_replies: 0, ...extra,
+    id: 1, summary: "x", status: "open", replies: [], hidden_replies: 0, awaits_judgment: false, ...extra,
   });
   const round = (extra: Record<string, unknown> = {}) => ({
     id: 1, base_sha: "a".repeat(40), head_sha: "b".repeat(40), post_state: null, resolutions: 0, issues: [],

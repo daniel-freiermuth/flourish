@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { clock, datetime, isHttpUrl, ktok, reviewIssueStatusLabel, reviewStateLabel, roundPostTally, ts } from "./format";
+import { clock, datetime, isHttpUrl, issuesAwaitingJudgment, ktok, reviewIssueStatusLabel, reviewStateLabel, roundPostTally, ts } from "./format";
+import type { PrReviewIssueOut, PrReviewOut, PrReviewRoundOut } from "./types";
 
 describe("reviewStateLabel", () => {
   it("names a review that ended on hunter's own PR", () => {
@@ -24,19 +25,39 @@ describe("reviewIssueStatusLabel", () => {
 
 /** The Post button's count of what posting a round sends. */
 describe("roundPostTally", () => {
-  it("counts issues alone when the round resolves nothing", () => {
-    expect(roundPostTally(1, 0)).toBe("1 issue");
-    expect(roundPostTally(2, 0)).toBe("2 issues");
+  it("counts issues alone when the round resolves and answers nothing", () => {
+    expect(roundPostTally(1, 0, 0)).toBe("1 issue");
+    expect(roundPostTally(2, 0, 0)).toBe("2 issues");
   });
 
-  it("adds the resolutions after the issues", () => {
-    expect(roundPostTally(2, 1)).toBe("2 issues, 1 resolution");
-    expect(roundPostTally(1, 3)).toBe("1 issue, 3 resolutions");
+  it("adds the resolutions and answers after the issues", () => {
+    expect(roundPostTally(2, 1, 0)).toBe("2 issues, 1 resolution");
+    expect(roundPostTally(1, 3, 2)).toBe("1 issue, 3 resolutions, 2 answers");
   });
 
-  it("names only the resolutions of a round without new issues", () => {
-    expect(roundPostTally(0, 1)).toBe("1 resolution");
-    expect(roundPostTally(0, 2)).toBe("2 resolutions");
+  it("names only what a round without new issues posts", () => {
+    expect(roundPostTally(0, 1, 0)).toBe("1 resolution");
+    expect(roundPostTally(0, 2, 1)).toBe("2 resolutions, 1 answer");
+    expect(roundPostTally(0, 0, 1)).toBe("1 answer");
+  });
+});
+
+/** A round of a review whose issues await judgment as `awaiting` says. */
+function round(...awaiting: boolean[]): PrReviewRoundOut {
+  const issues = awaiting.map((a) => ({ awaits_judgment: a }) as PrReviewIssueOut);
+  return { issues } as PrReviewRoundOut;
+}
+
+/** The issues whose news makes a watched review due without new commits. */
+describe("issuesAwaitingJudgment", () => {
+  const review = (...rounds: PrReviewRoundOut[]) => ({ rounds }) as PrReviewOut;
+
+  it("counts the issues awaiting judgment across every round", () => {
+    expect(issuesAwaitingJudgment(review(round(true, false), round(true)))).toBe(2);
+  });
+
+  it("counts none when every issue's news was judged", () => {
+    expect(issuesAwaitingJudgment(review(round(false), round()))).toBe(0);
   });
 });
 

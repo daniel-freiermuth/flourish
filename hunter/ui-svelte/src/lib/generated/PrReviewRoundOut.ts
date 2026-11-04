@@ -4,7 +4,12 @@ import type { PrReviewIssueOut } from "./PrReviewIssueOut";
 /**
  * One review attempt of the range `base_sha..head_sha`.
  */
-export type PrReviewRoundOut = { id: number, job_id: number | null, base_sha: string, head_sha: string, 
+export type PrReviewRoundOut = { id: number, job_id: number | null, base_sha: string, 
+/**
+ * `base_sha` too for a round that reviewed no new commits: one that
+ * ran for replies and reopens alone.
+ */
+head_sha: string, 
 /**
  * `ok` (the reviewer finished the range, which counts as reviewed),
  * `partial` (it was stopped partway: its issues and verdicts count,
@@ -16,9 +21,10 @@ verdict: string,
  */
 failure: string | null, finished_at: number, 
 /**
- * Null when there is nothing to post (failed, or no issues);
- * otherwise `pending` (awaiting a user), `approved` (posted on the next
- * PR sync), `posted` or `discarded`.
+ * Null when there is nothing to post (failed, or no issues and no
+ * verdict that changes what a thread shows); otherwise `pending`
+ * (awaiting a user), `approved` (posted on the PR review duty's next
+ * run), `posted` or `discarded`.
  */
 post_state: string | null, 
 /**
@@ -33,6 +39,14 @@ post_error: string | null, posted_at: number | null,
 landed: boolean, 
 /**
  * Earlier issues this round judged addressed or rebutted whose inline
- * thread its post answers and resolves.
+ * thread its post answers and resolves, unless a newer judgement of
+ * the issue stands by then.
  */
-resolutions: number, issues: Array<PrReviewIssueOut>, };
+resolutions: number, 
+/**
+ * Earlier issues this round judged still open whose thread waits for
+ * an answer: somebody replied, or hunter's last answer there settled
+ * the issue. Its post answers each one ("Still open", "Open again")
+ * and unresolves a thread hunter had resolved.
+ */
+answers: number, issues: Array<PrReviewIssueOut>, };

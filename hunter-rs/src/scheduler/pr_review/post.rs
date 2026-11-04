@@ -13,15 +13,22 @@
 //! issue's newest released judgement
 //! ([`Store::pr_review_round_threads`](crate::store::Store::pr_review_round_threads)):
 //! answered and resolved when it is addressed or rebutted, answered and
-//! unresolved when hunter had settled it and it is open again, and left
-//! alone where it shows that already. Each thread is found afresh,
+//! unresolved when it is open again, answered where somebody replied, and
+//! left alone where it shows that already, or where news came in that the
+//! verdict's round was not shown. Each thread is found afresh,
 //! by its first comment, on one read of every thread of the PR: one a
 //! human deleted is recorded gone and left out, never a reason to fail
 //! the rest. Each step is recorded as it lands, so a post that failed
 //! partway retries only what is missing, and two posts never say the same
 //! thing twice. A step the forge took whose recording failed is held
 //! ([`Landed`]) and recorded on the next sync instead of being taken
-//! again: in memory only, so that holds while the daemon runs.
+//! again. A step whose forge call failed may have landed all the same (a
+//! timeout, a 5xx after the write), so a retry reads before it takes one
+//! again: the review and each answer carry a step mark naming their round
+//! ([`forge::step_mark`]), and the review an earlier post sent is looked
+//! for on the PR ([`send_review`]), an answer in the thread read anyway,
+//! and a resolution is set only where that read shows the thread
+//! otherwise ([`settle_thread`]). What either finds is recorded instead.
 //!
 //! A GitLab post is draft notes of the operator's login published one by
 //! one, and a post that failed or was stopped leaves the rest as drafts the
@@ -222,6 +229,14 @@ async fn post_round(store: &AdminStore, cfg: &Config, round: &ApprovedRound) -> 
     true
 }
 
+/// What a post did in its threads, for its event.
+#[derive(Debug, Default)]
+struct Tally {
+    answered: usize,
+    resolved: usize,
+    unresolved: usize,
+}
+
 /// One step of a post, by what it touches on the forge: the key of a step
 /// that landed but is not recorded yet ([`Landed`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -252,6 +267,7 @@ enum Landed {
         issue: i64,
         round: i64,
         verdict: IssueVerdict,
+        answers_reply_at: Option<i64>,
     },
     Resolution {
         issue: i64,
@@ -306,9 +322,10 @@ async fn record(store: &AdminStore, landed: Landed) -> anyhow::Result<()> {
             issue,
             round,
             verdict,
+            answers_reply_at,
         } => {
             store
-                .record_pr_review_answered((*issue, *round), *verdict)
+                .record_pr_review_answered((*issue, *round), *verdict, *answers_reply_at)
                 .await
         }
         Landed::Resolution { issue, resolved } => {
@@ -541,14 +558,6 @@ async fn post_review(
     .await
 }
 
-/// What a post did in its threads, for its event.
-#[derive(Debug, Default)]
-struct Tally {
-    answered: usize,
-    resolved: usize,
-    unresolved: usize,
-}
-
 /// Read back the forge ids of round `round`'s inline comments that have
 /// none yet, from its review `review_ref`, and record them: an issue's
 /// thread is found by its comment's id from then on. They are asked for
@@ -602,8 +611,12 @@ async fn read_back_refs(
 /// threads with something to do are found on one read of every thread of
 /// the PR, by their first comment: one the read does not hold is gone (a
 /// human deleted it), which is recorded and logged, and the post goes on
-/// without it. A failed read or step fails the post, whose retry takes
-/// only the steps still to do.
+/// without it. A thread holding news its verdict's round was not shown
+/// ([`ThreadToSettle::saw`]: by the rule that makes a round due) is left
+/// as it is and logged: the news leaves the issue awaiting judgment, and
+/// the round it makes due answers it. A
+/// failed read or step fails the post, whose retry takes only the steps
+/// still to do.
 async fn settle_threads(
     store: &AdminStore,
     cfg: &Config,
@@ -643,9 +656,19 @@ async fn settle_threads(
         }
     }
     for t in due {
-        if let Some(found) = thread_of(t) {
-            settle_thread(store, review, (t, found), tally).await?;
+        let Some(found) = thread_of(t) else {
+            continue;
+        };
+        if !t.saw(&super::thread_seen(t.issue_id, found.clone())) {
+            let msg = format!(
+                "{label}: round {}: issue {} has a reply in its thread the verdict did not see; \
+                 left for the next round",
+                round.id, t.issue_id
+            );
+            let _ = store.log_event(EVENT, &msg, None, None).await;
+            continue;
         }
+        settle_thread(store, review, (t, found), tally).await?;
     }
     Ok(())
 }
@@ -688,6 +711,7 @@ async fn settle_thread(
                 issue: t.issue_id,
                 round: t.round_id,
                 verdict: t.verdict,
+                answers_reply_at: t.answers_reply_at,
             }
         };
         record(store, landed).await?;
@@ -728,6 +752,7 @@ fn answer_text(reply: Reply, t: &ThreadToSettle) -> String {
             "Rebuttal accepted".to_owned()
         }
         Reply::Settled => format!("Addressed in `{}`", head.get(..7).unwrap_or(head)),
+        Reply::StillOpen => "Still open".to_owned(),
         Reply::OpenAgain => format!("Open again at `{}`", head.get(..7).unwrap_or(head)),
     };
     if note.is_empty() {

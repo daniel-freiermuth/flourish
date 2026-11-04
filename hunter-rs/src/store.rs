@@ -54,8 +54,8 @@ mod pr_state;
 pub use pr_review::{
     ApprovedRound, EarlierIssue, HEAD_STABLE_MS, InlineState, IssueVerdict, NewPrReview,
     POST_GIVE_UP_AT, PR_REVIEW_HOLD_AT, PostDecided, PostDecision, PostableIssue, PrReviewRound,
-    PrReviewRow, Reply, ReportedIssue, Said, ThreadSeen, ThreadSteps, ThreadToSettle, ThreadsRead,
-    Verdict,
+    PrReviewRow, REPLY_QUIET_MS, Reply, ReportedIssue, Said, ThreadSeen, ThreadSteps,
+    ThreadToSettle, ThreadsRead, Verdict,
 };
 pub use pr_state::{PrRead, PrSyncPass};
 
@@ -6229,9 +6229,10 @@ impl AdminStore {
         &self,
         (issue_id, round_id): (i64, i64),
         verdict: IssueVerdict,
+        answers_reply_at: Option<i64>,
     ) -> sqlx::Result<()> {
         self.0
-            .record_pr_review_answered((issue_id, round_id), verdict)
+            .record_pr_review_answered((issue_id, round_id), verdict, answers_reply_at)
             .await
     }
 
@@ -6245,6 +6246,18 @@ impl AdminStore {
         self.0
             .record_pr_review_thread_resolution(issue_id, resolved)
             .await
+    }
+
+    /// Record what the PR review duty read in the threads of a watched PR
+    /// review, reopening those a human reopened on the forge and marking
+    /// those it found gone. See the private `Store` method of the same
+    /// name.
+    pub async fn observe_pr_review_threads(
+        &self,
+        read: &ThreadsRead,
+        read_at: i64,
+    ) -> sqlx::Result<u64> {
+        self.0.observe_pr_review_threads(read, read_at).await
     }
 
     /// Record round `round_id` as posted, threads and all. See the private

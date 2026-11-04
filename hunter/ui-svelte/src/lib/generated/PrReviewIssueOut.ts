@@ -39,4 +39,10 @@ replies: Array<PrReviewReplyOut>,
 /**
  * Replies the screen dropped: counted, never shown.
  */
-hidden_replies: number, };
+hidden_replies: number, 
+/**
+ * Whether its thread holds news no round judged yet: a reply newer
+ * than any its newest verdict was shown, or a reopen. A watched
+ * review's next round judges it once the news is quiet.
+ */
+awaits_judgment: boolean, };
