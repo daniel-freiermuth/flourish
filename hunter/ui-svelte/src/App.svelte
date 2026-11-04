@@ -8,6 +8,7 @@
   import KanbanPage from "./pages/KanbanPage.svelte";
   import AllFindingsPage from "./pages/AllFindingsPage.svelte";
   import ReposPage from "./pages/ReposPage.svelte";
+  import ReviewsPage from "./pages/ReviewsPage.svelte";
   import StatsPage from "./pages/StatsPage.svelte";
   import LogPage from "./pages/LogPage.svelte";
   import Login from "./components/Login.svelte";
@@ -20,6 +21,7 @@
     { id: "kanban", label: "KANBAN", icon: "▥" },
     { id: "findings", label: "FINDINGS", icon: "◉" },
     { id: "repos", label: "REPOS", icon: "⌂" },
+    { id: "reviews", label: "REVIEWS", icon: "◎" },
     { id: "stats", label: "STATS", icon: "▤" },
     { id: "log", label: "LOG", icon: "≡" },
   ] as const;
@@ -222,6 +224,8 @@
           <AllFindingsPage {focusId} />
         {:else if page === "repos"}
           <ReposPage />
+        {:else if page === "reviews"}
+          <ReviewsPage />
         {:else if page === "stats"}
           <StatsPage />
         {:else if page === "log"}

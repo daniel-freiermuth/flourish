@@ -1,5 +1,7 @@
 // Shared formatting utilities (ported from app.ts helpers).
 
+import type { PrReviewOut } from "./types";
+
 /** Token count to human-readable: 150000 → "150k", 2100000 → "2.1M" */
 export function ktok(n: number | null): string {
   if (n == null) return "\u2013";
@@ -144,6 +146,48 @@ export function holdReasonLabel(r: string): string {
  */
 export function repoWorkLabel(k: string): string {
   return k === "sync" ? "sync (clone, fetch, branch)" : k || "?";
+}
+
+/**
+ * A job kind where the status panel names it. Kind strings read as words
+ * except the PR review's, whose snake_case string would be the only one
+ * on the panel that does not.
+ */
+export function jobKindLabel(kind: string): string {
+  return kind === "pr_review" ? "PR review" : kind;
+}
+
+/**
+ * A PR review's state on its badge: its PR's while the review follows it
+ * (open, merged, closed). `own` is a review that ended because hunter
+ * opened the PR itself, which is engaged, never reviewed.
+ */
+export function reviewStateLabel(s: string): string {
+  return s === "own" ? "hunter's own PR" : s || "?";
+}
+
+/** What a review waiting for its next round shows: its badge and why. */
+export interface RoundWait {
+  label: string;
+  title: string;
+}
+
+/**
+ * The badge of a review waiting for its next round, or null when no round
+ * is due or one is running. When a round is due is the daemon's call
+ * (`due_at`, the rule its scheduler picks by), never worked out here: an
+ * unwatched review a request asked a round of is due, one whose repo
+ * moved or whose fork changed hands never is. A round due later waits for
+ * the head to stay unchanged.
+ */
+export function roundWait(review: PrReviewOut, now: number): RoundWait | null {
+  if (review.due_at === null || review.running_job_id !== null) return null;
+  return {
+    label: "pending",
+    title: review.due_at <= now
+      ? "Waiting for the scheduler"
+      : `Waiting for the head to stay unchanged until ${clock(review.due_at)}, then for the scheduler`,
+  };
 }
 
 /** The button for a way to release a hold (`ReleaseAction`). */
