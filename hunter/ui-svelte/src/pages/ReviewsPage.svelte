@@ -160,12 +160,12 @@
       }
       // `requested` (a new review, or a round asked of one that follows
       // the open PR), `updated` (watch and auto-post set; a round already
-      // reviewed the PR's head), `reopened` (its PR was reopened) or
-      // `rebound` (the repo's URL changed).
+      // reviewed the PR's head, and nothing awaits judgment), `reopened`
+      // (its PR was reopened) or `rebound` (the repo's URL changed).
       const outcome = typeof r.body?.outcome === "string" ? r.body.outcome : "requested";
       toast(
         outcome === "updated"
-          ? `Review of PR ${pr} updated: its head is already reviewed`
+          ? `Review of PR ${pr} updated: its head is already reviewed, with nothing to judge`
           : `Review of PR ${pr} ${outcome}`,
         true,
       );
@@ -205,9 +205,22 @@
     }
   }
 
-  /** Discarding is final, so it asks first. */
+  /** A round's range, or what a round without new commits ran for. */
+  function roundLabel(round: PrReviewRoundOut): string {
+    return round.base_sha === round.head_sha
+      ? "re: replies"
+      : `${short(round.base_sha)}..${short(round.head_sha)}`;
+  }
+
+  /**
+   * Discarding is final, so it asks first. The round's verdicts go with
+   * it, so on a watched review the replies they judged make it due again.
+   */
   function discardRound(review: PrReviewOut, round: PrReviewRoundOut) {
-    if (!confirm(`Never post round ${short(round.base_sha)}..${short(round.head_sha)} to the PR?`)) return;
+    const again = review.watch
+      ? "\n\nThe review is watched: replies this round judged count as unjudged again, so a new round judges them again."
+      : "";
+    if (!confirm(`Never post round ${roundLabel(round)} to the PR?${again}`)) return;
     void reviewWrite(review, "/api/pr-review/discard", { round_id: round.id }, "round discarded");
   }
 </script>
@@ -216,7 +229,13 @@
   {@const blocking = round.issues.filter((i) => i.blocking).length}
   <div class="round">
     <div class="round-head">
-      <code class="range" title="{round.base_sha}..{round.head_sha}">{short(round.base_sha)}..{short(round.head_sha)}</code>
+      <code
+        class="range"
+        class:replies-round={round.base_sha === round.head_sha}
+        title={round.base_sha === round.head_sha
+          ? `No new commits at ${round.head_sha}: this round judged the replies in the earlier issues' threads`
+          : `${round.base_sha}..${round.head_sha}`}
+      >{roundLabel(round)}</code>
       <span
         class="badge verdict-{round.verdict}"
         title={round.verdict === "partial"
@@ -234,6 +253,13 @@
             {round.resolutions} {round.resolutions === 1 ? "resolution" : "resolutions"}
           </span>
         {/if}
+        {#if round.answers > 0}
+          <!-- Replies in threads of issues the round found still open get
+               an answer too; those threads stay open. -->
+          <span class="answer-count" title="Earlier issues this round found still open where somebody replied, or where hunter's last answer settled them; posting answers each thread and leaves it open">
+            {round.answers} {round.answers === 1 ? "answer" : "answers"}
+          </span>
+        {/if}
       {/if}
       <span class="dim">{clock(round.finished_at)}</span>
       {#if round.job_id !== null}
@@ -245,9 +271,9 @@
           class="retry-btn"
           disabled={busy.has(review.id) || review.state !== "open"}
           onclick={() => reviewWrite(review, "/api/pr-review/post", { round_id: round.id }, "posting to the PR")}
-          title="Post this round to the PR under your forge login: its issues as one comment review, and a reply resolving each earlier issue's thread it judged settled"
+          title="Post this round to the PR under your forge login: its issues as one comment review, then an answer in each thread whose issue it judged differently from what the thread says, resolving the threads of settled issues"
         >
-          Post to PR ({roundPostTally(round.issues.length, round.resolutions)})
+          Post to PR ({roundPostTally(round.issues.length, round.resolutions, round.answers)})
         </button>
         {#if !round.landed}
           <button
@@ -474,6 +500,10 @@
                   head <code>{short(review.head_sha)}</code>
                   <span class="meta-sep">·</span>
                   reviewed <code>{short(review.last_reviewed_sha)}</code>
+                  {#if review.awaiting_since !== null}
+                    <span class="meta-sep">·</span>
+                    news to judge since {datetime(review.awaiting_since)}
+                  {/if}
                 </div>
                 <div class="badge-row">
                   <span class="badge state-{review.state}">{reviewStateLabel(review.state)}</span>
@@ -955,10 +985,12 @@
   }
 
   .range { color: var(--text); }
+  .range.replies-round { color: var(--accent); }
 
   .issue-count { color: var(--text-dim); }
   .issue-count.has-blocking { color: var(--bad); }
   .resolution-count { color: var(--ok); }
+  .answer-count { color: var(--accent); }
 
   .round-failure {
     margin: 0;

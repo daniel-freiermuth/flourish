@@ -788,8 +788,9 @@ bug the current gates cannot see.
 review rounds, results in the UI; inline COMMENT posting with per-review
 auto-post or per-round approval; later rounds read the screened replies in
 hunter's threads, judge earlier issues addressed / rebuttal accepted /
-open, and answer and resolve the threads hunter opened when posted). Not
-yet: issues still open at merge becoming findings (slice 4).
+open, and answer and resolve the threads hunter opened when posted), and
+Watch acts on replies alone (below). Not yet: issues still open at merge
+becoming findings (slice 4).
 
 Reviews are enabled by hand, per PR, never by repo-wide discovery: the
 open PRs that are not hunter's own were, when designed, the operator's
@@ -847,6 +848,43 @@ is reopened and the review requested again, and one whose PR turns out to
 be hunter's own ends for good. A blocking issue still open
 at merge becomes a `new` finding, which the hunt's novelty check then
 recognises when it reaches the merged commits.
+
+**Watch also acts on replies and reopens.** A rebuttal on a PR nobody
+pushes to must not wait for a push that never comes, and neither must a
+thread a human unresolved without a word. The admin lane's PR review duty reads
+the threads of a watched open review's posted issues, settled ones too (a
+thread hunter resolved that a human reopens reopens its issue there)
+(one GraphQL query / `discussions` read per review, as a round does; none
+for a review without a posted issue), and records the screened replies on
+the issues with the newest one by a trusted author other than hunter. A
+verdict counts over the thread it was given over, and only that: as it
+keeps the reopen its round read, it keeps the newest reply its round was
+shown. An issue awaits judgment while its thread holds news no verdict
+was given over -- a reopen no round judged since, or a reply newer than
+any its newest verdict saw, unless it sits under hunter's own standing
+resolution (asking for nothing; a human who disagrees reopens) -- so a
+reply on an issue a still unposted round settled is judged, not counted
+seen, a rebuttal posted with GitLab's "Comment & resolve thread" is
+answered, and discarding a round takes back what its verdicts saw. A
+post leaves a thread alone exactly when it holds such news. At the
+reviewed head, a watched review with an issue awaiting judgment is due
+once the newest such news has been quiet for 2 minutes (a burst of
+replies is one round). Its round has no new commits (`base == head ==
+last_reviewed_sha`): the prompt says so (a round for a new head with
+nothing in it, as after a force-push back to the merge-base, is the
+head's and recorded empty), and the reviewer judges the earlier issues
+against the replies and the code, reporting a new issue only if a reply
+reveals one. Only a verdict on an issue awaiting judgment is progress: a
+round for replies alone that gives none fails (counting toward the hold)
+rather than being due again at once with the same prompt, and one
+stopped by its cap after giving some is kept as `partial`. Verdicts are
+recorded and posted as for any round; additionally every issue judged
+`open` whose thread ends in somebody's reply gets an answer ("Still open:
+<note>", no resolve), once per reply whichever round's post says it. A
+post never answers or resolves a thread holding a reply the verdict's
+round was not shown: that reply awaits the next round. A new head with
+pending replies stays one ordinary round under the head's stability
+rule, which reads the replies anyway.
 
 **Posting.** Auto-post is chosen per request; otherwise a round's review
 waits in the UI for approval. Hunter posts under the operator's login, so

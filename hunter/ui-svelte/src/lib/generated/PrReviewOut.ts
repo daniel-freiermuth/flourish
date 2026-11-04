@@ -35,6 +35,13 @@ repo_moved: boolean,
  */
 fork_changed_hands: boolean, running_job_id: number | null, 
 /**
+ * When the newest news in hunter's threads that no round judged yet
+ * arrived (epoch ms): a trusted reply newer than any its issue's
+ * newest verdict was shown, or a reopen; null when there is none
+ * ([`PrReviewIssueOut::awaits_judgment`] marks the issues).
+ */
+awaiting_since: number | null, 
+/**
  * When the review's next round is due (epoch ms;
  * [`crate::store::PrReviewRow::due_at`]): what the scheduler picks by,
  * so a review shows as waiting for a round exactly when it is. Null

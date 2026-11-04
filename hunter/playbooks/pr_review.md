@@ -29,6 +29,8 @@ The change to review is `git diff {{BASE}}..HEAD` (commits:
 `git log {{BASE}}..HEAD`). Review the WHOLE diff against the base, and read
 the surrounding code it touches: full functions, callers, state it shares.
 
+{{REPLIES_ONLY}}
+
 # Earlier rounds
 Issues earlier review rounds already reported on this PR (empty on the
 first round, and on a later one whose earlier rounds found nothing). Each
@@ -74,7 +76,8 @@ verdict so far:
 
 An issue you do not list stays as it was: never leave one out to make it
 go away. The note is posted on the PR as hunter's answer in the issue's
-thread, so keep it to one factual sentence.
+thread (for `open`, when somebody replied there after hunter last did), so
+keep it to one factual sentence.
 
 # What to look for, in this order
 1. Bugs the change INTRODUCES: new edge cases and boundary mistakes, error

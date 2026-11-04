@@ -13,4 +13,9 @@ author: string, body: string,
  * and came from hunter's login or a pusher). The only way to tell
  * one apart: a person's login may be `hunter` too.
  */
-own: boolean, };
+own: boolean, 
+/**
+ * When it was written (epoch ms, as the forge dates it); 0 for a
+ * reply read before reply times were kept.
+ */
+at: number, };

@@ -35,10 +35,13 @@ CREATE TABLE pr_reviews (
     -- 1: review every new head once it is stable; 0: only the round a
     -- request asks for.
     watch INTEGER NOT NULL,
-    -- Only an 'open' review is worked on. The sync sets 'merged', which is
-    -- final, and 'closed', which a request that finds the PR reopened
-    -- undoes; 'own' (final) ends a review whose PR turned out to be one
-    -- hunter opened.
+    -- Only an 'open' review is worked on. The sync sets 'merged', and
+    -- 'closed', which a request that finds the PR reopened undoes; 'own'
+    -- ends a review whose PR turned out to be one hunter opened. 'merged'
+    -- is final for the review's current binding: a request that binds it to
+    -- the repo's new URL opens it again, its number naming another PR there.
+    -- 'own' is final at any URL: hunter's PRs are the repo's wherever it
+    -- lives, and a request for one is refused.
     state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'merged', 'closed', 'own')),
     -- Newest head the forge reported, and when it was first seen. A watched
     -- review waits for the head to stay unchanged a while so a burst of
@@ -54,19 +57,21 @@ CREATE TABLE pr_reviews (
     -- or one for a review already following the open PR), and the head it
     -- read (NULL when the forge reported none); both NULL while no request
     -- waits. A request waits unless a round already reviewed the head it
-    -- read; while one waits a round is due at once, watched or not, at a
-    -- head not reviewed yet. A finished round answers the request made
-    -- before it read the PR's head, and one made after that read the head
-    -- the round reviewed; a request for a newer head, made while the round
-    -- ran, waits. Only requests write these, and finished rounds clear
-    -- them: a head the PR sync reads is no request.
+    -- read and no news in a thread awaits judgment; while one waits a
+    -- round is due at once, watched or not, at a head not reviewed yet or
+    -- with news to judge. A finished round answers only the request made
+    -- before it read the PR: one made since read the PR, and maybe threads
+    -- with news, the round did not, and waits (a round at a head reviewed
+    -- already, with nothing to judge, answers it without a reviewer).
+    -- Only requests write these, and rounds clear them: a head the PR
+    -- review duty reads is no request.
     round_requested_at INTEGER,
     requested_head_sha TEXT,
     -- The author, when they cannot push and a user vouched for running
     -- their code; NULL for trusted authors.
     vouched_author TEXT,
     -- The owner of the fork the head lives in as the newest read of the PR
-    -- (a request's, the PR sync's, a round's) reported it: a round
+    -- (a request's, the PR review duty's, a round's) reported it: a round
     -- runs their repository's code. NULL when the head is in the repo
     -- itself; '' when the forge names no owner (the fork is gone).
     head_owner TEXT,
