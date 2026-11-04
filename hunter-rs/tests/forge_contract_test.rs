@@ -869,6 +869,25 @@ fn gitlab_view_survives_a_failing_notes_endpoint() {
     assert_eq!(bins.calls_to("glab").len(), 2, "both endpoints were tried");
 }
 
+/// The view a caller reads to check whether hunter's own post already
+/// landed must see every note or fail: an MR whose notes could not be read
+/// is not one without notes, and taking it for one posts the same comment
+/// again.
+#[test]
+fn gitlab_comments_view_fails_on_a_failing_notes_endpoint() {
+    let bins = FakeBins::acquire("forge-gl-comments-notes-down");
+    bins.script(
+        "glab",
+        &format!(
+            "case \"$*\" in\n  *notes*) echo 'notes endpoint is down' >&2; exit 1 ;;\nesac\ncat <<'__MR_EOF__'\n{GL_MR_JSON}\n__MR_EOF__\nexit 0"
+        ),
+    );
+
+    let view = forge_for(ForgeName::Gitlab).view_pr_comments(GL_REPO, PR, &ReviewBots::default());
+
+    assert!(view.is_err(), "{view:?}");
+}
+
 /// GitLab project paths are nested and go into the URL path, so every `/`
 /// must be percent-encoded. An unencoded slash silently addresses a
 /// different (usually nonexistent) project.

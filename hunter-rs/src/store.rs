@@ -3080,6 +3080,46 @@ impl Store {
         .await
     }
 
+    /// How many attempts in `job_id`'s chain (walked as
+    /// [`Self::resume_chain_stats`] walks it) have notes matching one of
+    /// `note_patterns`, SQL `LIKE` patterns: the scheduler's count of
+    /// attempts kept only to publish, which bounds how long it spares such
+    /// a chain the give-up ceiling. `since` limits it to attempts started
+    /// after that instant, as it limits [`Self::resume_chain_stats`]: the
+    /// operator's last release, from which the ceiling and the streak count
+    /// again.
+    pub async fn chain_links_noted(
+        &self,
+        job_id: i64,
+        note_patterns: &[String],
+        since: Option<i64>,
+    ) -> sqlx::Result<i64> {
+        let patterns = serde_json::to_string(note_patterns).unwrap_or_else(|_| "[]".to_owned());
+        sqlx::query_scalar!(
+            r#"
+            WITH RECURSIVE chain(id, resumed_from, kind, depth) AS (
+                SELECT id, resumed_from, kind, 0 FROM jobs WHERE id = ?1
+                UNION
+                SELECT j.id, j.resumed_from, j.kind, c.depth + 1
+                FROM jobs j, chain c
+                WHERE c.depth < ?2
+                  AND j.kind = c.kind
+                  AND (j.id = c.resumed_from OR j.resumed_from = c.id)
+            )
+            SELECT COUNT(*) AS "noted!: i64"
+            FROM jobs WHERE id IN (SELECT id FROM chain)
+              AND EXISTS (SELECT 1 FROM json_each(?3) p WHERE jobs.notes LIKE p.value)
+              AND (?4 IS NULL OR started_at > ?4)
+            "#,
+            job_id,
+            RESUME_CHAIN_MAX_DEPTH,
+            patterns,
+            since
+        )
+        .fetch_one(&self.pool)
+        .await
+    }
+
     /// The first attempt in `job_id`'s chain — the one that ran from a
     /// real playbook prompt.
     ///
@@ -3724,6 +3764,19 @@ impl Store {
         .unwrap_or(false))
     }
 
+    /// The PR head `job_id`'s engage chain started from, as the PR sync
+    /// had recorded it ([`Self::set_started_on`]); `None` when it recorded
+    /// none.
+    pub async fn started_on_head(&self, job_id: i64) -> sqlx::Result<Option<String>> {
+        Ok(sqlx::query_scalar!(
+            r#"SELECT started_on_head_sha FROM jobs WHERE id = ?1"#,
+            job_id
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten())
+    }
+
     /// Whether the chain rooted at `origin_id` still needs its working
     /// tree, and how long ago it last did anything.
     ///
@@ -3935,14 +3988,19 @@ impl Store {
 
     /// Downgrade an already-recorded job to failed (e.g. post-run push
     /// failure). Takes the [`RecordedJob`] its outcome was recorded as, so
-    /// it cannot end a job that is still `running`.
+    /// it cannot end a job that is still `running`. The job ends now: a
+    /// publish that failed ran after the worker's outcome was recorded,
+    /// and the wait before its retry counts from when the forge refused it
+    /// (`scheduler::PUBLISH_RETRY_MS`), not from before the push began.
     async fn fail_job(&self, job: &RecordedJob, notes: &str) -> sqlx::Result<()> {
         let job_id = job.id();
         let failed = JobState::Failed;
+        let now = now_ms();
         sqlx::query!(
-            "UPDATE jobs SET state = ?1, notes = ?2 WHERE id = ?3",
+            "UPDATE jobs SET state = ?1, notes = ?2, finished_at = ?3 WHERE id = ?4",
             failed,
             notes,
+            now,
             job_id
         )
         .execute(&self.pool)

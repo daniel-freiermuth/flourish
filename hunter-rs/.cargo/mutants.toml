@@ -111,4 +111,15 @@ exclude_re = [
     # one slow on purpose would pin a wall-clock race. Returning 0 (every
     # fetch timed out at once) is caught.
     "replace Fetcher::timeout_s -> u64 with 1$",
+    # `publish_retry_pending`'s `<` against `<=` differs only when the
+    # operator's release has the very millisecond the refused attempt
+    # ended, and either reading of that tie is right. A release before
+    # the refusal (`==`) is caught (`a_refusal_after_a_release_waits`).
+    "replace < with <= in publish_retry_pending",
+    # `engage_pr_moved`'s `>` against `>=` differs only when the PR's
+    # newest feedback (the forge's clock) has the very millisecond the
+    # attempt started (hunter's), which is coincidence, not a distinction
+    # the check draws. Feedback after the start (`==`) is caught
+    # (`a_kept_engage_that_pushed_is_redecided_only_when_its_pr_moved`).
+    "replace > with >= in engage_pr_moved",
 ]

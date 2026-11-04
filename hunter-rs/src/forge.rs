@@ -837,6 +837,18 @@ pub trait Forge: Send + Sync {
     /// Lightweight PR view for `sync_prs` (state, checks, mergeable), its
     /// feedback screened ([`screen_feedback`]).
     fn view_pr_sync(&self, url: &str, pr_number: i64, bots: &ReviewBots) -> anyhow::Result<PrView>;
+    /// [`Self::view_pr_sync`] for a caller that must see every comment, or
+    /// fail: checking whether hunter's own post already landed before
+    /// posting it again. GitLab's sync view tolerates a failed notes read
+    /// with an empty list; this one fails instead.
+    fn view_pr_comments(
+        &self,
+        url: &str,
+        pr_number: i64,
+        bots: &ReviewBots,
+    ) -> anyhow::Result<PrView> {
+        self.view_pr_sync(url, pr_number, bots)
+    }
     /// Heavier PR view for engage and harvest: title/body, and every
     /// inline comment (with its [`CodeLocation`]) among `comments`, its
     /// feedback screened ([`screen_feedback`]). Sync does without GitHub's
@@ -1149,11 +1161,14 @@ fn gitlab_split_notes(notes: &[GlNote]) -> Vec<GhComment> {
         .collect()
 }
 
-/// Fetch GitLab MR + notes via `glab api`, returning typed structs.
+/// Fetch GitLab MR + notes via `glab api`, returning typed structs. A notes
+/// read that fails leaves the notes empty, unless `strict_notes`
+/// ([`Forge::view_pr_comments`]), when it fails the fetch.
 fn gitlab_fetch_mr(
     url: &str,
     slug: &str,
     number: i64,
+    strict_notes: bool,
 ) -> anyhow::Result<(GlMergeRequest, Vec<GlNote>)> {
     let enc = slug.replace('/', "%2F");
     let api_path = format!("projects/{enc}/merge_requests/{number}");
@@ -1170,10 +1185,15 @@ fn gitlab_fetch_mr(
     // thread. Flipped back below, since consumers want oldest-first.
     let notes_path = format!("projects/{enc}/merge_requests/{number}/notes?sort=desc&per_page=100");
     let (rc2, out2) = gitlab_api(url, &notes_path, None, &[]);
-    let mut notes: Vec<GlNote> = if rc2 == 0 {
-        serde_json::from_str(out2.trim()).unwrap_or_default()
+    let parsed = if rc2 == 0 {
+        serde_json::from_str::<Vec<GlNote>>(out2.trim()).map_err(|e| e.to_string())
     } else {
-        Vec::new()
+        Err(format!("rc={rc2}: {out2}"))
+    };
+    let mut notes = match parsed {
+        Ok(notes) => notes,
+        Err(e) if strict_notes => anyhow::bail!("glab api {notes_path} failed ({e})"),
+        Err(_) => Vec::new(),
     };
     notes.reverse();
     Ok((mr, notes))
@@ -1503,26 +1523,16 @@ impl Forge for GitLabForge {
     }
 
     fn view_pr_sync(&self, url: &str, pr_number: i64, bots: &ReviewBots) -> anyhow::Result<PrView> {
-        let (_, path) = gitlab_host_path(url)
-            .ok_or_else(|| anyhow::anyhow!("cannot parse GitLab URL: {url}"))?;
-        let (mr, notes) = gitlab_fetch_mr(url, path, pr_number)?;
-        let comments = gitlab_feedback(url, path, &notes, bots)?;
-        let state = gitlab_norm_state(&mr.state);
-        let mergeable = gitlab_norm_mergeable(&mr);
-        let status_check_rollup = gitlab_norm_pipeline(&mr);
-        Ok(PrView {
-            state,
-            mergeable,
-            review_decision: ReviewDecision::None,
-            head_ref: mr.source_branch,
-            head_sha: mr.sha,
-            updated_at: mr.updated_at,
-            title: String::new(),
-            body: String::new(),
-            status_check_rollup,
-            comments,
-            reviews: Vec::new(),
-        })
+        gitlab_view_sync(url, pr_number, bots, false)
+    }
+
+    fn view_pr_comments(
+        &self,
+        url: &str,
+        pr_number: i64,
+        bots: &ReviewBots,
+    ) -> anyhow::Result<PrView> {
+        gitlab_view_sync(url, pr_number, bots, true)
     }
 
     fn view_pr_engage(
@@ -1533,7 +1543,7 @@ impl Forge for GitLabForge {
     ) -> anyhow::Result<PrView> {
         let (_, path) = gitlab_host_path(url)
             .ok_or_else(|| anyhow::anyhow!("cannot parse GitLab URL: {url}"))?;
-        let (mr, notes) = gitlab_fetch_mr(url, path, pr_number)?;
+        let (mr, notes) = gitlab_fetch_mr(url, path, pr_number, false)?;
         let comments = gitlab_feedback(url, path, &notes, bots)?;
         let state = gitlab_norm_state(&mr.state);
         let mergeable = gitlab_norm_mergeable(&mr);
@@ -1641,6 +1651,37 @@ impl Forge for GitLabForge {
         }
         Ok(())
     }
+}
+
+/// GitLab's [`Forge::view_pr_sync`], with its notes required when
+/// `strict_notes` ([`Forge::view_pr_comments`]): a notes read that fails is
+/// then the view failing, not an MR without notes.
+fn gitlab_view_sync(
+    url: &str,
+    pr_number: i64,
+    bots: &ReviewBots,
+    strict_notes: bool,
+) -> anyhow::Result<PrView> {
+    let (_, path) =
+        gitlab_host_path(url).ok_or_else(|| anyhow::anyhow!("cannot parse GitLab URL: {url}"))?;
+    let (mr, notes) = gitlab_fetch_mr(url, path, pr_number, strict_notes)?;
+    let comments = gitlab_feedback(url, path, &notes, bots)?;
+    let state = gitlab_norm_state(&mr.state);
+    let mergeable = gitlab_norm_mergeable(&mr);
+    let status_check_rollup = gitlab_norm_pipeline(&mr);
+    Ok(PrView {
+        state,
+        mergeable,
+        review_decision: ReviewDecision::None,
+        head_ref: mr.source_branch,
+        head_sha: mr.sha,
+        updated_at: mr.updated_at,
+        title: String::new(),
+        body: String::new(),
+        status_check_rollup,
+        comments,
+        reviews: Vec::new(),
+    })
 }
 
 // ---------------------------------------------------------------------------
