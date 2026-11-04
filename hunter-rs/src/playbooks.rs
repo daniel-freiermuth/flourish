@@ -500,6 +500,53 @@ pub fn build_review_prompt(
     render(&template, &slots)
 }
 
+/// What a PR review prompt names about the reviewed pull request.
+#[derive(Debug, Clone, Copy)]
+pub struct PrUnderReview<'a> {
+    pub number: i64,
+    pub title: &'a str,
+    pub body: &'a str,
+    pub author: &'a str,
+}
+
+/// The prompt of a review of somebody else's PR (`pr_review.md`): a fresh
+/// session that reviews `<base>..HEAD` in `worktree`, the PR's head, and
+/// writes its issues to `out_path`, outside the tree. `earlier_issues` is
+/// the JSON array of what earlier rounds reported (`[]` on the first), so
+/// an incremental round does not report them again.
+pub fn build_pr_review_prompt(
+    root: &Path,
+    repo: &Repo,
+    repo_notes: &str,
+    worktree: &Path,
+    base: &str,
+    pr: PrUnderReview<'_>,
+    out_path: &Path,
+    earlier_issues: &str,
+) -> Result<String> {
+    let notes = notes_or_default(repo_notes, "(No notes yet)");
+    let template = read_template(root, "pr_review.md")?;
+    let mut slots = HashMap::new();
+    slots.insert("REPO_NAME", repo.name.clone());
+    slots.insert("REPO_NOTES", notes);
+    slots.insert("WORKTREE", worktree.display().to_string());
+    slots.insert("BASE", base.to_owned());
+    slots.insert("PR_NUMBER", pr.number.to_string());
+    slots.insert("PR_TITLE", pr.title.to_owned());
+    slots.insert(
+        "PR_BODY",
+        if pr.body.is_empty() {
+            "(no description)".to_owned()
+        } else {
+            pr.body.to_owned()
+        },
+    );
+    slots.insert("PR_AUTHOR", pr.author.to_owned());
+    slots.insert("OUT_PATH", out_path.display().to_string());
+    slots.insert("EARLIER_ISSUES", earlier_issues.to_owned());
+    render(&template, &slots)
+}
+
 /// What a resumed fixer is told after a review round raised blocking
 /// issues (`review_followup.md`). `issues` is the reviewer's blocking
 /// entries as JSON, verbatim; `decline_file` is the file the fixer's own

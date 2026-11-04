@@ -702,7 +702,70 @@ impl std::str::FromStr for FindingJobKind {
 }
 
 // ---------------------------------------------------------------------------
-// Job kind — composed of the two sub-enums. Serializes to flat strings
+// PR job kinds: work on a pull request hunter did not open.
+// ---------------------------------------------------------------------------
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, sqlx::Type, TS,
+)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum PrJobKind {
+    #[serde(rename = "pr_review")]
+    #[sqlx(rename = "pr_review")]
+    #[ts(rename = "pr_review")]
+    Review,
+}
+
+impl PrJobKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Review => "pr_review",
+        }
+    }
+}
+
+impl std::fmt::Display for PrJobKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for PrJobKind {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pr_review" => Ok(Self::Review),
+            _ => Err(format!("unknown PR job kind: {s:?}")),
+        }
+    }
+}
+
+/// `pr_reviews.state` (migration 034): a requested review follows its PR
+/// until the PR merges or closes; both ends are terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type, TS)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum PrReviewState {
+    Open,
+    Merged,
+    Closed,
+}
+
+impl PrReviewState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Merged => "merged",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Job kind — composed of the sub-enums. Serializes to flat strings
 // ("hunt", "fix", etc.) for DB/JSON compatibility. All parsing and
 // serialization delegates to the sub-enums — adding a variant there
 // automatically extends JobKind with zero changes here.
@@ -713,6 +776,7 @@ impl std::str::FromStr for FindingJobKind {
 pub enum JobKind {
     Repo(RepoJobKind),
     Finding(FindingJobKind),
+    Pr(PrJobKind),
 }
 
 impl JobKind {
@@ -720,6 +784,7 @@ impl JobKind {
         match self {
             Self::Repo(r) => r.as_str(),
             Self::Finding(f) => f.as_str(),
+            Self::Pr(p) => p.as_str(),
         }
     }
 
@@ -734,14 +799,14 @@ impl JobKind {
     pub fn as_repo(self) -> Option<RepoJobKind> {
         match self {
             Self::Repo(r) => Some(r),
-            Self::Finding(_) => None,
+            Self::Finding(_) | Self::Pr(_) => None,
         }
     }
 
     pub fn as_finding(self) -> Option<FindingJobKind> {
         match self {
             Self::Finding(f) => Some(f),
-            Self::Repo(_) => None,
+            Self::Repo(_) | Self::Pr(_) => None,
         }
     }
 }
@@ -758,6 +823,12 @@ impl From<FindingJobKind> for JobKind {
     }
 }
 
+impl From<PrJobKind> for JobKind {
+    fn from(k: PrJobKind) -> Self {
+        Self::Pr(k)
+    }
+}
+
 impl std::fmt::Display for JobKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
@@ -770,6 +841,7 @@ impl std::str::FromStr for JobKind {
         s.parse::<RepoJobKind>()
             .map(Self::Repo)
             .or_else(|_| s.parse::<FindingJobKind>().map(Self::Finding))
+            .or_else(|_| s.parse::<PrJobKind>().map(Self::Pr))
             .map_err(|_| format!("unknown job kind: {s:?}"))
     }
 }

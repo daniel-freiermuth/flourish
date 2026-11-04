@@ -234,15 +234,17 @@ what actually runs):
 1. Any finding with an active **budget override** (any category) — human
    escape hatch, jumps the whole queue.
 2. **Engage** the flagged PR with the oldest-outstanding attention reason.
-3. **Harvest** the oldest merged or closed PR still pending its review
+3. **Review** a requested PR (§ PR reviews) whose next round is due: the
+   oldest request first. A human is waiting on it like on a flagged PR.
+4. **Harvest** the oldest merged or closed PR still pending its review
    (a closed PR qualifies only while its finding is `closed`, which no
    verdict can set; a finding a human moved on after the closure, even to
    `rejected`, is left alone. Closures from before the closed-PR harvest,
    which left their finding `rejected`, were moved to `closed` once by
    migration 016).
-4. **Recheck** the oldest finding stuck in `rechecking`.
-5. **Fix** the oldest queued finding.
-6. **Resume** the newest suspended attempt that can still be continued.
+5. **Recheck** the oldest finding stuck in `rechecking`.
+6. **Fix** the oldest queued finding.
+7. **Resume** the newest suspended attempt that can still be continued.
    A worker killed for running out of window headroom keeps its session
    and comes back as `suspended` rather than `killed`, and the next cycle
    hands omp that exact session instead of starting cold. So does one
@@ -478,6 +480,31 @@ login, so its own comments are recognised by the hidden
 from someone who can push, such a comment is never new activity, and
 engage prompts show it in the thread as hunter's own earlier reply.
 
+### PR reviews
+
+Hunter can also review pull requests it did not open (future.md §8.8).
+A review is requested by hand on the Reviews page. Hunter's own PRs are
+refused: they are engaged, not reviewed. Reviewing runs the PR's code with
+the daemon's credentials, so an author who cannot push to the repo (and
+is no `reviewBots` entry) needs the requester's vouch. A fork's author
+also stands in for everyone who can push to that fork.
+
+Each round fetches the PR's head (`refs/pull/N/head` or
+`refs/merge-requests/N/head`) and runs a reviewer (`playbooks/pr_review.md`;
+it may build and run targeted tests, but must leave the tree as it found
+it) in a tree detached at that head. The first round reviews from the
+merge-base with the PR's base branch. Later rounds review only from the
+head the last successful round reviewed, as long as the PR still descends
+from it, and are shown every issue reported since the last round that
+reviewed from the merge-base. With **Watch** on, every new head is
+reviewed once it has stayed unchanged for 10 minutes; with it off, only
+the first round runs. A paused (disabled) repo's reviews still run:
+pausing stops scans, not work a human asked for. The PR sync refreshes
+each open review's head, title and state, and a merged or closed PR ends
+its review. A failed round counts toward a hold at 3 in a row; turning
+Watch on or **Retry** clears it. Budget and offline denials count
+nothing. Results stay in hunter: nothing is posted to the forge.
+
 ## Web UI
 
 Served at `http://localhost:8377` (configurable). Left-nav pages:
@@ -489,6 +516,7 @@ Served at `http://localhost:8377` (configurable). Left-nav pages:
 | **Kanban / Pipeline** | Findings in flight, a separate Needs you section with held work, a finding's or a repo's (why it is held, the report, and its Continue/Restart/... controls), suppressed (rejected/wontfix), and informational (note) findings |
 | **All Findings** | Every finding, filterable by repo/type/status/severity, with full detail (jobs, PR state, timeline) on expand, and the actions its status allows (verdicts on new/note/closed, releases of held work, Recheck on new, Unqueue on queued, budget override while something will still pick it) |
 | **Repos** | Add/remove/pause repos; each repo's held scans and failing sync with why and the way out (**Continue**, **Restart**; **Retry now** for a held sync), and the scans failing without a hold yet; queue a full re-hunt (the next hunt reviews the repo's complete history instead of only new commits — the same scope as the periodic `hunt.rehuntDays` re-hunt — and the request stays pending until such a hunt finishes cleanly); per-repo notes (free-text context injected into every prompt for that repo — coding conventions, known false positives, anything worth a hunter remembering across runs) |
+| **Reviews** | Reviews of PRs hunter did not open: request one by URL or number, or pick from the repo's open PRs (with **Watch**, every new head is reviewed again once it has been stable for 10 minutes); authors who cannot push need a vouch; each review's state, rounds (base..head, verdict) and issues, with **Retry** for one held after 3 failed rounds |
 | **Stats** | Aggregate totals by kind and by finding type |
 | **Log** | Full job and event history |
 
@@ -579,6 +607,11 @@ answers `401 {"error": "login required"}` without a live session cookie.
 | POST | `/api/repo/delete` | Remove a repo |
 | POST | `/api/repo/rehunt` | Queue a full re-hunt of a repo |
 | POST | `/api/repo/notes` | Append a note to a repo |
+| GET | `/api/repo/open-prs` | A repo's open PRs from its forge (`id`), marked when hunter opened them or a review exists |
+| GET | `/api/pr-reviews` | Requested PR reviews with their rounds and issues, newest request first |
+| POST | `/api/pr-review` | Request a review (`{"repo_id", "pr": URL or number, "watch", "vouch"?}`); 409 `needs_vouch` when the author cannot push, 409 for hunter's own PR |
+| POST | `/api/pr-review/watch` | Turn a review's Watch on or off (`{"id", "watch"}`); on also clears a hold |
+| POST | `/api/pr-review/retry` | Clear a review's failures and hold (`{"id"}`) |
 
 ## Architecture
 
@@ -639,6 +672,11 @@ for the schema — most columns carry comments explaining *why*, not just *what*
 - **`pr_state`** — one row per finding with an open/merged PR: forge state,
   attention fingerprint + suppression marker (state-based, see § PR
   follow-up loop), harvest tracking.
+- **`pr_reviews`**, **`pr_review_rounds`**, **`pr_review_issues`** —
+  requested reviews of PRs hunter did not open (PR, author, Watch, vouch,
+  newest and last reviewed head, failure streak and hold), each attempt's
+  `base..head` and verdict, and the issues a round reported.
+  `jobs.pr_review_id` names the review a `pr_review` job ran for.
 - **`window_log`** — mirror of budget observations at decision time.
 - **`calibration_samples`** — empirical tokens-spent → used-fraction-moved
   correlation, informational only (estimates real remaining capacity;

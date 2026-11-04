@@ -1312,7 +1312,7 @@ async fn answer_review(
 /// description that becomes the PR body (untracked, so `status` shows it
 /// the same whatever it says).
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct TreeState {
+pub(super) struct TreeState {
     head: Option<String>,
     /// The ref `HEAD` points at (`refs/heads/<branch>`); `None` detached.
     branch: Option<String>,
@@ -1320,7 +1320,15 @@ struct TreeState {
     description: Option<Vec<u8>>,
 }
 
-async fn tree_state(tree: &Path) -> TreeState {
+impl TreeState {
+    /// Whether git reported the commit and the status: only then is there
+    /// a state to compare a reviewer's tree against.
+    pub(super) const fn readable(&self) -> bool {
+        self.head.is_some() && self.status.is_some()
+    }
+}
+
+pub(super) async fn tree_state(tree: &Path) -> TreeState {
     let tree: PathBuf = tree.to_owned();
     tokio::task::spawn_blocking(move || {
         let ok = |(rc, out): (i32, String)| (rc == 0).then(|| out.trim().to_owned());
@@ -1348,7 +1356,7 @@ async fn tree_state(tree: &Path) -> TreeState {
 /// string `summary` is an issue, one whose `blocking` is not a boolean is
 /// taken as blocking (a slip in severity must not let a defect ship), and
 /// anything else is counted and dropped, never taking the others with it.
-fn parse_review(out: &Path) -> Result<(Vec<serde_json::Value>, usize), String> {
+pub(super) fn parse_review(out: &Path) -> Result<(Vec<serde_json::Value>, usize), String> {
     let bytes = std::fs::read(out).map_err(|e| format!("no review file: {e}"))?;
     let entries: Vec<serde_json::Value> = serde_json::from_slice(&bytes)
         .map_err(|e| format!("the review file is not an array: {e}"))?;

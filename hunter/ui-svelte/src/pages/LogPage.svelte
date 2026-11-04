@@ -48,6 +48,7 @@
       case "fix":
       case "review":
       case "engage":
+      case "pr_review":
       case "harvest":
       case "recheck":
       case "verdict":

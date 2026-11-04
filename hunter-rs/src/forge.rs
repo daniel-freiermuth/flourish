@@ -332,6 +332,48 @@ struct GlMergeRequest {
     head_pipeline: Option<GlPipeline>,
     #[serde(default)]
     pipeline: Option<GlPipeline>,
+    #[serde(default)]
+    target_branch: String,
+    #[serde(default)]
+    author: Option<GlAuthor>,
+    #[serde(default)]
+    source_project_id: Option<i64>,
+    #[serde(default)]
+    target_project_id: Option<i64>,
+    #[serde(default)]
+    iid: i64,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    web_url: String,
+}
+
+/// What a review of somebody else's PR needs to know about it
+/// ([`Forge::view_pr_meta`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrMeta {
+    pub state: PrState,
+    pub head_sha: String,
+    pub head_ref: String,
+    /// The branch the PR merges into.
+    pub base_ref: String,
+    /// The author's forge login.
+    pub author: String,
+    pub title: String,
+    pub body: String,
+    /// Whether the head lives in a fork rather than the repo itself.
+    pub cross_repo: bool,
+}
+
+/// One open PR of a repo ([`Forge::list_open_prs`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenPr {
+    pub number: i64,
+    pub title: String,
+    pub author: String,
+    pub is_draft: bool,
+    pub cross_repo: bool,
+    pub url: String,
 }
 
 /// One file of `merge_requests/:iid/diffs`: GitLab returns the hunks
@@ -857,6 +899,71 @@ pub trait Forge: Send + Sync {
     fn close_pr(&self, url: &str, pr_number: i64, comment: &str) -> anyhow::Result<()>;
     /// Push to the remote (--force to raw SSH URL).
     fn push(&self, repo_path: &Path, url: &str, branch: &str) -> anyhow::Result<()>;
+    /// What a review of PR `pr_number` needs: state, head, base, author,
+    /// title and body, and whether the head is in a fork.
+    fn view_pr_meta(&self, url: &str, pr_number: i64) -> anyhow::Result<PrMeta>;
+    /// The repo's open PRs (one page of up to 100).
+    fn list_open_prs(&self, url: &str) -> anyhow::Result<Vec<OpenPr>>;
+    /// Whether `login` can push to the repo at `url`: the one definition
+    /// of a trusted author. Cached like feedback screening's lookups.
+    fn can_push(&self, url: &str, login: &str) -> anyhow::Result<bool>;
+    /// The web URL of PR `pr_number` of the repo at `url`.
+    fn pr_web_url(&self, url: &str, pr_number: i64) -> String;
+    /// The fetch refspec that brings PR `pr_number`'s head, fork or not,
+    /// into the clone as `refs/hunter/pr/<n>` ([`pr_head_ref`]).
+    fn pr_head_refspec(&self, pr_number: i64) -> String;
+}
+
+/// The local ref a PR's head is fetched into ([`Forge::pr_head_refspec`]).
+pub fn pr_head_ref(pr_number: i64) -> String {
+    format!("refs/hunter/pr/{pr_number}")
+}
+
+/// `https://<host>/<path>` of the repo at `url`, whatever form `url` is in.
+fn repo_web_url(url: &str) -> String {
+    url_host_path(url).map_or_else(
+        || {
+            url.trim_end_matches('/')
+                .trim_end_matches(".git")
+                .to_owned()
+        },
+        |(host, path)| {
+            let path = path.trim_end_matches('/').trim_end_matches(".git");
+            format!("https://{host}/{path}")
+        },
+    )
+}
+
+/// The `-R` slug of the GitHub repo at `url`.
+fn github_slug(url: &str) -> anyhow::Result<String> {
+    let (owner, repo) = github_owner_repo(url)
+        .ok_or_else(|| anyhow::anyhow!("cannot parse owner/repo from {url}"))?;
+    Ok(format!("{owner}/{repo}"))
+}
+
+/// GitLab user id of `username` on the instance at `url`; `None` when no
+/// such user exists.
+fn gitlab_user_id(url: &str, username: &str) -> anyhow::Result<Option<i64>> {
+    let api = format!(
+        "users?username={}",
+        username.replace(['&', '?', '#', '/'], "")
+    );
+    let (rc, out) = gitlab_api(url, &api, None, &[]);
+    if rc != 0 {
+        anyhow::bail!("glab api {api} failed (rc={rc}): {out}");
+    }
+    let users: Vec<GlAuthor> = serde_json::from_str(out.trim())
+        .map_err(|e| anyhow::anyhow!("glab api {api}: unparseable users: {e}"))?;
+    Ok(users.into_iter().find_map(|u| u.id))
+}
+
+/// A GitLab MR's state word as a [`PrState`].
+fn gitlab_pr_state(state: &str) -> PrState {
+    match state {
+        "merged" => PrState::Merged,
+        "closed" | "locked" => PrState::Closed,
+        _ => PrState::Open,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1389,6 +1496,133 @@ impl Forge for GitHubForge {
         }
         Ok(())
     }
+
+    fn view_pr_meta(&self, url: &str, pr_number: i64) -> anyhow::Result<PrMeta> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct View {
+            #[serde(default)]
+            state: String,
+            #[serde(default)]
+            head_ref_oid: String,
+            #[serde(default)]
+            head_ref_name: String,
+            #[serde(default)]
+            base_ref_name: String,
+            #[serde(default)]
+            author: Option<GhAuthor>,
+            #[serde(default)]
+            title: String,
+            #[serde(default)]
+            body: String,
+            #[serde(default)]
+            is_cross_repository: bool,
+        }
+        let slug = github_slug(url)?;
+        let num = pr_number.to_string();
+        let (rc, out) = run_cmd(
+            &[
+                "gh",
+                "pr",
+                "view",
+                &num,
+                "-R",
+                &slug,
+                "--json",
+                "state,headRefOid,headRefName,baseRefName,author,title,body,isCrossRepository",
+            ],
+            30,
+        );
+        if rc != 0 {
+            anyhow::bail!("gh pr view failed (rc={rc}): {out}");
+        }
+        let v: View = serde_json::from_str(out.trim())
+            .map_err(|e| anyhow::anyhow!("gh pr view: unparseable PR: {e}"))?;
+        Ok(PrMeta {
+            state: match v.state.to_ascii_uppercase().as_str() {
+                "MERGED" => PrState::Merged,
+                "CLOSED" => PrState::Closed,
+                _ => PrState::Open,
+            },
+            head_sha: v.head_ref_oid,
+            head_ref: v.head_ref_name,
+            base_ref: v.base_ref_name,
+            author: v.author.map(|a| a.login).unwrap_or_default(),
+            title: v.title,
+            body: v.body,
+            cross_repo: v.is_cross_repository,
+        })
+    }
+
+    fn list_open_prs(&self, url: &str) -> anyhow::Result<Vec<OpenPr>> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Listed {
+            number: i64,
+            #[serde(default)]
+            title: String,
+            #[serde(default)]
+            author: Option<GhAuthor>,
+            #[serde(default)]
+            is_draft: bool,
+            #[serde(default)]
+            is_cross_repository: bool,
+            #[serde(default)]
+            url: String,
+        }
+        let slug = github_slug(url)?;
+        let (rc, out) = run_cmd(
+            &[
+                "gh",
+                "pr",
+                "list",
+                "-R",
+                &slug,
+                "--state",
+                "open",
+                "--json",
+                "number,title,author,isDraft,isCrossRepository,url",
+                "-L",
+                "100",
+            ],
+            30,
+        );
+        if rc != 0 {
+            anyhow::bail!("gh pr list failed (rc={rc}): {out}");
+        }
+        let listed: Vec<Listed> = serde_json::from_str(out.trim())
+            .map_err(|e| anyhow::anyhow!("gh pr list: unparseable list: {e}"))?;
+        Ok(listed
+            .into_iter()
+            .map(|p| OpenPr {
+                number: p.number,
+                title: p.title,
+                author: p.author.map(|a| a.login).unwrap_or_default(),
+                is_draft: p.is_draft,
+                cross_repo: p.is_cross_repository,
+                url: p.url,
+            })
+            .collect())
+    }
+
+    fn can_push(&self, url: &str, login: &str) -> anyhow::Result<bool> {
+        let repo = url_host_path(url).map_or_else(
+            || url.to_owned(),
+            |(host, path)| format!("{}/{path}", host.to_ascii_lowercase()),
+        );
+        cached_lookup(
+            format!("github-push:{repo}:{}", normalize_login(login)),
+            || github_can_push(url, login),
+        )
+    }
+
+    fn pr_web_url(&self, url: &str, pr_number: i64) -> String {
+        format!("{}/pull/{pr_number}", repo_web_url(url))
+    }
+
+    fn pr_head_refspec(&self, pr_number: i64) -> String {
+        format!("+refs/pull/{pr_number}/head:{}", pr_head_ref(pr_number))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1638,6 +1872,82 @@ impl Forge for GitLabForge {
             anyhow::bail!("git push failed (rc={rc}): {out}");
         }
         Ok(())
+    }
+
+    fn view_pr_meta(&self, url: &str, pr_number: i64) -> anyhow::Result<PrMeta> {
+        let (_, path) = gitlab_host_path(url)
+            .ok_or_else(|| anyhow::anyhow!("cannot parse GitLab URL: {url}"))?;
+        let api = format!(
+            "projects/{}/merge_requests/{pr_number}",
+            path.replace('/', "%2F")
+        );
+        let (rc, out) = gitlab_api(url, &api, None, &[]);
+        if rc != 0 {
+            anyhow::bail!("glab api {api} failed (rc={rc}): {out}");
+        }
+        let mr: GlMergeRequest = serde_json::from_str(out.trim())
+            .map_err(|e| anyhow::anyhow!("glab api {api}: unparseable MR: {e}"))?;
+        Ok(PrMeta {
+            state: gitlab_pr_state(&mr.state),
+            head_sha: mr.sha,
+            head_ref: mr.source_branch,
+            base_ref: mr.target_branch,
+            author: mr.author.map(|a| a.username).unwrap_or_default(),
+            title: mr.title,
+            body: mr.description,
+            cross_repo: mr.source_project_id != mr.target_project_id,
+        })
+    }
+
+    fn list_open_prs(&self, url: &str) -> anyhow::Result<Vec<OpenPr>> {
+        let (_, path) = gitlab_host_path(url)
+            .ok_or_else(|| anyhow::anyhow!("cannot parse GitLab URL: {url}"))?;
+        let api = format!(
+            "projects/{}/merge_requests?state=opened&per_page=100",
+            path.replace('/', "%2F")
+        );
+        let (rc, out) = gitlab_api(url, &api, None, &[]);
+        if rc != 0 {
+            anyhow::bail!("glab api {api} failed (rc={rc}): {out}");
+        }
+        let mrs: Vec<GlMergeRequest> = serde_json::from_str(out.trim())
+            .map_err(|e| anyhow::anyhow!("glab api {api}: unparseable MR list: {e}"))?;
+        Ok(mrs
+            .into_iter()
+            .map(|mr| OpenPr {
+                number: mr.iid,
+                title: mr.title,
+                author: mr.author.map(|a| a.username).unwrap_or_default(),
+                is_draft: mr.draft,
+                cross_repo: mr.source_project_id != mr.target_project_id,
+                url: mr.web_url,
+            })
+            .collect())
+    }
+
+    fn can_push(&self, url: &str, login: &str) -> anyhow::Result<bool> {
+        let (host, project) = gitlab_host_path(url)
+            .ok_or_else(|| anyhow::anyhow!("cannot parse GitLab URL: {url}"))?;
+        let key = format!(
+            "gitlab-push-login:{}/{project}:{}",
+            host.to_ascii_lowercase(),
+            login.to_ascii_lowercase()
+        );
+        cached_lookup(key, || match gitlab_user_id(url, login)? {
+            Some(id) => gitlab_can_push(url, project, id),
+            None => Ok(false),
+        })
+    }
+
+    fn pr_web_url(&self, url: &str, pr_number: i64) -> String {
+        format!("{}/-/merge_requests/{pr_number}", repo_web_url(url))
+    }
+
+    fn pr_head_refspec(&self, pr_number: i64) -> String {
+        format!(
+            "+refs/merge-requests/{pr_number}/head:{}",
+            pr_head_ref(pr_number)
+        )
     }
 }
 
