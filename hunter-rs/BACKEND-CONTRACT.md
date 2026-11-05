@@ -224,8 +224,9 @@ failure, `gave_up` when the give-up ceiling's failure completed the streak)
 and the report, or the failure key and its output, as its detail. A hold
 never changes the finding's status: a held fix stays `queued`, and every
 tier, the resume tier and the summary preview skip it through one query
-(`Store::held_work`), as does the daemon's queued count (`count_queued`),
-which would otherwise keep it cycling without sleep. Holding ends the
+(`Store::held_work`). The daemon counts no work for its sleep: after a job
+it goes straight back to the pick, so a held fix cannot keep it cycling
+without sleep. Holding ends the
 streak, and the held attempt becomes the work item's checkpoint if a worker
 ran in it (it has a transcript); one that left nothing to continue (no job,
 or a tree never made) keeps the checkpoint the work item already had, and

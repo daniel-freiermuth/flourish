@@ -3732,19 +3732,6 @@ async fn a_hold_without_a_new_checkpoint_keeps_the_existing_one() {
     }
 }
 
-/// A held fix stays `queued` but is no work the daemon can do, so it is not
-/// counted as queued: the daemon drains its queue without sleeping while
-/// it has queued fixes, and a held one would keep it cycling for nothing.
-#[tokio::test]
-async fn a_held_fix_is_not_counted_as_queued() {
-    let (_dir, store, _pool) = hold_fixture().await;
-    assert_eq!(store.count_queued().await.unwrap(), 1);
-
-    assert!(hold_fix(&store, HoldReason::Stuck, "no commits", Some(10)).await);
-
-    assert_eq!(store.count_queued().await.unwrap(), 0);
-}
-
 /// Counting a failure leaves the checkpoint alone (WORK-MODEL.md §6.3): an
 /// attempt that ran has moved the pointer already when its job finished,
 /// and a failure before any attempt (a fetch, a PR view, a runner that

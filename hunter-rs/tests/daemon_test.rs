@@ -593,6 +593,27 @@ async fn a_skipped_cycle_restarts_at_once() {
     assert_eq!(hunter::daemon::compute_sleep_s(&store, &idle).await, 900.0);
 }
 
+/// A cycle that ran a job goes straight back to the pick, even with
+/// nothing queued and no repo enabled: only the pick decides whether work
+/// is due. When it finds none, that idle cycle sleeps the idle interval,
+/// so a job costs at most one extra cycle before any sleep.
+#[tokio::test]
+#[allow(
+    clippy::float_cmp,
+    reason = "the sleeps are exact constants, not computed values"
+)]
+async fn a_finished_job_goes_straight_back_to_the_pick() {
+    let dir = TempDir::new("daemon-job-sleep");
+    let (_db, store) = support::fresh_store(&dir, "job").await;
+    let done = hunter::scheduler::CycleSummary {
+        state: Some(hunter::domain::JobState::Done),
+        ..Default::default()
+    };
+    assert_eq!(hunter::daemon::compute_sleep_s(&store, &done).await, 0.0);
+    let idle = hunter::scheduler::CycleSummary::default();
+    assert_eq!(hunter::daemon::compute_sleep_s(&store, &idle).await, 900.0);
+}
+
 /// While a PR is open the job lane never sleeps past the admin lane's
 /// interval: the admin lane wakes it only for work a sync made, and an
 /// engage due a retry on a PR already flagged is not that. A budget

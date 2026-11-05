@@ -609,28 +609,21 @@ pub fn describe_cycle(summary: &CycleSummary) -> (String, String) {
 }
 
 /// How long the daemon should sleep after a cycle (`server._compute_sleep_s`).
+///
+/// After a cycle that ran a job the next starts at once, whatever is
+/// queued: the cycle's pick is the single place that decides what is due,
+/// and asking it here as well would duplicate that decision. If it finds
+/// nothing, that idle cycle sleeps through the branches below, so a job
+/// costs at most one extra cycle before any sleep and cannot spin.
 pub async fn compute_sleep_s(store: &Store, summary: &CycleSummary) -> f64 {
     let sleep_s: f64;
     if summary.error.is_some() {
         sleep_s = 5.0 * 60.0;
-    } else if {
-        matches!(
-            summary.state,
-            Some(JobState::Done | JobState::Killed | JobState::Failed | JobState::Suspended)
-        )
-    } {
-        let queued = store.count_queued().await.unwrap_or(0);
-        let inserted = summary.ingest.as_ref().map_or(0, |i| i.inserted);
-        let enabled = store.count_enabled_repos().await.unwrap_or(0);
-        sleep_s = if queued > 0 {
-            0.0
-        } else if inserted > 0 {
-            5.0
-        } else if enabled > 0 {
-            60.0
-        } else {
-            15.0 * 60.0
-        };
+    } else if matches!(
+        summary.state,
+        Some(JobState::Done | JobState::Killed | JobState::Failed | JobState::Suspended)
+    ) {
+        sleep_s = 0.0;
     } else if summary.denied.is_some() {
         if let Some(retry_at) = summary.retry_at.map(|v| v as f64) {
             if retry_at > 0.0 {
