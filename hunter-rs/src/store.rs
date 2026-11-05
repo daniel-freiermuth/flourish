@@ -984,33 +984,6 @@ impl Store {
     // Private — all SQL goes through typed store methods.
     // No code outside this module can access the raw pool (field is not pub).
 
-    // ── counting helpers (daemon sleep logic) ─────────────────────────
-
-    /// Queued fixes the scheduler can work on: held ones stay `queued` but
-    /// wait for the operator, and counting them would keep the daemon
-    /// cycling without sleep for nothing.
-    pub async fn count_queued(&self) -> sqlx::Result<i64> {
-        let status = FindingStatus::Queued;
-        let fix = FindingJobKind::Fix;
-        sqlx::query_scalar!(
-            r#"SELECT COUNT(*) AS "n!: i64" FROM findings f WHERE f.status = ?1
-               AND NOT EXISTS (SELECT 1 FROM work_holds h WHERE h.finding_id = f.id
-                               AND h.kind = ?2 AND h.released_at IS NULL)"#,
-            status,
-            fix
-        )
-        .fetch_one(&self.pool)
-        .await
-    }
-
-    pub async fn count_enabled_repos(&self) -> sqlx::Result<i64> {
-        sqlx::query_scalar!(
-            r#"SELECT COUNT(*) AS "n!: i64" FROM repos WHERE enabled = 1 AND deleted_at IS NULL"#
-        )
-        .fetch_one(&self.pool)
-        .await
-    }
-
     // ── repo timestamp helpers (scheduler) ────────────────────────────
 
     /// A Renovate scan of `repo_id` settled: record the run

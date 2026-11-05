@@ -593,9 +593,9 @@ async fn a_skipped_cycle_restarts_at_once() {
     assert_eq!(hunter::daemon::compute_sleep_s(&store, &idle).await, 900.0);
 }
 
-/// A failed cycle backs off five minutes; a finished job with nothing
-/// queued and no repo enabled idles 15; a denial whose `retry_at` is 0
-/// has no estimate and backs off 30.
+/// A failed cycle backs off five minutes; a finished job goes straight
+/// back to the pick, even with nothing queued and no repo enabled; a
+/// denial whose `retry_at` is 0 has no estimate and backs off 30.
 #[tokio::test]
 #[allow(
     clippy::float_cmp,
@@ -617,7 +617,7 @@ async fn a_cycle_sleeps_by_how_it_ended() {
                 state: Some(hunter::domain::JobState::Done),
                 ..Default::default()
             },
-            900.0,
+            0.0,
         ),
         (
             hunter::scheduler::CycleSummary {
@@ -631,6 +631,90 @@ async fn a_cycle_sleeps_by_how_it_ended() {
         let slept = hunter::daemon::compute_sleep_s(&store, &summary).await;
         assert_eq!(slept, expected, "{summary:?}");
     }
+}
+
+/// A cycle that ran a job goes straight back to the pick, even with
+/// nothing queued and no repo enabled: only the pick decides whether work
+/// is due. When it finds none, that idle cycle sleeps the idle interval,
+/// so a job costs at most one extra cycle before any sleep.
+#[tokio::test]
+#[allow(
+    clippy::float_cmp,
+    reason = "the sleeps are exact constants, not computed values"
+)]
+async fn a_finished_job_goes_straight_back_to_the_pick() {
+    let dir = TempDir::new("daemon-job-sleep");
+    let (_db, store) = support::fresh_store(&dir, "job").await;
+    let done = hunter::scheduler::CycleSummary {
+        state: Some(hunter::domain::JobState::Done),
+        ..Default::default()
+    };
+    assert_eq!(hunter::daemon::compute_sleep_s(&store, &done).await, 0.0);
+    let idle = hunter::scheduler::CycleSummary::default();
+    assert_eq!(hunter::daemon::compute_sleep_s(&store, &idle).await, 900.0);
+}
+
+/// The idle cycle a job's cycle goes straight back to keeps naming the
+/// job in the status: it follows at once, and would otherwise wipe what
+/// the job did before anyone could read it. The idle cycle after that
+/// says idle alone, as one after a sleep always did.
+#[test]
+fn the_idle_cycle_after_a_job_keeps_naming_the_job() {
+    let done = hunter::scheduler::CycleSummary {
+        state: Some(hunter::domain::JobState::Done),
+        kind: Some(hunter::domain::JobKind::Finding(
+            hunter::domain::FindingJobKind::Fix,
+        )),
+        finding_id: Some(7),
+        outcome: Some("pr opened".into()),
+        ..Default::default()
+    };
+    let idle = hunter::scheduler::CycleSummary {
+        idle: Some("nothing to do".into()),
+        ..Default::default()
+    };
+    let mut last_job = None;
+    assert_eq!(
+        hunter::daemon::cycle_state(&done, &mut last_job).1,
+        "last: fix #7 -> pr opened"
+    );
+    assert_eq!(
+        hunter::daemon::cycle_state(&idle, &mut last_job).1,
+        "nothing to do; last: fix #7 -> pr opened"
+    );
+    assert_eq!(
+        hunter::daemon::cycle_state(&idle, &mut last_job).1,
+        "nothing to do"
+    );
+}
+
+/// Only an idle cycle keeps naming the job before it: a cycle that ran a
+/// job of its own, or was denied, says what it did and nothing older.
+#[test]
+fn a_cycle_that_is_not_idle_does_not_name_the_job_before_it() {
+    let done = |fid| hunter::scheduler::CycleSummary {
+        state: Some(hunter::domain::JobState::Done),
+        kind: Some(hunter::domain::JobKind::Finding(
+            hunter::domain::FindingJobKind::Fix,
+        )),
+        finding_id: Some(fid),
+        outcome: Some("pr opened".into()),
+        ..Default::default()
+    };
+    let denied = hunter::scheduler::CycleSummary {
+        denied: Some("budget".into()),
+        ..Default::default()
+    };
+    let mut last_job = None;
+    hunter::daemon::cycle_state(&done(7), &mut last_job);
+    assert_eq!(
+        hunter::daemon::cycle_state(&done(8), &mut last_job).1,
+        "last: fix #8 -> pr opened"
+    );
+    assert_eq!(
+        hunter::daemon::cycle_state(&denied, &mut last_job).1,
+        "last: budget"
+    );
 }
 
 /// While a PR is open the job lane never sleeps past the admin lane's
