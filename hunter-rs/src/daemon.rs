@@ -608,28 +608,44 @@ pub fn describe_cycle(summary: &CycleSummary) -> (String, String) {
     ("idle".into(), "cycle produced no actionable outcome".into())
 }
 
+/// The (`state_label`, detail) a cycle leaves in `scheduler_state`:
+/// [`describe_cycle`]'s, but an idle cycle right after one that ran a job
+/// (`last_job`, the detail that job's cycle left) keeps naming that job.
+/// After a job the lane goes straight back to the pick
+/// ([`compute_sleep_s`]), and the idle cycle that finds nothing would
+/// otherwise wipe what the job did from the status page at once; the next
+/// idle cycle shows idle alone, as one after a sleep always did.
+pub fn cycle_state(summary: &CycleSummary, last_job: &mut Option<String>) -> (String, String) {
+    let (label, detail) = describe_cycle(summary);
+    let ran_job = matches!(
+        summary.state,
+        Some(JobState::Done | JobState::Killed | JobState::Failed | JobState::Suspended)
+    );
+    let job = last_job.take();
+    if ran_job {
+        *last_job = Some(detail.clone());
+    }
+    match job {
+        Some(job) if summary.idle.is_some() => (label, format!("{detail}; {job}")),
+        _ => (label, detail),
+    }
+}
+
 /// How long the daemon should sleep after a cycle (`server._compute_sleep_s`).
+///
+/// After a cycle that ran a job the next starts at once, whatever is
+/// queued: the cycle's pick is the single place that decides what is due,
+/// and asking it here as well would duplicate that decision. If it finds
+/// nothing, that idle cycle sleeps through the branches below, so a job
+/// costs at most one extra cycle before any sleep and cannot spin.
 pub async fn compute_sleep_s(store: &Store, summary: &CycleSummary) -> f64 {
     let sleep_s = if summary.error.is_some() {
         5.0 * 60.0
-    } else if {
-        matches!(
-            summary.state,
-            Some(JobState::Done | JobState::Killed | JobState::Failed | JobState::Suspended)
-        )
-    } {
-        let queued = store.count_queued().await.unwrap_or(0);
-        let inserted = summary.ingest.as_ref().map_or(0, |i| i.inserted);
-        let enabled = store.count_enabled_repos().await.unwrap_or(0);
-        if queued > 0 {
-            0.0
-        } else if inserted > 0 {
-            5.0
-        } else if enabled > 0 {
-            60.0
-        } else {
-            15.0 * 60.0
-        }
+    } else if matches!(
+        summary.state,
+        Some(JobState::Done | JobState::Killed | JobState::Failed | JobState::Suspended)
+    ) {
+        0.0
     } else if summary.denied.is_some() {
         // A denial with no informed estimate backs off 30 minutes.
         summary
@@ -861,6 +877,9 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     // stop timeout only ever has to cover one run.
     jobs.stop_on(shutdown_rx.clone());
     let mut stop = *shutdown_rx.borrow();
+    // What the last cycle that ran a job left in `scheduler_state`
+    // ([`cycle_state`]).
+    let mut last_job: Option<String> = None;
     while !stop {
         // Not atomic with the `cycle_running.store(true)` below, on
         // purpose. A pause stored between the two (a window of a few
@@ -909,7 +928,7 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
             scheduler.pr_sync_wake.notify_one();
         }
         let sleep_s = compute_sleep_s(&store, &summary).await;
-        let (state_label, detail) = describe_cycle(&summary);
+        let (state_label, detail) = cycle_state(&summary, &mut last_job);
         let next_wake = next_wake_ms(crate::util::now_ms(), sleep_s);
         let _ = store
             .set_scheduler_state(&state_label, &detail, Some(next_wake))
