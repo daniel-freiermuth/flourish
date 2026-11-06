@@ -374,6 +374,31 @@ async fn repo_briefs(store: &Store) -> Result<Vec<RepoBrief>, ApiError> {
         .collect())
 }
 
+/// The budget verdict the summary previews for `c`, as the scheduler's
+/// budget gate (`budget_gate`) would reach it: a continuation that costs
+/// no model tokens skips that gate, so it is granted without asking the
+/// backend; anything else asks for its reservation.
+async fn preview_verdict(
+    state: &AppState,
+    c: &crate::scheduler::Candidate,
+    is_prioritized: bool,
+) -> Result<crate::backend::Verdict, ApiError> {
+    if c.is_free() {
+        return Ok(crate::backend::Verdict::Granted {
+            cap_tokens: None,
+            reason: "publishes only: no model tokens".to_owned(),
+        });
+    }
+    let anticipated =
+        crate::scheduler::candidate_reservation(&state.store, &state.config, c).await?;
+    let outlook = state.backend.decide(anticipated).await?;
+    Ok(if is_prioritized {
+        outlook.prioritized
+    } else {
+        outlook.normal
+    })
+}
+
 // -- /api/summary (contract §3) ---------------------------------------------
 
 async fn summary(State(state): State<AppState>) -> Result<Json<Summary>, ApiError> {
@@ -407,15 +432,8 @@ async fn summary(State(state): State<AppState>) -> Result<Json<Summary>, ApiErro
     let next_candidate: Option<NextCandidate> = if current_job.is_none() {
         match scheduler::preview_next(store, &state.config).await {
             Ok(Some(c)) => {
-                let anticipated =
-                    scheduler::candidate_reservation(store, &state.config, &c).await?;
-                let outlook = state.backend.decide(anticipated).await?;
                 let is_prioritized = scheduler_overdrive || c.budget_override().is_some();
-                let verdict = if is_prioritized {
-                    outlook.prioritized
-                } else {
-                    outlook.normal
-                };
+                let verdict = preview_verdict(&state, &c, is_prioritized).await?;
                 let (budget_state, budget_reason, budget_retry_at) = match verdict {
                     Verdict::Denied { reason, retry_at } => (BudgetState::Denied, reason, retry_at),
                     Verdict::Granted { reason, .. } => (BudgetState::Allowed, reason, None),
