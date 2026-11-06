@@ -68,12 +68,14 @@ jobs:
       - name: List the mutants this PR introduces
         id: plan
         env:
-          # Mutants per shard. At -j 2 on a hosted runner a mutant costs
-          # about 50 s with today's suite (shards of 37 took 23-35 min on
-          # PR #94, and two hit the cap; it was 30 s when 40 was chosen on
-          # PR #69). 20 keeps a shard near 15 min, well inside the
-          # 35-minute cap in the shard job, as the suite keeps growing.
-          MAX_MUTANTS: "20"
+          # Mutants per shard. A mutant's cost is its incremental build plus
+          # the test run, and both grow with the code a diff touches: on
+          # PR #133 (the PR-review feature) they took ~120 s + ~160-200 s
+          # at -j 2, so shards of 20 hit the 35-minute cap in 12 of 52
+          # shards and left part of the diff untested (it was ~50 s per
+          # mutant on PR #94, 30 s on PR #69). 8 runs as 4 rounds of two,
+          # about 20 min at today's cost, leaving room for the suite to grow.
+          MAX_MUTANTS: "8"
           BASE_REF: ${{ github.base_ref }}
         run: |
           # --relative is load-bearing: without it git emits repo-relative
