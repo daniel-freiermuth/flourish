@@ -207,6 +207,16 @@ async fn anticipated_tokens_warm_requires_same_repo_and_non_denied() {
     .execute(&pool)
     .await
     .unwrap();
+    // Recent hunt on repo 1 that made no model call (a retry that only
+    // published a kept attempt): it warmed no cache.
+    sqlx::query(
+        "INSERT INTO jobs (id, kind, repo_id, state, started_at, finished_at, calls) \
+         VALUES (13, 'hunt', 1, 'done', ?1, ?1, 0)",
+    )
+    .bind(recent)
+    .execute(&pool)
+    .await
+    .unwrap();
     let store = open_store(pool, &path).await;
     let cfg = test_config(3600.0);
     let got = anticipated_tokens(&store, &cfg, 1, RepoJobKind::Hunt.into())

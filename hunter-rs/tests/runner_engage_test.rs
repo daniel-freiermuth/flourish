@@ -2877,13 +2877,13 @@ async fn a_refused_push_keeps_the_attempt_only_while_the_branch_is_unmoved() {
     }
 }
 
-/// The retry of an engage kept to publish still publishes when its own run
-/// fails before its first token (a rate limit): that run left the finished
-/// attempt's tree as it was. Refused again, the attempt stays kept and the
-/// refusal counts as the same failure, so the work is neither redone nor
-/// its streak reset.
+/// The retries of an engage kept to publish publish its finished tree
+/// without resuming the worker. Refused again, the attempt stays kept and
+/// the refusal counts as the same failure, so the work is neither redone
+/// nor its streak reset; the chain still continues from the transcript the
+/// finished attempt left.
 #[tokio::test]
-async fn a_kept_engage_publishes_even_when_its_retry_run_does_nothing() {
+async fn a_kept_engage_retries_its_publish_without_a_worker_run() {
     let f = fixture("engage-kept-retry").await;
     let bins = FakeBins::acquire("engage-kept-retry");
     bins.ok("gh", PR_VIEW_JSON);
@@ -2906,12 +2906,7 @@ async fn a_kept_engage_publishes_even_when_its_retry_run_does_nothing() {
         sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
             .await
             .unwrap();
-    let rate_limited = ScriptedBackend::staged(|_, session| RunResult {
-        exit_code: Some(1),
-        tokens_new: 0,
-        session_file: session.map(|p| p.to_string_lossy().into_owned()),
-        ..done()
-    });
+    let idle = ScriptedBackend::new(support::done_with_transcript);
     let retry = async || {
         // Past any wait, however many refusals came before.
         sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
@@ -2931,7 +2926,7 @@ async fn a_kept_engage_publishes_even_when_its_retry_run_does_nothing() {
             f.store.test_lane(),
             &f.cfg,
             Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
-            &rate_limited,
+            &idle,
         )
         .await
         .unwrap()
@@ -2966,6 +2961,7 @@ async fn a_kept_engage_publishes_even_when_its_retry_run_does_nothing() {
         "{published:?}"
     );
     assert!(bins.called_with("gh", "comment"), "{:?}", bins.calls());
+    assert!(idle.runs().is_empty(), "no worker resumed to publish");
     assert_eq!(
         git(&origin, &["log", "-1", "--format=%s", BRANCH]).trim(),
         "address review"
@@ -2974,8 +2970,9 @@ async fn a_kept_engage_publishes_even_when_its_retry_run_does_nothing() {
 
 /// An engage whose push landed but whose reply the forge refused is kept
 /// too, while the PR's head is still its push: the retry finds its commits
-/// already on the PR and only replies, instead of the whole engagement
-/// being redone cold, and waits like any refused publish.
+/// already on the PR and only replies, without resuming the worker,
+/// instead of the whole engagement being redone cold, and waits like any
+/// refused publish.
 #[tokio::test]
 async fn an_engage_whose_reply_was_refused_after_its_push_only_replies_again() {
     let f = fixture("engage-reply-refused").await;
@@ -3030,17 +3027,20 @@ async fn an_engage_whose_reply_was_refused_after_its_push_only_replies_again() {
     else {
         panic!("the kept engage is continued");
     };
+    assert_eq!(plan.anticipated(), 0, "the budget gate reserves nothing");
+    let idle = ScriptedBackend::new(support::done_with_transcript);
     let replied = hunter::scheduler::run_engage(
         &support::scope(&f.store),
         f.store.test_lane(),
         &f.cfg,
         Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
-        &ScriptedBackend::new(support::done_with_transcript),
+        &idle,
     )
     .await
     .unwrap();
 
     assert_eq!(replied.outcome.as_deref(), Some("engaged"), "{replied:?}");
+    assert!(idle.runs().is_empty(), "no worker resumed to publish");
     assert!(bins.called_with("gh", "comment"), "{:?}", bins.calls());
     assert_eq!(
         git(&origin, &["rev-parse", BRANCH]),
@@ -3140,21 +3140,56 @@ async fn a_kept_engage_that_cannot_read_the_branch_does_not_push_again() {
     assert_eq!(push_count, 1, "the one push is counted once");
 }
 
-/// A kept engage whose retry adds a commit on top of its own earlier push
-/// pushes it: the lease is to the PR's head this tree contains, not to the
-/// chain's first commit, which the chain's own push already moved off.
-#[tokio::test]
-async fn a_kept_engage_that_commits_again_pushes_over_its_own_push() {
-    let f = fixture("engage-kept-commits").await;
-    let bins = FakeBins::acquire("engage-kept-commits");
-    let origin = kept_after_its_push(&f, &bins).await;
+/// The fixture's kept engage, held on its refusal and released by an
+/// operator: the one continuation of a kept attempt whose worker runs
+/// (any other only publishes, without a run), so the plan that continues
+/// it.
+async fn released_plan(f: &Fixture) -> hunter::scheduler::ResumePlan {
+    let checkpoint = f
+        .store
+        .checkpoint_job(f.fid, hunter::domain::FindingJobKind::Engage)
+        .await
+        .unwrap()
+        .map(|j| j.id);
+    let held = support::scope(&f.store)
+        .store()
+        .hold_work(
+            f.fid,
+            hunter::domain::FindingJobKind::Engage,
+            hunter::domain::HoldReason::Stuck,
+            "PR comment failed: HTTP 500",
+            checkpoint,
+        )
+        .await
+        .unwrap();
+    assert!(held);
+    support::release(
+        &f.store,
+        f.fid,
+        hunter::domain::FindingJobKind::Engage,
+        hunter::domain::ReleaseAction::Continue,
+    )
+    .await;
     let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
         hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
             .await
             .unwrap()
     else {
-        panic!("the kept engage is continued");
+        panic!("the released engage is continued");
     };
+    *plan
+}
+
+/// A kept engage whose released retry adds a commit on top of its own
+/// earlier push pushes it: the lease is to the PR's head this tree
+/// contains, not to the chain's first commit, which the chain's own push
+/// already moved off.
+#[tokio::test]
+async fn a_kept_engage_that_commits_again_pushes_over_its_own_push() {
+    let f = fixture("engage-kept-commits").await;
+    let bins = FakeBins::acquire("engage-kept-commits");
+    let origin = kept_after_its_push(&f, &bins).await;
+    let plan = released_plan(&f).await;
     let more = ScriptedBackend::new(|tree| {
         git(tree, &["commit", "--allow-empty", "-qm", "one more"]);
         support::done_with_transcript(tree)
@@ -3320,22 +3355,17 @@ async fn a_kept_reply_is_redecided_when_its_branch_moved() {
     }
 }
 
-/// A retry of a kept engage publishes the kept tree whatever its own run
-/// ended as only when that run did no metered work: one that worked and
-/// then failed may have left the tree half-changed, and publishes nothing.
+/// A released retry of a kept engage publishes the kept tree whatever its
+/// own run ended as only when that run did no metered work: one that
+/// worked and then failed may have left the tree half-changed, and
+/// publishes nothing.
 #[tokio::test]
 async fn a_kept_engage_whose_retry_worked_and_failed_publishes_nothing() {
     let f = fixture("engage-kept-retry-fails").await;
     let bins = FakeBins::acquire("engage-kept-retry-fails");
     let origin = kept_after_its_push(&f, &bins).await;
     let pushed = git(&origin, &["rev-parse", BRANCH]);
-    let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
-        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
-            .await
-            .unwrap()
-    else {
-        panic!("the kept engage is continued");
-    };
+    let plan = released_plan(&f).await;
     let failing = ScriptedBackend::new(|_| RunResult {
         exit_code: Some(1),
         ..done()
@@ -3359,6 +3389,73 @@ async fn a_kept_engage_whose_retry_worked_and_failed_publishes_nothing() {
         .count();
     assert_eq!(comments, 1, "only the kept attempt's refused reply");
     assert_eq!(git(&origin, &["rev-parse", BRANCH]), pushed);
+}
+
+/// A released retry of a kept engage whose run fails before its first
+/// token (a rate limit) still publishes: that run left the finished
+/// attempt's tree as it was.
+#[tokio::test]
+async fn a_released_engage_retry_that_did_nothing_still_publishes() {
+    let f = fixture("engage-released-rate-limited").await;
+    let bins = FakeBins::acquire("engage-released-rate-limited");
+    kept_after_its_push(&f, &bins).await;
+    let plan = released_plan(&f).await;
+    let rate_limited = ScriptedBackend::staged(|_, session| RunResult {
+        exit_code: Some(1),
+        tokens_new: 0,
+        session_file: session.map(|p| p.to_string_lossy().into_owned()),
+        ..done()
+    });
+
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
+        &rate_limited,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
+    assert_eq!(rate_limited.runs().len(), 1, "the released worker ran");
+    let comments = bins
+        .calls_to("gh")
+        .into_iter()
+        .filter(|c| c.iter().any(|a| a == "comment"))
+        .count();
+    assert_eq!(comments, 2, "the refused reply, then this one");
+}
+
+/// A reply the forge refuses again while the model provider is down is
+/// still the forge's refusal: posting talks to the forge alone. It counts
+/// as a refused publish, not as an engage kept offline.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_reply_while_the_provider_is_down_counts_as_a_refusal() {
+    let mut f = fixture("engage-refused-provider-down").await;
+    let bins = FakeBins::acquire("engage-refused-provider-down");
+    kept_after_its_push(&f, &bins).await;
+    bins.ok_unless_action("gh", "pr comment", PR_VIEW_JSON);
+    f.cfg.network_gate = true;
+    let provider = "api.provider.example";
+    let down = ScriptedBackend::new(support::done_with_transcript)
+        .needing(&[provider])
+        .offline(&[provider]);
+
+    let again =
+        hunter::scheduler::run_cycle(&mut support::jobs(&f.store), &f.cfg, &down, None).await;
+
+    assert_eq!(again.outcome.as_deref(), Some("retry"), "{again:?}");
+    assert_eq!(again.unreachable, None, "{again:?}");
+    let streak = f
+        .store
+        .work_streak(f.fid, hunter::domain::FindingJobKind::Engage)
+        .await
+        .unwrap();
+    assert_eq!(
+        (streak.streak, streak.last_failure.as_deref()),
+        (2, Some("publish refused"))
+    );
 }
 
 /// A withdrawal the forge refused is kept only while the PR's branch is
@@ -3398,22 +3495,16 @@ async fn a_refused_withdrawal_on_a_moved_branch_is_not_kept() {
     );
 }
 
-/// A kept engage whose retry amends the commit the chain already pushed
-/// force-pushes the amended one: the lease is to the chain's own recorded
-/// push, which is the PR's head, so only what this chain put there is
-/// replaced.
+/// A kept engage whose released retry amends the commit the chain already
+/// pushed force-pushes the amended one: the lease is to the chain's own
+/// recorded push, which is the PR's head, so only what this chain put
+/// there is replaced.
 #[tokio::test]
 async fn a_kept_engage_that_amends_its_own_push_pushes_the_amend() {
     let f = fixture("engage-kept-amends").await;
     let bins = FakeBins::acquire("engage-kept-amends");
     let origin = kept_after_its_push(&f, &bins).await;
-    let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
-        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
-            .await
-            .unwrap()
-    else {
-        panic!("the kept engage is continued");
-    };
+    let plan = released_plan(&f).await;
     let amending = ScriptedBackend::new(|tree| {
         git(
             tree,
@@ -3589,6 +3680,11 @@ async fn withdrawal_reason_posted_once(comment_errs: bool) {
     else {
         panic!("the kept withdrawal is continued");
     };
+    // Costs nothing itself, but its close hands on into the harvest, which
+    // is gated and reserved for as a resume: so is the withdrawal, which
+    // then runs only when that warm handoff can.
+    assert!(plan.anticipated() > 0, "{label}");
+    assert!(!plan.free(), "{label}");
 
     let again = hunter::scheduler::run_engage(
         &support::scope(&f.store),

@@ -4120,8 +4120,10 @@ impl Store {
         .unwrap_or(false))
     }
 
-    /// Targeted query for `anticipated_tokens`: is there a warm (non-denied,
-    /// finished within cutoff) job for this exact (repo, kind)?
+    /// Targeted query for `anticipated_tokens`: is there a warm job for this
+    /// exact (repo, kind): finished within cutoff, not denied, and not one
+    /// that made no model call (`calls = 0`), such as a retry that only
+    /// published a kept attempt, which warmed no cache.
     pub async fn has_warm_job(
         &self,
         repo_id: i64,
@@ -4131,7 +4133,7 @@ impl Store {
         let row = sqlx::query_scalar!(
             r#"SELECT 1 AS "x!: i64" FROM jobs
                WHERE repo_id = ?1 AND kind = ?2 AND finished_at > ?3
-               AND state != 'denied' LIMIT 1"#,
+               AND state != 'denied' AND (calls IS NULL OR calls > 0) LIMIT 1"#,
             repo_id,
             kind,
             cutoff_ms
