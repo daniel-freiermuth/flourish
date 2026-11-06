@@ -1115,14 +1115,16 @@ fn packs(clone: &std::path::Path) -> usize {
 /// An admin fetch runs none of git's housekeeping: a repack of a large
 /// clone would hold the permit a job starting on the repo waits for. The
 /// job lane's own fetches run it. Here the clone's housekeeping is due (a
-/// threshold of one, thousands of loose objects), and fetch-ahead leaves
-/// its packs as they were.
+/// threshold of one, for gc and for git 2.56's geometric repack, and
+/// thousands of loose objects), and fetch-ahead leaves its packs as they
+/// were.
 #[tokio::test]
 async fn an_admin_fetch_leaves_housekeeping_to_the_job_lane() {
     let (dir, store, _cfg, _fid) = fixture("lanes-fetch-no-gc").await;
     let alpha = store.get_repo_by_id(1).await.unwrap().unwrap();
     let clone = std::path::Path::new(&alpha.path);
     support::git(clone, &["config", "gc.auto", "1"]);
+    support::git(clone, &["config", "maintenance.geometric-repack.auto", "1"]);
     let loose = dir.subdir("loose");
     let paths: Vec<String> = (0..3000)
         .map(|i| {
