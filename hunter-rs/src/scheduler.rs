@@ -97,6 +97,11 @@ pub struct ResumePlan {
     /// metered work leaves its tree as that attempt finished it, so it
     /// still publishes.
     publish_only: bool,
+    /// Continuing costs no model tokens ([`publishes_for_free`]): no
+    /// worker runs and no review is due, so only the forge is needed, and
+    /// neither the budget gate nor the model provider's reachability
+    /// stands in its way.
+    free: bool,
 }
 
 impl ResumePlan {
@@ -125,6 +130,21 @@ impl ResumePlan {
 
     pub const fn publish_only(&self) -> bool {
         self.publish_only
+    }
+
+    /// A continuation with nothing for its worker to do: its predecessor
+    /// was kept only to publish, and no operator has released a hold on
+    /// it since, so no forge answer has to be acted on. Its kept tree is
+    /// published as it is, without resuming the session ([`worker_run`]),
+    /// which would re-send the whole transcript only to be told to end.
+    pub const fn publishes_as_kept(&self) -> bool {
+        self.publish_only && self.after_hold.is_none()
+    }
+
+    /// Continuing costs no model tokens: no worker runs and no review is
+    /// due ([`publishes_for_free`]).
+    pub const fn free(&self) -> bool {
+        self.free
     }
 
     pub const fn predecessor_id(&self) -> i64 {
@@ -194,6 +214,12 @@ pub enum Candidate {
 }
 
 impl Candidate {
+    /// A continuation that costs no model tokens ([`ResumePlan::free`]):
+    /// neither the budget nor the model provider stands in its way.
+    pub fn is_free(&self) -> bool {
+        matches!(self, Self::Resume { plan, .. } if plan.free)
+    }
+
     pub fn job_kind(&self) -> JobKind {
         match self {
             Self::Repo { kind, .. } => (*kind).into(),
@@ -393,7 +419,30 @@ pub async fn pick_next(
     cfg: &Config,
     force_repo: Option<&str>,
 ) -> anyhow::Result<Option<Candidate>> {
-    select(scope.store(), cfg, force_repo, Pick::Run(scope)).await
+    select(scope.store(), cfg, force_repo, Pick::Run(scope), None).await
+}
+
+/// A kept attempt whose retry only publishes, at no model cost
+/// ([`Candidate::is_free`]), for a cycle whose [`pick_next`] the budget or
+/// the network gate denied, other than those of the findings in `tried`.
+/// A spent budget or an unreachable model provider does not stop such a
+/// retry, so it runs instead of the cycle ending. It keeps its rank
+/// otherwise: it is only the fallback, never ahead of work that can run,
+/// so a kept attempt whose own forge is down blocks nothing.
+pub async fn pick_free(
+    scope: &CycleScope<'_>,
+    cfg: &Config,
+    force_repo: Option<&str>,
+    tried: &[i64],
+) -> anyhow::Result<Option<Candidate>> {
+    select(
+        scope.store(),
+        cfg,
+        force_repo,
+        Pick::Run(scope),
+        Some(tried),
+    )
+    .await
 }
 
 /// The `/api/summary` "what's next" preview: [`pick_next`]'s selection
@@ -406,7 +455,13 @@ pub async fn pick_next(
 /// preview names the fresh start a given-up chain makes way for, even
 /// where the scheduler's count ends that work instead.
 pub async fn preview_next(store: &Store, cfg: &Config) -> anyhow::Result<Option<Candidate>> {
-    select(store, cfg, None, Pick::Preview).await
+    select(store, cfg, None, Pick::Preview, None).await
+}
+
+/// [`pick_free`]'s choice, without its writes: what the summary previews
+/// when [`preview_next`]'s candidate would be denied.
+pub async fn preview_free(store: &Store, cfg: &Config) -> anyhow::Result<Option<Candidate>> {
+    select(store, cfg, None, Pick::Preview, Some(&[])).await
 }
 
 /// Whether a selection records what it finds on the way, and with what
@@ -420,7 +475,8 @@ enum Pick<'s> {
     Preview,
 }
 
-/// [`pick_next`], or with [`Pick::Preview`] [`preview_next`].
+/// [`pick_next`], or with [`Pick::Preview`] [`preview_next`]; with
+/// `free_only`, [`pick_free`] or [`preview_free`], skipping its findings.
 #[allow(
     clippy::too_many_lines,
     reason = "one tier after another in priority order; splitting it would \
@@ -431,6 +487,7 @@ async fn select(
     cfg: &Config,
     force_repo: Option<&str>,
     mode: Pick<'_>,
+    free_only: Option<&[i64]>,
 ) -> anyhow::Result<Option<Candidate>> {
     let mut rechecking = findings_with_status(store, FindingStatus::Rechecking).await?;
     let (mut attention, flagged) = list_engage(store).await?;
@@ -496,6 +553,27 @@ async fn select(
         (FindingJobKind::Fix, &queued),
     ];
 
+    // (0) Only for [`pick_free`]: a kept attempt that only publishes, at no
+    // model cost, for a cycle whose pick a gate it skips denied.
+    if let Some(tried) = free_only {
+        for (kind, items) in tiers {
+            for f in items.iter().filter(|f| !tried.contains(&f.id)) {
+                let kept = store.checkpoint_job(f.id, kind).await?;
+                if !kept.is_some_and(|j| kept_to_publish(&j)) {
+                    continue;
+                }
+                match finding_pick(store, cfg, kind, f, false, mode).await? {
+                    Picked::Work(c) if c.is_free() => return Ok(Some(c)),
+                    Picked::Ended => {
+                        return Box::pin(select(store, cfg, force_repo, mode, free_only)).await;
+                    }
+                    Picked::Work(_) | Picked::Nothing => {}
+                }
+            }
+        }
+        return Ok(None);
+    }
+
     // (1) A budget-overridden finding jumps the queue, scanned in the
     // same kind order the normal priorities use (`scheduler.pick_next`).
     // (2)-(5) Then the normal finding-kind priorities, in that order,
@@ -511,7 +589,7 @@ async fn select(
                     // Its given-up chain just ended `f`'s work, which may
                     // have held it: select again, from the top.
                     Picked::Ended => {
-                        return Box::pin(select(store, cfg, force_repo, mode)).await;
+                        return Box::pin(select(store, cfg, force_repo, mode, None)).await;
                     }
                     // A flagless engage whose checkpoint could not be
                     // continued: nothing to do here, and nothing changed.
@@ -534,7 +612,7 @@ async fn select(
         Picked::Work(c) => return Ok(Some(c)),
         // A repo chain given up there was counted as a failure, which may
         // have held its work: select again, from the top.
-        Picked::Ended => return Box::pin(select(store, cfg, force_repo, mode)).await,
+        Picked::Ended => return Box::pin(select(store, cfg, force_repo, mode, None)).await,
         Picked::Nothing => {}
     }
 
@@ -770,29 +848,17 @@ const MAX_RESUME_ATTEMPTS: i64 = 4;
 const RESUME_PROMPT: &str = "Continue the work you were doing in this session. You were interrupted; \
      pick up where you left off.";
 
-/// The whole prompt a continuation of an attempt kept only to publish gets
-/// ([`kept_to_publish`]), whatever hold an operator released to get there:
-/// its work is finished and was refused only by the forge, or found it
-/// unreachable. A worker that changed its commits or its report would void
-/// what was finished (a fix's saved review verdict covers the tree exactly
-/// as it is), so it is told to change nothing.
-const PUBLISH_ONLY_PROMPT: &str = "Your work in this session is finished. Only publishing it \
-     failed: the forge refused it or could not be reached, not because anything in the work \
-     was wrong. It is published again once you end. Change nothing: no commits, no edits to \
-     PR-DESCRIPTION.md, PR-REPLY.md or WITHDRAW.md. End now.";
-
-/// The prompt a continuation of an attempt kept only to publish gets
-/// ([`kept_to_publish`]): [`PUBLISH_ONLY_PROMPT`], or, for the first
-/// attempt after an operator continued its hold, one that gives the
-/// worker what the forge kept answering. A refusal about the work itself
-/// (push protection finding a secret, a file too large, a hook's commit
-/// message rule, a protected branch) is refused the same way every time,
-/// and only a change to the work gets it published; anything else should
-/// still change nothing.
-fn publish_only_prompt(plan: &ResumePlan) -> String {
-    let Some((_, detail)) = &plan.after_hold else {
-        return PUBLISH_ONLY_PROMPT.to_owned();
-    };
+/// The prompt the first continuation of an attempt kept only to publish
+/// ([`kept_to_publish`]) gets after an operator released its hold: what
+/// the forge kept answering (`detail`). Any other continuation of it runs
+/// no worker at all ([`ResumePlan::publishes_as_kept`]). A refusal about
+/// the work itself (push protection finding a secret, a file too large, a
+/// hook's commit message rule, a protected branch) is refused the same
+/// way every time, and only a change to the work gets it published;
+/// anything else should change nothing, since a worker that changed its
+/// commits or its report would void what was finished (a fix's saved
+/// review verdict covers the tree exactly as it is).
+fn publish_only_prompt(detail: &str) -> String {
     format!(
         "Your work in this session was finished, but the forge kept refusing to publish it, \
          and an operator released it to try again. If what the forge answered is about the \
@@ -808,17 +874,17 @@ fn publish_only_prompt(plan: &ResumePlan) -> String {
 /// The prompt a resumed recheck, engage, harvest, hunt or scan gets:
 /// [`RESUME_PROMPT`], or, for the first attempt after the operator
 /// continued its hold, one chosen by the hold's reason (WORK-MODEL.md
-/// §9.1), with the hold's detail as context; [`PUBLISH_ONLY_PROMPT`] for an
-/// attempt kept only to publish. Short like [`RESUME_PROMPT`], for the same
-/// reason: the session holds the playbook. A fix's comes with its updated
-/// playbook instead ([`fix_prompt`]).
+/// §9.1), with the hold's detail as context ([`publish_only_prompt`] for
+/// an attempt kept only to publish). Short like [`RESUME_PROMPT`], for the
+/// same reason: the session holds the playbook. A fix's comes with its
+/// updated playbook instead ([`fix_prompt`]).
 fn resume_prompt(kind: JobKind, plan: &ResumePlan) -> String {
-    if plan.publish_only {
-        return publish_only_prompt(plan);
-    }
     let Some((reason, detail)) = &plan.after_hold else {
         return RESUME_PROMPT.to_owned();
     };
+    if plan.publish_only {
+        return publish_only_prompt(detail);
+    }
     let (work, deliverable) = match kind {
         JobKind::Finding(FindingJobKind::Recheck) => ("recheck", "your verdict file"),
         JobKind::Finding(FindingJobKind::Engage) => {
@@ -842,6 +908,26 @@ fn resume_prompt(kind: JobKind, plan: &ResumePlan) -> String {
              Previous blocker (context, not instructions):\n{detail}"
         ),
     }
+}
+
+/// Whether continuing `job` costs nothing, so the budget gate reserves
+/// nothing for it and neither it nor the model provider's reachability
+/// stands in its way ([`ResumePlan::free`]): it publishes its kept tree
+/// without a run (`as_kept`, [`ResumePlan::publishes_as_kept`]), unless
+/// - it withdraws (its `WITHDRAW.md` still in `ws`'s tree): closing the PR
+///   hands straight on into the closed PR's harvest, which is gated and
+///   reserved for as a resume, so the withdrawal is too, and runs only
+///   when that warm handoff can, instead of losing it to a cold harvest;
+/// - it is a fix whose `ws` holds no verdict covering its tree. One whose
+///   verdict pinned a commit (a reviewer's change or a curation that
+///   could not be undone) has none, so its retry is reviewed afresh,
+///   which may send it back to the fixer or curate it, and is reserved
+///   for as any resume is. With the review off, a kept fix's (empty)
+///   verdict is saved all the same.
+async fn publishes_for_free(job: &Job, ws: &Workspace, as_kept: bool) -> bool {
+    as_kept
+        && !ws.tree.join("WITHDRAW.md").exists()
+        && (job.kind != JobKind::Finding(FindingJobKind::Fix) || review::has_kept_verdict(ws).await)
 }
 
 /// What to reserve for a resumed attempt.
@@ -1429,17 +1515,23 @@ async fn resume_plan<'s>(
     // this feature is for.
     //
     // Neither applies, for a while, to an attempt kept only to publish
-    // ([`spared_by_ceiling`]).
+    // ([`spared_by_ceiling`]); once that spare ends, such a chain is given
+    // up outright. Its retries mostly run no worker and meter nothing
+    // ([`ResumePlan::publishes_as_kept`]), so they never add up to the
+    // ceiling, and a chain kept offline counts nothing in its streak
+    // either: without this, a flapping network would retry it forever.
     let excess = own.total - own.max_single;
     let too_many = own.attempts >= MAX_RESUME_ATTEMPTS;
     let too_costly = z > 0 && own.attempts >= 2 && excess > GIVE_UP_MULTIPLE * z;
     let publish_only = kept_to_publish(&job);
     let spared = publish_only && spared_by_ceiling(store, job.id, released_at).await?;
-    if (too_many || too_costly) && !spared {
+    if (too_many || too_costly || publish_only) && !spared {
         let why = if too_many {
             format!("{} attempts, the limit", own.attempts)
-        } else {
+        } else if too_costly {
             format!("{excess} tok outside its largest attempt > {GIVE_UP_MULTIPLE}x {z} typical")
+        } else {
+            format!("kept to publish {MAX_PUBLISH_REFUSALS} times, the limit")
         };
         let msg = format!(
             "resume {} {}: giving up after {} tok across the chain ({why})",
@@ -1468,7 +1560,12 @@ async fn resume_plan<'s>(
     // per-kind typical than a zero that would reserve nothing and
     // let the ramp grant a job it cannot afford.
     let ctx = crate::backends::omp_scavenge::harness::ctx_at_suspension(&session_file).unwrap_or(z);
-    let anticipated = resume_reservation(ctx, z, chain_spent);
+    let free = publishes_for_free(&job, &workspace, publish_only && after_hold.is_none()).await;
+    let anticipated = if free {
+        0
+    } else {
+        resume_reservation(ctx, z, chain_spent)
+    };
 
     // No "resuming" event here: this function is also the
     // /api/summary preview, which polls every few seconds, and an
@@ -1483,6 +1580,7 @@ async fn resume_plan<'s>(
         predecessor_id: job.id,
         origin_job_id,
         session_file,
+        free,
         workspace,
         pinned_sha,
         anticipated,
@@ -2496,6 +2594,15 @@ async fn budget_gate(
     finding_id: Option<i64>,
     resume: Option<&ResumePlan>,
 ) -> anyhow::Result<BudgetDecision> {
+    // A continuation that costs no tokens ([`ResumePlan::free`]) only
+    // publishes: the window's headroom is no reason to hold it, and a
+    // weekly window's reset can be days away.
+    if resume.is_some_and(ResumePlan::free) {
+        return Ok(BudgetDecision::Approved {
+            cap: None,
+            anticipated: 0,
+        });
+    }
     // A resumed attempt costs its context back plus whatever is left of
     // the per-kind typical, not the per-kind typical on its own: the
     // first call re-establishes a transcript that may be far larger than
@@ -5076,8 +5183,11 @@ fn fix_prompt(
     if curation_undone && resume.is_some() {
         return Ok(review::CURATION_UNDONE_PROMPT.to_owned());
     }
-    if let Some(plan) = resume.filter(|r| r.publish_only()) {
-        return Ok(publish_only_prompt(plan));
+    if let Some((_, detail)) = resume
+        .filter(|r| r.publish_only())
+        .and_then(ResumePlan::after_hold)
+    {
+        return Ok(publish_only_prompt(detail));
     }
     if let Some((HoldReason::Prerequisite, detail)) = resume.and_then(|r| r.after_hold.as_ref())
         && let Some(held) = review::held_resume_prompt(cfg, start, detail)
@@ -5353,7 +5463,7 @@ async fn conclude_fix(
         // reviewing it again.
         review::keep_for_publish(start, &ending).await;
     }
-    if let Some(host) = unreachable_now(cfg, &start.repo.url, backend).await {
+    if let Some(host) = forge_unreachable_now(cfg, &start.repo.url, backend).await {
         return Ok(FixOutcome::Offline {
             host,
             publishing: finished,
@@ -6036,6 +6146,43 @@ async fn record_unpublished_fix(
     summary.failure = Some(failure);
 }
 
+/// Run a fix's or an engage's worker on `prompt`, continuing `resume`'s
+/// session, if any: unless that continuation only publishes the tree
+/// its predecessor was kept with ([`ResumePlan::publishes_as_kept`]).
+/// Then no worker runs: resuming the session would re-send its whole
+/// transcript only to be told to change nothing and end. The attempt
+/// finishes at once, having spent nothing, on the predecessor's
+/// transcript, which a later continuation of the chain resumes.
+async fn worker_run(
+    backend: &dyn Backend,
+    ws: &Workspace,
+    (prompt, cap, max_wall_s): (&str, Option<i64>, i64),
+    resume: Option<&ResumePlan>,
+) -> anyhow::Result<RunResult> {
+    if let Some(plan) = resume.filter(|r| r.publishes_as_kept()) {
+        return Ok(RunResult {
+            exit_code: Some(0),
+            killed_reason: None,
+            tokens_new: 0,
+            calls: 0,
+            session_file: Some(plan.session_file.to_string_lossy().into_owned()),
+            duration_s: 0.0,
+            stdout_tail: String::new(),
+            usage_delta: None,
+        });
+    }
+    backend
+        .run(
+            ws,
+            prompt,
+            cap,
+            max_wall_s,
+            JobClass::Fix,
+            resume.map(|r| r.session_file.as_path()),
+        )
+        .await
+}
+
 /// Run a fix job (`scheduler.run_fix`): start it ([`start_fix`]), run the
 /// worker, then decide ([`conclude_fix`]) and record
 /// ([`record_fix_outcome`]) what the attempt amounts to.
@@ -6065,16 +6212,13 @@ pub async fn run_fix(
         }
     };
     let model = cfg.model_for("fix");
-    let rr = match backend
-        .run(
-            &start.ws,
-            &prompt,
-            start.cap,
-            cfg.fix_max_wall_s,
-            JobClass::Fix,
-            resume.map(|r| r.session_file.as_path()),
-        )
-        .await
+    let rr = match worker_run(
+        backend,
+        &start.ws,
+        (&prompt, start.cap, cfg.fix_max_wall_s),
+        resume,
+    )
+    .await
     {
         Ok(r) => r,
         Err(e) => {
@@ -7817,7 +7961,7 @@ async fn unpublished_offline(
     (fid, start): (i64, &EngageStart),
     recorded: Option<RecordedJob>,
 ) -> Option<CycleSummary> {
-    let host = unreachable_now(cfg, &start.repo.url, backend).await?;
+    let host = forge_unreachable_now(cfg, &start.repo.url, backend).await?;
     let job = start.job;
     if let Some(recorded) = recorded {
         log_write_failure(
@@ -7929,16 +8073,13 @@ pub async fn run_engage(
     };
     let prompt = engage_prompt(cfg, attempt, &start)?;
     let model = cfg.model_for("fix");
-    let rr = match backend
-        .run(
-            &start.ws,
-            &prompt,
-            start.cap,
-            cfg.fix_max_wall_s,
-            JobClass::Fix,
-            resume.map(|r| r.session_file.as_path()),
-        )
-        .await
+    let rr = match worker_run(
+        backend,
+        &start.ws,
+        (&prompt, start.cap, cfg.fix_max_wall_s),
+        resume,
+    )
+    .await
     {
         Ok(rr) => rr,
         Err(e) => {
@@ -8206,6 +8347,7 @@ async fn continue_into_harvest(
         handoff: true,
         after_hold: None,
         publish_only: false,
+        free: false,
     };
     let Ok(resumed) = Resumed::<kind::Harvest>::load(store, &plan).await else {
         return;
@@ -9163,6 +9305,23 @@ async fn unreachable_now(cfg: &Config, repo_url: &str, backend: &dyn Backend) ->
         .await
 }
 
+/// [`unreachable_now`] for a publish step that failed (a push, a PR
+/// create, a reply, a close): the forge the repo at `repo_url` names, if
+/// it cannot be reached right now. That step talks to the forge alone, so
+/// the model provider being down cannot be why it failed, and a refusal
+/// while the provider is down is still the forge's refusal.
+async fn forge_unreachable_now(
+    cfg: &Config,
+    repo_url: &str,
+    backend: &dyn Backend,
+) -> Option<String> {
+    if !cfg.network_gate {
+        return None;
+    }
+    let forge: Vec<String> = crate::forge::web_host(repo_url).into_iter().collect();
+    backend.first_unreachable(&forge).await
+}
+
 /// The cycle's end when a host its work needs is unreachable: denied, to
 /// be retried in [`NETWORK_RETRY_MS`], with a `deny` event naming the host
 /// and the host in the summary, so the status page shows it offline.
@@ -9226,7 +9385,9 @@ async fn unmetered_offline(
 }
 
 /// The host `candidate` needs that cannot be reached, if any; always
-/// `None` with `network.gate` off.
+/// `None` with `network.gate` off. A continuation that costs no tokens
+/// ([`ResumePlan::free`]) talks to the forge alone, so the model
+/// provider's hosts are not asked about.
 async fn network_gate(
     store: &Store,
     cfg: &Config,
@@ -9236,8 +9397,10 @@ async fn network_gate(
     if !cfg.network_gate {
         return Ok(None);
     }
+    let free = candidate.is_free();
     // A repo that is gone has no forge to probe; dispatch reports it.
     let hosts = match store.get_repo_by_id(candidate.repo_id()).await? {
+        Some(repo) if free => crate::forge::web_host(&repo.url).into_iter().collect(),
         Some(repo) => work_hosts(&repo.url, backend),
         None => backend.worker_hosts(),
     };
@@ -9557,9 +9720,10 @@ async fn run_cycle_inner(
     // Once the candidate is known, so only the hosts it needs are probed,
     // and before dispatch, so none of its work starts, fails or is
     // counted while its forge or provider cannot be reached (#95).
-    if let Some(host) = network_gate(store, cfg, backend, &candidate).await? {
-        return Ok(offline_denial(store, candidate.job_kind(), None, None, host).await);
-    }
+    let denied = match network_gate(store, cfg, backend, &candidate).await? {
+        Some(host) => Some(offline_denial(store, candidate.job_kind(), None, None, host).await),
+        None => None,
+    };
 
     // A repo kind's `last_{kind}_at` moves only when its runner succeeds.
     // A failure is counted on its work item and leaves the timestamp
@@ -9569,25 +9733,52 @@ async fn run_cycle_inner(
     // its runner did not count is counted here, as `cycle error`: left
     // uncounted, the work would stay the stalest in the rotation and be
     // picked again every cycle, starving every other repo's.
-    let result = match dispatch(scope, lane, cfg, backend, &candidate).await {
-        Ok(result) => result,
-        Err(e) => {
-            if let JobKind::Repo(kind) = candidate.job_kind()
-                && e.downcast_ref::<Counted>().is_none()
-            {
-                record_repo_failure(
-                    RepoStreak::Job(store, kind.into()),
-                    (candidate.repo_id(), candidate.label().unwrap_or_default()),
-                    None,
-                    CYCLE_ERROR,
-                    &format!("{CYCLE_ERROR}: {e:#}"),
-                    HoldReason::Stuck,
-                )
-                .await;
+    let mut result = match denied {
+        Some(denied) => denied,
+        None => match dispatch(scope, lane, cfg, backend, &candidate).await {
+            Ok(result) => result,
+            Err(e) => {
+                if let JobKind::Repo(kind) = candidate.job_kind()
+                    && e.downcast_ref::<Counted>().is_none()
+                {
+                    record_repo_failure(
+                        RepoStreak::Job(store, kind.into()),
+                        (candidate.repo_id(), candidate.label().unwrap_or_default()),
+                        None,
+                        CYCLE_ERROR,
+                        &format!("{CYCLE_ERROR}: {e:#}"),
+                        HoldReason::Stuck,
+                    )
+                    .await;
+                }
+                return Err(e);
             }
-            return Err(e);
-        }
+        },
     };
+
+    // The pick was denied, by its budget or a host it needs: a kept
+    // attempt that only publishes, which neither stops, runs instead of
+    // the cycle ending ([`pick_free`]): the first whose own forge answers.
+    // A free pick denied by its own forge is offered again first, found
+    // down again, and passed over like any other.
+    if result.denied.is_some() {
+        let mut tried = Vec::new();
+        while let Some(free) = pick_free(scope, cfg, force_repo, &tried).await? {
+            if network_gate(store, cfg, backend, &free).await?.is_none() {
+                result = dispatch(scope, lane, cfg, backend, &free).await?;
+                break;
+            }
+            // Only a finding's kept attempt is free; anything else ends the
+            // search rather than being offered again.
+            let Candidate::Resume { plan, .. } = &free else {
+                break;
+            };
+            let Some(fid) = plan.finding_id else {
+                break;
+            };
+            tried.push(fid);
+        }
+    }
 
     // Build log line
     let mut parts: Vec<String> = Vec::new();

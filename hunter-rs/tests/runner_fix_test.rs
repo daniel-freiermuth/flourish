@@ -2593,6 +2593,32 @@ async fn pending_resume(f: &Fixture) -> hunter::scheduler::ResumePlan {
     *plan
 }
 
+/// The pending resume of the fixture's fix after an operator released a
+/// hold on its checkpoint: for an attempt kept only to publish, the one
+/// continuation whose worker runs (any other publishes without a run).
+async fn released_resume(f: &Fixture) -> hunter::scheduler::ResumePlan {
+    let held = support::scope(&f.store)
+        .store()
+        .hold_work(
+            f.fid,
+            FindingJobKind::Fix,
+            HoldReason::Stuck,
+            "push failed: HTTP 500",
+            checkpoint(f).await,
+        )
+        .await
+        .unwrap();
+    assert!(held);
+    support::release(
+        &f.store,
+        f.fid,
+        FindingJobKind::Fix,
+        ReleaseAction::Continue,
+    )
+    .await;
+    pending_resume(f).await
+}
+
 /// The fixture's fix is neither continued nor started fresh: it waits.
 async fn assert_waits(f: &Fixture) {
     let picked = hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
@@ -3214,9 +3240,10 @@ async fn work_after_an_unpublished_review_is_reviewed_again_and_ships_whole() {
 
 /// An already-reviewed fix that could not publish offline ships on its
 /// saved verdict when the push is retried, however the retry's fixer run
-/// ended: one that failed before its first token changed nothing the
-/// review covered, and throwing the fix away for it would count a failure
-/// against a finished, reviewed fix.
+/// ended (a retry an operator released runs its fixer): one that failed
+/// before its first token changed nothing the review covered, and throwing
+/// the fix away for it would count a failure against a finished, reviewed
+/// fix.
 #[tokio::test]
 async fn a_reviewed_fix_ships_on_its_saved_verdict_when_the_retry_run_fails() {
     let bins = support::FakeBins::acquire("fix-review-saved");
@@ -3236,7 +3263,7 @@ async fn a_reviewed_fix_ships_on_its_saved_verdict_when_the_retry_run_fails() {
     git(&f.repo_dir, &["config", "--unset-all", &nowhere_key]);
     route_push(&f, None);
     f.cfg.network_gate = false;
-    let plan = pending_resume(&f).await;
+    let plan = released_resume(&f).await;
     let retry = reviewed_worker(vec![Act::ContinueThen(Ending::Failed)]);
 
     let summary = resume(&f, &plan, &retry).await;
@@ -3308,11 +3335,12 @@ async fn a_fix_the_forge_refused_waits_then_publishes_without_redoing_it() {
         first.job_id,
         "the refused attempt"
     );
-    // The retry's own run fails before its first token (a rate limit),
-    // and the saved verdict ships it anyway: refused again, it is still
-    // kept, counted as the same failure, and waits.
-    let failing = reviewed_worker(vec![Act::ContinueThen(Ending::Failed)]);
-    let second = resume(&f, &plan, &failing).await;
+    assert_eq!(plan.anticipated(), 0, "the budget gate reserves nothing");
+    // The retry runs no worker: refused again, it is still kept, counted
+    // as the same failure, and waits.
+    let idle = reviewed_worker(vec![]);
+    let second = resume(&f, &plan, &idle).await;
+    assert!(idle.runs().is_empty(), "nothing for a worker to do");
     assert_eq!(second.outcome.as_deref(), Some("requeued"), "{second:?}");
     assert_eq!(
         fix_streak(&f).await.streak,
@@ -3332,14 +3360,13 @@ async fn a_fix_the_forge_refused_waits_then_publishes_without_redoing_it() {
     route_push(&f, None);
     let plan = pending_resume(&f).await;
     assert_eq!(Some(plan.predecessor_id()), second.job_id);
-    let retry = reviewed_worker(vec![Act::Continue]);
+    let retry = reviewed_worker(vec![]);
     let shipped = resume(&f, &plan, &retry).await;
 
     assert_eq!(shipped.outcome.as_deref(), Some("pr_open"), "{shipped:?}");
-    assert_eq!(
-        retry.runs().len(),
-        1,
-        "the fix is not redone or reviewed again"
+    assert!(
+        retry.runs().is_empty(),
+        "published without redoing, reviewing or even resuming the fix"
     );
     assert_eq!(worker.runs().len(), 2, "one fixer and one reviewer, once");
     assert_eq!(shipped_subject(&f), "fix: the real bug");
@@ -3441,6 +3468,435 @@ async fn a_refusal_after_a_release_waits() {
     let again = resume(&f, &plan, &reviewed_worker(vec![Act::Continue])).await;
 
     assert_eq!(again.outcome.as_deref(), Some("requeued"), "{again:?}");
+    assert_waits(&f).await;
+}
+
+/// A released retry of a kept fix whose own run fails before its first
+/// token (a rate limit) still ships the saved verdict, and when the forge
+/// refuses that again the finished work stays kept: its job is failed with
+/// the refusal as its notes and is the next retry's checkpoint, not lost
+/// to a cold redo because its run did not end `done`.
+#[tokio::test]
+async fn a_released_fix_retry_whose_run_failed_stays_kept_when_refused_again() {
+    let _bins = support::FakeBins::acquire("fix-released-refused-again");
+    let mut f = fixture("fix-released-refused-again").await;
+    review_on(&mut f, 3);
+    let nowhere = f.cfg.work_root.join("refusing.git");
+    route_push(&f, Some(&nowhere.to_string_lossy()));
+    let refused = fix(&f, &reviewed_worker(vec![Act::Fix, Act::Review(CLEAN)])).await;
+    assert_eq!(refused.outcome.as_deref(), Some("requeued"), "{refused:?}");
+    let plan = released_resume(&f).await;
+    let failing = reviewed_worker(vec![Act::ContinueThen(Ending::Failed)]);
+
+    let again = resume(&f, &plan, &failing).await;
+
+    assert_eq!(again.outcome.as_deref(), Some("requeued"), "{again:?}");
+    assert_eq!(failing.runs().len(), 1, "the released fixer ran");
+    assert_eq!(checkpoint(&f).await, again.job_id, "still kept");
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    let (state, notes): (String, Option<String>) =
+        sqlx::query_as("SELECT state, notes FROM jobs WHERE id = ?1")
+            .bind(again.job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "failed");
+    assert!(notes.is_some_and(|n| n.starts_with("push failed: ")));
+}
+
+/// A kept fix whose retry costs no model tokens (no worker, a saved
+/// verdict) needs only the forge: it publishes while the model budget is
+/// spent and the model provider is unreachable, instead of waiting for a
+/// window's reset or the provider to come back. It goes ahead of work the
+/// tiers rank higher (an older queued fix), which those would deny and end
+/// the cycle on.
+#[tokio::test]
+async fn a_kept_fix_publishes_past_a_spent_budget_and_an_unreachable_provider() {
+    let bins = support::FakeBins::acquire("fix-kept-free");
+    bins.ok("gh", "https://github.com/acme/widget/pull/42");
+    let mut f = fixture("fix-kept-free").await;
+    review_on(&mut f, 3);
+    let nowhere = f.cfg.work_root.join("refusing.git");
+    route_push(&f, Some(&nowhere.to_string_lossy()));
+    let refused = fix(&f, &reviewed_worker(vec![Act::Fix, Act::Review(CLEAN)])).await;
+    assert_eq!(refused.outcome.as_deref(), Some("requeued"), "{refused:?}");
+    let key = format!("url.{}.insteadOf", nowhere.display());
+    git(&f.repo_dir, &["config", "--unset-all", &key]);
+    route_push(&f, None);
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
+        .bind(24 * 60 * 60_000_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // The fixture's bystander, filed first, is the older queued fix.
+    f.store
+        .set_finding_status(f.fid - 1, hunter::domain::FindingStatus::Queued)
+        .await
+        .unwrap();
+    f.cfg.network_gate = true;
+    let provider = "api.provider.example";
+    let spent = reviewed_worker(vec![])
+        .needing(&[provider])
+        .offline(&[provider])
+        .denying_above(-1);
+
+    let summary =
+        hunter::scheduler::run_cycle(&mut support::jobs(&f.store), &f.cfg, &spent, None).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    assert!(spent.runs().is_empty(), "no worker");
+    assert_eq!(shipped_subject(&f), "fix: the real bug");
+}
+
+/// A kept fix keeps its rank behind an older queued fix, whether its
+/// retry costs nothing or runs its fixer (released by an operator): a
+/// free retry is only the cycle's fallback when the pick is denied, so a
+/// kept fix whose own forge is down blocks no work that can run.
+#[tokio::test]
+async fn a_kept_fix_keeps_its_rank() {
+    for released in [false, true] {
+        let label = format!("fix-kept-rank-{released}");
+        let _bins = support::FakeBins::acquire(&label);
+        let mut f = fixture(&label).await;
+        review_on(&mut f, 3);
+        let nowhere = f.cfg.work_root.join("refusing.git");
+        route_push(&f, Some(&nowhere.to_string_lossy()));
+        let refused = fix(&f, &reviewed_worker(vec![Act::Fix, Act::Review(CLEAN)])).await;
+        assert_eq!(refused.outcome.as_deref(), Some("requeued"), "{refused:?}");
+        let plan = if released {
+            released_resume(&f).await
+        } else {
+            let pool = sqlx::SqlitePool::connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db),
+            )
+            .await
+            .unwrap();
+            sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
+                .bind(24 * 60 * 60_000_i64)
+                .execute(&pool)
+                .await
+                .unwrap();
+            pending_resume(&f).await
+        };
+        assert_eq!(plan.free(), !released, "{label}");
+        // Only a free retry is the cycle's fallback.
+        let offered = hunter::scheduler::pick_free(&support::scope(&f.store), &f.cfg, None, &[])
+            .await
+            .unwrap();
+        assert_eq!(offered.is_some(), !released, "{label}: {offered:?}");
+        // The fixture's bystander, filed first, is the older queued fix.
+        let older = f.fid - 1;
+        f.store
+            .set_finding_status(older, hunter::domain::FindingStatus::Queued)
+            .await
+            .unwrap();
+
+        let picked = hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(
+                picked,
+                Some(hunter::scheduler::Candidate::Finding { finding_id, .. })
+                    if finding_id == older
+            ),
+            "{label}: the older queued fix first: {picked:?}"
+        );
+    }
+}
+
+/// The cycle's fallback offers each free retry in turn: one whose own
+/// forge is down is passed over (`tried`), and the next is offered, so it
+/// stops no other free retry from publishing.
+#[tokio::test]
+async fn the_free_fallback_offers_each_kept_fix_in_turn() {
+    let _bins = support::FakeBins::acquire("fix-free-each");
+    let mut f = fixture("fix-free-each").await;
+    review_on(&mut f, 3);
+    let nowhere = f.cfg.work_root.join("refusing.git");
+    route_push(&f, Some(&nowhere.to_string_lossy()));
+    // The fixture's bystander, filed first, is the older queued fix.
+    let older = f.fid - 1;
+    f.store
+        .set_finding_status(older, hunter::domain::FindingStatus::Queued)
+        .await
+        .unwrap();
+    for fid in [older, f.fid] {
+        let finding = f.store.get_finding(fid).await.unwrap().unwrap();
+        let refused = hunter::scheduler::run_fix(
+            &support::scope(&f.store),
+            f.store.test_lane(),
+            &f.cfg,
+            Attempt::Cold(&finding),
+            &reviewed_worker(vec![Act::Fix, Act::Review(CLEAN)]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(refused.outcome.as_deref(), Some("requeued"), "{refused:?}");
+    }
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
+        .bind(24 * 60 * 60_000_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let free = async |tried: &[i64]| {
+        hunter::scheduler::pick_free(&support::scope(&f.store), &f.cfg, None, tried)
+            .await
+            .unwrap()
+            .map(|c| c.target_id())
+    };
+
+    assert_eq!(free(&[]).await, Some(older), "the older first");
+    assert_eq!(free(&[older]).await, Some(f.fid), "then the next");
+    assert_eq!(free(&[older, f.fid]).await, None);
+}
+
+/// In a cycle, a free retry whose own forge is down does not stop the
+/// next one: with the budget spent, the cycle publishes the newer kept fix
+/// (on GitHub) past the older one (on a GitLab that is down), whether that
+/// older one is the cycle's pick, denied by its forge, or is passed over
+/// after a fresh fix with a `once` override, ranked above both, was denied
+/// by the budget.
+#[tokio::test]
+async fn a_cycle_publishes_past_a_free_retry_whose_forge_is_down() {
+    for overridden_first in [false, true] {
+        publishes_past_a_down_forge(overridden_first).await;
+    }
+}
+
+async fn publishes_past_a_down_forge(overridden_first: bool) {
+    let label = format!("fix-free-forge-down-{overridden_first}");
+    let bins = support::FakeBins::acquire(&label);
+    bins.ok("gh", "https://github.com/acme/widget/pull/42");
+    let mut f = fixture(&label).await;
+    review_on(&mut f, 3);
+    // A second repo on another forge, sharing the fixture's clone, owns
+    // the fixture's bystander, the older finding.
+    let gitlab = "git@gitlab.example.com:acme/other.git";
+    let repos_root = f.repo_dir.parent().unwrap().to_path_buf();
+    let rid = f
+        .store
+        .add_repo("other", gitlab, &repos_root, "main", ForgeName::Gitlab)
+        .await
+        .unwrap();
+    std::os::unix::fs::symlink(
+        &f.repo_dir,
+        hunter::store::Store::repo_dir(&repos_root, rid),
+    )
+    .unwrap();
+    let older = f.fid - 1;
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    sqlx::query("UPDATE findings SET repo_id = ?1 WHERE id = ?2")
+        .bind(rid)
+        .bind(older)
+        .execute(&pool)
+        .await
+        .unwrap();
+    f.store
+        .set_finding_status(older, hunter::domain::FindingStatus::Queued)
+        .await
+        .unwrap();
+    let nowhere = f.cfg.work_root.join("refusing.git");
+    let refusing = nowhere.to_string_lossy().into_owned();
+    route_push(&f, Some(&refusing));
+    git(
+        &f.repo_dir,
+        &[
+            "config",
+            &format!("url.{refusing}.insteadOf"),
+            gitlab,
+            "--add",
+        ],
+    );
+    for fid in [older, f.fid] {
+        let finding = f.store.get_finding(fid).await.unwrap().unwrap();
+        let refused = hunter::scheduler::run_fix(
+            &support::scope(&f.store),
+            f.store.test_lane(),
+            &f.cfg,
+            Attempt::Cold(&finding),
+            &reviewed_worker(vec![Act::Fix, Act::Review(CLEAN)]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(refused.outcome.as_deref(), Some("requeued"), "{refused:?}");
+    }
+    sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
+        .bind(24 * 60 * 60_000_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let key = format!("url.{refusing}.insteadOf");
+    git(&f.repo_dir, &["config", "--unset-all", &key]);
+    route_push(&f, None);
+    f.cfg.network_gate = true;
+    if overridden_first {
+        queue_overridden_fix(&f).await;
+    }
+    let spent = reviewed_worker(vec![])
+        .offline(&["gitlab.example.com"])
+        .denying_above(-1);
+
+    let summary =
+        hunter::scheduler::run_cycle(&mut support::jobs(&f.store), &f.cfg, &spent, None).await;
+
+    assert_eq!(
+        summary.outcome.as_deref(),
+        Some("pr_open"),
+        "{label}: {summary:?}"
+    );
+    assert_eq!(summary.finding_id, Some(f.fid), "{label}: {summary:?}");
+    drop(bins);
+}
+
+/// File a fresh fix in the fixture's repo, queued and with a `once`
+/// override: ranked above every other finding's work.
+async fn queue_overridden_fix(f: &Fixture) {
+    let repo_id = f.store.get_finding(f.fid).await.unwrap().unwrap().repo_id;
+    let (first, _) = f
+        .store
+        .upsert_finding(
+            repo_id,
+            &FindingInsert {
+                fingerprint: "fp-overridden".to_owned(),
+                file: "src/third.rs".to_owned(),
+                severity: hunter::domain::Severity::Low,
+                confidence: 0.5,
+                summary: "prioritised".to_owned(),
+                ..Default::default()
+            },
+            "bug",
+            None,
+        )
+        .await
+        .unwrap();
+    f.store
+        .set_finding_status(first, hunter::domain::FindingStatus::Queued)
+        .await
+        .unwrap();
+    f.store
+        .set_budget_override(first, Some(hunter::domain::BudgetOverride::Once))
+        .await
+        .unwrap();
+}
+
+/// The status page previews a kept fix whose retry costs no model tokens
+/// as the scheduler runs it: allowed, even with the budget spent, since
+/// the budget gate does not ask about it, and in place of the older queued
+/// fix ranked above it, which the spent budget denies.
+#[tokio::test]
+async fn the_summary_previews_a_free_retry_as_allowed_with_the_budget_spent() {
+    use tower::util::ServiceExt;
+
+    let _bins = support::FakeBins::acquire("fix-kept-summary");
+    let mut f = fixture("fix-kept-summary").await;
+    review_on(&mut f, 3);
+    let nowhere = f.cfg.work_root.join("refusing.git");
+    route_push(&f, Some(&nowhere.to_string_lossy()));
+    let refused = fix(&f, &reviewed_worker(vec![Act::Fix, Act::Review(CLEAN)])).await;
+    assert_eq!(refused.outcome.as_deref(), Some("requeued"), "{refused:?}");
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
+        .bind(24 * 60 * 60_000_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+    support::seed_session(&pool).await;
+    // The fixture's bystander, filed first, is the older queued fix.
+    f.store
+        .set_finding_status(f.fid - 1, hunter::domain::FindingStatus::Queued)
+        .await
+        .unwrap();
+    let state = hunter::server::AppState {
+        store: std::sync::Arc::new(f.store.clone()),
+        config: std::sync::Arc::new(f.cfg.clone()),
+        // Denies every reservation, 0 included: a spent window.
+        backend: std::sync::Arc::new(hunter::backend::NullBackend),
+        repo_notes: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        scheduler: {
+            // Overdrive on: the fallback it previews runs prioritized.
+            let scheduler = hunter::server::SchedulerHandle::default();
+            scheduler
+                .overdrive
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            scheduler
+        },
+    };
+
+    let response = hunter::server::router(state)
+        .oneshot(
+            axum::http::Request::builder()
+                .header(axum::http::header::COOKIE, support::TEST_COOKIE)
+                .uri("/api/summary")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let summary: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let next = &summary["next_candidate"];
+    assert_eq!(next["id"], f.fid, "{next}");
+    assert_eq!(next["budget_state"], "allowed", "{next}");
+    assert_eq!(next["is_prioritized"], true, "{next}");
+}
+
+/// A publish the forge refuses while the model provider is down is still
+/// the forge's refusal: the push talks to the forge alone. It is counted
+/// and waits like any refusal, not taken for an offline attempt, which
+/// would count nothing, skip the wait, and give the finished work up once
+/// the chain's spare ran out.
+#[tokio::test]
+async fn a_refusal_while_the_provider_is_down_counts_as_a_refusal() {
+    let _bins = support::FakeBins::acquire("fix-refused-provider-down");
+    let mut f = fixture("fix-refused-provider-down").await;
+    review_on(&mut f, 3);
+    let nowhere = f.cfg.work_root.join("refusing.git");
+    route_push(&f, Some(&nowhere.to_string_lossy()));
+    let refused = fix(&f, &reviewed_worker(vec![Act::Fix, Act::Review(CLEAN)])).await;
+    assert_eq!(refused.outcome.as_deref(), Some("requeued"), "{refused:?}");
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
+        .bind(24 * 60 * 60_000_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+    f.cfg.network_gate = true;
+    let provider = "api.provider.example";
+    let down = reviewed_worker(vec![])
+        .needing(&[provider])
+        .offline(&[provider]);
+
+    let again =
+        hunter::scheduler::run_cycle(&mut support::jobs(&f.store), &f.cfg, &down, None).await;
+
+    assert_eq!(again.outcome.as_deref(), Some("requeued"), "{again:?}");
+    assert_eq!(again.unreachable, None, "{again:?}");
+    assert_eq!(fix_streak(&f).await.streak, 2, "counted as a refusal");
     assert_waits(&f).await;
 }
 
@@ -3559,6 +4015,50 @@ async fn a_refused_fix_at_the_resume_ceiling_is_still_continued() {
     }
 }
 
+/// A kept fix whose retries keep finding the forge unreachable (a flapping
+/// network) counts nothing in its streak, and its retries run no worker,
+/// so they never add up to the resume ceiling: once the chain holds
+/// `MAX_PUBLISH_REFUSALS` attempts kept to publish, it is given up
+/// outright instead of being retried forever.
+#[tokio::test]
+async fn a_fix_kept_offline_is_given_up_when_its_spare_ends() {
+    let _bins = support::FakeBins::acquire("fix-offline-spare");
+    let mut f = fixture("fix-offline-spare").await;
+    review_on(&mut f, 3);
+    let nowhere = f.cfg.work_root.join("refusing.git");
+    route_push(&f, Some(&nowhere.to_string_lossy()));
+    let refused = fix(&f, &reviewed_worker(vec![Act::Fix, Act::Review(CLEAN)])).await;
+    assert_eq!(refused.outcome.as_deref(), Some("requeued"), "{refused:?}");
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
+        .bind(hunter::scheduler::PUBLISH_RETRY_MS)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut plan = pending_resume(&f).await;
+    let host = "github.com";
+    for kept in 2..=6 {
+        f.cfg.network_gate = true;
+        let offline = resume(&f, &plan, &reviewed_worker(vec![]).offline(&[host])).await;
+        assert_eq!(offline.unreachable.as_deref(), Some(host), "{offline:?}");
+        f.cfg.network_gate = false;
+        let picked = hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
+            .await
+            .unwrap();
+        match picked {
+            Some(hunter::scheduler::Candidate::Resume { plan: next, .. }) if kept < 6 => {
+                plan = *next;
+            }
+            Some(hunter::scheduler::Candidate::Finding { .. }) if kept == 6 => {}
+            other => panic!("{kept} kept: {other:?}"),
+        }
+    }
+    assert_eq!(checkpoint(&f).await, None, "the chain is given up");
+}
+
 /// The spare counts attempts kept to publish since the operator's last
 /// release, as the ceiling and the streak do: a refused fix the operator
 /// continued is still continued at the ceiling after four more refusals,
@@ -3652,8 +4152,8 @@ async fn a_refused_fix_keeps_its_once_override() {
 /// A refused fix whose review ended without a verdict of its own (a
 /// reviewer that wrote no review: the fix ships with a note, and is
 /// otherwise reviewed again) still ships on the retry that only publishes,
-/// with the same note, even when that retry's own run fails before its
-/// first token: the verdict it shipped is kept with it.
+/// with the same note, and without any worker run: the verdict it shipped
+/// is kept with it.
 #[tokio::test]
 async fn a_refused_fix_after_a_failed_review_ships_on_its_retry() {
     let bins = support::FakeBins::acquire("fix-refused-failed-review");
@@ -3679,17 +4179,94 @@ async fn a_refused_fix_after_a_failed_review_ships_on_its_retry() {
         .await
         .unwrap();
     let plan = pending_resume(&f).await;
-    let retry = reviewed_worker(vec![Act::ContinueThen(Ending::Failed)]);
+    let retry = reviewed_worker(vec![]);
 
     let shipped = resume(&f, &plan, &retry).await;
 
     assert_eq!(shipped.outcome.as_deref(), Some("pr_open"), "{shipped:?}");
-    assert_eq!(retry.runs().len(), 1, "not reviewed again");
+    assert!(retry.runs().is_empty(), "not resumed or reviewed again");
     assert!(
         pr_body(&bins).starts_with("the body\n\n"),
         "{}",
         pr_body(&bins)
     );
+}
+
+/// A refused fix whose verdict pinned a commit (a reviewer changed the
+/// tree in a way that could not be undone: the commit it was shown ships,
+/// not the tree) keeps no verdict, so its retry is reviewed again. No
+/// fixer is resumed for it, but the review costs, so the budget gate
+/// reserves for it as for any resume.
+#[tokio::test]
+async fn a_refused_fix_with_a_pinned_verdict_is_reserved_for_and_reviewed_again() {
+    let bins = support::FakeBins::acquire("fix-refused-pinned");
+    bins.ok("gh", "https://github.com/acme/widget/pull/42");
+    let mut f = fixture("fix-refused-pinned").await;
+    review_on(&mut f, 3);
+    let nowhere = f.cfg.work_root.join("refusing.git");
+    route_push(&f, Some(&nowhere.to_string_lossy()));
+    let refused = fix(
+        &f,
+        &reviewed_worker(vec![Act::Fix, Act::LitteringReview(NOT_BLOCKING)]),
+    )
+    .await;
+    assert_eq!(refused.outcome.as_deref(), Some("requeued"), "{refused:?}");
+    let key = format!("url.{}.insteadOf", nowhere.display());
+    git(&f.repo_dir, &["config", "--unset-all", &key]);
+    route_push(&f, None);
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
+        .bind(24 * 60 * 60_000_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let plan = pending_resume(&f).await;
+    assert!(plan.anticipated() > 0, "the review is reserved for");
+    let retry = reviewed_worker(vec![Act::Review(CLEAN)]);
+
+    let shipped = resume(&f, &plan, &retry).await;
+
+    assert_eq!(shipped.outcome.as_deref(), Some("pr_open"), "{shipped:?}");
+    assert_eq!(retry.runs().len(), 1, "a reviewer, and no fixer");
+    assert_eq!(shipped_subject(&f), "fix: the real bug");
+}
+
+/// Only a saved verdict that covers the kept tree spares its retry the
+/// review, and so the reservation: one left from a tree that has changed
+/// since (a curation that pinned the reviewed commit leaves the clean
+/// review's verdict behind) is no verdict, and the retry is reserved for.
+#[tokio::test]
+async fn a_saved_verdict_for_another_tree_does_not_spare_the_reservation() {
+    let _bins = support::FakeBins::acquire("fix-refused-stale-verdict");
+    let mut f = fixture("fix-refused-stale-verdict").await;
+    review_on(&mut f, 3);
+    let nowhere = f.cfg.work_root.join("refusing.git");
+    route_push(&f, Some(&nowhere.to_string_lossy()));
+    let refused = fix(&f, &reviewed_worker(vec![Act::Fix, Act::Review(CLEAN)])).await;
+    assert_eq!(refused.outcome.as_deref(), Some("requeued"), "{refused:?}");
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
+        .bind(24 * 60 * 60_000_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let plan = pending_resume(&f).await;
+    assert_eq!(plan.anticipated(), 0, "its verdict covers the kept tree");
+    std::fs::write(
+        plan.workspace().root.join("review-ending.json"),
+        r#"{"note":null,"title":null,"tree":{"head":"0123456789abcdef0123456789abcdef01234567","branch":null,"status":null,"description":null}}"#,
+    )
+    .unwrap();
+
+    let plan = pending_resume(&f).await;
+
+    assert!(plan.anticipated() > 0, "a stale verdict covers nothing");
 }
 
 /// Refused publishes hold the fix only at the sixth in a row, not the
@@ -4696,8 +5273,8 @@ async fn curation_is_skipped_for_one_commit_or_when_off() {
 }
 
 /// A curated fix that could not publish offline ships its curated history
-/// on the retry without another review or curation: the saved verdict is
-/// for the tree as curated.
+/// on the retry without another review or curation, or any run at all:
+/// the saved verdict is for the tree as curated.
 #[tokio::test]
 async fn a_curated_fix_retried_after_an_offline_push_ships_on_its_saved_verdict() {
     let bins = support::FakeBins::acquire("fix-curate-offline");
@@ -4726,12 +5303,12 @@ async fn a_curated_fix_retried_after_an_offline_push_ships_on_its_saved_verdict(
     route_push(&f, None);
     f.cfg.network_gate = false;
     let plan = pending_resume(&f).await;
-    let retry = reviewed_worker(vec![Act::Continue]);
+    let retry = reviewed_worker(vec![]);
 
     let summary = resume(&f, &plan, &retry).await;
 
     assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
-    assert_eq!(retry.runs().len(), 1, "no review, no curation again");
+    assert!(retry.runs().is_empty(), "no run, review or curation again");
     assert_eq!(shipped_commits(&f), ["fix: the real bug, curated"]);
 }
 
@@ -4796,8 +5373,8 @@ async fn a_curation_the_daemon_died_in_is_undone_and_the_reviewed_commits_ship()
 }
 
 /// A saved verdict covers the tree it was reached on and nothing else: a
-/// fixer that commits more before an offline push is retried is reviewed
-/// again.
+/// fixer that commits more on a released retry of an offline push is
+/// reviewed again.
 #[tokio::test]
 async fn a_saved_verdict_does_not_cover_a_tree_that_changed_since() {
     let bins = support::FakeBins::acquire("fix-review-saved-stale");
@@ -4815,7 +5392,8 @@ async fn a_saved_verdict_does_not_cover_a_tree_that_changed_since() {
     git(&f.repo_dir, &["config", "--unset-all", &nowhere_key]);
     route_push(&f, None);
     f.cfg.network_gate = false;
-    let plan = pending_resume(&f).await;
+    let plan = released_resume(&f).await;
+    assert!(plan.anticipated() > 0, "a run that resumes is reserved for");
     let retry = reviewed_worker(vec![Act::FixMore, Act::Review(CLEAN)]);
 
     let summary = resume(&f, &plan, &retry).await;
