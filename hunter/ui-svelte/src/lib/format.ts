@@ -1,5 +1,7 @@
 // Shared formatting utilities (ported from app.ts helpers).
 
+import type { PrReviewOut } from "./types";
+
 /** Token count to human-readable: 150000 → "150k", 2100000 → "2.1M" */
 export function ktok(n: number | null): string {
   if (n == null) return "\u2013";
@@ -146,6 +148,24 @@ export function repoWorkLabel(k: string): string {
   return k === "sync" ? "sync (clone, fetch, branch)" : k || "?";
 }
 
+/**
+ * A job kind where the status panel names it. Kind strings read as words
+ * except the PR review's, whose snake_case string would be the only one
+ * on the panel that does not.
+ */
+export function jobKindLabel(kind: string): string {
+  return kind === "pr_review" ? "PR review" : kind;
+}
+
+/**
+ * A PR review's state on its badge: its PR's while the review follows it
+ * (open, merged, closed). `own` is a review that ended because hunter
+ * opened the PR itself, which is engaged, never reviewed.
+ */
+export function reviewStateLabel(s: string): string {
+  return s === "own" ? "hunter's own PR" : s || "?";
+}
+
 /** The button for a way to release a hold (`ReleaseAction`). */
 export function releaseActionLabel(a: string): string {
   switch (a) {
@@ -166,6 +186,45 @@ export function releaseActionLabel(a: string): string {
     default:
       return a || "?";
   }
+}
+
+/**
+ * A PR review issue's status as later rounds judged it. `rebutted` means
+ * the reviewer accepted a reply's rebuttal, not that the issue was
+ * argued against, so it says so.
+ */
+export function reviewIssueStatusLabel(s: string): string {
+  return s === "rebutted" ? "rebuttal accepted" : s || "?";
+}
+
+/**
+ * What posting a review round sends: its issues, the replies that resolve
+ * earlier issues' threads, and the answers to replies in the threads of
+ * issues it found still open. A round without new issues names only what
+ * it does post rather than reading as "0 issues", which would suggest
+ * nothing posts.
+ */
+export function roundPostTally(issues: number, resolutions: number, answers: number): string {
+  const parts: string[] = [];
+  if (issues > 0 || (resolutions === 0 && answers === 0)) {
+    parts.push(`${issues} ${issues === 1 ? "issue" : "issues"}`);
+  }
+  if (resolutions > 0) parts.push(`${resolutions} ${resolutions === 1 ? "resolution" : "resolutions"}`);
+  if (answers > 0) parts.push(`${answers} ${answers === 1 ? "answer" : "answers"}`);
+  return parts.join(", ");
+}
+
+/**
+ * How many issues of a review await judgment: their thread holds a reply
+ * newer than any their newest verdict was shown, or a human reopened it
+ * since. What makes a watched review due without new commits.
+ */
+export function issuesAwaitingJudgment(review: PrReviewOut): number {
+  let n = 0;
+  for (const round of review.rounds) {
+    n += round.issues.filter((i) => i.awaits_judgment).length;
+  }
+  return n;
 }
 
 /**

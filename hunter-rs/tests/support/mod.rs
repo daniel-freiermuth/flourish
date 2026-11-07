@@ -488,6 +488,11 @@ pub struct ScriptedBackend {
     hosts: Vec<String>,
     /// The hosts the reachability probe reports unreachable.
     offline: Vec<String>,
+    /// The hosts it reports unreachable once a runner asked for its
+    /// budget ([`ScriptedBackend::offline_once_dispatched`]).
+    offline_dispatched: Vec<String>,
+    /// Whether a runner asked for its budget yet.
+    dispatched: std::sync::atomic::AtomicBool,
     runs: Mutex<Vec<Run>>,
     /// Awaited at the start of every `decide()`: whatever a test needs to
     /// happen while a runner stands at its budget gate.
@@ -518,6 +523,8 @@ impl ScriptedBackend {
             fails: false,
             hosts: Vec::new(),
             offline: Vec::new(),
+            offline_dispatched: Vec::new(),
+            dispatched: std::sync::atomic::AtomicBool::new(false),
             runs: Mutex::new(Vec::new()),
             on_decide: None,
             usage_delta: None,
@@ -558,6 +565,16 @@ impl ScriptedBackend {
     #[must_use]
     pub fn offline(mut self, hosts: &[&str]) -> Self {
         self.offline = hosts.iter().map(|&h| h.to_owned()).collect();
+        self
+    }
+
+    /// Answer the reachability probe with `hosts` up until a runner asks
+    /// for its budget (`Backend::decide`), and down from then on: the
+    /// network gate before dispatch passes, and the machine goes offline
+    /// while the runner works.
+    #[must_use]
+    pub fn offline_once_dispatched(mut self, hosts: &[&str]) -> Self {
+        self.offline_dispatched = hosts.iter().map(|&h| h.to_owned()).collect();
         self
     }
 
@@ -637,6 +654,8 @@ impl Backend for ScriptedBackend {
         if let Some(hook) = &self.on_decide {
             hook().await;
         }
+        self.dispatched
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let verdict = if self
             .deny_above
             .is_some_and(|limit| anticipated_tokens > limit)
@@ -669,9 +688,15 @@ impl Backend for ScriptedBackend {
         self.hosts.clone()
     }
 
-    /// No socket: the first of `hosts` marked [`ScriptedBackend::offline`].
+    /// No socket: the first of `hosts` marked [`ScriptedBackend::offline`],
+    /// or [`ScriptedBackend::offline_once_dispatched`] once a runner asked
+    /// for its budget.
     async fn first_unreachable(&self, hosts: &[String]) -> Option<String> {
-        hosts.iter().find(|h| self.offline.contains(h)).cloned()
+        let dispatched = self.dispatched.load(std::sync::atomic::Ordering::SeqCst);
+        hosts
+            .iter()
+            .find(|h| self.offline.contains(h) || dispatched && self.offline_dispatched.contains(h))
+            .cloned()
     }
 
     async fn run(

@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  isEventList, isFindingDetail, isFindingList, isJobList, isStats, isSummary,
+  isEventList, isFindingDetail, isFindingList, isJobList, isOpenPrList, isPrReviewList, isStats,
+  isSummary,
 } from "./validate";
 
 // A body shaped like what the daemon actually serves, trimmed to the
@@ -351,5 +352,100 @@ describe("isSummary repo work", () => {
     expect(isSummary({ ...summary, repos: [repo({ holds: [hold("hunt", ["restart", "restart"])] })] })).toBe(false);
     expect(isSummary({ ...summary, repos: [repo({ holds: [{ kind: "hunt" }] })] })).toBe(false);
     expect(isSummary({ ...summary, repos: [repo({ failing: [{ kind: "hunt" }, { kind: "hunt" }] })] })).toBe(false);
+  });
+});
+
+// ReviewsPage renders `{#each reviews as review (review.id)}`, per review
+// `{#each rounds as round (round.id)}`, per round slices both shas, keys
+// `issues` by `issue.id`, counts `resolutions` and picks its posting
+// controls by `post_state`, and per issue lists `replies` and counts
+// `hidden_replies`.
+describe("isPrReviewList", () => {
+  const issue = (extra: Record<string, unknown> = {}) => ({
+    id: 1, summary: "x", status: "open", replies: [], hidden_replies: 0, awaits_judgment: false, ...extra,
+  });
+  const round = (extra: Record<string, unknown> = {}) => ({
+    id: 1, base_sha: "a".repeat(40), head_sha: "b".repeat(40), post_state: null, resolutions: 0, issues: [],
+    ...extra,
+  });
+  const review = (id: unknown, rounds: unknown) => ({ id, rounds });
+
+  it("accepts empty lists and reviews with rounds and issues", () => {
+    expect(isPrReviewList([])).toBe(true);
+    expect(isPrReviewList([review(1, []), review(2, [round()])])).toBe(true);
+    expect(
+      isPrReviewList([review(1, [round({ id: 2, issues: [issue()], post_state: "pending" }), round()])]),
+    ).toBe(true);
+  });
+
+  it("accepts a round that only resolves earlier issues, and issues with replies", () => {
+    const replies = [{ author: "alice", body: "fixed in\nabc123", own: false }, { author: "hunter", body: "Addressed.", own: true }];
+    expect(
+      isPrReviewList([review(1, [
+        round({ id: 2, resolutions: 1, post_state: "pending" }),
+        round({ issues: [issue({ status: "addressed", replies, hidden_replies: 2 }), issue({ id: 2 })] }),
+      ])]),
+    ).toBe(true);
+  });
+
+  it("rejects reviews the page cannot key by id", () => {
+    expect(isPrReviewList([review(1, []), review(1, [])])).toBe(false);
+    expect(isPrReviewList([{ rounds: [] }])).toBe(false);
+    expect(isPrReviewList({})).toBe(false);
+  });
+
+  it("rejects absent, repeated or unkeyed rounds", () => {
+    expect(isPrReviewList([{ id: 1 }])).toBe(false);
+    expect(isPrReviewList([review(1, [round(), round()])])).toBe(false);
+    expect(isPrReviewList([review(1, [round({ id: "1" })])])).toBe(false);
+  });
+
+  it("rejects a round whose shas or issues the page cannot render", () => {
+    expect(isPrReviewList([review(1, [round({ base_sha: null })])])).toBe(false);
+    expect(isPrReviewList([review(1, [round({ head_sha: undefined })])])).toBe(false);
+    expect(isPrReviewList([review(1, [round({ issues: null })])])).toBe(false);
+    expect(isPrReviewList([review(1, [round({ issues: ["nope"] })])])).toBe(false);
+  });
+
+  it("rejects issues the page cannot key by id", () => {
+    expect(isPrReviewList([review(1, [round({ issues: [issue(), issue()] })])])).toBe(false);
+    expect(isPrReviewList([review(1, [round({ issues: [issue({ id: undefined })] })])])).toBe(false);
+    expect(isPrReviewList([review(1, [round({ issues: [issue({ id: "1" })] })])])).toBe(false);
+  });
+
+  it("rejects a round whose resolutions are missing or not a count", () => {
+    expect(isPrReviewList([review(1, [round({ resolutions: undefined })])])).toBe(false);
+    expect(isPrReviewList([review(1, [round({ resolutions: "1" })])])).toBe(false);
+  });
+
+  it("rejects an issue whose replies the page cannot list", () => {
+    const bad = (extra: Record<string, unknown>) => isPrReviewList([review(1, [round({ issues: [issue(extra)] })])]);
+    expect(bad({ replies: undefined })).toBe(false);
+    expect(bad({ replies: ["nope"] })).toBe(false);
+    expect(bad({ replies: [{ author: "alice", own: false }] })).toBe(false);
+    expect(bad({ replies: [{ author: null, body: "x", own: false }] })).toBe(false);
+    expect(bad({ replies: [{ author: "hunter", body: "x" }] })).toBe(false);
+    expect(bad({ hidden_replies: undefined })).toBe(false);
+    expect(bad({ hidden_replies: "2" })).toBe(false);
+  });
+
+  it("rejects a round whose post state is missing or not a word", () => {
+    expect(isPrReviewList([review(1, [round({ post_state: undefined })])])).toBe(false);
+    expect(isPrReviewList([review(1, [round({ post_state: 1 })])])).toBe(false);
+  });
+});
+
+// The open-PR picker renders `{#each prs as pr (pr.number)}`.
+describe("isOpenPrList", () => {
+  it("accepts an empty list and distinct PR numbers", () => {
+    expect(isOpenPrList([])).toBe(true);
+    expect(isOpenPrList([{ number: 3 }, { number: 4 }])).toBe(true);
+  });
+
+  it("rejects repeated, missing or non-numeric numbers and an error body", () => {
+    expect(isOpenPrList([{ number: 3 }, { number: 3 }])).toBe(false);
+    expect(isOpenPrList([{ title: "x" }])).toBe(false);
+    expect(isOpenPrList([{ number: "3" }])).toBe(false);
+    expect(isOpenPrList({ error: "gh failed" })).toBe(false);
   });
 });

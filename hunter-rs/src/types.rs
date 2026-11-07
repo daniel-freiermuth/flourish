@@ -22,7 +22,7 @@
 
 use crate::domain::{
     BudgetOverride, BugClass, FindingJobKind, FindingStatus, FindingType, ForgeName, HoldReason,
-    JobKind, JobState, ReleaseAction, RepoWorkKind, Severity,
+    JobKind, JobState, PrReviewState, ReleaseAction, RepoWorkKind, Severity,
 };
 use serde::Serialize;
 use ts_rs::TS;
@@ -469,6 +469,10 @@ pub struct Summary {
 pub enum AdminTask {
     /// Reading every open PR from its forge (`scheduler::sync_prs`).
     PrSync,
+    /// Reading every open PR review's PR from its forge and posting the
+    /// approved rounds (`scheduler::sync_pr_reviews`,
+    /// `scheduler::post_pr_reviews`).
+    PrReviews,
     /// Removing the clones of deleted repos (`server::reap_deleted_repos`).
     Reap,
     /// Fetching enabled repos' clones ahead of their jobs
@@ -620,6 +624,173 @@ impl StatsHorizon {
         };
         Some(now_ms - days * DAY_MS)
     }
+}
+
+// ---------------------------------------------------------------------------
+// PR reviews (migration 035; future.md §8.8)
+// ---------------------------------------------------------------------------
+
+/// One issue a review round reported, as the reviewer wrote it, with what
+/// later rounds and the PR's thread made of it.
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the issue's independent flags, as the UI reads them"
+)]
+pub struct PrReviewIssueOut {
+    pub id: i64,
+    pub kind: String,
+    pub blocking: bool,
+    pub severity: Option<String>,
+    pub confidence: Option<f64>,
+    pub file: Option<String>,
+    pub line: Option<i64>,
+    /// `"RIGHT"` when `line` numbers the PR's head, `"LEFT"` the base (code
+    /// the PR removes); null when the reviewer did not say, read as RIGHT.
+    pub side: Option<String>,
+    pub summary: String,
+    pub detail: String,
+    /// Whether the issue went out as an inline comment on the PR's diff
+    /// (rather than in the posted review's body).
+    pub posted_inline: bool,
+    /// `open`, `addressed` (a later round found the new commits fix it),
+    /// `rebutted` (a later round accepted a reply's rebuttal) or `reopened`
+    /// (a human reopened the thread hunter had resolved, and no round
+    /// judged it since).
+    pub status: String,
+    /// Whether hunter answered and resolved the issue's thread on the PR.
+    pub resolved_on_forge: bool,
+    /// The newest round's note on this issue, when a round judged it.
+    pub verdict_note: Option<String>,
+    /// The replies in the issue's thread as the newest read saw them,
+    /// screened to the authors a review trusts; hunter's own flagged `own`.
+    pub replies: Vec<PrReviewReplyOut>,
+    /// Replies the screen dropped: counted, never shown.
+    pub hidden_replies: i64,
+    /// Whether its thread holds news no round judged yet: a reply newer
+    /// than any its newest verdict was shown, or a reopen. A watched
+    /// review's next round judges it once the news is quiet.
+    pub awaits_judgment: bool,
+}
+
+/// One reply in the thread of a posted issue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize, TS)]
+#[ts(export)]
+pub struct PrReviewReplyOut {
+    /// The author's login; `hunter` for one of hunter's own replies.
+    pub author: String,
+    pub body: String,
+    /// Whether it is hunter's own reply (it carried the own-comment mark
+    /// and came from hunter's login or a pusher). The only way to tell
+    /// one apart: a person's login may be `hunter` too.
+    pub own: bool,
+    /// When it was written (epoch ms, as the forge dates it); 0 for a
+    /// reply read before reply times were kept.
+    #[serde(default)]
+    pub at: i64,
+}
+
+/// One review attempt of the range `base_sha..head_sha`.
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export)]
+pub struct PrReviewRoundOut {
+    pub id: i64,
+    pub job_id: Option<i64>,
+    pub base_sha: String,
+    /// `base_sha` too for a round that reviewed no new commits: one that
+    /// ran for replies and reopens alone.
+    pub head_sha: String,
+    /// `ok` (the reviewer finished the range, which counts as reviewed),
+    /// `partial` (it was stopped partway: its issues and verdicts count,
+    /// but the range is reviewed again) or `failed` (nothing counts).
+    pub verdict: String,
+    /// Why the round failed, or stopped partway.
+    pub failure: Option<String>,
+    pub finished_at: i64,
+    /// Null when there is nothing to post (failed, or no issues and no
+    /// verdict that changes what a thread shows); otherwise `pending`
+    /// (awaiting a user), `approved` (posted on the PR review duty's next
+    /// run), `posted` or `discarded`.
+    pub post_state: Option<String>,
+    /// The newest failed post's reason; kept after the round fell back to
+    /// `pending`, cleared once it is approved again.
+    pub post_error: Option<String>,
+    pub posted_at: Option<i64>,
+    /// Part of the round's post is on the PR already (a post that failed
+    /// partway): it can only be approved again, never discarded.
+    pub landed: bool,
+    /// Earlier issues this round judged addressed or rebutted whose inline
+    /// thread its post answers and resolves, unless a newer judgement of
+    /// the issue stands by then.
+    pub resolutions: i64,
+    /// Earlier issues this round judged still open whose thread waits for
+    /// an answer: somebody replied, or hunter's last answer there settled
+    /// the issue. Its post answers each one ("Still open", "Open again")
+    /// and unresolves a thread hunter had resolved.
+    pub answers: i64,
+    pub issues: Vec<PrReviewIssueOut>,
+}
+
+/// GET /api/pr-reviews: one requested review, rounds newest first.
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the review's independent flags, as the UI reads them"
+)]
+pub struct PrReviewOut {
+    pub id: i64,
+    pub repo_id: i64,
+    pub repo_name: String,
+    pub pr_number: i64,
+    pub pr_url: String,
+    pub title: String,
+    pub author: String,
+    pub cross_repo: bool,
+    pub watch: bool,
+    /// Whether a new round with issues is posted without waiting for a
+    /// user's approval.
+    pub auto_post: bool,
+    pub state: PrReviewState,
+    pub head_sha: Option<String>,
+    pub last_reviewed_sha: Option<String>,
+    pub vouched_author: Option<String>,
+    pub requested_by: String,
+    pub requested_at: i64,
+    pub failures: i64,
+    pub last_failure: Option<String>,
+    pub held: bool,
+    /// Whether the repo's URL changed since the review was requested: the
+    /// review does nothing until a request binds it to the new URL,
+    /// deciding about the author afresh.
+    pub repo_moved: bool,
+    pub running_job_id: Option<i64>,
+    /// When the newest news in hunter's threads that no round judged yet
+    /// arrived (epoch ms): a trusted reply newer than any its issue's
+    /// newest verdict was shown, or a reopen; null when there is none
+    /// ([`PrReviewIssueOut::awaits_judgment`] marks the issues).
+    pub awaiting_since: Option<i64>,
+    /// Whether that news makes the review's next round due: watched, open
+    /// and not held. The round waits until the newest news has been quiet
+    /// for two minutes, so a burst of replies costs one.
+    pub judgment_pending: bool,
+    pub rounds: Vec<PrReviewRoundOut>,
+}
+
+/// GET /api/repo/open-prs: one open PR of a repo, with whether hunter
+/// opened it (not reviewable) and the review already requested for it.
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export)]
+pub struct OpenPrOut {
+    pub number: i64,
+    pub title: String,
+    pub author: String,
+    pub is_draft: bool,
+    pub cross_repo: bool,
+    pub url: String,
+    pub hunter_own: bool,
+    pub review_id: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------

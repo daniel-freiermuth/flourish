@@ -16,11 +16,11 @@ use crate::clones::{ClonePermit, FetchOutcome, FetchedBy, Force, Lane, LastFetch
 use crate::config::Config;
 use crate::domain::{
     BudgetOverride, ClosureClass, FindingJobKind, FindingStatus, FindingType, FinishedState,
-    HoldReason, JobKind, JobState, RepoJobKind, RepoWorkKind, Severity,
+    HoldReason, JobKind, JobState, PrJobKind, RepoJobKind, RepoWorkKind, Severity,
 };
 use crate::store::{
     AdminStore, FindingFilter, JobInsertError, JobOutcome, JobPlace, JobStart, JobStore,
-    PrSyncPass, SeenActivity, Store, StoreWriteError,
+    PrReviewRow, PrSyncPass, SeenActivity, Store, StoreWriteError,
 };
 use crate::transition::{
     Moved, PR_CLOSED_AWAITING_HARVEST, PrEnded, PrEnding, PrRef, Transition, Unclaimed,
@@ -29,8 +29,11 @@ use crate::types::{Finding, Job, JobPhase, Repo};
 use crate::util::now_ms;
 
 mod attempt;
+mod pr_review;
 mod review;
 pub use attempt::{Attempt, Kind, Resumed, kind};
+use pr_review::run_pr_review;
+pub use pr_review::{post_pr_reviews, sync_pr_reviews};
 
 /// Everything a resumed attempt needs and a cold one does not.
 ///
@@ -191,6 +194,13 @@ pub enum Candidate {
         /// other variants.
         plan: Box<ResumePlan>,
     },
+    /// A round of a requested PR review (`pr_reviews`, migration 035).
+    Pr {
+        kind: PrJobKind,
+        review_id: i64,
+        repo_id: i64,
+        label: Option<String>,
+    },
 }
 
 impl Candidate {
@@ -198,30 +208,36 @@ impl Candidate {
         match self {
             Self::Repo { kind, .. } => (*kind).into(),
             Self::Finding { kind, .. } => (*kind).into(),
+            Self::Pr { kind, .. } => (*kind).into(),
             Self::Resume { plan, .. } => plan.kind,
         }
     }
 
     pub fn repo_id(&self) -> i64 {
         match self {
-            Self::Repo { repo_id, .. } | Self::Finding { repo_id, .. } => *repo_id,
+            Self::Repo { repo_id, .. }
+            | Self::Finding { repo_id, .. }
+            | Self::Pr { repo_id, .. } => *repo_id,
             Self::Resume { plan, .. } => plan.repo_id,
         }
     }
 
     pub fn label(&self) -> Option<&str> {
         match self {
-            Self::Repo { label, .. } | Self::Finding { label, .. } | Self::Resume { label, .. } => {
-                label.as_deref()
-            }
+            Self::Repo { label, .. }
+            | Self::Finding { label, .. }
+            | Self::Pr { label, .. }
+            | Self::Resume { label, .. } => label.as_deref(),
         }
     }
 
-    /// The primary target ID: `finding_id` for finding kinds, `repo_id` for repo kinds.
+    /// The primary target ID: `finding_id` for finding kinds, `repo_id` for
+    /// repo kinds, the review's id for PR kinds.
     pub fn target_id(&self) -> i64 {
         match self {
             Self::Repo { repo_id, .. } => *repo_id,
             Self::Finding { finding_id, .. } => *finding_id,
+            Self::Pr { review_id, .. } => *review_id,
             Self::Resume { plan, .. } => plan.finding_id.unwrap_or(plan.repo_id),
         }
     }
@@ -234,8 +250,22 @@ impl Candidate {
             | Self::Resume {
                 budget_override, ..
             } => *budget_override,
-            Self::Repo { .. } => None,
+            Self::Repo { .. } | Self::Pr { .. } => None,
         }
+    }
+}
+
+/// Candidate for a PR review round. label = "PR #<n> <title>".
+fn pr_review_candidate(r: &PrReviewRow) -> Candidate {
+    Candidate::Pr {
+        kind: PrJobKind::Review,
+        review_id: r.id,
+        repo_id: r.repo_id,
+        label: Some(
+            format!("PR #{} {}", r.pr_number, r.title)
+                .trim_end()
+                .to_owned(),
+        ),
     }
 }
 
@@ -362,7 +392,8 @@ fn engage_held_back(mode: Pick<'_>, fid: i64) -> bool {
 ///
 /// Priority (`scheduler.pick_next`): a budget-overridden finding (any
 /// category) jumps the queue -> flagged PR (oldest-outstanding reason
-/// first) -> oldest merged or closed PR pending its harvest
+/// first) -> due requested PR review ([`Store::list_due_pr_reviews`]) ->
+/// oldest merged or closed PR pending its harvest
 /// ([`Store::list_pending_harvest`]) -> oldest
 /// rechecking -> oldest queued fix -> resumable suspended work -> the
 /// most stale-of-rotation job type for the least-recently-hunted enabled
@@ -479,6 +510,18 @@ async fn select(
     ] {
         tier.retain(|f| !busy(JobPlace::Finding(f.id)));
     }
+    // Requested PR reviews whose next round is due: a reviewer is
+    // waiting on them like on a flagged PR, so they rank right below the
+    // engage tier. One running per repo (migration 031's index).
+    let pr_kind: JobKind = PrJobKind::Review.into();
+    let mut due_reviews = store.list_due_pr_reviews(now_ms()).await?;
+    due_reviews.retain(|r| {
+        force_id.is_none_or(|rid| r.repo_id == rid)
+            && !busy(JobPlace::RepoWork {
+                repo_id: r.repo_id,
+                kind: pr_kind,
+            })
+    });
 
     // list_findings is id DESC: oldest first, as the engage and harvest
     // lists already are.
@@ -499,7 +542,7 @@ async fn select(
     // (1) A budget-overridden finding jumps the queue, scanned in the
     // same kind order the normal priorities use (`scheduler.pick_next`).
     // (2)-(5) Then the normal finding-kind priorities, in that order,
-    // oldest first.
+    // oldest first, with a due PR review right after the engage tier.
     for overridden in [true, false] {
         for (kind, items) in tiers {
             for f in items
@@ -517,6 +560,14 @@ async fn select(
                     // continued: nothing to do here, and nothing changed.
                     Picked::Nothing => {}
                 }
+            }
+            // A review carries no budget override, so it waits for the
+            // normal pass.
+            if !overridden
+                && kind == FindingJobKind::Engage
+                && let Some(r) = due_reviews.first()
+            {
+                return Ok(Some(pr_review_candidate(r)));
             }
         }
     }
@@ -827,6 +878,9 @@ fn resume_prompt(kind: JobKind, plan: &ResumePlan) -> String {
         JobKind::Finding(FindingJobKind::Fix) => ("fix", "PR-DESCRIPTION.md"),
         JobKind::Finding(FindingJobKind::Harvest) => ("PR review", "what the playbook asks for"),
         JobKind::Repo(_) => ("scan", "the findings file your playbook names"),
+        // A PR review keeps no checkpoint (`point_checkpoint` records
+        // none for it), so it is never resumed; named for completeness.
+        JobKind::Pr(PrJobKind::Review) => ("PR review", "your review file"),
     };
     match reason {
         HoldReason::Stuck | HoldReason::GaveUp => format!(
@@ -884,7 +938,7 @@ pub async fn candidate_reservation(
 ) -> anyhow::Result<i64> {
     Ok(match c {
         Candidate::Resume { plan, .. } => plan.anticipated,
-        Candidate::Repo { .. } | Candidate::Finding { .. } => {
+        Candidate::Repo { .. } | Candidate::Finding { .. } | Candidate::Pr { .. } => {
             cold_reservation(anticipated_tokens(store, cfg, c.repo_id(), c.job_kind()).await?)
         }
     })
@@ -917,7 +971,8 @@ async fn pick_resume(
             }
             (JobKind::Finding(kind), Some(fid)) => held.finding(fid, kind),
             (JobKind::Repo(kind), _) => held.repo(job.repo_id, kind),
-            (JobKind::Finding(_), None) => false,
+            // No checkpoint is ever recorded for a PR review.
+            (JobKind::Finding(_), None) | (JobKind::Pr(_), _) => false,
         };
         if is_held || running.contains(&JobPlace::of(job.kind, job.repo_id, job.finding_id)) {
             continue;
@@ -1399,7 +1454,7 @@ async fn resume_plan<'s>(
             store.repo_last_release_at(job.repo_id, kind).await?,
             store.repo_continued_hold(job.repo_id, kind, job.id).await?,
         ),
-        (JobKind::Finding(_), None) => (None, None),
+        (JobKind::Finding(_), None) | (JobKind::Pr(_), _) => (None, None),
     };
     let own = if released_at.is_some() {
         store.resume_chain_stats(job.id, released_at).await?
@@ -1510,7 +1565,8 @@ async fn end_checkpoint(scope: &CycleScope<'_>, job: &Job, msg: &str) -> bool {
                 .drop_repo_checkpoint(job.repo_id, kind, job.id, msg)
                 .await
         }
-        (JobKind::Finding(_), None) => return false,
+        // A PR review has no checkpoint to drop.
+        (JobKind::Finding(_), None) | (JobKind::Pr(_), _) => return false,
     };
     dropped.unwrap_or(false)
 }
@@ -1669,6 +1725,11 @@ pub struct CycleSummary {
     /// ([`crate::daemon::EngageWaits`]).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub awaits_pr_sync: bool,
+    /// The cycle recorded a PR review round that is to be posted now
+    /// (auto-post): the daemon wakes the PR review duty, which posts it,
+    /// instead of leaving it for the next tick.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub posts_approved: bool,
 }
 
 /// Maximum consecutive identical failures before giving up (`scheduler.MAX_CONSECUTIVE_SAME_FAILURE`).
@@ -1770,6 +1831,7 @@ fn job_refused(kind: JobKind, repo: &str, err: JobInsertError) -> anyhow::Result
     match err {
         JobInsertError::RepoDeleted { .. }
         | JobInsertError::NotContinuable { .. }
+        | JobInsertError::NoPrReviewDue { .. }
         | JobInsertError::NoHarvestDue { .. }
         | JobInsertError::NoEngageDue { .. } => Ok(CycleSummary {
             kind: Some(kind),
@@ -5473,11 +5535,16 @@ async fn count_unmade_engage_tree(
 /// outage to count as identical failures.
 const RUNNER_ERROR: &str = "runner error";
 
-/// Whose work an attempt was: a finding's, or a repo's.
+/// Whose work an attempt was: a finding's, a repo's, or a PR review's
+/// round over `range` (base, head).
 #[derive(Clone, Copy)]
 enum WorkOf<'a> {
     Finding(FindingJobKind, i64),
     Repo(RepoJobKind, &'a Repo),
+    Pr {
+        review: &'a PrReviewRow,
+        range: (&'a str, &'a str),
+    },
 }
 
 impl WorkOf<'_> {
@@ -5485,13 +5552,14 @@ impl WorkOf<'_> {
         match self {
             Self::Finding(kind, _) => kind.into(),
             Self::Repo(kind, _) => kind.into(),
+            Self::Pr { .. } => PrJobKind::Review.into(),
         }
     }
 
     fn finding_id(self) -> Option<i64> {
         match self {
             Self::Finding(_, fid) => Some(fid),
-            Self::Repo(..) => None,
+            Self::Repo(..) | Self::Pr { .. } => None,
         }
     }
 }
@@ -5547,6 +5615,10 @@ async fn runner_failed(
                 HoldReason::Stuck,
             )
             .await;
+            return None;
+        }
+        WorkOf::Pr { review, range } => {
+            pr_review::count_failure(store, review, Some(job), range, &detail).await;
             return None;
         }
     };
@@ -9365,6 +9437,9 @@ async fn dispatch(
         Candidate::Repo { kind, repo_id, .. } => {
             run_repo_job(scope, lane, cfg, backend, *kind, *repo_id).await
         }
+        Candidate::Pr { review_id, .. } => {
+            run_pr_review(scope, lane, cfg, backend, *review_id).await
+        }
         // A resume runs through the executor of the kind that was
         // suspended — so ingest, watermarks and PR handling are that
         // kind's own, unchanged. Logged here rather than in `pick_next`,
@@ -9446,6 +9521,13 @@ async fn run_resume(
             let resumed = Resumed::<kind::Harvest>::load(store, plan).await?;
             run_harvest(scope, lane, cfg, Attempt::Resume(&resumed), backend).await
         }
+        // Never planned: a PR review records no checkpoint
+        // (`point_checkpoint`), so no resume of one is ever listed. A plan
+        // naming one is a fault to surface, not work to run.
+        JobKind::Pr(PrJobKind::Review) => anyhow::bail!(
+            "job {} is a PR review, which cannot be resumed",
+            plan.predecessor_id
+        ),
     }
 }
 

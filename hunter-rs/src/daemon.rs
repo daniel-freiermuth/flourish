@@ -10,12 +10,13 @@
 //!   next work, run its job. Only it holds the
 //!   [`JobAuthority`](crate::recovery::JobAuthority), so only it creates
 //!   jobs and claims fixes, one cycle at a time.
-//! - The admin lane runs its duties ([`ADMIN_DUTIES`]): PR sync, reaping
-//!   deleted repos, fetch-ahead, the Renovate dependency scans, the
-//!   workspace sweep. Each is its own task on its own timer
+//! - The admin lane runs its duties ([`ADMIN_DUTIES`]): PR sync, the PR
+//!   reviews, reaping deleted repos, fetch-ahead, the Renovate dependency
+//!   scans, the workspace sweep. Each is its own task on its own timer
 //!   ([`spawn_admin_lane`]), so a slow one -- a Renovate scan, the fetch
-//!   of a large repo -- delays none of the others, and PR sync above all
-//!   records a merge within its interval whatever else the lane is doing.
+//!   of a large repo, a backlog of review posts -- delays none of the
+//!   others, and PR sync above all records a merge within its interval
+//!   whatever else the lane is doing.
 //!   Each run is its own task too ([`supervise_duty`]): a run that panics
 //!   is logged and the duty runs again at its next tick. Only this lane
 //!   holds the [`AdminAuthority`], which its duties take, so only it
@@ -133,8 +134,9 @@ pub const ADMIN_INTERVAL: Duration = Duration::from_mins(5);
 pub const FETCH_AHEAD_MIN_AGE: Duration = Duration::from_mins(30);
 
 /// The admin lane's duties, each its own task ([`spawn_admin_lane`]).
-pub const ADMIN_DUTIES: [AdminTask; 5] = [
+pub const ADMIN_DUTIES: [AdminTask; 6] = [
     AdminTask::PrSync,
+    AdminTask::PrReviews,
     AdminTask::Reap,
     AdminTask::FetchAhead,
     AdminTask::DependencyScan,
@@ -179,6 +181,11 @@ async fn sweep_workspaces(admin: &AdminAuthority, work_root: &Path) {
 pub enum DutyRun {
     /// The PR sync's counts; `None` when another sync pass was live.
     Synced(Option<SyncResult>),
+    /// The PR reviews' refresh and posts: whether the refresh brought a
+    /// review's next round forward ([`refresh_pr_reviews`]).
+    Reviewed {
+        due_sooner: bool,
+    },
     /// How many deleted repos' directories were removed.
     Reaped(usize),
     Fetched(FetchAhead),
@@ -188,11 +195,12 @@ pub enum DutyRun {
 
 impl DutyRun {
     /// Whether this run gave the job lane work it did not have: a PR's end
-    /// or flag ([`SyncResult::made_work`]), or a repo whose AI dependency
-    /// scan is now due.
+    /// or flag ([`SyncResult::made_work`]), a review round due sooner than
+    /// any before, or a repo whose AI dependency scan is now due.
     pub fn made_work(&self) -> bool {
         match self {
             Self::Synced(sync) => sync.as_ref().is_some_and(SyncResult::made_work),
+            Self::Reviewed { due_sooner } => *due_sooner,
             Self::Scanned(scans) => scans.fallbacks > 0,
             Self::Reaped(_) | Self::Fetched(_) | Self::Swept => false,
         }
@@ -203,10 +211,10 @@ impl DutyRun {
 /// (`status`). None of it creates a job; that takes the job lane's
 /// authority, which this does not have.
 ///
-/// Once `shutdown` is set, a sync stops at the next PR, and fetch-ahead
-/// and the dependency scans at the next repo: the daemon waits for every
-/// duty's run in progress, and a run over many PRs or repos is many
-/// round trips.
+/// Once `shutdown` is set, a sync and the PR reviews stop at the next PR,
+/// and fetch-ahead and the dependency scans at the next repo: the daemon
+/// waits for every duty's run in progress, and a run over many PRs or
+/// repos is many round trips.
 pub async fn admin_duty(
     admin: &AdminAuthority,
     cfg: &Config,
@@ -218,6 +226,9 @@ pub async fn admin_duty(
     let _shown = status.begin(task);
     match task {
         AdminTask::PrSync => DutyRun::Synced(sync_open_prs(admin, cfg, shutdown).await),
+        AdminTask::PrReviews => DutyRun::Reviewed {
+            due_sooner: refresh_pr_reviews(admin, cfg, shutdown).await,
+        },
         AdminTask::Reap => DutyRun::Reaped(
             crate::server::reap_deleted_repos(admin, &cfg.work_root, notes_lock).await,
         ),
@@ -259,6 +270,46 @@ async fn sync_open_prs(
         let _ = admin.store().log_event("prsync", &line, None, None).await;
     }
     Some(s)
+}
+
+/// The PR review duty: the refresh of every open PR review
+/// ([`crate::scheduler::sync_pr_reviews`]), then the posting of every
+/// approved review round ([`crate::scheduler::post_pr_reviews`]), which
+/// reads the heads the refresh just recorded. Returns whether the refresh
+/// brought a review's round forward (a new head, a new reply): work for
+/// the job lane, which planned its sleep without it. Its failures are
+/// already events of their own, one per PR (`pr_review <repo> #<n>: ...`).
+///
+/// Its own duty, never part of the PR sync: a sync pass is what held
+/// engages wait for ([`EngageWaits`]), and the job lane is woken for a
+/// PR's end once the sync's run returns ([`supervise_duty`]). Neither may
+/// wait for review traffic, a forge read per open review and every
+/// approved round's sends, reads, replies and resolves, which grows with
+/// the reviews open.
+async fn refresh_pr_reviews(
+    admin: &AdminAuthority,
+    cfg: &Config,
+    shutdown: &watch::Receiver<bool>,
+) -> bool {
+    let stopping = || *shutdown.borrow();
+    let before = review_due_times(admin.store()).await;
+    crate::scheduler::sync_pr_reviews(admin.store(), cfg, stopping).await;
+    let after = review_due_times(admin.store()).await;
+    let due_sooner = after.iter().any(|&(id, due)| {
+        let was = before.iter().find(|&&(b, _)| b == id).and_then(|&(_, d)| d);
+        due.is_some_and(|due| was.is_none_or(|was| due < was))
+    });
+    crate::scheduler::post_pr_reviews(admin.store(), cfg, stopping).await;
+    due_sooner
+}
+
+/// Each open PR review's id and when its next round is due
+/// ([`crate::store::PrReviewRow::due_at`]); none when they cannot be read.
+async fn review_due_times(store: &Store) -> Vec<(i64, Option<i64>)> {
+    store.open_pr_reviews().await.map_or_else(
+        |_| Vec::new(),
+        |reviews| reviews.iter().map(|r| (r.id, r.due_at())).collect(),
+    )
 }
 
 /// The PR sync passes the admin lane has begun and finished, so the job
@@ -417,6 +468,9 @@ pub struct AdminLane {
     /// The PR sync duty's wake (`SchedulerHandle::pr_sync_wake`): a
     /// trigger.
     pub pr_sync_wake: Arc<Notify>,
+    /// The PR review duty's wake (`SchedulerHandle::pr_review_wake`): a
+    /// round approved for posting, or a trigger.
+    pub pr_review_wake: Arc<Notify>,
     /// The reaper duty's wake (`SchedulerHandle::reap_wake`): a repo was
     /// deleted.
     pub reap_wake: Arc<Notify>,
@@ -428,17 +482,20 @@ pub struct AdminLane {
 
 /// Start every admin duty ([`ADMIN_DUTIES`]) as its own task, each run
 /// every [`ADMIN_INTERVAL`] ([`supervise_duty`]); PR sync also whenever
-/// `pr_sync_wake` is notified, the reaper whenever `reap_wake` is. Pausing
+/// `pr_sync_wake` is notified, the PR reviews whenever `pr_review_wake`
+/// is, the reaper whenever `reap_wake` is. Pausing
 /// the scheduler does not stop them: a
 /// pause stops new jobs, which spend tokens, while these spend none, and a
-/// paused daemon still records merges, closes and review comments and
-/// sweeps finished trees. The tasks end at shutdown, once their run in
-/// progress has ([`admin_duty`]).
+/// paused daemon still records merges, closes and review comments, posts
+/// approved reviews and sweeps finished trees. The tasks end at shutdown,
+/// once their run in progress has ([`admin_duty`]).
 ///
 /// One task per duty, never one shared pass: a pass ran PR sync, reaping,
 /// fetch-ahead, the Renovate scans and the sweep in turn, so a merge or a
-/// review comment waited for every Renovate scan due. See the module docs
-/// for why the lanes have no queue type.
+/// review comment waited for every Renovate scan due. The PR reviews are
+/// apart from the PR sync for the same reason: the engages held for a
+/// sync pass would wait for every review read and post. See the module
+/// docs for why the lanes have no queue type.
 pub fn spawn_admin_lane(lane: AdminLane, shutdown: &watch::Receiver<bool>) -> Vec<JoinHandle<()>> {
     let lane = Arc::new(lane);
     ADMIN_DUTIES
@@ -448,6 +505,7 @@ pub fn spawn_admin_lane(lane: AdminLane, shutdown: &watch::Receiver<bool>) -> Ve
                 interval: ADMIN_INTERVAL,
                 wake: match task {
                     AdminTask::PrSync => Some(Arc::clone(&lane.pr_sync_wake)),
+                    AdminTask::PrReviews => Some(Arc::clone(&lane.pr_review_wake)),
                     AdminTask::Reap => Some(Arc::clone(&lane.reap_wake)),
                     _ => None,
                 },
@@ -609,28 +667,21 @@ pub fn describe_cycle(summary: &CycleSummary) -> (String, String) {
 }
 
 /// How long the daemon should sleep after a cycle (`server._compute_sleep_s`).
+///
+/// After a cycle that ran a job the next starts at once, whatever is
+/// queued: the cycle's pick is the single place that decides what is due,
+/// and asking it here as well would duplicate that decision. If it finds
+/// nothing, that idle cycle sleeps through the branches below, so a job
+/// costs at most one extra cycle before any sleep and cannot spin.
 pub async fn compute_sleep_s(store: &Store, summary: &CycleSummary) -> f64 {
-    let sleep_s: f64;
+    let mut sleep_s: f64;
     if summary.error.is_some() {
         sleep_s = 5.0 * 60.0;
-    } else if {
-        matches!(
-            summary.state,
-            Some(JobState::Done | JobState::Killed | JobState::Failed | JobState::Suspended)
-        )
-    } {
-        let queued = store.count_queued().await.unwrap_or(0);
-        let inserted = summary.ingest.as_ref().map_or(0, |i| i.inserted);
-        let enabled = store.count_enabled_repos().await.unwrap_or(0);
-        sleep_s = if queued > 0 {
-            0.0
-        } else if inserted > 0 {
-            5.0
-        } else if enabled > 0 {
-            60.0
-        } else {
-            15.0 * 60.0
-        };
+    } else if matches!(
+        summary.state,
+        Some(JobState::Done | JobState::Killed | JobState::Failed | JobState::Suspended)
+    ) {
+        sleep_s = 0.0;
     } else if summary.denied.is_some() {
         if let Some(retry_at) = summary.retry_at.map(|v| v as f64) {
             if retry_at > 0.0 {
@@ -655,13 +706,23 @@ pub async fn compute_sleep_s(store: &Store, summary: &CycleSummary) -> f64 {
     } else {
         sleep_s = 15.0 * 60.0;
     }
-    // While a PR is open, never sleep past the admin lane's interval
-    // (budget backoff excepted, which only the budget can lift). The admin
-    // lane wakes this one when a sync makes new work, but not for work that
-    // was already there: an engage whose last attempt failed and is due a
-    // retry, or a PR still flagged from an earlier pass.
-    if summary.denied.is_none() && has_open_pr(store).await {
-        return sleep_s.min(ADMIN_INTERVAL.as_secs_f64());
+    // A budget denial keeps its backoff, which only the budget can lift.
+    if summary.denied.is_some() {
+        return sleep_s;
+    }
+    // While a PR is open, never sleep past the admin lane's interval. The
+    // admin lane wakes this one when a sync makes new work, but not for
+    // work that was already there: an engage whose last attempt failed and
+    // is due a retry, or a PR still flagged from an earlier pass.
+    if has_open_pr(store).await {
+        sleep_s = sleep_s.min(ADMIN_INTERVAL.as_secs_f64());
+    }
+    // Nor past the moment a PR review becomes due by the clock alone (a
+    // watched head settling, a reply going quiet): nothing else wakes this
+    // lane then. One due already is the pick's, which just passed it by.
+    let now = crate::util::now_ms();
+    if let Ok(Some(due)) = store.next_pr_review_due_at(now).await {
+        sleep_s = sleep_s.min((due - now) as f64 / 1000.0);
     }
     sleep_s
 }
@@ -840,6 +901,7 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
             notes_lock: repo_notes.clone(),
             status: scheduler.admin.clone(),
             pr_sync_wake: scheduler.pr_sync_wake.clone(),
+            pr_review_wake: scheduler.pr_review_wake.clone(),
             reap_wake: scheduler.reap_wake.clone(),
             pr_sync_passes: pr_sync_passes.clone(),
             job_wake: wake.clone(),
@@ -902,6 +964,9 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         if summary.awaits_pr_sync {
             engage_waits.ended(&summary, &pr_sync_passes);
             scheduler.pr_sync_wake.notify_one();
+        }
+        if summary.posts_approved {
+            scheduler.pr_review_wake.notify_one();
         }
         let sleep_s = compute_sleep_s(&store, &summary).await;
         let (state_label, detail) = describe_cycle(&summary);

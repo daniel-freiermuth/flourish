@@ -234,15 +234,17 @@ what actually runs):
 1. Any finding with an active **budget override** (any category) — human
    escape hatch, jumps the whole queue.
 2. **Engage** the flagged PR with the oldest-outstanding attention reason.
-3. **Harvest** the oldest merged or closed PR still pending its review
+3. **Review** a requested PR (§ PR reviews) whose next round is due: the
+   oldest request first. A human is waiting on it like on a flagged PR.
+4. **Harvest** the oldest merged or closed PR still pending its review
    (a closed PR qualifies only while its finding is `closed`, which no
    verdict can set; a finding a human moved on after the closure, even to
    `rejected`, is left alone. Closures from before the closed-PR harvest,
    which left their finding `rejected`, were moved to `closed` once by
    migration 016).
-4. **Recheck** the oldest finding stuck in `rechecking`.
-5. **Fix** the oldest queued finding.
-6. **Resume** the newest suspended attempt that can still be continued.
+5. **Recheck** the oldest finding stuck in `rechecking`.
+6. **Fix** the oldest queued finding.
+7. **Resume** the newest suspended attempt that can still be continued.
    A worker killed for running out of window headroom keeps its session
    and comes back as `suspended` rather than `killed`, and the next cycle
    hands omp that exact session instead of starting cold. So does one
@@ -478,6 +480,304 @@ login, so its own comments are recognised by the hidden
 from someone who can push, such a comment is never new activity, and
 engage prompts show it in the thread as hunter's own earlier reply.
 
+### PR reviews
+
+Hunter can also review pull requests it did not open (future.md §8.8).
+A review is requested by hand on the Reviews page. Hunter's own PRs are
+refused: they are engaged, not reviewed. A finding's PR is hunter's from
+the moment it is opened (its `pr_url`, not only once the PR sync recorded
+its number), and a review requested before hunter opened its PR ends as
+*hunter's own PR* at its next round or PR sync. Reviewing runs the PR's code with
+the daemon's credentials, so an author who cannot push to the repo needs
+the requester's vouch, even one whose login is a `reviewBots` entry: a
+login is only a name, and a human may hold a bot's. A fork's author
+also stands in for everyone who can push to that fork. Hunter's forge
+login must be able to push to a repo whose PRs it reviews, as to every
+repo it tracks: GitHub tells who can push only to those who can, and
+every trust check here rests on that; a request where hunter's login
+cannot push fails saying so.
+
+Each round fetches the PR's head (`refs/pull/N/head` or
+`refs/merge-requests/N/head`) and runs a reviewer (`playbooks/pr_review.md`;
+it may build and run targeted tests, but must leave the tree as it found
+it) in a tree detached at that head. The first round reviews from the
+merge-base with the PR's base branch. Later rounds review only from the
+head the last round that finished reviewed, as long as the PR still descends
+from it and the merge-base has not moved past it (after a force-push, or
+once the base branch was merged into the PR, from the merge-base again:
+the round would otherwise review the merged-in upstream commits). Every
+round is shown, and judges, every issue reported since the last round that reviewed
+from the merge-base, plus every older issue that is still open or whose
+thread hunter has not resolved yet: a
+force-push does not settle what it replaced. A discarded round's issues
+are never shown: they were never the review's. With **Watch** on, every new head is
+reviewed once it has stayed unchanged for 10 minutes (a round that finds
+the PR moved again since it was picked skips, and the newest head waits
+out its own 10 minutes), and replies alone bring a round too (below);
+with it off, only the round a request asks for runs. A round due by the
+clock alone (a head settling, a reply going quiet) starts when it comes
+due: the job lane's idle sleep ends then, and a PR sync that brings a
+round forward wakes the lane to sleep until it instead. A
+paused (disabled) repo's reviews still run:
+pausing stops scans, not work a human asked for; a repo no job has cloned
+yet is cloned first. A reviewer stopped by its token cap or the wall
+clock keeps the issues and verdicts it already wrote (the playbook has it
+rewrite each file after every entry), but did not review the whole range:
+its round is *partial*, the head stays unreviewed, and the next round
+reviews the same commits again, shown what the stopped one wrote. One
+stopped before writing either failed its round, and so did one that
+changed its worktree (a file a test left behind counts) and wrote neither:
+its silence is no proof the PR is clean. An issue or a verdict a reviewer
+wrote stands whether it changed the tree or not: the tree is discarded,
+and what it wrote is about the PR's commits. The PR sync refreshes
+each open review's head, title and state. A merged PR ends its review for
+good; a closed one ends it until the PR is reopened: requesting the
+review again then reads the PR and, open again, reviews it again at the
+head it has now, watched or not (a round that already reviewed that head
+leaves nothing to review), with the vouch the first request gave (while
+the PR is still closed the request is refused). A review is bound to the
+repo URL it was requested under (`pr_reviews.repo_url`): that is where the
+request decided whether the author can push, and which PR its number
+names. Once the repo's URL is changed, the same number may name another
+PR, by an author nobody decided about, so the review does nothing — no
+round, no read of the PR, no post — and the Reviews page says why until a
+request binds it to the new URL, reading the PR there (refused unless it
+is open) and asking the push check (or a vouch) afresh. That holds for a
+review that ended too: merged, closed or hunter's own said so of the PR
+at the earlier URL, so the rebound review is open. That starts the
+review over (its `binding`
+goes up by one): every round so far was about the PR at the earlier URL,
+so none of them counts again — the first round at the new URL reviews
+the PR from its merge-base, is told none of their issues and reads none
+of their threads, and a round that was running at the earlier URL when
+the request came changes nothing. A failed or partial round counts
+toward a hold at 3 in a row (a reviewer whose cap never lets it finish
+the range is held, not run forever); a finished round, turning Watch on
+or **Retry** clears it. Budget and offline denials count
+nothing.
+
+A round with issues is posted to the PR as one review, under the
+operator's `gh`/`glab` login and therefore always a plain COMMENT review
+(never an approval or a change request). Nothing goes out without a
+decision: a round waits as *pending* until a user clicks **Post to PR**
+(or **Discard**, which is final and takes back the round's verdicts),
+unless the review was requested with
+**Post automatically** (`auto_post`, toggleable per review), in which case
+a new round starts out approved. Toggling it touches only rounds recorded
+afterwards. A round with nothing to post — no issues and no verdict that
+changes what a thread on the PR says (below) — or a failed one has no
+post state. A round of the review's earlier URL is never posted: a
+request that binds the review to a new URL discards its rounds still to
+post (one part of which already landed on the earlier PR stays as it
+is), and only a round of the review's current binding is posted or
+approved.
+The admin lane's PR sync posts every approved round of an open review
+right after refreshing the reviews; a round recorded approved wakes it at
+once. Each issue whose line lies inside a
+hunk of the PR's diff (the reviewer's `side`: `RIGHT` numbers the head,
+`LEFT` the base, for removed code) becomes an inline comment; the rest —
+no file or line, or outside every hunk — go into the review's body under
+a header naming the round's `base..head`, and the body carries the
+`<!-- posted by hunter -->` mark. GitHub gets one `pulls/N/reviews` call
+at the round's head commit; GitLab gets one draft note per inline issue
+(positioned on the MR's `diff_refs`) plus one for the body, each marked
+and then published on its own, the body last (not `bulk_publish`, which
+would also publish the operator's own drafts on the MR). GitLab runs a line that
+begins with `/` and a command's name (`/merge`, `/approve`, ...) as a
+quick action under the operator's login, and the reviewer's text quotes
+the PR: every text hunter posts to GitLab, an MR's description included,
+goes out with each such line escaped as `\/`, which Markdown shows as `/`
+and GitLab runs nothing for. The inline comments' ids are
+then read back from the PR, each found by its text as posted (GitHub: the
+review's comments; GitLab: the MR's discussions opened by the login `glab`
+acts as, since publishing gives a note a new id; anybody can copy hunter's
+text, so a note somebody else wrote is never hunter's thread). Comments of
+one text are told apart by the order the post created them in, which the
+forge's ids follow: the newest comments of a text are the post's own, in
+its order, and one an earlier round left with the same text is older. They
+are recorded: a thread is found by its first
+comment's id from then on. A read that fails leaves the review up and the
+round approved with the error, and the next sync reads the ids again
+without posting the review again; a comment the read does not find (it
+lists every one) was deleted, and its thread is recorded *gone*. A round
+counts as posted only once each of its inline comments has its id or is
+gone. A round whose head the PR has since moved past is posted with
+every issue in the body: its lines would land on other code; it names the
+PR's current head, since after a force-push the round's own is no commit
+of the PR and GitHub refuses it. So are the `LEFT` issues of a round
+whose base is not the merge-base it resolved (`merge_base_sha`: they
+number the head an earlier round reviewed, the PR's diff the merge-base;
+an earlier round that ended at the merge-base makes no difference), and
+every issue when the forge will not
+serve the diff (GitHub refuses one past its size limits). A review that
+went up but could not be recorded is recorded on the next sync rather than
+posted again. A GitLab post that failed after publishing some of its
+inline notes records those, and its retry posts only the rest (the
+header still counts every issue). The drafts a GitLab post did not
+publish — it failed, or the daemon stopped mid-post — are the operator
+login's, and their next review by hand would publish them under their
+name: a post marks its review before it creates any, and the sync deletes
+every draft of the login on the MR that carries the mark (the operator's
+own are left alone), right after the failure and on every sync until
+that succeeds; until then the review posts nothing new. A step the
+forge took whose recording then fails (a review, those inline notes, a
+thread's answer, resolve or unresolve) is held in memory and recorded on
+the next sync instead of being taken again: that holds while the daemon
+runs, so only a restart in that window says it twice. A failed
+post keeps its error and is retried on the next sync; after 3 failures
+the round falls back to pending with the error shown, for a user to
+approve again or discard — but once any part of it is on the PR (its
+review, an inline note, an answer in a thread) it is shown *partly
+posted* and can only be approved again: what is on the PR stays said. A
+post that failed while the forge host was unreachable (network gate)
+counts nothing.
+
+Later rounds also judge what earlier ones reported. Before taking the
+clone's permit, a round reads the threads every one of hunter's inline
+comments opened on the PR, settled issues' and older chains' too (GitHub: one GraphQL query of the PR's `reviewThreads`, matched
+by the first comment's id; GitLab: the MR's `discussions`, matched by the
+first note's id). A read lists every thread of the PR (one with more than
+1000 is an error, not a partial read), so a thread of hunter's it does not
+hold was deleted: it is recorded gone, and no later read looks for it. A
+round records each found thread's replies, screened to the authors a
+review trusts: those who can push, configured `reviewBots`, hunter's own
+login, and the PR's author (the request vouched for them). Everyone
+else's replies are only counted. Each reply is dated by when it went out
+on the forge (GitHub's `publishedAt`: a comment written in a pending
+review goes out when the review is submitted, not when it was drafted),
+and a comment still in a pending review is no reply yet: it is neither
+kept nor counted until it is submitted.
+A reply carrying the own-comment mark,
+from hunter's login or a pusher, is shown as hunter's and flagged its own;
+only that flag makes a reply hunter's, so a person whose login is `hunter`
+is answered like anybody, never taken for hunter itself. If a thread hunter
+resolved is found unresolved, a human reopened it and the issue is open
+again. A failed read is logged and the round goes on without replies. The
+reviewer is then shown every earlier issue of the chain, plus any older
+one still open, reopened or rebutted (the author won that point, whatever
+commits came since; an older chain's addressed one is about code the
+new chain replaced, judged afresh) or whose thread hunter has not
+resolved yet, with its id,
+status and replies, and writes a second file of verdicts:
+`addressed` (the code at HEAD fixes it), `rebuttal-accepted` (a reply
+argued it away and the argument checks out against the code; accepted
+only where somebody other than hunter replied) or `open`, each with a
+one-sentence note. An issue it does not name stays as it was — silence
+never resolves anything — and a failed round records no verdict.
+
+Nothing records an issue's status: `pr_review_verdicts` keeps every
+round's verdicts and notes, and the status is derived from them (the
+`pr_review_issue_state` view): the newest verdict of a round not
+discarded — `addressed`, `rebutted` or `open` — or *reopened* once a human
+reopened a thread hunter had resolved, which voids every verdict given
+over the thread as it stood before: a verdict counts only while no reopen
+was recorded since its round read the issues, so one the PR sync records
+while the reviewer runs voids that round's verdict on the issue. The
+issue stays *reopened* until a round that read the reopen judges it,
+whatever the verdict: `open` too answers the reopen. A verdict counts over
+the replies it was shown as well, and only those: each keeps the newest
+reply by somebody other than hunter its round saw (`seen_reply_at`), and a
+newer one in a thread hunter has not resolved leaves the issue awaiting
+judgment again, whatever the verdict said. Discarding a round therefore takes its verdicts back, and what they saw, with nothing
+to undo. What hunter has said in each thread is recorded instead: its
+standing answer (the verdict of its newest reply there), the newest reply
+it answered, and whether it resolved the thread. A post makes every
+thread of an issue its round judged or reported show that issue's newest
+*released* verdict — of a round approved, posted, landed in part, or with
+nothing to post — and does only what the thread lacks: a settled issue
+gets a reply ("Addressed in `<head>`: <note>" or "Rebuttal accepted:
+<note>", marked as hunter's) and its thread is resolved (GitHub: a REST
+reply under the thread's first comment, `POST
+…/pulls/:n/comments/:id/replies`, which publishes at once — GraphQL's
+`addPullRequestReviewThreadReply` would drop it into the operator's
+pending review, if they have one open, unseen while hunter counts it said;
+with such a review open GitHub refuses the REST reply, and the post is
+retried — then `resolveReviewThread`; GitLab: a
+discussion note and `PUT …/discussions/:id?resolved=true`); an issue
+found open again after hunter settled it (the fix was reverted) gets "Open
+again at `<head>`: <note>" and its thread is unresolved; an open issue
+whose thread, as the round was shown it, ended in somebody's reply (not
+hunter's) gets "Still open: <note>" and its thread stays open, so a
+rebuttal gets an answer either way. A round with such a verdict has
+something to post when the issue went out inline or its round is still
+to be posted. So rounds that waited for approval post in any order
+without contradicting each other: an older round posted after a newer
+one says the newer one's verdict, the same answer is never said twice
+(two rounds answering the same reply answer it once), and an issue a
+later round settled while its own round waited is answered and resolved
+in the thread its own round's review opens. Only threads hunter opened
+are ever answered or resolved, and each is found afresh, by its first
+comment, on one read of every thread of the PR at post time — never by an
+id kept from an earlier read, so a thread deleted since is recorded gone
+and skipped, and the post goes on with the rest. A thread that read finds
+holding news the verdict's round was not shown — a reply that would make
+a round due, by the same rule (below) — is left as it is — no "Rebuttal
+accepted" or resolution over an objection nobody judged — and the reply
+makes the next round due. Each step is recorded as it lands, so a
+post that failed partway retries only what is missing; a failed post
+counts toward the round's 3 attempts like any other. So does a resolve or
+unresolve the forge fails, whatever it answers (GitHub's secondary rate
+limit is a 403): hunter's login can push, so the forge never refuses it a
+thread's resolution for want of access, and the retry takes up where the
+post stopped. A forge call that failed may still have acted (a timeout,
+a 5xx after the write), so a retry never takes a step again on the
+strength of the failure alone: each answer and each review carries a
+hidden mark naming its round, and the retry looks for it first — the
+answer in the thread it reads anyway, the review among the PR's reviews
+(GitHub) or notes (GitLab) by the operator's login, read only when an
+earlier post sent it (`review_sent_at`) — and records what it finds
+instead of saying it twice; a thread already showing the resolution a
+step wants is recorded so, not set again.
+
+Watch also acts on replies and reopens alone. For every watched open
+review with posted issues, the PR sync reads their threads (one GraphQL
+query or `discussions` read per review, as a round does; a review with
+none costs no call), so a thread hunter resolved that a human reopened
+reopens its issue without waiting for a push. It records the screened
+replies on the issues, with the newest by a trusted author other than
+hunter (`newest_reply_at`). An issue *awaits judgment* (`awaits_since`,
+derived in the `pr_review_issue_state` view) while it holds news no
+verdict was given over: a reopen no round judged since, or a reply newer
+than the newest one its newest verdict was shown — any reply, on an issue
+no round judged — unless hunter's own resolution of the thread stands: a
+reply under it asks for nothing (one that disagrees reopens the thread),
+while one in a thread somebody else resolved is news all the same
+(GitLab's *Comment & resolve thread* is a rebuttal and a resolution in
+one action). The post's check above is this rule over its own read. An
+issue a reviewer left out stays as it was, never settled by
+silence, and its news still awaits; so does every issue of a round whose
+verdict file is missing or unreadable, which records none. While the
+PR's head is still the reviewed one, a watched review with an issue
+awaiting judgment is due once the newest such news has been quiet for 2
+minutes (`REPLY_QUIET_MS`; a burst of replies is one round). That round
+has no commits to review (`base == head`, shown as *re: replies*): the
+reviewer is told so, judges the earlier issues against their replies and
+the code, and reports a new issue only if a reply reveals one. Only a
+verdict on an issue awaiting judgment is progress, so a round of this
+kind that gives none — no readable verdict file, every such issue left
+out, or stopped by its cap before judging one — fails toward the hold
+rather than being due again at once with the same prompt; one stopped
+after judging some is kept (as partial, counting toward the hold), and
+the rest still await. It records its verdicts and is posted like any
+round, and leaves `last_reviewed_sha` where it was. What makes a round
+one for replies is why it is due — the head is the reviewed one — never
+an empty range: a round for a new head is that head's. A head with no
+commits past its base (a first round of a PR without any, or a watched
+PR force-pushed back to its merge-base, whose earlier issues wait for
+code, a reply or a reopen) runs no reviewer and is recorded as an empty
+successful round, so the head does not keep the review due; news
+awaiting judgment stays so and, the head being reviewed, brings a round
+for it alone. A new head with pending replies is one ordinary round,
+which reads the replies as well; a round that finds the head moved since
+the pick skips, and the new head waits out its stability window. A round
+reviews exactly the head the forge reported: when the fetched
+`refs/pull/N/head` (`refs/merge-requests/N/head`), which the forge
+updates some time after a push, still names another commit, the round
+fails as a failed fetch does and is retried after the error backoff,
+never reviewing or recording that other commit. A forge error in the
+sync's read is logged and changes nothing; failed rounds, holds, and
+budget or offline denials count as for any round.
+
 ## Web UI
 
 Served at `http://localhost:8377` (configurable). Left-nav pages:
@@ -489,6 +789,7 @@ Served at `http://localhost:8377` (configurable). Left-nav pages:
 | **Kanban / Pipeline** | Findings in flight in foldable columns (folds remembered per browser), a **Held** column with held findings (why each is held, the report, and its Continue/Restart/... controls), a Held scans section for repos with held work, suppressed (rejected/wontfix), and informational (note) findings |
 | **All Findings** | Every finding, filterable by repo/type/status/severity, with full detail (jobs, PR state, timeline) on expand, and the actions its status allows (verdicts on new/note/closed, releases of held work, Recheck on new, Unqueue on queued, budget override while something will still pick it) |
 | **Repos** | Add/remove/pause repos; each repo's held scans and failing sync with why and the way out (**Continue**, **Restart**; **Retry now** for a held sync), and the scans failing without a hold yet; queue a full re-hunt (the next hunt reviews the repo's complete history instead of only new commits — the same scope as the periodic `hunt.rehuntDays` re-hunt — and the request stays pending until such a hunt finishes cleanly); per-repo notes (free-text context injected into every prompt for that repo — coding conventions, known false positives, anything worth a hunter remembering across runs) |
+| **Reviews** | Reviews of PRs hunter did not open: request one by URL or number, or pick from the repo's open PRs (with **Watch**, every new head is reviewed again once it has been stable for 10 minutes, and replies or reopened threads no round has judged bring a round of their own, shown as *N issues to judge again — review queued* with the time of the newest such news; with **Post automatically**, rounds go to the PR without approval); authors who cannot push need a vouch; each review's state, auto-post toggle, rounds (base..head, or *re: replies* for a round without new commits; verdict, issue, resolution and answer counts, post state with **Post to PR** / **Discard** for a pending one (*partly posted* and no **Discard** once part of it is on the PR) and the last post error) and issues (marked *inline* once posted as a diff comment; status open / addressed / rebuttal accepted / reopened, the newest verdict's note, *resolved on forge* once hunter answered and resolved the thread, and the thread's screened replies with a count of hidden ones), with **Retry** for one held after 3 failed rounds |
 | **Stats** | Aggregate totals by kind and by finding type |
 | **Log** | Full job and event history |
 
@@ -580,6 +881,14 @@ answers `401 {"error": "login required"}` without a live session cookie.
 | POST | `/api/repo/delete` | Remove a repo |
 | POST | `/api/repo/rehunt` | Queue a full re-hunt of a repo |
 | POST | `/api/repo/notes` | Append a note to a repo |
+| GET | `/api/repo/open-prs` | A repo's open PRs from its forge (`id`), marked when hunter opened them or a review exists |
+| GET | `/api/pr-reviews` | Requested PR reviews with their rounds and issues, newest request first |
+| POST | `/api/pr-review` | Request a review (`{"repo_id", "pr": URL or number, "watch", "auto_post"?, "vouch"?}`); 409 `needs_vouch` when the author cannot push, 409 for hunter's own PR; for an existing review, sets its `watch` and `auto_post` |
+| POST | `/api/pr-review/watch` | Turn a review's Watch on or off (`{"id", "watch"}`); on also clears a hold |
+| POST | `/api/pr-review/retry` | Clear a review's failures and hold (`{"id"}`) |
+| POST | `/api/pr-review/auto-post` | Post a review's future rounds without approval, or stop (`{"id", "auto_post"}`) |
+| POST | `/api/pr-review/post` | Approve a pending round for posting (`{"round_id"}`), also after failed posts (clears the error); wakes the PR sync; 409 unless pending and the PR open |
+| POST | `/api/pr-review/discard` | Never post a pending round (`{"round_id"}`); 409 unless pending, or once part of it is on the PR |
 
 ## Architecture
 
@@ -640,6 +949,31 @@ for the schema — most columns carry comments explaining *why*, not just *what*
 - **`pr_state`** — one row per finding with an open/merged PR: forge state,
   attention fingerprint + suppression marker (state-based, see § PR
   follow-up loop), harvest tracking.
+- **`pr_reviews`**, **`pr_review_rounds`**, **`pr_review_issues`**,
+  **`pr_review_verdicts`** — requested reviews of PRs hunter did not open
+  (PR, the repo URL it was requested under and its binding to it, author,
+  Watch, auto-post, vouch, newest and last reviewed head,
+  whether a request still awaits its round, failure streak and hold, and
+  whether a post may have left drafts on the PR), each attempt's
+  `base..head` (equal for a round run for replies and reopens alone) with
+  the merge-base it resolved and the binding it ran under,
+  verdict (`ok`, `partial`: stopped before it finished, or `failed`) and
+  post state (`pending`, `approved`, `posted`,
+  `discarded`; error, attempts, posted time, when a post last sent its
+  review, the forge's review id, and
+  when part of it first landed on the PR), the
+  issues a round reported (with the `side` their line numbers; once posted
+  inline, the comment's forge id once read back and when its thread was
+  found gone, the thread's screened replies with their times and hidden
+  count, the newest trusted reply in it, and
+  what hunter said there: its standing answer, the newest reply it
+  answered, when it resolved the thread, or saw it reopened), and each
+  later round's verdict and note per earlier issue, with the newest reply
+  and the reopen it was given over and the reply it answers when the
+  thread awaited one. An issue's status is not stored: the
+  `pr_review_issue_state` view derives it, the verdict its thread is to
+  show and whether it awaits judgment, from the verdicts.
+  `jobs.pr_review_id` names the review a `pr_review` job ran for.
 - **`window_log`** — mirror of budget observations at decision time.
 - **`calibration_samples`** — empirical tokens-spent → used-fraction-moved
   correlation, informational only (estimates real remaining capacity;
@@ -786,7 +1120,8 @@ table created by hand beforehand makes the migration fail at startup.
 It idles at zero token cost between cycles and wakes on a smart-sleep
 policy: right after a job with more queued work → drain immediately;
 budget denied → short retry if the ramp is actively rising, otherwise sleep
-to the window reset; genuinely idle → 15 minutes. PR-comment polling is
+to the window reset; genuinely idle → 15 minutes, or until the next PR
+review round comes due, if sooner. PR-comment polling is
 decoupled from the token-budget backoff loop, so a long budget-driven sleep
 never delays noticing new PR feedback. Every wake re-checks the budget gate
 before spending anything, and starts no job while the filesystem holding

@@ -9,6 +9,7 @@ use std::hash::BuildHasher;
 use std::path::Path;
 
 use crate::forge::{CodeLocation, GhAuthor, OWN_MARK, PrView, Voice};
+use crate::store::EarlierIssue;
 use crate::types::{Finding, PrState, Repo};
 
 /// `PLAYBOOK_DIR` = <`project_root>/playbooks` (types.py `PLAYBOOK_DIR`).
@@ -497,6 +498,89 @@ pub fn build_review_prompt(
     slots.insert("OUT_PATH", out_path.display().to_string());
     slots.insert("REPO_NAME", repo.name.clone());
     slots.insert("REPO_NOTES", notes);
+    render(&template, &slots)
+}
+
+/// What a PR review prompt names about the reviewed pull request.
+#[derive(Debug, Clone, Copy)]
+pub struct PrUnderReview<'a> {
+    pub number: i64,
+    pub title: &'a str,
+    pub body: &'a str,
+    pub author: &'a str,
+}
+
+/// Where a PR reviewer writes: its new issues, and its verdicts on the
+/// earlier ones. Both outside the tree it reviews.
+#[derive(Debug, Clone, Copy)]
+pub struct ReviewOutputs<'a> {
+    pub issues: &'a Path,
+    pub earlier: &'a Path,
+}
+
+/// What a PR review round for replies alone is told
+/// (`{{REPLIES_ONLY}}`): there is no diff, and the round is about the
+/// replies and reopened threads. Empty for a round with new commits.
+pub const REPLIES_ONLY: &str = "\
+THIS ROUND HAS NO NEW COMMITS: HEAD is the head the previous round reviewed,
+so the diff is empty. It runs because people replied in, or reopened, the
+threads of the earlier issues below since a round last judged them. Judge
+every earlier issue against its replies and the code at HEAD; that is the
+whole job. Report a new issue only if a reply reveals one you can prove in
+the code; otherwise leave the issues file `[]`, which is a valid verdict.";
+
+/// The prompt of a review of somebody else's PR (`pr_review.md`): a fresh
+/// session that reviews `<base>..HEAD` in `worktree`, the PR's head, and
+/// writes its issues and its verdicts on `earlier` to `out`. `earlier` is
+/// what earlier rounds of the chain reported (none on the first), with
+/// each issue's id, status and the screened replies in its thread, so an
+/// incremental round does not report them again and can judge them.
+/// Without `new_commits` (`base` is the head) the round ran for replies
+/// alone, and is told so ([`REPLIES_ONLY`]).
+///
+/// The earlier issues go in as one JSON document: replies are other
+/// people's text, and JSON escaping keeps every line break and quote of
+/// theirs inside a string, where it cannot end the block or pass for
+/// prompt text.
+pub fn build_pr_review_prompt(
+    root: &Path,
+    repo: &Repo,
+    repo_notes: &str,
+    worktree: &Path,
+    base: &str,
+    pr: PrUnderReview<'_>,
+    out: ReviewOutputs<'_>,
+    earlier: &[EarlierIssue],
+    new_commits: bool,
+) -> Result<String> {
+    let notes = notes_or_default(repo_notes, "(No notes yet)");
+    let template = read_template(root, "pr_review.md")?;
+    let mut slots = HashMap::new();
+    slots.insert("REPO_NAME", repo.name.clone());
+    slots.insert("REPO_NOTES", notes);
+    slots.insert("WORKTREE", worktree.display().to_string());
+    slots.insert("BASE", base.to_owned());
+    slots.insert("PR_NUMBER", pr.number.to_string());
+    slots.insert("PR_TITLE", pr.title.to_owned());
+    slots.insert(
+        "PR_BODY",
+        if pr.body.is_empty() {
+            "(no description)".to_owned()
+        } else {
+            pr.body.to_owned()
+        },
+    );
+    slots.insert("PR_AUTHOR", pr.author.to_owned());
+    slots.insert("OUT_PATH", out.issues.display().to_string());
+    slots.insert("EARLIER_OUT", out.earlier.display().to_string());
+    slots.insert(
+        "EARLIER_ISSUES",
+        serde_json::to_string_pretty(earlier).context("serializing the earlier issues")?,
+    );
+    slots.insert(
+        "REPLIES_ONLY",
+        if new_commits { "" } else { REPLIES_ONLY }.to_owned(),
+    );
     render(&template, &slots)
 }
 
