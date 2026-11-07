@@ -720,13 +720,22 @@ fn with_follow_ups(ending: &mut Ending, follow_ups: &[serde_json::Value]) {
 /// The saved verdict ([`ENDING_FILE`]), if it covers `start`'s tree
 /// exactly as it is now.
 async fn saved_ending(start: &FixStart) -> Option<Ending> {
-    let saved = read_json::<Saved>(&start.ws.root.join(ENDING_FILE))?;
-    let covers = saved.tree.head.is_some() && saved.tree == tree_state(&start.ws.tree).await;
-    covers.then_some(Ending {
+    let saved = covering_verdict(&start.ws).await?;
+    Some(Ending {
         note: saved.note,
         head: None,
         title: saved.title,
     })
+}
+
+/// The verdict saved in `ws` ([`ENDING_FILE`]), if it covers its tree
+/// exactly as it is now. A file left from a verdict whose tree has since
+/// changed (a rejected curation that could not be undone, which pins the
+/// reviewed commit instead) covers nothing.
+async fn covering_verdict(ws: &Workspace) -> Option<Saved> {
+    let saved = read_json::<Saved>(&ws.root.join(ENDING_FILE))?;
+    let covers = saved.tree.head.is_some() && saved.tree == tree_state(&ws.tree).await;
+    covers.then_some(saved)
 }
 
 /// End the loop's files. Its progress is reset to round 0, keeping the
@@ -789,6 +798,13 @@ pub(super) async fn keep_for_publish(start: &FixStart, ending: &Ending) {
     if ending.head.is_none() {
         save_ending(start, ending).await;
     }
+}
+
+/// Whether `ws` holds a saved verdict that covers its tree as it is now
+/// ([`covering_verdict`]): a kept fix's retry then ships on it without a
+/// review.
+pub(super) async fn has_kept_verdict(ws: &Workspace) -> bool {
+    covering_verdict(ws).await.is_some()
 }
 
 /// In the workspace root: the review stop a hold was made for ([`Held`]),
