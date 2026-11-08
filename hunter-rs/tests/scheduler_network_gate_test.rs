@@ -279,6 +279,141 @@ async fn reachable_hosts_let_the_candidate_run() {
     assert_eq!(backend.runs().len(), 1, "the worker ran");
 }
 
+/// A second enabled repo, `beta`, cloned at `url` and due for a `test_gap`
+/// scan just like the fixture's `alpha`, which is ahead of it in the
+/// rotation. The returned directory holds beta's origin.
+async fn add_beta(dir: &TempDir, store: &Store, url: &str) -> TempDir {
+    let remote = TempDir::new("net-beta-origin");
+    let repo = GitRepo::with_branch(&remote, "feature");
+    let clone = dir.path().join("repo-2");
+    std::fs::rename(&repo.work, &clone).unwrap();
+    let origin = repo.origin.to_string_lossy().to_string();
+    support::git(&clone, &["remote", "set-url", "origin", url]);
+    support::git(&clone, &["config", &format!("url.{origin}.insteadOf"), url]);
+    let alpha = store.get_repo_by_id(1).await.unwrap().unwrap();
+    // The fixture's database, which `fixture` seeded the same way.
+    let pool = sqlx::SqlitePool::connect_with(
+        sqlx::sqlite::SqliteConnectOptions::new().filename(dir.join("net.db")),
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO repos \
+         (id, name, url, path, forge, default_branch, enabled, added_at, \
+          last_hunt_at, last_test_gap_at, last_dep_update_at, last_refactor_at, \
+          last_modernization_at, last_standards_at, last_simplification_at) \
+         VALUES (2, 'beta', ?1, ?2, 'github', 'main', 1, 1000, ?3, ?4, ?3, ?3, ?3, ?3, ?3)",
+    )
+    .bind(url)
+    .bind(clone.to_string_lossy().to_string())
+    .bind(alpha.last_hunt_at)
+    .bind(LAST_TEST_GAP_AT)
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    remote
+}
+
+/// One repo's forge unreachable while another's answers, with the provider
+/// up: the cycle passes over the unreachable repo's work to the next
+/// candidate instead of being denied, cycle after cycle, for a host the
+/// other repo never needed. This machine is online; only that forge is not.
+#[tokio::test]
+async fn an_unreachable_forge_does_not_block_another_repos_work() {
+    const OTHER: &str = "other.example";
+    let (dir, store, cfg) = fixture("net-one-forge-down", &forge_url(FORGE), true).await;
+    let _beta_origin = add_beta(&dir, &store, &forge_url(OTHER)).await;
+    let backend = ScriptedBackend::noop()
+        .needing(&[PROVIDER])
+        .offline(&[FORGE]);
+
+    let summary = run_cycle(&mut support::jobs(&store), &cfg, &backend, None).await;
+
+    assert_eq!(summary.denied, None, "{summary:?}");
+    assert_eq!(summary.repo.as_deref(), Some("beta"), "{summary:?}");
+    assert_eq!(backend.runs().len(), 1, "beta's scan ran");
+    let alpha = store.get_repo_by_id(1).await.unwrap().unwrap();
+    assert_eq!(
+        alpha.last_test_gap_at,
+        Some(LAST_TEST_GAP_AT),
+        "alpha's scan, passed over, has not had its turn"
+    );
+    let events = store.recent_events(20).await.unwrap();
+    let passed_over = format!("offline: {FORGE} unreachable; passed over test_gap on alpha");
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "deny" && e.message == passed_over),
+        "the work passed over is named, with the host it waits for: {events:?}"
+    );
+}
+
+/// The forge and the provider both down, as on a laptop with no network:
+/// the forge is the first host the gate finds unreachable, but no other
+/// repo's work could run either. The cycle is one denial, as before the
+/// pass-over, with no work passed over and no event for it.
+#[tokio::test]
+async fn an_offline_machine_passes_nothing_over() {
+    const OTHER: &str = "other.example";
+    let down = FORGE.to_owned();
+    let (dir, store, cfg) = fixture("net-all-down", &forge_url(FORGE), true).await;
+    let _beta_origin = add_beta(&dir, &store, &forge_url(OTHER)).await;
+    let backend = ScriptedBackend::new(|_| panic!("no worker may start offline"))
+        .needing(&[PROVIDER])
+        .offline(&[FORGE, OTHER, PROVIDER]);
+
+    let before = hunter::util::now_ms();
+    let summary = run_cycle(&mut support::jobs(&store), &cfg, &backend, None).await;
+
+    assert_denied_for(&store, &summary, &down, before).await;
+    let denials: Vec<_> = store
+        .recent_events(20)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "deny")
+        .map(|e| e.message)
+        .collect();
+    assert_eq!(
+        denials,
+        [format!("offline: {down} unreachable")],
+        "one denial, nothing passed over"
+    );
+}
+
+/// Work passed over for its unreachable forge, and the next candidate
+/// denied by the budget: the cycle ends on that budget denial, which may
+/// have no estimate (30 minutes) or one an hour away. The work passed
+/// over still waits only on the network, so the lane looks again within
+/// the gate's three minutes, as it would had that work been denied
+/// itself.
+#[tokio::test]
+async fn work_passed_over_is_looked_at_again_after_a_budget_denial() {
+    const OTHER: &str = "other.example";
+    let (dir, store, cfg) = fixture("net-pass-then-budget", &forge_url(FORGE), true).await;
+    let _beta_origin = add_beta(&dir, &store, &forge_url(OTHER)).await;
+    let backend = ScriptedBackend::new(|_| panic!("the budget denies every worker"))
+        .needing(&[PROVIDER])
+        .offline(&[FORGE])
+        .denying_above(-1);
+
+    let summary = run_cycle(&mut support::jobs(&store), &cfg, &backend, None).await;
+
+    assert!(
+        summary
+            .denied
+            .as_deref()
+            .is_some_and(|d| d.contains("does not fit")),
+        "beta's scan, picked after alpha's was passed over, is denied by the budget: {summary:?}"
+    );
+    let sleep_s = hunter::daemon::compute_sleep_s(&store, &summary).await;
+    assert!(
+        sleep_s <= 3.0 * 60.0 + 30.0,
+        "the lane looks again when the network gate would, not after {sleep_s} s: {summary:?}"
+    );
+}
+
 /// With `network.gate` off nothing is probed: a machine that reaches its
 /// hosts only through a proxy would otherwise never run anything.
 #[tokio::test]
