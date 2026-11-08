@@ -152,11 +152,17 @@ impl Fixture {
 
 /// A GitHub repo and one `pr_open` finding pointing at [`PR_URL`].
 async fn fixture(label: &str) -> Fixture {
+    fixture_on(label, ForgeName::Github, REPO_URL, PR_URL).await
+}
+
+/// A repo on `forge` at `repo_url` and one `pr_open` finding pointing at
+/// `pr_url`.
+async fn fixture_on(label: &str, forge: ForgeName, repo_url: &str, pr_url: &str) -> Fixture {
     let dir = TempDir::new(label);
     let (db, store) = fresh_store(&dir, "sync").await;
     let repos_root = dir.subdir("repos");
     let rid = store
-        .add_repo("widget", REPO_URL, &repos_root, "main", ForgeName::Github)
+        .add_repo("widget", repo_url, &repos_root, "main", forge)
         .await
         .unwrap();
     let (fid, _) = store
@@ -175,7 +181,7 @@ async fn fixture(label: &str) -> Fixture {
         )
         .await
         .unwrap();
-    store.set_finding_pr_open(fid, PR_URL).await.unwrap();
+    store.set_finding_pr_open(fid, pr_url).await.unwrap();
     let mut cfg = support::load_config(dir.path());
     cfg.work_root = dir.subdir("work_root");
     Fixture {
@@ -730,6 +736,57 @@ async fn activity_after_the_watermark_is_new_comments() {
     assert!(ps.attention_since.unwrap() >= before, "{ps:?}");
     // Comments are not a static reason, so nothing is fingerprinted.
     assert_eq!(ps.attention_fingerprint, None);
+}
+
+/// A GitLab MR's notes are a second request, and the sync view tolerates
+/// it failing: the MR's state is still worth having. The notes are then
+/// unknown, not absent, so a pass that cannot read them leaves the
+/// activity recorded before, and the `new_comments` it raised, as they
+/// were. Taken for an empty thread, the activity dropped to 0, the flag
+/// cleared, and the next good pass raised it again with a fresh
+/// `attention_since`, at the back of the attention order.
+#[tokio::test]
+async fn a_gitlab_pass_that_cannot_read_the_notes_keeps_the_recorded_activity() {
+    const GL_REPO_URL: &str = "https://gitlab.com/acme/widget";
+    const GL_MR_URL: &str = "https://gitlab.com/acme/widget/-/merge_requests/7";
+    const MR: &str = r#"{"state":"opened","detailed_merge_status":"mergeable","source_branch":"fix/some-bug","sha":"deadbeef","updated_at":"2026-01-02T03:04:05Z","title":"t","description":"d","head_pipeline":{"status":"success"}}"#;
+    let f = fixture_on(
+        "sync-gl-notes-down",
+        ForgeName::Gitlab,
+        GL_REPO_URL,
+        GL_MR_URL,
+    )
+    .await;
+    let bins = FakeBins::acquire("sync-gl-notes-down");
+    let serve_mr = |notes: &str| {
+        bins.script(
+            "glab",
+            &format!(
+                "case \"$*\" in\n\
+                 \x20 *members/all/5*) echo '{{\"access_level\":30}}'; exit 0 ;;\n\
+                 \x20 *notes*) {notes} ;;\n\
+                 esac\n\
+                 cat <<'__MR_EOF__'\n{MR}\n__MR_EOF__\nexit 0"
+            ),
+        );
+    };
+    serve_mr(
+        r#"echo '[{"body":"please rename","created_at":"2026-01-02T04:00:00Z","author":{"id":5,"username":"dev"}}]'; exit 0"#,
+    );
+    let first = f.sync().await;
+    assert_eq!((first.synced, first.attention), (1, 1), "{first:?}");
+    let flagged = f.pr_state().await;
+    assert_eq!(flagged.last_activity_at, Some(LATER_MS));
+    assert_eq!(flagged.needs_attention.as_deref(), Some("new_comments"));
+
+    serve_mr("echo 'notes endpoint is down' >&2; exit 1");
+    let second = f.sync().await;
+
+    assert_eq!((second.synced, second.errors), (1, 0), "{second:?}");
+    let ps = f.pr_state().await;
+    assert_eq!(ps.last_activity_at, Some(LATER_MS), "{ps:?}");
+    assert_eq!(ps.needs_attention.as_deref(), Some("new_comments"));
+    assert_eq!(ps.attention_since, flagged.attention_since);
 }
 
 // ---------------------------------------------------------------------------
