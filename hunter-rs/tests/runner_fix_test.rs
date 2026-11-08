@@ -3410,6 +3410,20 @@ async fn continuing_a_held_refused_fix_does_not_wait() {
         ReleaseAction::Continue,
     )
     .await;
+    // Released the very millisecond the refusal ended: still since then.
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    sqlx::query(
+        "UPDATE work_holds SET released_at = (SELECT finished_at FROM jobs WHERE id = ?1)
+         WHERE finding_id = ?2",
+    )
+    .bind(refused.job_id)
+    .bind(f.fid)
+    .execute(&pool)
+    .await
+    .unwrap();
 
     let plan = pending_resume(&f).await;
     assert_eq!(Some(plan.predecessor_id()), refused.job_id);
@@ -3682,31 +3696,12 @@ async fn publishes_past_a_down_forge(overridden_first: bool) {
     bins.ok("gh", "https://github.com/acme/widget/pull/42");
     let mut f = fixture(&label).await;
     review_on(&mut f, 3);
-    // A second repo on another forge, sharing the fixture's clone, owns
-    // the fixture's bystander, the older finding.
-    let gitlab = "git@gitlab.example.com:acme/other.git";
-    let repos_root = f.repo_dir.parent().unwrap().to_path_buf();
-    let rid = f
-        .store
-        .add_repo("other", gitlab, &repos_root, "main", ForgeName::Gitlab)
-        .await
-        .unwrap();
-    std::os::unix::fs::symlink(
-        &f.repo_dir,
-        hunter::store::Store::repo_dir(&repos_root, rid),
-    )
-    .unwrap();
+    let gitlab = bystander_on_gitlab(&f).await;
     let older = f.fid - 1;
     let pool =
         sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
             .await
             .unwrap();
-    sqlx::query("UPDATE findings SET repo_id = ?1 WHERE id = ?2")
-        .bind(rid)
-        .bind(older)
-        .execute(&pool)
-        .await
-        .unwrap();
     f.store
         .set_finding_status(older, hunter::domain::FindingStatus::Queued)
         .await
@@ -3764,6 +3759,34 @@ async fn publishes_past_a_down_forge(overridden_first: bool) {
     drop(bins);
 }
 
+/// The GitLab URL of a second repo on another forge, sharing the
+/// fixture's clone, which now owns the fixture's bystander.
+async fn bystander_on_gitlab(f: &Fixture) -> &'static str {
+    let gitlab = "git@gitlab.example.com:acme/other.git";
+    let repos_root = f.repo_dir.parent().unwrap().to_path_buf();
+    let rid = f
+        .store
+        .add_repo("other", gitlab, &repos_root, "main", ForgeName::Gitlab)
+        .await
+        .unwrap();
+    std::os::unix::fs::symlink(
+        &f.repo_dir,
+        hunter::store::Store::repo_dir(&repos_root, rid),
+    )
+    .unwrap();
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    sqlx::query("UPDATE findings SET repo_id = ?1 WHERE id = ?2")
+        .bind(rid)
+        .bind(f.fid - 1)
+        .execute(&pool)
+        .await
+        .unwrap();
+    gitlab
+}
+
 /// File a fresh fix in the fixture's repo, queued and with a `once`
 /// override: ranked above every other finding's work.
 async fn queue_overridden_fix(f: &Fixture) {
@@ -3793,6 +3816,167 @@ async fn queue_overridden_fix(f: &Fixture) {
         .set_budget_override(first, Some(hunter::domain::BudgetOverride::Once))
         .await
         .unwrap();
+}
+
+/// A denied or idle cycle that ran no free retry says when one could run
+/// (`kept_retry_at`), so the job lane does not sleep past it. Two kept
+/// fixes wait out their refusals, the bystander's ending a minute sooner,
+/// and a fresh fix with a `once` override is the pick:
+/// - `waiting`, the budget spent: when the bystander's wait ends, also
+///   when the cycle is forced onto their repo;
+/// - `held`, the bystander held: when the fixture's own wait ends;
+/// - `forge down`, the budget spent and the bystander's wait over, free,
+///   but on a GitLab that is down: when an offline cycle looks again,
+///   sooner than the fixture's wait ends;
+/// - `idle`, no fresh fix and every repo disabled: nothing to pick, and
+///   when the bystander's wait ends.
+#[tokio::test]
+async fn a_cycle_says_when_a_kept_fix_can_retry() {
+    for case in ["waiting", "held", "forge down", "idle"] {
+        let label = format!("fix-kept-retry-at-{}", case.replace(' ', "-"));
+        let bins = support::FakeBins::acquire(&label);
+        let mut f = fixture(&label).await;
+        review_on(&mut f, 3);
+        let aged = if case == "forge down" {
+            bystander_on_gitlab(&f).await;
+            24 * 60 * 60_000
+        } else {
+            60_000
+        };
+        let ends = refuse_both(&f, aged).await;
+        if case == "held" {
+            hold_bystander(&f).await;
+        }
+        if case == "idle" {
+            disable_repos(&f).await;
+        } else {
+            queue_overridden_fix(&f).await;
+        }
+        f.cfg.network_gate = true;
+        let spent = reviewed_worker(vec![]).offline(&["gitlab.example.com"]);
+        let spent = if case == "idle" {
+            spent
+        } else {
+            spent.denying_above(-1)
+        };
+        let force = (case == "waiting").then_some("widget");
+
+        let before = hunter::util::now_ms();
+        let summary =
+            hunter::scheduler::run_cycle(&mut support::jobs(&f.store), &f.cfg, &spent, force).await;
+        let after = hunter::util::now_ms();
+
+        assert_eq!(
+            summary.denied.is_some(),
+            case != "idle",
+            "{case}: {summary:?}"
+        );
+        assert_eq!(summary.unreachable, None, "{case}: {summary:?}");
+        let at = summary.kept_retry_at;
+        match case {
+            "waiting" | "idle" => assert_eq!(at, Some(ends[0]), "{case}: {summary:?}"),
+            "held" => assert_eq!(at, Some(ends[1]), "{case}: {summary:?}"),
+            _ => {
+                let three_min = 3 * 60_000;
+                assert!(ends[1] > after + three_min);
+                assert!(
+                    at.is_some_and(|t| (before + three_min..=after + three_min).contains(&t)),
+                    "{case}: {summary:?}"
+                );
+            }
+        }
+        drop(bins);
+    }
+}
+
+/// Hold the fixture's bystander's fix on its checkpoint.
+async fn hold_bystander(f: &Fixture) {
+    let older = f.fid - 1;
+    let checkpoint = f
+        .store
+        .checkpoint_job(older, FindingJobKind::Fix)
+        .await
+        .unwrap()
+        .map(|j| j.id);
+    let held = support::scope(&f.store)
+        .store()
+        .hold_work(
+            older,
+            FindingJobKind::Fix,
+            HoldReason::Stuck,
+            "held",
+            checkpoint,
+        )
+        .await
+        .unwrap();
+    assert!(held);
+}
+
+/// Take every repo out of the rotation.
+async fn disable_repos(f: &Fixture) {
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    sqlx::query("UPDATE repos SET enabled = 0")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+/// Queue the fixture's bystander and have the forge refuse both fixes,
+/// the bystander's ended `aged` ms ago and the fixture's just now: when
+/// each one's wait ends, the bystander's first.
+async fn refuse_both(f: &Fixture, aged: i64) -> [i64; 2] {
+    let older = f.fid - 1;
+    f.store
+        .set_finding_status(older, hunter::domain::FindingStatus::Queued)
+        .await
+        .unwrap();
+    let nowhere = f.cfg.work_root.join("refusing.git");
+    route_push(f, Some(&nowhere.to_string_lossy()));
+    // The bystander's repo may be on GitLab (`bystander_on_gitlab`).
+    let refusing = format!("url.{}.insteadOf", nowhere.display());
+    git(
+        &f.repo_dir,
+        &[
+            "config",
+            &refusing,
+            "git@gitlab.example.com:acme/other.git",
+            "--add",
+        ],
+    );
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    let mut ends = [0; 2];
+    for (end, (fid, aged)) in ends.iter_mut().zip([(older, aged), (f.fid, 0)]) {
+        let finding = f.store.get_finding(fid).await.unwrap().unwrap();
+        let refused = hunter::scheduler::run_fix(
+            &support::scope(&f.store),
+            f.store.test_lane(),
+            &f.cfg,
+            Attempt::Cold(&finding),
+            &reviewed_worker(vec![Act::Fix, Act::Review(CLEAN)]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(refused.outcome.as_deref(), Some("requeued"), "{refused:?}");
+        (*end,) = sqlx::query_as::<_, (i64,)>(
+            "UPDATE jobs SET finished_at = finished_at - ?1 WHERE id = ?2
+             RETURNING finished_at + ?3",
+        )
+        .bind(aged)
+        .bind(refused.job_id)
+        .bind(hunter::scheduler::PUBLISH_RETRY_MS)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    }
+    let key = format!("url.{}.insteadOf", nowhere.display());
+    git(&f.repo_dir, &["config", "--unset-all", &key]);
+    ends
 }
 
 /// The status page previews a kept fix whose retry costs no model tokens

@@ -1197,27 +1197,68 @@ fn kept_to_publish_patterns() -> Vec<String> {
         .collect()
 }
 
-/// Whether `job`, a checkpoint, is an attempt whose publishing the forge
-/// refused ([`publish_refused`]) less than [`publish_retry_wait`] of its
-/// streak ago, and so waits. An operator's release since it ended
-/// (`continue`) lifts the wait: the operator is the one who knows the
-/// forge is back.
-async fn publish_retry_pending(store: &Store, job: &Job) -> anyhow::Result<bool> {
+/// When the wait of `job`, a checkpoint, ends, in epoch ms, while it is an
+/// attempt whose publishing the forge refused ([`publish_refused`]) less
+/// than [`publish_retry_wait`] of its streak ago, and so waits; `None` when
+/// it does not wait. An operator's release since it ended (`continue`)
+/// lifts the wait: the operator is the one who knows the forge is back.
+async fn publish_retry_wait_end(store: &Store, job: &Job) -> anyhow::Result<Option<i64>> {
     let Some(ended) = job.finished_at.filter(|_| publish_refused(job)) else {
-        return Ok(false);
+        return Ok(None);
     };
     let JobKind::Finding(kind) = job.kind else {
-        return Ok(false);
+        return Ok(None);
     };
     let Some(fid) = job.finding_id else {
-        return Ok(false);
+        return Ok(None);
     };
     let refusals = store.work_streak(fid, kind).await?.streak;
-    if now_ms() - ended >= publish_retry_wait(refusals) {
-        return Ok(false);
+    let end = ended + publish_retry_wait(refusals);
+    if now_ms() >= end {
+        return Ok(None);
     }
     let released = store.last_release_at(fid, kind).await?;
-    Ok(released.is_none_or(|at| at < ended))
+    Ok(released.is_none_or(|at| at < ended).then_some(end))
+}
+
+/// Whether `job`, a checkpoint, waits out a refused publish
+/// ([`publish_retry_wait_end`]).
+async fn publish_retry_pending(store: &Store, job: &Job) -> anyhow::Result<bool> {
+    Ok(publish_retry_wait_end(store, job).await?.is_some())
+}
+
+/// When a kept attempt's retry could next run for free ([`pick_free`]),
+/// in epoch ms, for a cycle that was denied or found nothing to do and ran
+/// none: the job lane wakes then rather than sleeping out the denial,
+/// which may be an hour away, or the idle 15 minutes
+/// ([`CycleSummary::kept_retry_at`]).
+///
+/// That is when the first refused publish of a finding's kept attempt,
+/// among those not held (and on `force_repo` if given), stops waiting
+/// ([`publish_retry_wait_end`]), or, if `forge_down` (the cycle passed
+/// over a free retry whose forge did not answer), when an offline cycle
+/// looks again ([`NETWORK_RETRY_MS`]), whichever comes first. Whether the
+/// waiting retry will be free is left to that cycle: one that is not
+/// costs a wake, a denied cycle that runs nothing.
+async fn kept_retry_at(
+    store: &Store,
+    force_repo: Option<&str>,
+    forge_down: bool,
+) -> anyhow::Result<Option<i64>> {
+    let held = store.held_work().await?;
+    let mut first = forge_down.then(|| now_ms() + NETWORK_RETRY_MS);
+    for job in store.list_resumable_jobs().await? {
+        let (JobKind::Finding(kind), Some(fid)) = (job.kind, job.finding_id) else {
+            continue;
+        };
+        if held.finding(fid, kind) || force_repo.is_some_and(|name| job.repo_name != name) {
+            continue;
+        }
+        if let Some(end) = publish_retry_wait_end(store, &job).await? {
+            first = Some(first.map_or(end, |f| f.min(end)));
+        }
+    }
+    Ok(first)
 }
 
 /// The failure a given-up chain records in its work item's streak.
@@ -1731,6 +1772,12 @@ pub struct CycleSummary {
     /// why in prose); the status page shows such a cycle as offline.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unreachable: Option<String>,
+    /// On a denied cycle that ran no free retry instead, or an idle one:
+    /// when one could run, epoch ms ([`kept_retry_at()`]). The job lane
+    /// sleeps no longer than that, where the denial's own `retry_at` may
+    /// be an hour away and an idle sleep 15 minutes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kept_retry_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -9698,9 +9745,12 @@ async fn run_cycle_inner(
 
     let picked = pick_next(scope, cfg, force_repo).await?;
     if picked.is_none() {
+        // A kept attempt waiting out a refused publish is skipped by the
+        // pick: the idle lane wakes when it can run, not a flat sleep on.
         let result = CycleSummary {
             kind: None,
             idle: Some("no queued findings, no enabled repos".into()),
+            kept_retry_at: kept_retry_at(store, force_repo, false).await?,
             ..Default::default()
         };
         let _ = store
@@ -9777,6 +9827,9 @@ async fn run_cycle_inner(
                 break;
             };
             tried.push(fid);
+        }
+        if result.denied.is_some() {
+            result.kept_retry_at = kept_retry_at(store, force_repo, !tried.is_empty()).await?;
         }
     }
 
