@@ -903,6 +903,10 @@ fn gitlab_view_survives_a_failing_notes_endpoint() {
     assert_eq!(view.head_ref, "fix/x");
     assert_eq!(view.head_sha, "cafe");
     assert!(view.comments.is_empty(), "no notes could be fetched");
+    assert!(
+        view.feedback_unread,
+        "an unread thread is not an empty one: the sync keeps the activity it recorded"
+    );
     assert!(view.reviews.is_empty());
     assert_eq!(
         view.status_check_rollup.len(),
