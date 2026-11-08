@@ -861,6 +861,10 @@ pub struct PrView {
     pub status_check_rollup: Vec<GhCheckRun>,
     pub comments: Vec<GhComment>,
     pub reviews: Vec<GhReview>,
+    /// Part of the feedback could not be read (GitLab's notes, which the
+    /// sync view tolerates failing): `comments` is not the whole thread,
+    /// and the newest activity on the PR is unknown, not none.
+    pub feedback_unread: bool,
 }
 
 /// Whose feedback a comment or review is.
@@ -1781,6 +1785,7 @@ fn gh_pr_view(slug: &str, pr_number: i64, fields: &str) -> anyhow::Result<PrView
             .unwrap_or_default(),
         reviews: serde_json::from_value(v.get("reviews").cloned().unwrap_or_default())
             .unwrap_or_default(),
+        feedback_unread: false,
     })
 }
 
@@ -1924,7 +1929,7 @@ fn gitlab_split_notes(notes: &[GlNote]) -> Vec<GhComment> {
 }
 
 /// Fetch GitLab MR + notes via `glab api`, returning typed structs. A notes
-/// read that fails leaves the notes empty, unless `strict_notes`
+/// read that fails leaves the notes `None`, unless `strict_notes`
 /// ([`Forge::view_pr_comments`], [`Forge::view_pr_engage`]), when it fails
 /// the fetch.
 fn gitlab_fetch_mr(
@@ -1932,7 +1937,7 @@ fn gitlab_fetch_mr(
     slug: &str,
     number: i64,
     strict_notes: bool,
-) -> anyhow::Result<(GlMergeRequest, Vec<GlNote>)> {
+) -> anyhow::Result<(GlMergeRequest, Option<Vec<GlNote>>)> {
     let enc = slug.replace('/', "%2F");
     let api_path = format!("projects/{enc}/merge_requests/{number}");
     let (rc, out) = gitlab_api(url, &api_path, None, &[]);
@@ -1956,10 +1961,10 @@ fn gitlab_fetch_mr(
     let mut notes = match parsed {
         Ok(notes) => notes,
         Err(e) if strict_notes => anyhow::bail!("glab api {notes_path} failed ({e})"),
-        Err(_) => Vec::new(),
+        Err(_) => return Ok((mr, None)),
     };
     notes.reverse();
-    Ok((mr, notes))
+    Ok((mr, Some(notes)))
 }
 
 /// Run `glab api <path>`, adding --hostname for self-hosted instances.
@@ -3344,7 +3349,7 @@ impl Forge for GitLabForge {
         // Engage acts on the feedback: notes that could not be read are not
         // an MR without feedback, so the view fails instead.
         let (mr, notes) = gitlab_fetch_mr(url, path, pr_number, true)?;
-        let comments = gitlab_feedback(url, path, &notes, bots)?;
+        let comments = gitlab_feedback(url, path, notes.as_deref().unwrap_or_default(), bots)?;
         let state = gitlab_norm_state(&mr.state);
         let mergeable = gitlab_norm_mergeable(&mr);
         let status_check_rollup = gitlab_norm_pipeline(&mr);
@@ -3360,6 +3365,7 @@ impl Forge for GitLabForge {
             status_check_rollup,
             comments,
             reviews: Vec::new(),
+            feedback_unread: notes.is_none(),
         })
     }
 
@@ -3671,7 +3677,8 @@ impl Forge for GitLabForge {
 
 /// GitLab's [`Forge::view_pr_sync`], with its notes required when
 /// `strict_notes` ([`Forge::view_pr_comments`]): a notes read that fails is
-/// then the view failing, not an MR without notes.
+/// then the view failing, not an MR without notes; otherwise it is a view
+/// whose [`PrView::feedback_unread`] is set.
 fn gitlab_view_sync(
     url: &str,
     pr_number: i64,
@@ -3681,7 +3688,7 @@ fn gitlab_view_sync(
     let (_, path) =
         gitlab_host_path(url).ok_or_else(|| anyhow::anyhow!("cannot parse GitLab URL: {url}"))?;
     let (mr, notes) = gitlab_fetch_mr(url, path, pr_number, strict_notes)?;
-    let comments = gitlab_feedback(url, path, &notes, bots)?;
+    let comments = gitlab_feedback(url, path, notes.as_deref().unwrap_or_default(), bots)?;
     let state = gitlab_norm_state(&mr.state);
     let mergeable = gitlab_norm_mergeable(&mr);
     let status_check_rollup = gitlab_norm_pipeline(&mr);
@@ -3697,6 +3704,7 @@ fn gitlab_view_sync(
         status_check_rollup,
         comments,
         reviews: Vec::new(),
+        feedback_unread: notes.is_none(),
     })
 }
 

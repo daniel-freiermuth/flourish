@@ -92,8 +92,9 @@ pub struct ObservedOpenPr<'p> {
     failing_checks: Vec<String>,
     head_ref: String,
     head_sha: String,
-    /// Newest feedback from anyone but hunter itself (epoch ms).
-    last_activity_at: i64,
+    /// Newest feedback from anyone but hunter itself (epoch ms); `None`
+    /// when the forge could not read all of it ([`PrView::feedback_unread`]).
+    last_activity_at: Option<i64>,
 }
 
 /// [`ObservedOpenPr`]'s fields as a test sets them: a fixture, only in a
@@ -122,7 +123,7 @@ impl<'p> ObservedOpenPr<'p> {
             failing_checks,
             head_ref: pr.head_ref.clone(),
             head_sha: pr.head_sha.clone(),
-            last_activity_at: latest_activity_ms(pr),
+            last_activity_at: (!pr.feedback_unread).then(|| latest_activity_ms(pr)),
         }
     }
 
@@ -138,7 +139,7 @@ impl<'p> ObservedOpenPr<'p> {
             failing_checks: f.failing_checks,
             head_ref: f.head_ref,
             head_sha: f.head_sha,
-            last_activity_at: f.last_activity_at,
+            last_activity_at: Some(f.last_activity_at),
         }
     }
 
@@ -178,7 +179,8 @@ impl<'p> ObservedOpenPr<'p> {
         &self.head_sha
     }
 
-    pub fn last_activity_at(&self) -> i64 {
+    /// `None`: unknown, and the activity recorded before stands.
+    pub fn last_activity_at(&self) -> Option<i64> {
         self.last_activity_at
     }
 }
