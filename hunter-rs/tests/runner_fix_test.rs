@@ -4347,6 +4347,54 @@ async fn a_kept_fix_publishes_past_a_spent_budget_and_an_unreachable_provider() 
     assert_eq!(shipped_subject(&f), "fix: the real bug");
 }
 
+/// A kept fix the cycle falls back to while its pick is denied, and whose
+/// retry errors before it concludes (here a playbook typo its prompt
+/// cannot be rendered past), is counted as `cycle error` like the pick's
+/// own: three in a row hold it, instead of the fallback offering it, and
+/// failing on it, every cycle.
+#[tokio::test]
+async fn a_free_retry_that_errors_is_held_at_the_streak_limit() {
+    let _bins = support::FakeBins::acquire("fix-kept-free-error");
+    let mut f = fixture("fix-kept-free-error").await;
+    review_on(&mut f, 3);
+    let nowhere = f.cfg.work_root.join("refusing.git");
+    route_push(&f, Some(&nowhere.to_string_lossy()));
+    let refused = fix(&f, &reviewed_worker(vec![Act::Fix, Act::Review(CLEAN)])).await;
+    assert_eq!(refused.outcome.as_deref(), Some("requeued"), "{refused:?}");
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
+        .bind(24 * 60 * 60_000_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // The fixture's bystander, filed first, is the older queued fix.
+    f.store
+        .set_finding_status(f.fid - 1, hunter::domain::FindingStatus::Queued)
+        .await
+        .unwrap();
+    std::fs::write(
+        f.cfg.root.join("playbooks").join("fix.md"),
+        "fix {{WORKTREE}} {{NO_SUCH_SLOT}}\n",
+    )
+    .unwrap();
+    let spent = reviewed_worker(vec![]).denying_above(-1);
+
+    for _ in 0..3 {
+        let summary =
+            hunter::scheduler::run_cycle(&mut support::jobs(&f.store), &f.cfg, &spent, None).await;
+        assert!(summary.error.is_some(), "{summary:?}");
+    }
+
+    assert!(spent.runs().is_empty(), "no worker");
+    let hold = support::hold_of(&f.store, f.fid, hunter::domain::FindingJobKind::Fix)
+        .await
+        .expect("held at the limit");
+    assert!(hold.detail.contains("NO_SUCH_SLOT"), "{hold:?}");
+}
+
 /// A kept fix keeps its rank behind an older queued fix, whether its
 /// retry costs nothing or runs its fixer (released by an operator): a
 /// free retry is only the cycle's fallback when the pick is denied, so a

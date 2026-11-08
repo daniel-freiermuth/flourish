@@ -4373,6 +4373,28 @@ async fn an_engage_whose_pr_will_not_load_is_held_at_the_streak_limit() {
     assert_eq!(hold.checkpoint_job_id, None, "no worker ran");
 }
 
+/// The same through the cycle: the view failure the engage counted is not
+/// counted again as `cycle error`, which would reset its streak every
+/// cycle and leave the engage, the highest tier, picked forever.
+#[tokio::test]
+async fn an_engage_whose_pr_will_not_load_is_held_through_the_cycle() {
+    let f = fixture("engage-view-fails-cycle").await;
+    let bins = FakeBins::acquire("engage-view-fails-cycle");
+    bins.script("gh", "echo \"HTTP 502 at $(date +%s%N)\" >&2\nexit 1");
+    let never = ScriptedBackend::new(|_| panic!("no worker without the PR"));
+
+    for _ in 0..3 {
+        let summary =
+            hunter::scheduler::run_cycle(&mut support::jobs(&f.store), &f.cfg, &never, None).await;
+        assert!(summary.error.is_some(), "{summary:?}");
+    }
+
+    let hold = support::hold_of(&f.store, f.fid, hunter::domain::FindingJobKind::Engage)
+        .await
+        .expect("held at the limit");
+    assert!(hold.detail.starts_with("PR/MR view failed"), "{hold:?}");
+}
+
 /// A held engage stays held when its PR gets new activity: only the
 /// operator releases it (WORK-MODEL.md §9.4). The activity is shown on the
 /// hold, since it may well be what the hold waits for.
