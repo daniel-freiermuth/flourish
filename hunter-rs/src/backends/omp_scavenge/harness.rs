@@ -378,13 +378,15 @@ pub fn run_worker(
     // `--session-dir` does not move it (see the argument below), so the
     // source must still be there for the continuation to be the one meant.
     let mut resume_head: Option<Vec<u8>> = None;
+    let mut resume_len: u64 = 0;
     if let Some(sf) = resume_from {
         if !run_dir.is_dir() {
             return resume_unavailable(sf, "session directory is gone");
         }
         // Empty counts as gone: omp treats an unreadable resume source
         // as "start fresh here", which is the failure this refuses.
-        if fs::metadata(sf).map_or(0, |m| m.len()) == 0 {
+        resume_len = fs::metadata(sf).map_or(0, |m| m.len());
+        if resume_len == 0 {
             return resume_unavailable(sf, "session file is missing or empty");
         }
         resume_head = Some(first_line(sf));
@@ -610,12 +612,25 @@ pub fn run_worker(
         }
         // On a resume the directory already holds the predecessor's
         // transcript, so "a ledger exists" says nothing about this
-        // attempt; the equivalent signal is "this attempt has recorded no
-        // call yet".
-        let unmetered = if resume_from.is_some() {
-            calls == 0
-        } else {
-            session.is_none()
+        // attempt; the equivalent signal is "this attempt has not
+        // appended to it". omp appends its opening records, the prompt
+        // among them, as it starts — the moment a cold run's ledger
+        // appears. "No call recorded yet" is not equivalent: a call is
+        // written only once it completes, and a resume's first call
+        // re-sends the whole transcript, so it is the slowest one.
+        //
+        // Appended means grown with its opening record intact. A changed
+        // opening record is a lost resume: omp wrote a fresh session over
+        // the file, whose spend reads as 0 against the predecessor's
+        // baseline until it passes the whole inherited total, so the cap
+        // cannot fire and this kill is the only bound left.
+        let unmetered = match resume_from {
+            Some(sf) => {
+                let appended = fs::metadata(sf).map_or(0, |m| m.len()) > resume_len
+                    && resume_head.as_ref() == Some(&first_line(sf));
+                calls == 0 && !appended
+            }
+            None => session.is_none(),
         };
         if unmetered && t0.elapsed().as_secs() >= cfg.session_grace_s {
             tracing::warn!(
