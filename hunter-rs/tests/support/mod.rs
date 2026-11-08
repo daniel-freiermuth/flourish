@@ -498,6 +498,8 @@ pub struct ScriptedBackend {
     offline_dispatched: Vec<String>,
     /// Whether a runner asked for its budget yet.
     dispatched: std::sync::atomic::AtomicBool,
+    /// Every list of hosts the reachability probe was asked about.
+    probes: Mutex<Vec<Vec<String>>>,
     runs: Mutex<Vec<Run>>,
     /// Awaited at the start of every `decide()`: whatever a test needs to
     /// happen while a runner stands at its budget gate.
@@ -530,6 +532,7 @@ impl ScriptedBackend {
             offline: Vec::new(),
             offline_dispatched: Vec::new(),
             dispatched: std::sync::atomic::AtomicBool::new(false),
+            probes: Mutex::new(Vec::new()),
             runs: Mutex::new(Vec::new()),
             on_decide: None,
             usage_delta: None,
@@ -622,6 +625,12 @@ impl ScriptedBackend {
     pub fn runs(&self) -> Vec<Run> {
         self.runs.lock().unwrap().clone()
     }
+
+    /// Every list of hosts probed so far (`Backend::first_unreachable`),
+    /// oldest first.
+    pub fn probes(&self) -> Vec<Vec<String>> {
+        self.probes.lock().unwrap().clone()
+    }
 }
 
 /// A successful, cheap `RunResult`.
@@ -697,6 +706,7 @@ impl Backend for ScriptedBackend {
     /// or [`ScriptedBackend::offline_once_dispatched`] once a runner asked
     /// for its budget.
     async fn first_unreachable(&self, hosts: &[String]) -> Option<String> {
+        self.probes.lock().unwrap().push(hosts.to_vec());
         let dispatched = self.dispatched.load(std::sync::atomic::Ordering::SeqCst);
         hosts
             .iter()

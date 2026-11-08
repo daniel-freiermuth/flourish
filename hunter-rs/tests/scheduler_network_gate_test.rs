@@ -382,6 +382,41 @@ async fn an_offline_machine_passes_nothing_over() {
     );
 }
 
+/// Two repos on the same unreachable forge, the provider up: both are
+/// passed over, and the forge, found down for the first, is not probed
+/// again for the second, so a cycle with many repos on a VPN-only forge
+/// does not wait out one probe timeout per repo.
+#[tokio::test]
+async fn a_forge_found_down_is_not_probed_again_in_the_cycle() {
+    let down = FORGE.to_owned();
+    let (dir, store, cfg) = fixture("net-forge-once", &forge_url(FORGE), true).await;
+    let _beta_origin = add_beta(&dir, &store, &forge_url(FORGE)).await;
+    let backend = ScriptedBackend::new(|_| panic!("no worker may start offline"))
+        .needing(&[PROVIDER])
+        .offline(&[FORGE]);
+
+    let before = hunter::util::now_ms();
+    let summary = run_cycle(&mut support::jobs(&store), &cfg, &backend, None).await;
+
+    assert_denied_for(&store, &summary, &down, before).await;
+    let events = store.recent_events(20).await.unwrap();
+    for repo in ["alpha", "beta"] {
+        let passed_over = format!("offline: {FORGE} unreachable; passed over test_gap on {repo}");
+        assert!(
+            events
+                .iter()
+                .any(|e| e.kind == "deny" && e.message == passed_over),
+            "{repo}'s work is passed over: {events:?}"
+        );
+    }
+    let forge_probes = backend
+        .probes()
+        .iter()
+        .filter(|hosts| hosts.contains(&down))
+        .count();
+    assert_eq!(forge_probes, 1, "probes: {:?}", backend.probes());
+}
+
 /// Work passed over for its unreachable forge, and the next candidate
 /// denied by the budget: the cycle ends on that budget denial, which may
 /// have no estimate (30 minutes) or one an hour away. The work passed
