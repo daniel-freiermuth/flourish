@@ -963,6 +963,84 @@ fn a_resumed_worker_that_has_recorded_a_call_outlives_the_grace_period() {
     );
 }
 
+/// A resume's first call is its slowest — it re-sends the whole
+/// transcript — and a call is written only once it completes. So "no call
+/// recorded yet" is not the resume's equivalent of "no ledger yet": omp
+/// appends its opening records, the prompt among them, to the transcript
+/// it continues as soon as it starts, the same moment a cold run's ledger
+/// appears. A first call that outlasts the grace period after that is a
+/// slow call, not an unmetered worker, and killing it ends the chain.
+#[test]
+fn a_resumed_worker_whose_first_call_outlasts_the_grace_period_is_not_killed() {
+    let mut fx = Fixture::new("resume-slow-first-call");
+    let ledger = predecessor(&fx);
+    fx.cfg.session_grace_s = 1;
+    let prompt = serde_json::json!({
+        "type": "message",
+        "message": {"role": "user", "content": [{"type": "text", "text": PROMPT}]},
+    });
+    // `ledger_sh(&[])` is only the argv-resolved `$LEDGER`; the prompt goes
+    // in at once, the call's usage record three seconds later.
+    fx.bins.script(
+        "omp",
+        &format!(
+            "{start}printf '%s\\n' '{prompt}' >> \"$LEDGER\"\nsleep 3\n{call}exit 0",
+            start = ledger_sh(&[]),
+            call = ledger_sh(&[(400, 50, 10)]),
+        ),
+    );
+
+    let res = fx.resume_bounded(&ledger, Some(1_000_000), 300);
+
+    assert_eq!(res.killed_reason, None, "{:?}", res.stdout_tail);
+    assert_eq!(res.exit_code, Some(0));
+    assert_eq!((res.tokens_new, res.calls), (460, 1));
+    assert!(
+        res.duration_s >= 2.0,
+        "the first call must have run past the 1 s grace period: {}s",
+        res.duration_s
+    );
+}
+
+/// The limit of the test above: a transcript that changed is not one that
+/// was continued. When a resume does not take, omp writes a fresh session
+/// over the `--resume` path. Until the worker exits the cap still meters
+/// against the predecessor's baseline, so the fresh session's spend reads
+/// as 0 until it passes the whole inherited total and the cap cannot fire.
+/// The grace kill is then the only bound, and a replaced opening record
+/// must not count as this attempt writing to its transcript.
+#[test]
+fn a_resume_that_replaced_its_transcript_is_still_killed_at_the_grace_period() {
+    let mut fx = Fixture::new("resume-replaced-grace");
+    let ledger = predecessor(&fx);
+    fx.cfg.session_grace_s = 1;
+    let header = serde_json::json!({"type": "title", "title": "fresh"});
+    // A fresh header over the file, then one call worth ten times the cap.
+    fx.bins.script(
+        "omp",
+        &format!(
+            "{start}printf '%s\\n' '{header}' > \"$LEDGER\"\n{call}sleep 10\nexit 0",
+            start = ledger_sh(&[]),
+            call = ledger_sh(&[(1000, 0, 0)]),
+        ),
+    );
+
+    // max_wall_s is far larger, so a kill cannot be the wall-clock branch.
+    let res = fx.resume_bounded(&ledger, Some(100), 300);
+
+    assert_eq!(
+        res.killed_reason.as_deref(),
+        Some("unmetered"),
+        "{:?}",
+        res.stdout_tail
+    );
+    assert!(
+        res.duration_s < 5.0,
+        "must be killed at the grace period, not after the worker's own sleep: {}s",
+        res.duration_s
+    );
+}
+
 /// A resumed attempt's cap bounds what that attempt spends, not the
 /// transcript it inherited — and it is still armed.
 ///
