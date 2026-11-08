@@ -17,9 +17,11 @@ mod support;
 use std::path::PathBuf;
 
 use hunter::config::Config;
-use hunter::domain::{HoldReason, JobState, ReleaseAction, RepoJobKind, RepoWorkKind};
+use hunter::domain::{
+    FindingJobKind, FindingStatus, HoldReason, JobState, ReleaseAction, RepoJobKind, RepoWorkKind,
+};
 use hunter::scheduler::{Attempt, Candidate, pick_next, run_cycle};
-use hunter::store::{RepoHold, Store};
+use hunter::store::{FindingInsert, RepoHold, Store};
 use hunter::types::RunResult;
 use support::{GitRepo, ScriptedBackend, TempDir};
 
@@ -799,6 +801,62 @@ async fn a_hunt_that_errors_before_its_worker_is_held_and_passes_the_turn_on() {
         "no worker may have been launched"
     );
     assert!(held.detail.contains("NO_SUCH_SLOT"), "{held:?}");
+}
+
+/// A recheck that errors before its worker runs, on a playbook typo, is
+/// counted on the finding's recheck as `cycle error`: three in a row hold
+/// it, and the repo rotation it outranks gets its turn instead of the
+/// same recheck being picked again every cycle.
+#[tokio::test]
+async fn a_recheck_that_errors_before_its_worker_is_held_and_passes_the_turn_on() {
+    let (dir, store, cfg) = two_hunts_due("rotation-recheck-error").await;
+    let (fid, _) = store
+        .upsert_finding(
+            1,
+            &FindingInsert {
+                fingerprint: "alpha:README.md:seed:1".to_owned(),
+                file: "README.md".to_owned(),
+                summary: "a real bug".to_owned(),
+                ..Default::default()
+            },
+            "bug",
+            None,
+        )
+        .await
+        .unwrap();
+    store
+        .set_finding_status(fid, FindingStatus::Rechecking)
+        .await
+        .unwrap();
+    std::fs::write(
+        dir.join("playbooks").join("recheck.md"),
+        "recheck {{REPO_PATH}} {{NO_SUCH_SLOT}}\n",
+    )
+    .unwrap();
+    let backend = ScriptedBackend::noop();
+
+    let cycles = run_while(&store, &cfg, &backend, |c| {
+        c.job_kind() == FindingJobKind::Recheck.into()
+    })
+    .await;
+
+    assert_eq!(cycles, 3);
+    assert!(
+        backend.runs().is_empty(),
+        "no worker may have been launched"
+    );
+    let holds = store.active_holds().await.unwrap();
+    let hold = holds.iter().find(|h| h.finding_id == fid).expect("held");
+    assert_eq!(hold.kind, FindingJobKind::Recheck);
+    assert_eq!(hold.reason, HoldReason::Stuck);
+    assert!(hold.detail.contains("NO_SUCH_SLOT"), "{hold:?}");
+    let picked = pick_next(&support::scope(&store), &cfg, None)
+        .await
+        .unwrap();
+    assert!(
+        is_repo_pick(picked.as_ref(), 1, RepoJobKind::Hunt),
+        "alpha's hunt must get the next turn, got {picked:?}"
+    );
 }
 
 /// A hunt whose fetch fails never gets as far as a job. The failure is the
