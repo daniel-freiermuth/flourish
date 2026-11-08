@@ -2743,16 +2743,72 @@ async fn record_repo_failure(
     }
 }
 
-/// The failure a repo's hunt or scan records when its runner returns an
-/// error that no step of it counted: a suppression list that cannot be
-/// read, a playbook that cannot be rendered, a store read or write that
-/// fails (WORK-MODEL.md §17.3). Fixed, with the error as
+/// The failure a repo's or a finding's work records when its runner
+/// returns an error that no step of it counted: a suppression list that
+/// cannot be read, a playbook that cannot be rendered, a store read or
+/// write that fails (WORK-MODEL.md §17.3). Fixed, with the error as
 /// the detail, so the same error every cycle is identical however it is
 /// worded and the work is held instead of being picked again forever.
 const CYCLE_ERROR: &str = "cycle error";
 
-/// An error whose failure its runner has counted on a repo work item
-/// already ([`repo_sync_failed`], [`runner_failed`]). The cycle does not
+/// Count a [`CYCLE_ERROR`] of `fid`'s `kind` work, `detail` describing it,
+/// as [`record_repo_failure`] does for a repo's. The
+/// [`MAX_CONSECUTIVE_SAME_FAILURE`]th holds the work as `stuck`. Every
+/// finding tier outranks the repo rotation, so uncounted, the same finding
+/// would be picked every cycle and nothing below its tier would run. A
+/// count or a hold that could not be recorded is reported as such and
+/// ends nothing.
+async fn record_finding_cycle_error(
+    store: &JobStore,
+    kind: FindingJobKind,
+    fid: i64,
+    detail: &str,
+) {
+    let log = |message: String| async move {
+        let _ = store.log_event("error", &message, None, Some(fid)).await;
+    };
+    let streak = match store.record_work_failure(fid, kind, CYCLE_ERROR).await {
+        Ok(Some(streak)) => streak,
+        Ok(None) => {
+            log(format!(
+                "{kind} #{fid}: {detail}, not counted: it has left the tier"
+            ))
+            .await;
+            return;
+        }
+        Err(e) => {
+            log(format!(
+                "{kind} #{fid}: {detail}, will retry (not counted: {e})"
+            ))
+            .await;
+            return;
+        }
+    };
+    if streak < MAX_CONSECUTIVE_SAME_FAILURE {
+        log(format!("{kind} #{fid}: {detail}, will retry")).await;
+        return;
+    }
+    let message = match store
+        .hold_work(fid, kind, HoldReason::Stuck, detail, None)
+        .await
+    {
+        Ok(true) => format!("{kind} #{fid}: held after {streak} identical failures ({detail})"),
+        Ok(false) => format!(
+            "{kind} #{fid}: {streak} identical failures ({detail}), but it has left the tier \
+             or is already held; nothing held"
+        ),
+        Err(e) => format!(
+            "{kind} #{fid}: {streak} identical failures ({detail}), but holding it failed: \
+             {e}; will retry"
+        ),
+    };
+    log(message).await;
+}
+
+/// An error whose failure its runner has counted on its work item
+/// already ([`repo_sync_failed`], [`runner_failed`],
+/// [`engage_prefetch_failed`], [`harvest_prefetch_failed`]), or left
+/// uncounted on purpose (a harvest handoff's). The cycle does not
 /// count it again as [`CYCLE_ERROR`], which would reset the streak it
 /// just extended. Reads exactly as the error it wraps.
 #[derive(Debug)]
@@ -2770,7 +2826,7 @@ impl std::error::Error for Counted {
     }
 }
 
-/// Mark `err` as already counted on its repo work item ([`Counted`]).
+/// Mark `err` as already counted on its work item ([`Counted`]).
 fn counted(err: anyhow::Error) -> anyhow::Error {
     anyhow::Error::new(Counted(err))
 }
@@ -3908,7 +3964,7 @@ pub async fn run_recheck(
             None,
         )
         .await;
-        anyhow::bail!("{}", failure.detail);
+        return Err(counted(anyhow::anyhow!("{}", failure.detail)));
     }
 
     let override_mode = finding.budget_override;
@@ -4023,7 +4079,7 @@ pub async fn run_recheck(
             let ran = (WorkOf::Finding(FindingJobKind::Recheck, fid), running);
             let denied = runner_failed(store, (cfg, backend, &repo.url), ran, &e).await;
             close_workspace(lane, ws).await;
-            return denied.ok_or(e);
+            return denied.ok_or_else(|| counted(e));
         }
     };
     let ran = (WorkOf::Finding(FindingJobKind::Recheck, fid), running);
@@ -6560,7 +6616,7 @@ pub async fn run_fix(
             let denied = runner_failed(store, (cfg, backend, &start.repo.url), ran, &e).await;
             release_claim(claim).await;
             close_workspace(lane, start.ws).await;
-            return denied.ok_or(e);
+            return denied.ok_or_else(|| counted(e));
         }
     };
     let ran = (WorkOf::Finding(FindingJobKind::Fix, fid), running);
@@ -7266,7 +7322,7 @@ async fn engage_view(
             {
                 return Ok(Err(denied));
             }
-            anyhow::bail!("PR/MR view failed");
+            Err(counted(anyhow::anyhow!("PR/MR view failed")))
         }
     }
 }
@@ -7339,7 +7395,7 @@ async fn engage_prefetch<T>(
         Ok(value) => Ok(Ok(value)),
         Err(e) => match engage_prefetch_failed(store, net, finding, &e.to_string()).await {
             Some(denied) => Ok(Err(denied)),
-            None => Err(e),
+            None => Err(counted(e)),
         },
     }
 }
@@ -8422,7 +8478,7 @@ pub async fn run_engage(
             let ran = (WorkOf::Finding(FindingJobKind::Engage, fid), running);
             let denied = runner_failed(store, (cfg, backend, &start.repo.url), ran, &e).await;
             close_workspace(lane, start.ws).await;
-            return denied.ok_or(e);
+            return denied.ok_or_else(|| counted(e));
         }
     };
     let ran = (WorkOf::Finding(FindingJobKind::Engage, fid), running);
@@ -9025,7 +9081,7 @@ pub async fn run_harvest(
                 {
                     return Ok(denied);
                 }
-                anyhow::bail!("PR/MR view failed");
+                return Err(counted(anyhow::anyhow!("PR/MR view failed")));
             }
         }
     } else {
@@ -9053,7 +9109,7 @@ pub async fn run_harvest(
                 {
                     return Ok(denied);
                 }
-                anyhow::bail!("PR/MR diff failed");
+                return Err(counted(anyhow::anyhow!("PR/MR diff failed")));
             }
         }
     } else {
@@ -9088,7 +9144,7 @@ pub async fn run_harvest(
             {
                 return Ok(denied);
             }
-            anyhow::bail!("fetch failed: {tail}");
+            return Err(counted(anyhow::anyhow!("fetch failed: {tail}")));
         }
         let rev = format!("origin/{db}");
         let tip = permit
@@ -9250,7 +9306,7 @@ pub async fn run_harvest(
                 runner_failed(store, (cfg, backend, &repo.url), ran, &e).await
             };
             close_workspace(lane, ws).await;
-            return denied.ok_or(e);
+            return denied.ok_or_else(|| counted(e));
         }
     };
     let ran = (WorkOf::Finding(FindingJobKind::Harvest, fid), running);
@@ -9917,6 +9973,51 @@ async fn dispatch(
     }
 }
 
+/// [`dispatch`] `candidate`, counting an error its runner did not count
+/// as [`CYCLE_ERROR`] on the repo's or the finding's work. A repo kind's
+/// `last_{kind}_at` moves only when its runner succeeds, and a failure
+/// leaves it alone, so the work is retried as soon as the rotation
+/// reaches it and is held after three identical failures (WORK-MODEL.md
+/// §17). Left uncounted, the work would be picked again every cycle,
+/// starving every other repo's, and for a finding every lower tier; for
+/// the free fallback, every other kept attempt.
+async fn dispatch_counted(
+    scope: &CycleScope<'_>,
+    lane: &mut Lane,
+    cfg: &Config,
+    backend: &dyn Backend,
+    candidate: &Candidate,
+) -> anyhow::Result<CycleSummary> {
+    let e = match dispatch(scope, lane, cfg, backend, candidate).await {
+        Ok(result) => return Ok(result),
+        Err(e) => e,
+    };
+    if e.downcast_ref::<Counted>().is_none() {
+        let store = scope.store();
+        let detail = format!("{CYCLE_ERROR}: {e:#}");
+        match candidate.job_kind() {
+            JobKind::Repo(kind) => {
+                record_repo_failure(
+                    RepoStreak::Job(store, kind.into()),
+                    (candidate.repo_id(), candidate.label().unwrap_or_default()),
+                    None,
+                    CYCLE_ERROR,
+                    &detail,
+                    HoldReason::Stuck,
+                )
+                .await;
+            }
+            JobKind::Finding(kind) => {
+                record_finding_cycle_error(store, kind, candidate.target_id(), &detail).await;
+            }
+            // A PR review keeps its failure count and backoff on its own
+            // row (`store::PR_REVIEW_HOLD_AT`), not on a work streak.
+            JobKind::Pr(_) => {}
+        }
+    }
+    Err(e)
+}
+
 /// Run `plan` through the executor of its own kind, on the subject it
 /// names. Each arm loads the plan as a [`Resumed`] of the kind it matched,
 /// so a runner is only ever handed its own kind's plans.
@@ -10102,35 +10203,11 @@ async fn run_cycle_inner(
         None => None,
     };
 
-    // A repo kind's `last_{kind}_at` moves only when its runner succeeds.
-    // A failure is counted on its work item and leaves the timestamp
-    // alone, so the work is retried as soon as the rotation reaches it and
-    // is held after three identical failures (WORK-MODEL.md §17), where it
-    // used to be bumped here and wait out its interval each time. An error
-    // its runner did not count is counted here, as `cycle error`: left
-    // uncounted, the work would stay the stalest in the rotation and be
-    // picked again every cycle, starving every other repo's.
+    // An error its runner did not count is counted as `cycle error`
+    // ([`dispatch_counted`]), here and in the free fallback below.
     let mut result = match denied {
         Some(denied) => denied,
-        None => match dispatch(scope, lane, cfg, backend, &candidate).await {
-            Ok(result) => result,
-            Err(e) => {
-                if let JobKind::Repo(kind) = candidate.job_kind()
-                    && e.downcast_ref::<Counted>().is_none()
-                {
-                    record_repo_failure(
-                        RepoStreak::Job(store, kind.into()),
-                        (candidate.repo_id(), candidate.label().unwrap_or_default()),
-                        None,
-                        CYCLE_ERROR,
-                        &format!("{CYCLE_ERROR}: {e:#}"),
-                        HoldReason::Stuck,
-                    )
-                    .await;
-                }
-                return Err(e);
-            }
-        },
+        None => dispatch_counted(scope, lane, cfg, backend, &candidate).await?,
     };
 
     // The pick was denied, by its budget or a host it needs: a kept
@@ -10142,7 +10219,7 @@ async fn run_cycle_inner(
         let mut tried = Vec::new();
         while let Some(free) = pick_free(scope, cfg, force_repo, &tried).await? {
             if network_gate(store, cfg, backend, &free).await?.is_none() {
-                result = dispatch(scope, lane, cfg, backend, &free).await?;
+                result = dispatch_counted(scope, lane, cfg, backend, &free).await?;
                 break;
             }
             // Only a finding's kept attempt is free; anything else ends the
