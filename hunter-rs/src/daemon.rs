@@ -610,9 +610,8 @@ pub fn describe_cycle(summary: &CycleSummary) -> (String, String) {
 
 /// How long the daemon should sleep after a cycle (`server._compute_sleep_s`).
 pub async fn compute_sleep_s(store: &Store, summary: &CycleSummary) -> f64 {
-    let sleep_s: f64;
-    if summary.error.is_some() {
-        sleep_s = 5.0 * 60.0;
+    let sleep_s = if summary.error.is_some() {
+        5.0 * 60.0
     } else if {
         matches!(
             summary.state,
@@ -622,7 +621,7 @@ pub async fn compute_sleep_s(store: &Store, summary: &CycleSummary) -> f64 {
         let queued = store.count_queued().await.unwrap_or(0);
         let inserted = summary.ingest.as_ref().map_or(0, |i| i.inserted);
         let enabled = store.count_enabled_repos().await.unwrap_or(0);
-        sleep_s = if queued > 0 {
+        if queued > 0 {
             0.0
         } else if inserted > 0 {
             5.0
@@ -630,31 +629,27 @@ pub async fn compute_sleep_s(store: &Store, summary: &CycleSummary) -> f64 {
             60.0
         } else {
             15.0 * 60.0
-        };
-    } else if summary.denied.is_some() {
-        if let Some(retry_at) = summary.retry_at.map(|v| v as f64) {
-            if retry_at > 0.0 {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs_f64();
-                let until = retry_at / 1000.0 - now;
-                sleep_s = (until + 30.0).clamp(60.0, 3600.0);
-            } else {
-                sleep_s = 30.0 * 60.0;
-            }
-        } else {
-            sleep_s = 30.0 * 60.0;
         }
+    } else if summary.denied.is_some() {
+        // A denial with no informed estimate backs off 30 minutes.
+        summary
+            .retry_at
+            .filter(|&at| at > 0)
+            .map_or(30.0 * 60.0, sleep_until)
     } else if summary.skipped.is_some() {
         // The pick did no work: it was stale (the finding left `queued` or
         // `rechecking`, its repo was deleted) or had nothing to do (a hunt
         // with no new commits). Every skip changes what the next pick sees,
         // so start the next cycle now instead of idling a slot away.
-        sleep_s = 0.0;
+        0.0
     } else {
-        sleep_s = 15.0 * 60.0;
-    }
+        15.0 * 60.0
+    };
+    // A kept attempt's free retry that a denied or idle cycle could not
+    // run yet wakes the lane when it can ([`CycleSummary::kept_retry_at`]).
+    let sleep_s = summary
+        .kept_retry_at
+        .map_or(sleep_s, |at| sleep_s.min(sleep_until(at)));
     // While a PR is open, never sleep past the admin lane's interval
     // (budget backoff excepted, which only the budget can lift). The admin
     // lane wakes this one when a sync makes new work, but not for work that
@@ -664,6 +659,16 @@ pub async fn compute_sleep_s(store: &Store, summary: &CycleSummary) -> f64 {
         return sleep_s.min(ADMIN_INTERVAL.as_secs_f64());
     }
     sleep_s
+}
+
+/// The sleep that wakes the lane 30 s after `at_ms`, epoch ms: at least a
+/// minute, at most an hour.
+fn sleep_until(at_ms: i64) -> f64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    (at_ms as f64 / 1000.0 - now + 30.0).clamp(60.0, 3600.0)
 }
 
 /// Whether any finding has an open PR; `false` when that cannot be read,

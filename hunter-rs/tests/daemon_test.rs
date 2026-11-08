@@ -593,6 +593,46 @@ async fn a_skipped_cycle_restarts_at_once() {
     assert_eq!(hunter::daemon::compute_sleep_s(&store, &idle).await, 900.0);
 }
 
+/// A failed cycle backs off five minutes; a finished job with nothing
+/// queued and no repo enabled idles 15; a denial whose `retry_at` is 0
+/// has no estimate and backs off 30.
+#[tokio::test]
+#[allow(
+    clippy::float_cmp,
+    reason = "the sleeps are exact constants, not computed values"
+)]
+async fn a_cycle_sleeps_by_how_it_ended() {
+    let dir = TempDir::new("daemon-sleeps");
+    let (_db, store) = support::fresh_store(&dir, "sleeps").await;
+    for (summary, expected) in [
+        (
+            hunter::scheduler::CycleSummary {
+                error: Some("boom".into()),
+                ..Default::default()
+            },
+            300.0,
+        ),
+        (
+            hunter::scheduler::CycleSummary {
+                state: Some(hunter::domain::JobState::Done),
+                ..Default::default()
+            },
+            900.0,
+        ),
+        (
+            hunter::scheduler::CycleSummary {
+                denied: Some("pacing".into()),
+                retry_at: Some(0),
+                ..Default::default()
+            },
+            1800.0,
+        ),
+    ] {
+        let slept = hunter::daemon::compute_sleep_s(&store, &summary).await;
+        assert_eq!(slept, expected, "{summary:?}");
+    }
+}
+
 /// While a PR is open the job lane never sleeps past the admin lane's
 /// interval: the admin lane wakes it only for work a sync made, and an
 /// engage due a retry on a PR already flagged is not that. A budget
@@ -619,6 +659,40 @@ async fn an_open_pr_caps_the_job_lanes_sleep_unless_denied() {
         hunter::daemon::compute_sleep_s(&store, &denied).await,
         1800.0
     );
+}
+
+/// A denied or idle cycle sleeps until the denial lifts (or for the idle
+/// 15 minutes) or a kept attempt's free retry can run (`kept_retry_at`),
+/// whichever is sooner, 30 s after it and at least a minute; a denial
+/// with no estimate counts as 30 minutes.
+#[tokio::test]
+async fn a_cycle_wakes_for_a_kept_retry_before_its_own_sleep_ends() {
+    let dir = TempDir::new("daemon-kept-retry");
+    let (_db, store) = support::fresh_store(&dir, "kept-retry").await;
+    let now = hunter::util::now_ms();
+    let min = 60_000;
+    for (denied, retry_at, kept_retry_at, expected) in [
+        (true, Some(now + 50 * min), Some(now + 10 * min), 630.0),
+        (true, Some(now + 20 * min), Some(now + 55 * min), 1230.0),
+        (true, None, Some(now + 10 * min), 630.0),
+        (true, None, Some(now + 40 * min), 1800.0),
+        (true, Some(now + 20 * min), Some(now - min), 60.0),
+        (true, Some(now + 20 * min), None, 1230.0),
+        (false, None, Some(now + 10 * min), 630.0),
+        (false, None, Some(now + 20 * min), 900.0),
+    ] {
+        let summary = hunter::scheduler::CycleSummary {
+            denied: denied.then(|| "pacing".into()),
+            retry_at,
+            kept_retry_at,
+            ..Default::default()
+        };
+        let slept = hunter::daemon::compute_sleep_s(&store, &summary).await;
+        assert!(
+            (slept - expected).abs() < 2.0,
+            "{denied}/{retry_at:?}/{kept_retry_at:?}: slept {slept}, expected {expected}"
+        );
+    }
 }
 
 /// The status page counts down to the loop's wake: now plus the sleep,
