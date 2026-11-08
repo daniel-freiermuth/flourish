@@ -451,7 +451,27 @@ pub async fn pick_next(
     cfg: &Config,
     force_repo: Option<&str>,
 ) -> anyhow::Result<Option<Candidate>> {
-    select(scope.store(), cfg, force_repo, Pick::Run(scope), None).await
+    select(scope.store(), cfg, force_repo, Pick::Run(scope), None, &[]).await
+}
+
+/// [`pick_next`] passing over the work of the repos in `offline`, whose
+/// forge this cycle found unreachable: an unreachable forge holds back
+/// the work that needs it, not every other repo's.
+async fn pick_reachable(
+    scope: &CycleScope<'_>,
+    cfg: &Config,
+    force_repo: Option<&str>,
+    offline: &[i64],
+) -> anyhow::Result<Option<Candidate>> {
+    select(
+        scope.store(),
+        cfg,
+        force_repo,
+        Pick::Run(scope),
+        None,
+        offline,
+    )
+    .await
 }
 
 /// A kept attempt whose retry only publishes, at no model cost
@@ -473,6 +493,7 @@ pub async fn pick_free(
         force_repo,
         Pick::Run(scope),
         Some(tried),
+        &[],
     )
     .await
 }
@@ -487,13 +508,13 @@ pub async fn pick_free(
 /// preview names the fresh start a given-up chain makes way for, even
 /// where the scheduler's count ends that work instead.
 pub async fn preview_next(store: &Store, cfg: &Config) -> anyhow::Result<Option<Candidate>> {
-    select(store, cfg, None, Pick::Preview, None).await
+    select(store, cfg, None, Pick::Preview, None, &[]).await
 }
 
 /// [`pick_free`]'s choice, without its writes: what the summary previews
 /// when [`preview_next`]'s candidate would be denied.
 pub async fn preview_free(store: &Store, cfg: &Config) -> anyhow::Result<Option<Candidate>> {
-    select(store, cfg, None, Pick::Preview, Some(&[])).await
+    select(store, cfg, None, Pick::Preview, Some(&[]), &[]).await
 }
 
 /// Whether a selection records what it finds on the way, and with what
@@ -509,6 +530,7 @@ enum Pick<'s> {
 
 /// [`pick_next`], or with [`Pick::Preview`] [`preview_next`]; with
 /// `free_only`, [`pick_free`] or [`preview_free`], skipping its findings.
+/// The work of the repos in `offline` is passed over ([`pick_reachable`]).
 #[allow(
     clippy::too_many_lines,
     reason = "one tier after another in priority order; splitting it would \
@@ -520,6 +542,7 @@ async fn select(
     force_repo: Option<&str>,
     mode: Pick<'_>,
     free_only: Option<&[i64]>,
+    offline: &[i64],
 ) -> anyhow::Result<Option<Candidate>> {
     let mut rechecking = findings_with_status(store, FindingStatus::Rechecking).await?;
     let (mut attention, flagged) = list_engage(store).await?;
@@ -541,6 +564,14 @@ async fn select(
         attention.retain(|f| f.repo_id == rid);
         pending_harvest.retain(|f| f.repo_id == rid);
         queued.retain(|f| f.repo_id == rid);
+    }
+    for tier in [
+        &mut rechecking,
+        &mut attention,
+        &mut pending_harvest,
+        &mut queued,
+    ] {
+        tier.retain(|f| !offline.contains(&f.repo_id));
     }
     // Held work waits for the operator: every tier, the resume tier and the
     // repo rotation skip it, through the one shared query (WORK-MODEL.md
@@ -609,7 +640,8 @@ async fn select(
                 match finding_pick(store, cfg, kind, f, false, mode).await? {
                     Picked::Work(c) if c.is_free() => return Ok(Some(c)),
                     Picked::Ended => {
-                        return Box::pin(select(store, cfg, force_repo, mode, free_only)).await;
+                        return Box::pin(select(store, cfg, force_repo, mode, free_only, offline))
+                            .await;
                     }
                     Picked::Work(_) | Picked::Nothing => {}
                 }
@@ -633,7 +665,7 @@ async fn select(
                     // Its given-up chain just ended `f`'s work, which may
                     // have held it: select again, from the top.
                     Picked::Ended => {
-                        return Box::pin(select(store, cfg, force_repo, mode, None)).await;
+                        return Box::pin(select(store, cfg, force_repo, mode, None, offline)).await;
                     }
                     // A flagless engage whose checkpoint could not be
                     // continued: nothing to do here, and nothing changed.
@@ -660,11 +692,13 @@ async fn select(
     // re-cache ratio 1.00 across 112 production events) where restarting
     // costs a flat ~37,000-token session floor plus every token already
     // spent, and advances no watermark to show for it.
-    match pick_resume(store, cfg, force_id, (&held, &running), mode).await? {
+    match pick_resume(store, cfg, force_id, offline, (&held, &running), mode).await? {
         Picked::Work(c) => return Ok(Some(c)),
         // A repo chain given up there was counted as a failure, which may
         // have held its work: select again, from the top.
-        Picked::Ended => return Box::pin(select(store, cfg, force_repo, mode, None)).await,
+        Picked::Ended => {
+            return Box::pin(select(store, cfg, force_repo, mode, None, offline)).await;
+        }
         Picked::Nothing => {}
     }
 
@@ -681,11 +715,12 @@ async fn select(
         .await?
         .into_iter()
         .filter(|r| {
-            if let Some(rid) = force_id {
+            let wanted = if let Some(rid) = force_id {
                 r.id == rid
             } else {
                 r.enabled != 0
-            }
+            };
+            wanted && !offline.contains(&r.id)
         })
         .collect();
     let hunt_busy = |r: &Repo| {
@@ -1056,11 +1091,12 @@ async fn pick_resume(
     store: &Store,
     cfg: &Config,
     force_id: Option<i64>,
+    offline: &[i64],
     (held, running): (&crate::store::HeldWork, &HashSet<JobPlace>),
     mode: Pick<'_>,
 ) -> anyhow::Result<Picked> {
     for job in store.list_resumable_jobs().await? {
-        if force_id.is_some_and(|rid| job.repo_id != rid) {
+        if force_id.is_some_and(|rid| job.repo_id != rid) || offline.contains(&job.repo_id) {
             continue;
         }
         let is_held = match (job.kind, job.finding_id) {
@@ -1307,10 +1343,10 @@ async fn publish_retry_pending(store: &Store, job: &Job) -> anyhow::Result<bool>
 /// That is when the first refused publish of a finding's kept attempt,
 /// among those not held (and on `force_repo` if given), stops waiting
 /// ([`publish_retry_wait_end`]), or, if `forge_down` (the cycle passed
-/// over a free retry whose forge did not answer), when an offline cycle
-/// looks again ([`NETWORK_RETRY_MS`]), whichever comes first. Whether the
-/// waiting retry will be free is left to that cycle: one that is not
-/// costs a wake, a denied cycle that runs nothing.
+/// over a free retry, or other work, whose forge did not answer), when an
+/// offline cycle looks again ([`NETWORK_RETRY_MS`]), whichever comes first.
+/// Whether the waiting retry will be free is left to that cycle: one that
+/// is not costs a wake, a denied cycle that runs nothing.
 async fn kept_retry_at(
     store: &Store,
     force_repo: Option<&str>,
@@ -10258,7 +10294,7 @@ async fn run_cycle_inner(
         return Ok(result);
     }
 
-    let Some(candidate) = picked else {
+    let Some(mut candidate) = picked else {
         return Ok(CycleSummary {
             kind: None,
             idle: Some("no candidate".into()),
@@ -10269,9 +10305,75 @@ async fn run_cycle_inner(
     // Once the candidate is known, so only the hosts it needs are probed,
     // and before dispatch, so none of its work starts, fails or is
     // counted while its forge or provider cannot be reached (#95).
-    let denied = match network_gate(store, cfg, backend, &candidate).await? {
-        Some(host) => Some(offline_denial(store, candidate.job_kind(), None, None, host).await),
-        None => None,
+    //
+    // An unreachable forge holds back only the work on its repos: the
+    // cycle passes over them to the next candidate, so one repo on a forge
+    // out of reach (a VPN-only GitLab, say) does not stop every other
+    // repo's work. That is only when the provider answers: the forge is
+    // probed first, so on a machine with no network at all it is the host
+    // the gate reports, and passing over would only probe every other
+    // forge in turn to be denied for the provider at the end. Any other
+    // host the candidate needs (the provider) every worker needs, so that
+    // one denies the cycle, as does running out of candidates. The denial
+    // is the first candidate's. Each piece of work
+    // passed over leaves a `deny` event naming it and the host it waits
+    // for, so a repo whose forge stays out of reach is not skipped
+    // silently while the cycle runs other work.
+    let mut first_down: Option<(JobKind, String)> = None;
+    let mut offline: Vec<i64> = Vec::new();
+    let mut down_forges: Vec<String> = Vec::new();
+    let mut provider_up: Option<bool> = None;
+    let denied = loop {
+        let repo = store.get_repo_by_id(candidate.repo_id()).await?;
+        let forge = repo
+            .as_ref()
+            .and_then(|repo| crate::forge::web_host(&repo.url));
+        let host = match forge.as_ref().filter(|f| down_forges.contains(f)) {
+            Some(known) => Some(known.clone()),
+            None => network_gate(store, cfg, backend, &candidate).await?,
+        };
+        let Some(host) = host else {
+            break None;
+        };
+        let only_forge = forge.as_ref() == Some(&host)
+            && if let Some(up) = provider_up {
+                up
+            } else {
+                let up = backend
+                    .first_unreachable(&backend.worker_hosts())
+                    .await
+                    .is_none();
+                *provider_up.insert(up)
+            };
+        let kind = candidate.job_kind();
+        let (kind, host) = first_down.get_or_insert((kind, host.clone())).clone();
+        let next = if only_forge {
+            if let Some(forge) = &forge
+                && !down_forges.contains(forge)
+            {
+                down_forges.push(forge.clone());
+            }
+            let finding_id = match &candidate {
+                Candidate::Finding { finding_id, .. } => Some(*finding_id),
+                Candidate::Resume { plan, .. } => plan.finding_id,
+                Candidate::Repo { .. } | Candidate::Pr { .. } => None,
+            };
+            let reason = format!(
+                "offline: {} unreachable; passed over {} on {}",
+                forge.as_deref().unwrap_or_default(),
+                candidate.job_kind(),
+                repo.as_ref().map_or("?", |r| r.name.as_str()),
+            );
+            let _ = store.log_event("deny", &reason, None, finding_id).await;
+            offline.push(candidate.repo_id());
+            pick_reachable(scope, cfg, force_repo, &offline).await?
+        } else {
+            None
+        };
+        match next {
+            Some(next) => candidate = next,
+            None => break Some(offline_denial(store, kind, None, None, host).await),
+        }
     };
 
     // An error its runner did not count is counted as `cycle error`
@@ -10303,8 +10405,13 @@ async fn run_cycle_inner(
             };
             tried.push(fid);
         }
+        // Work passed over for its unreachable forge, or a free retry
+        // whose forge did not answer, waits only on the network: the lane
+        // looks again when an offline cycle would, not after whatever the
+        // denial that ended this cycle (a later pick's budget) asks.
         if result.denied.is_some() {
-            result.kept_retry_at = kept_retry_at(store, force_repo, !tried.is_empty()).await?;
+            let forge_down = !tried.is_empty() || !offline.is_empty();
+            result.kept_retry_at = kept_retry_at(store, force_repo, forge_down).await?;
         }
     }
 

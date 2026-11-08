@@ -269,8 +269,13 @@ new ──recheck──> new / superseded / rejected
 
 One cycle picks exactly one unit of work, in strict priority order
 (`scheduler.pick_next` — the single place this is expressed; the UI's
-"what's next" preview calls the same function, so it can never drift from
-what actually runs):
+"what's next" preview calls the same function, so its order can never
+drift from the cycle's). The preview does not see what only the cycle
+learns as it runs: it does not probe the network gate below, so while a
+repo's work is passed over for its unreachable forge the preview still
+names that work, and the `deny` event the cycle leaves for it says why it
+did not run. Nor does it hold back an engage waiting for the PR sync.
+The order:
 
 1. Any finding with an active **budget override** (any category) — human
    escape hatch, jumps the whole queue.
@@ -327,13 +332,26 @@ e.g. `github.com` or the GitLab instance; none for a local clone) and the
 both, since every kind can run a worker. The probe opens a TCP connection
 to port 443 (or the URL's own port) on all of the host's addresses at
 once, and one must accept within 2 seconds, lookup included; no request
-is sent. If a host is unreachable, the cycle is denied with a
-`deny` event naming the host and retried in 3 minutes: nothing runs,
-nothing counts toward a failure streak or a rotation turn, and no job row,
-claim or checkpoint is touched. The daemon runs on a laptop that travels
+is sent. If the picked work's forge is unreachable while the provider
+answers, the cycle passes over that repo's work, and that of every other
+repo on the same forge, to the next candidate, so one repo on a forge out
+of reach (a GitLab behind a VPN, say) does not stop the others. If no
+candidate is left, or the provider is unreachable (alone, or with the
+forge, as on a machine with no network), the cycle is denied with a
+`deny` event naming the first host found unreachable and retried in 3
+minutes: nothing runs, nothing counts toward a failure streak or a
+rotation turn, and no job row, claim or checkpoint is touched. Work passed
+over is not touched either, but each cycle that passes it over leaves a
+`deny` event naming it, its repo and the host it waits for
+(`offline: <host> unreachable; passed over <kind> on <repo>`), so a repo
+whose forge stays out of reach does not drop out of sight while other work
+runs. A cycle that passed work over and then ends denied anyway (say, the
+next candidate's budget) still looks again within 3 minutes, so the work
+passed over runs soon after its forge is back. The daemon runs on a laptop
+that travels
 and sleeps, so being offline is a normal state, not a failure of the work
-it would have started. The Status page shows such a cycle as **offline**,
-naming the host, until a cycle gets past the gate.
+it would have started. The Status page shows a denied cycle as
+**offline**, naming the host, until a cycle gets past the gate.
 
 The network can also go while work runs. So before a finding's failure is
 counted, the same hosts are probed again: a forge call that failed before
