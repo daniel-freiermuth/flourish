@@ -2166,6 +2166,39 @@ async fn a_missing_pr_number_without_a_parseable_url_bails() {
     assert_eq!((ps.pr_number, ps.harvested_at), (None, None));
 }
 
+/// A harvest that cannot learn its PR number fails the same way every
+/// cycle, so it counts toward the streak and is held at the limit. Left
+/// uncounted, the harvest tier picked it again on every cycle and starved
+/// everything below it.
+#[tokio::test]
+async fn a_missing_pr_number_without_a_parseable_url_is_held() {
+    let bins = FakeBins::acquire("harvest-no-pr-number-held");
+    gh_default(&bins);
+    let f = fixture("harvest-no-pr-number-held", FindingStatus::Merged).await;
+    f.store.mark_pr_merged(f.fid, 7, 2).await.unwrap();
+    f.exec("UPDATE pr_state SET pr_number = NULL").await;
+    f.exec("UPDATE findings SET pr_url = 'not a pr url'").await;
+    let never_runs = ScriptedBackend::new(|_| panic!("no worker without a PR number"));
+
+    for attempt in 1..=3 {
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        let err = run_harvest(
+            &support::scope(&f.store),
+            f.store.test_lane(),
+            &f.cfg,
+            Attempt::Cold(&finding),
+            &never_runs,
+        )
+        .await
+        .expect_err("a harvest with no PR number must refuse");
+        assert_eq!(err.to_string(), "no pr_number");
+        if attempt < 3 {
+            assert_eq!(harvest_streak(&f).await, attempt, "attempt {attempt}");
+        }
+    }
+    assert_held(&f, ReleaseAction::MarkHarvested).await;
+}
+
 /// A harvest the budget denies ends before the forge and the tree: no
 /// job, no view, no worktree, nothing counted against it, and the PR
 /// stays pending for a window with room.
