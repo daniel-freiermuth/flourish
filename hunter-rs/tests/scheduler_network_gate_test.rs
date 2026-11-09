@@ -17,7 +17,7 @@ mod support;
 use hunter::config::Config;
 use hunter::domain::{FindingStatus, Severity};
 use hunter::scheduler::{Attempt, CycleSummary, run_cycle, work_hosts};
-use hunter::store::{FindingInsert, Store};
+use hunter::store::{FindingInsert, NewPrReview, Store, Trust};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -346,6 +346,64 @@ async fn an_unreachable_forge_does_not_block_another_repos_work() {
             .iter()
             .any(|e| e.kind == "deny" && e.message == passed_over),
         "the work passed over is named, with the host it waits for: {events:?}"
+    );
+}
+
+/// A requested PR review due on a repo whose forge is unreachable, another
+/// repo's work reachable, the provider up: the review is passed over like
+/// any other work on that repo, and the cycle runs the other repo's work.
+/// The review tier outranks the rotation, so a pick that kept offering it
+/// would pass over the same review again and again, and the cycle would
+/// never end.
+#[tokio::test]
+async fn a_pr_review_on_an_unreachable_forge_is_passed_over() {
+    const OTHER: &str = "other.example";
+    let (dir, store, cfg) = fixture("net-review-forge-down", &forge_url(FORGE), true).await;
+    let _beta_origin = add_beta(&dir, &store, &forge_url(OTHER)).await;
+    let url = forge_url(FORGE);
+    store
+        .request_pr_review(&NewPrReview {
+            repo_id: 1,
+            pr_number: 7,
+            repo_url: &url,
+            title: "make the widget faster",
+            author: "outsider",
+            base_ref: "main",
+            cross_repo: false,
+            head_sha: "aaa",
+            watch: false,
+            auto_post: false,
+            head_owner: None,
+            trust: Some(Trust::default()),
+            requested_by: "tester",
+            threads: None,
+        })
+        .await
+        .unwrap();
+    let backend = ScriptedBackend::noop()
+        .needing(&[PROVIDER])
+        .offline(&[FORGE]);
+
+    let Ok(summary) = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        run_cycle(&mut support::jobs(&store), &cfg, &backend, None),
+    )
+    .await
+    else {
+        let events = store.recent_events(3).await.unwrap();
+        panic!("the cycle never ends; its last events: {events:?}");
+    };
+
+    assert_eq!(summary.denied, None, "{summary:?}");
+    assert_eq!(summary.repo.as_deref(), Some("beta"), "{summary:?}");
+    assert_eq!(backend.runs().len(), 1, "beta's scan ran");
+    let events = store.recent_events(20).await.unwrap();
+    let passed_over = format!("offline: {FORGE} unreachable; passed over pr_review on alpha");
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "deny" && e.message == passed_over),
+        "the review passed over is named, with the host it waits for: {events:?}"
     );
 }
 
