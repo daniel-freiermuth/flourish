@@ -356,9 +356,9 @@ fn gitlab_close_targets_a_self_hosted_host() {
 // create_pr
 // ---------------------------------------------------------------------------
 
-/// The URL comes from the last line of `gh`'s chatter, and an empty title
-/// falls back to the branch name — `gh pr create --title ""` is rejected
-/// by the CLI, so the fallback is load-bearing.
+/// The URL is the last line of `gh`'s chatter that parses as a PR URL, and
+/// an empty title falls back to the branch name — `gh pr create --title ""`
+/// is rejected by the CLI, so the fallback is load-bearing.
 #[test]
 fn github_create_pr_returns_the_url_and_defaults_the_title_to_the_branch() {
     let bins = FakeBins::acquire("forge-gh-create-ok");
@@ -410,6 +410,37 @@ fn github_create_pr_propagates_a_non_zero_exit() {
         msg.contains("not authenticated"),
         "the CLI's diagnostics must survive: {msg}"
     );
+}
+
+/// `run_cmd` merges stderr into the output, so a create that exits 0 with
+/// no PR URL in it — only a warning — must fail, not hand the warning on
+/// as the finding's PR URL.
+#[test]
+fn github_create_pr_fails_when_no_pr_url_is_printed() {
+    let bins = FakeBins::acquire("forge-gh-create-no-url");
+    let dir = TempDir::new("forge-gh-create-no-url-cwd");
+    bins.ok("gh", "Warning: 1 uncommitted change");
+
+    let err = forge_for(ForgeName::Github)
+        .create_pr(dir.path(), "fix/x", "main", "t", "b")
+        .expect_err("output without a PR URL must not yield one");
+    assert!(err.to_string().contains("uncommitted change"), "{err}");
+}
+
+/// A warning after the URL is skipped: the URL is the line that parses.
+#[test]
+fn github_create_pr_skips_a_trailing_warning() {
+    let bins = FakeBins::acquire("forge-gh-create-trailing");
+    let dir = TempDir::new("forge-gh-create-trailing-cwd");
+    bins.ok(
+        "gh",
+        "https://github.com/acme/widget/pull/9\nWarning: 1 uncommitted change",
+    );
+
+    let url = forge_for(ForgeName::Github)
+        .create_pr(dir.path(), "fix/x", "main", "t", "b")
+        .expect("the URL is in the output");
+    assert_eq!(url, "https://github.com/acme/widget/pull/9");
 }
 
 /// `glab` prints the MR URL and then keeps talking, so the URL is found by
@@ -467,6 +498,18 @@ fn gitlab_create_pr_propagates_a_non_zero_exit() {
         msg.contains("403 forbidden"),
         "the CLI's diagnostics must survive: {msg}"
     );
+}
+
+#[test]
+fn gitlab_create_pr_fails_when_no_mr_url_is_printed() {
+    let bins = FakeBins::acquire("forge-gl-create-no-url");
+    let dir = TempDir::new("forge-gl-create-no-url-cwd");
+    bins.ok("glab", "Creating merge request for fix/x into main");
+
+    let err = forge_for(ForgeName::Gitlab)
+        .create_pr(dir.path(), "fix/x", "main", "t", "b")
+        .expect_err("output without an MR URL must not yield one");
+    assert!(err.to_string().contains("Creating merge request"), "{err}");
 }
 
 /// What `glab mr create` prints when GitLab answers 409 for a branch that
