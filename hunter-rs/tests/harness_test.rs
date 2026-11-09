@@ -163,6 +163,80 @@ fn test_ledger_dir_usage_unlistable_dir_is_an_error() {
     assert!(harness::ledger_dir_usage(&file).is_err());
 }
 
+/// omp writes each subagent's transcript in the directory named after the
+/// session that spawned it (`<dir>/<stem>.jsonl` +
+/// `<dir>/<stem>/<Agent>.jsonl`, and a subagent's own subagents under
+/// `<stem>/<Agent>/`). That is spend of the same run, so the meter must
+/// count it; the recorded `session_file` stays the top-level transcript a
+/// resume continues.
+#[test]
+fn test_ledger_dir_usage_counts_nested_subagent_transcripts() {
+    let dir = TempDir::new("ldu-nested");
+    let run = dir.join("run");
+    let stem = "2026-11-09T17-41-03-101Z_01a1c166";
+    fs::create_dir_all(run.join(stem).join("Recovery")).unwrap();
+    let line = |i: i64, o: i64, w: i64| {
+        format!(
+            "{{\"message\":{{\"role\":\"assistant\",\"usage\":{{\"input\":{i},\"output\":{o},\"cacheWrite\":{w}}}}}}}\n"
+        )
+    };
+    let top = run.join(format!("{stem}.jsonl"));
+    fs::write(&top, line(100, 50, 25)).unwrap();
+    fs::write(
+        run.join(stem).join("Recovery.jsonl"),
+        line(1000, 200, 100) + &line(10, 5, 0),
+    )
+    .unwrap();
+    fs::write(
+        run.join(stem).join("Recovery").join("Nested.jsonl"),
+        line(1, 1, 1),
+    )
+    .unwrap();
+    // Not a ledger: sibling artifacts omp keeps next to subagent transcripts.
+    fs::write(run.join(stem).join("Recovery.md"), "notes").unwrap();
+
+    let (session_file, tokens, calls) = harness::ledger_dir_usage(&run).unwrap().unwrap();
+    assert_eq!(tokens, 175 + 1300 + 15 + 3);
+    assert_eq!(calls, 4);
+    assert_eq!(
+        session_file, top,
+        "the run's own transcript, not a subagent's"
+    );
+}
+
+/// `<stem>/local/` is the worker's `local://` scratch root, not a
+/// transcript directory: whatever `*.jsonl` the agent writes there —
+/// findings notes, a copied transcript — is neither a ledger nor this
+/// run's spend. Reading it would kill the worker as unmetered on a
+/// non-ledger line, or bill a copy as calls that never happened.
+#[test]
+fn test_ledger_dir_usage_ignores_scratch_jsonl() {
+    let dir = TempDir::new("ldu-scratch");
+    let run = dir.join("run");
+    let stem = "2026-11-09T17-41-03-101Z_01a1c166";
+    let local = run.join(stem).join("local");
+    fs::create_dir_all(&local).unwrap();
+    let assistant =
+        r#"{"message":{"role":"assistant","usage":{"input":100,"output":50,"cacheWrite":25}}}"#;
+    let top = run.join(format!("{stem}.jsonl"));
+    fs::write(&top, format!("{assistant}\n")).unwrap();
+    fs::write(
+        local.join("notes.jsonl"),
+        "{\"file\":\"a.rs\",\"message\":\"unwrap on None\"}\nnot json\n",
+    )
+    .unwrap();
+    fs::write(
+        local.join("copy.jsonl"),
+        r#"{"message":{"role":"assistant","usage":{"input":100000,"output":0,"cacheWrite":0}}}"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        harness::ledger_dir_usage(&run).unwrap(),
+        Some((top, 175, 1))
+    );
+}
+
 // ============================================================
 // kill_tree — spawn a sleep, verify it dies
 // ============================================================
