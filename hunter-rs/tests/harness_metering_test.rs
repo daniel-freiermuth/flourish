@@ -264,6 +264,37 @@ fn worker_without_a_ledger_is_flagged_unmetered_despite_exit_zero() {
     assert_eq!(res.session_file, None);
 }
 
+/// omp changes its usage schema mid-run. A meter that read the renamed
+/// field as 0 would keep counting calls at no cost: the cap never fires
+/// and the run lands as Done at a fraction of its spend. The worker is
+/// killed as unmetered instead, keeping the last total that was metered.
+#[test]
+fn schema_drifted_usage_kills_the_worker_as_unmetered() {
+    let fx = Fixture::new("schema-drift");
+    let drifted = r#"{"message":{"role":"assistant","usage":{"input":5000,"output":5000,"cache_write":5000}}}"#;
+    fx.bins.script(
+        "omp",
+        &format!(
+            "{ledger}sleep 0.5\nprintf '%s\\n' '{drifted}' >> \"$LEDGER\"\nsleep 10\nexit 0",
+            ledger = ledger_sh(&[(1000, 200, 50)])
+        ),
+    );
+
+    let res = fx.run(Some(1_000_000), 30);
+
+    assert_eq!(res.killed_reason.as_deref(), Some("unmetered"));
+    assert_eq!(
+        res.tokens_new, 1250,
+        "the last good running total, neither 0 nor the drifted record at 0"
+    );
+    assert_eq!(res.calls, 1);
+    assert!(
+        res.duration_s < 5.0,
+        "killed on the meter error, not after the worker's own sleep: {}s",
+        res.duration_s
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Kill reasons
 // ---------------------------------------------------------------------------
@@ -722,7 +753,7 @@ fn a_resumed_run_meters_only_what_this_attempt_added() {
     assert_eq!(second.calls, 2, "two new calls, not the transcript's three");
     // The inherited history is still on disk — the subtraction is an
     // attribution rule, not a truncation of the transcript.
-    let (total_tokens, total_calls) = harness::ledger_usage(&ledger);
+    let (total_tokens, total_calls) = harness::ledger_usage(&ledger).unwrap();
     assert_eq!((total_tokens, total_calls), (4110, 3));
 }
 
