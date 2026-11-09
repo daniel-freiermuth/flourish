@@ -188,7 +188,16 @@ pub fn ctx_at_suspension(session_file: &Path) -> Option<i64> {
 /// Meter a worker's whole private session directory: every `*.jsonl` omp
 /// wrote for this run, summed. One file is the norm; summing rather than
 /// picking one means an extra transcript (a nested session) is counted as
-/// spend instead of silently discounted.
+/// spend instead of silently discounted. That includes subagents: omp
+/// keeps a session's artifacts in the directory named after its
+/// transcript (`<stem>.jsonl` → `<stem>/`) and writes each subagent's
+/// transcript there (`<stem>/<Agent>.jsonl`, whose own subagents go in
+/// `<stem>/<Agent>/`), and that spend is this run's.
+///
+/// Only such paired directories are walked. Everything else under
+/// `<stem>/` — notably `local/`, the worker's `local://` scratch root —
+/// holds whatever the agent chose to write, and a `*.jsonl` there is
+/// neither a ledger nor spend.
 ///
 /// `Ok(None)` until the directory exists and holds at least one ledger —
 /// that is the "not metered yet" signal `run_worker` waits on, and kills
@@ -204,11 +213,19 @@ pub fn ledger_dir_usage(run_dir: &Path) -> anyhow::Result<Option<(PathBuf, i64, 
         }
     };
     let mut files: Vec<PathBuf> = Vec::new();
+    let mut subdirs: Vec<PathBuf> = Vec::new();
     for entry in entries {
-        let p = entry
+        let entry = entry.with_context(|| format!("listing {}", run_dir.display()))?;
+        let p = entry.path();
+        // `DirEntry::file_type` does not follow symlinks, so a link cannot
+        // send the walk outside the run directory or around a cycle.
+        let is_dir = entry
+            .file_type()
             .with_context(|| format!("listing {}", run_dir.display()))?
-            .path();
-        if p.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            .is_dir();
+        if is_dir {
+            subdirs.push(p);
+        } else if p.extension().and_then(|e| e.to_str()) == Some("jsonl") {
             files.push(p);
         }
     }
@@ -223,6 +240,20 @@ pub fn ledger_dir_usage(run_dir: &Path) -> anyhow::Result<Option<(PathBuf, i64, 
         let (t, c) = ledger_usage(f)?;
         tokens += t;
         calls += c;
+    }
+    // Nested transcripts are subagents' spend: summed, but never the
+    // `session_file`. A directory is walked only when the transcript it
+    // belongs to sits next to it.
+    for d in subdirs {
+        let mut transcript = d.as_os_str().to_owned();
+        transcript.push(".jsonl");
+        if files.binary_search(&PathBuf::from(transcript)).is_err() {
+            continue;
+        }
+        if let Some((_, t, c)) = ledger_dir_usage(&d)? {
+            tokens += t;
+            calls += c;
+        }
     }
     Ok(Some((files.swap_remove(0), tokens, calls)))
 }
