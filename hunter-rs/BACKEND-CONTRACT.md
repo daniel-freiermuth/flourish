@@ -380,6 +380,14 @@ Constants: `_TOK_PER_FRAC_5H = 200_000 / 0.10 = 2_000_000.0` (:42; comment :39-4
 and headroom use one explicit decision-time snapshot. Tests can inject the
 exact reset without racing a second wall-clock read.
 
+**Rust prio waiver:** unlike the historical Python implementation above,
+which returned the override grant from the first waived row, a waived row
+does not end the pass. Every later row still gates, so an exhausted window
+after it (e.g. `anthropic:5h` behind a waived `anthropic:7d`) denies with
+its own reason and reset, and the override's cap is `_compute_headroom(prio=True)`,
+the min hard-limit headroom across all rows. That min being ≤ 0 denies
+with the first waived row's reason and retry.
+
 **`_frac_to_tokens(frac, dim) -> int`** (:271-276): `cap_5h, cap_7d = _capacities()`; `dim == "5h" or ":5h" in dim` → `int(frac * cap_5h)`; else → `int(frac * cap_7d)`. Both caps come from the one derivation `_unaccounted_fraction` uses: the 7d estimate is consulted, and the 5h-times-ratio value is only the fallback when there is not yet enough history to estimate one. (An earlier revision of this document claimed the 7d estimate was *not* consulted here and told the port to reproduce that asymmetry verbatim. It was a mis-transcription: the 7d estimate has always been read. The Rust port matches the source, not that sentence.)
 
 **`decide(*, anticipated_tokens) -> Outlook`** (:278-296):
@@ -394,10 +402,10 @@ Verdict quick reference (tests substring-match `"5h"`, `"7d"`, `"ramp"`, `"no wi
 | no windows | Denied | `no window data -- deny until fresh` | retry None |
 | :7d over ramp (pacing) | Denied | `{lid}: used {u:.2f} + unaccounted {r:.2f} = {eff:.2f} >= ramp {ramp:.2f}` | `retry_at_7d(resets, eff)` |
 | :7d exhausted | Denied | same format (eff = 1.0 + r) | `resets_at` |
-| :7d pacing + prio, cap>0 | Granted | `prio override ({7d reason})` | cap = `_frac_to_tokens(1 − capacity.effective_used(w, budget_7d), "7d")` |
+| :7d pacing + prio, cap>0 | Granted | `prio override ({7d reason})` | cap = `_frac_to_tokens(1 − capacity.effective_used(w, budget_7d), "7d")`; Rust: min with every other row's prio headroom, and later rows still gate |
 | 5h over ramp (pacing) | Denied | `5h: used {u:.2f} + unaccounted {r:.2f} = {eff:.2f} >= ramp {ramp:.2f}` | `retry_at_5h(resets, eff)` |
 | 5h exhausted | Denied | same | `resets_at` |
-| 5h pacing + prio, cap>0 | Granted | `prio override ({5h reason})` | cap dim "5h" |
+| 5h pacing + prio, cap>0 | Granted | `prio override ({5h reason})` | cap dim "5h"; Rust: min with every other row's prio headroom |
 | prio waiver but cap ≤ 0 | Denied | the pacing reason | the pacing retry |
 | all pass | Granted | `ok` | cap = min-headroom or None |
 

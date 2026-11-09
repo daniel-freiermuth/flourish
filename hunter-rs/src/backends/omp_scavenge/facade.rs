@@ -154,6 +154,10 @@ impl OmpScavengeBackend {
         }
 
         let quota = provider.quota();
+        // First pacing denial priority waived: it names the override, and
+        // its retry applies if no hard-limit headroom is left. Later rows
+        // still gate, so an exhausted window after it denies.
+        let mut waived: Option<(String, Option<f64>)> = None;
         for (quota_window, resv) in quota.windows.iter().zip(reservations) {
             for (lid, window) in windows.iter().filter(|(lid, _)| quota_window.gates(lid)) {
                 if let Some(resets_at) = window.resets_at
@@ -190,10 +194,8 @@ impl OmpScavengeBackend {
                     // measured against must not already contain it.
                     let cap = resv.tokens((1.0 - (reported + resv.budget)).max(0.0));
                     if cap > 0 {
-                        return Verdict::Granted {
-                            cap_tokens: Some(cap),
-                            reason: format!("prio override ({reason})"),
-                        };
+                        waived.get_or_insert((reason, retry_at));
+                        continue;
                     }
                 }
                 return Verdict::Denied { reason, retry_at };
@@ -202,6 +204,15 @@ impl OmpScavengeBackend {
 
         // Gate and cap use the same decision-time snapshot.
         let headroom = Self::compute_headroom(provider, windows, reservations, prio, now_ms);
+        if let Some((reason, retry_at)) = waived {
+            return match headroom {
+                Some(cap) if cap > 0 => Verdict::Granted {
+                    cap_tokens: Some(cap),
+                    reason: format!("prio override ({reason})"),
+                },
+                _ => Verdict::Denied { reason, retry_at },
+            };
+        }
         Verdict::Granted {
             cap_tokens: headroom,
             reason: "ok".to_owned(),

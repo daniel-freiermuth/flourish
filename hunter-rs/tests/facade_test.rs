@@ -1306,6 +1306,90 @@ async fn test_prio_exhausted_not_waived() {
     );
 }
 
+/// Priority waives the 7d ramp, but a shorter window checked after it
+/// still binds: an exhausted 5h window is a hard stop for prioritized
+/// work too, whatever the 7d row allowed.
+#[tokio::test]
+async fn test_prio_7d_override_still_denied_by_exhausted_5h() {
+    let now = now_ms();
+    let resets_5h = now + 2 * HOUR_MS;
+    let mut w = BTreeMap::new();
+    // 7d over its ramp (.60 ≥ .50), so normal is denied by 7d pacing.
+    w.insert(
+        "anthropic:7d".to_owned(),
+        ws("anthropic:7d", 0.60, "ok", now + WEEK_MS / 2, 60.0),
+    );
+    w.insert(
+        "anthropic:5h".to_owned(),
+        ws("anthropic:5h", 1.0, "exhausted", resets_5h, 60.0),
+    );
+    let b = make_backend(FakeLedger::new(0, 0));
+    let o = b.decide_with_windows(&w, 0, now).await.unwrap();
+
+    assert!(is_denied(&o.normal), "{:?}", o.normal);
+    assert!(
+        is_denied(&o.prioritized),
+        "an exhausted 5h window must deny prioritized work: {:?}",
+        o.prioritized
+    );
+    assert!(
+        reason(&o.prioritized).contains("anthropic:5h"),
+        "{:?}",
+        o.prioritized
+    );
+    let rt = retry_at(&o.prioritized).expect("retry_at should be Some");
+    assert!((rt - resets_5h as f64).abs() < 1.0, "retry_at {rt}");
+}
+
+/// The 7d prio override's cap is the hard-limit headroom of every gating
+/// window, not only the 7d row that was waived.
+///
+/// 7d capacity 10M at .60 (ramp .50) is waived with (1 − .60) × 10M = 4M
+/// of its own; 5h capacity 1M at .97 (ramp ≈ .98, so it passes) has only
+/// (1 − .97) × 1M = 30k left.
+#[tokio::test]
+async fn test_prio_7d_override_cap_bounded_by_5h_headroom() {
+    let now = now_ms();
+    let mut w = BTreeMap::new();
+    w.insert(
+        "anthropic:7d".to_owned(),
+        ws("anthropic:7d", 0.60, "ok", now + WEEK_MS / 2, 60.0),
+    );
+    w.insert(
+        "anthropic:5h".to_owned(),
+        ws(
+            "anthropic:5h",
+            0.97,
+            "ok",
+            now + (0.1 * HOUR_MS as f64) as i64,
+            60.0,
+        ),
+    );
+    let mut ledger = FakeLedger::new(0, 0);
+    ledger
+        .capacity
+        .insert("anthropic:5h".to_owned(), 1_000_000.0);
+    ledger
+        .capacity
+        .insert("anthropic:7d".to_owned(), 10_000_000.0);
+    let b = make_backend(ledger);
+    let o = b.decide_with_windows(&w, 0, now).await.unwrap();
+
+    assert!(is_denied(&o.normal), "{:?}", o.normal);
+    assert!(reason(&o.normal).contains("7d"), "{:?}", o.normal);
+    assert!(
+        reason(&o.prioritized).contains("prio override"),
+        "expected a prio override, got {:?}",
+        o.prioritized
+    );
+    let cap = cap_tokens(&o.prioritized).expect("a prio override cap");
+    assert!(
+        (cap - 30_000).abs() <= 2,
+        "prio cap {cap} should be the 5h hard-limit headroom (1 − .97) × 1M \
+         = 30000, not the waived 7d row's 4000000"
+    );
+}
+
 /// The 7d token cap uses the 7d capacity estimate when one exists.
 ///
 /// An earlier revision of BACKEND-CONTRACT.md asserted the opposite —
