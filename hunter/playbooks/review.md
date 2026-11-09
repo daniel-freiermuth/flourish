@@ -87,6 +87,6 @@ twenty guesses. An empty array is a valid verdict. Each entry:
 
 `blocking` is true only for a correctness defect you would refuse to merge;
 it ranks issues for the author and the human, and every issue but a
-follow-up is answered either way. A blocking issue still open when the
-review ends holds the change for a human instead of shipping it. Report
+follow-up is answered either way. An issue still open when the last
+review round ends holds the change for a human instead of shipping it. Report
 an issue only when you can point at the code that proves it. Then stop.

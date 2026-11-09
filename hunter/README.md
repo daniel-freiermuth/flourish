@@ -131,21 +131,47 @@ new ──recheck──> new / superseded / rejected
   new code evidence. Defects outside the change's scope are reported as
   `follow-up`s: never answered and never keeping the loop going, they are
   collected across rounds and ship in a "## Follow-ups from review"
-  section of the PR body. When issues are left after the last round (or
-  the grant is spent before the fixer can answer them, or its answer
-  fails without doing work while the forge is reachable; offline, the
-  attempt is kept and retried), a blocking one
-  holds the fix for you like a `BLOCKED.md`, with the remaining issues as
-  the hold's report; `continue` resumes the fixer on them and the review
-  runs again. Non-blocking ones ship in an "Unresolved review issues"
-  section of the PR body; a review that fails (a reviewer that ended early or left
+  section of the PR body. When issues are left after the last round, any
+  of them holds the fix for you like a `BLOCKED.md`, with the remaining
+  issues as the hold's report: a review still finding something after
+  `review.maxRounds` rounds is not converging. `continue` resumes the
+  fixer on them and the review runs again. When the grant is spent before
+  the fixer can answer them, or its answer fails without doing work while
+  the forge is reachable (offline, the attempt is kept and retried), a
+  blocking one holds the fix the same way and non-blocking ones ship in an
+  "Unresolved review issues" section of the PR body; a review that fails
+  (a reviewer that ended early or left
   no valid output without writing an issue) ships the fix with a note
-  saying so. Whatever a reviewer changes in the tree is undone, and
-  issues it had written still count. A fixer that did not finish ships
-  nothing while the review is on. Every run is metered into the one fix
-  job, under its one budget grant. Details: `hunter-rs/WORK-MODEL.md`
-  §5.7. Before the push, a multi-commit fix is curated into a few logical
-  commits of the same tree (`review.curate`).
+  saying so. The change is its commits: before every round the fixer's
+  uncommitted changes to tracked files are discarded and its untracked
+  files deleted, in every checked-out submodule as well, which is put
+  back to the commit the tree records (ignored files, such as build
+  caches, and `PR-DESCRIPTION.md`, untracked or committed and then
+  updated, stay), and the round's event lists what went; what cannot be
+  removed stays, named in the event, and the fix is reviewed with it. Whatever a reviewer then changes in the tree is undone (the branch
+  the reviewer was shown, the fix branch or one of the fixer's own,
+  checked out again at the reviewed commit, untracked files
+  deleted, submodules cleaned the same way). The verdict is about the
+  commits: a reviewer that left them alone, whatever it left uncommitted
+  (a test run's artifact, a lock file its build rewrote), changed nothing
+  it reviewed: its changes are reverted, the round's event names them,
+  and its verdict stands. One that committed, moved the branch or touched
+  `PR-DESCRIPTION.md` has issues it had written still count. When its changes cannot be undone,
+  the tree is put back to the commit the reviewer was shown before any
+  later attempt runs a worker in it, however that round ended (its issues
+  held the fix, a host went unreachable, or the publish of that commit
+  failed); while that fails (a hold's report, and each failure, names
+  what is still in the way) no worker runs, and the attempt fails as
+  `reviewed tree not restored`, three times in a row holding the fix
+  `stuck`. Until a fixer has run on the review's issues, any `continue`
+  resumes it on them, whichever hold it released. A fixer
+  that did not finish ships nothing while the review is on. Every run is
+  metered into the one fix job, under its one budget grant. Details:
+  `hunter-rs/WORK-MODEL.md` §5.7. Before the push, a multi-commit fix is
+  curated into a few logical commits of the same tree (`review.curate`); a
+  curation whose changes cannot be undone is put back the same way as
+  a reviewer's before any later attempt runs a worker, and the fixer
+  resumed then is told its rewrite was undone, not to pick it back up.
 - **Held work** is not a status. When a worker writes `BLOCKED.md`
   (a verification prerequisite, dependency, or human decision is
   missing; every finding kind's playbook says when: a recheck that cannot
@@ -1087,7 +1113,8 @@ quota source for one installation.
   `fix` override per job family; `null` inherits `default`. The pre-PR
   reviewer runs with the `fix` model.
 - `review.maxRounds` (default 7) — how many times a finished fix is
-  reviewed before it ships (§ Finding lifecycle); `0` ships unreviewed.
+  reviewed before it ships; issues still open after the last round hold
+  the fix for you (§ Finding lifecycle). `0` ships unreviewed.
 - `review.curate` (default true) — once a review ends in a ship with more
   than one commit, the fixer rewrites them into a few logical commits of
   the same tree (`playbooks/curate.md`); a rewrite that changes the tree

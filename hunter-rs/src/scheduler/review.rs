@@ -51,16 +51,51 @@ const PROGRESS_FILE: &str = "review-progress.json";
 const ENDING_FILE: &str = "review-ending.json";
 
 /// In the workspace root, while a curation runs ([`curate`]): the tree
-/// it started from ([`Curating`]). Left behind only when the daemon died
-/// during the curation; the next attempt puts the tree back to it before
-/// anything reads the tree ([`recover_curation`]).
+/// it started from ([`ReviewedTree`]). Left behind only when the daemon
+/// died during the curation; the next attempt puts the tree back to it
+/// before anything reads the tree ([`recover_curation`]).
 const CURATING_FILE: &str = "review-curating.json";
 
-/// The reviewed tree a curation started from, and the fixer's description.
+/// In the workspace root: the tree an agent was shown whose changes could
+/// not be undone, and which agent that was ([`Restore`]): a failed round's
+/// reviewer, or a curator, rejected or cut off by a restart
+/// ([`recover_curation`]). Recorded before the attempt goes on, whatever
+/// it then amounts to (a hold, a retry once a host is reachable again, a
+/// pinned commit whose publish failed), so every later attempt of the
+/// chain puts the tree back to it before any worker runs in it
+/// ([`restore_reviewed`]).
+const RESTORE_FILE: &str = "review-restore.json";
+
+/// A reviewed tree to put back to ([`undo`]), and the fixer's description:
+/// the one a curation started from ([`CURATING_FILE`]), or the one an
+/// agent was shown and could not be undone from ([`Restore`]).
 #[derive(Debug, Serialize, Deserialize)]
-struct Curating {
+struct ReviewedTree {
     before: TreeState,
     description: Vec<u8>,
+}
+
+/// Which agent changed a tree that is put back to the one it was shown.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum LeftBy {
+    /// A failed review round's reviewer: the fixer's session never saw
+    /// its changes.
+    #[default]
+    Reviewer,
+    /// A curator, which ran in the fixer's session: the resumed fixer is
+    /// told its rewrite was undone ([`CURATION_UNDONE_PROMPT`]).
+    Curator,
+}
+
+/// What [`RESTORE_FILE`] holds: the tree to put back to, and whose
+/// changes that undoes.
+#[derive(Debug, Serialize, Deserialize)]
+struct Restore {
+    #[serde(flatten)]
+    tree: ReviewedTree,
+    #[serde(default)]
+    by: LeftBy,
 }
 
 /// What the review loop leaves for the job's record and its PR.
@@ -136,9 +171,11 @@ enum RoundVerdict {
     /// they ship unresolved.
     Failed {
         why: String,
-        /// `HEAD` before the reviewer ran, when the tree could not be put
-        /// back to it: the commit that ships.
-        head: Option<String>,
+        /// The tree before the reviewer ran, when it could not be put back
+        /// to it: its commit is the one that ships, and the one every later
+        /// attempt puts the tree back to before a worker runs
+        /// ([`RESTORE_FILE`]).
+        left: Option<ReviewedTree>,
         issues: Vec<serde_json::Value>,
     },
 }
@@ -201,7 +238,7 @@ impl Rounds<'_> {
 enum Unanswered {
     /// An answer is coming: send them back to the fixer.
     No,
-    /// A blocking one holds the fix for the operator ([`hold`]).
+    /// The fix is held for the operator ([`hold`]).
     Held,
     /// They ship unresolved; `keep` saves the verdict for the tree.
     Ship(Ending, bool),
@@ -229,21 +266,36 @@ impl Rounds<'_> {
         Some(host)
     }
 
-    /// What a failed round amounts to (`why`). With a host the work needs
-    /// unreachable, whatever the reviewer did, the network's failure
+    /// What a failed round amounts to (`why`). A reviewer whose changes
+    /// could not be undone (`left`) has the tree it was shown recorded
+    /// first ([`record_restore`]), however the round ends: no later worker
+    /// builds on what it left. With a host the work needs unreachable,
+    /// whatever the reviewer did, the network's failure
     /// ([`Self::offline`]): an outage that cut a review off mid-way is no
     /// more the fix's than one that kept it from starting.
     /// Otherwise the fix ships, saying why it was not reviewed: the
-    /// reviewer never holds it hostage. But a blocking issue the reviewer
-    /// wrote before the round failed never ships: it holds the fix.
+    /// reviewer never holds it hostage. But issues the reviewer wrote
+    /// before the round failed hold the fix as an answered round's would
+    /// ([`Self::holds`]).
     async fn failed_round(
         &self,
         round: u32,
-        (why, head, issues): (&str, Option<String>, &[serde_json::Value]),
+        (why, left, issues): (&str, Option<ReviewedTree>, &[serde_json::Value]),
         follow_ups: &[serde_json::Value],
         also: &str,
     ) -> Unanswered {
         let start = self.start;
+        let head = left.and_then(|tree| {
+            let head = tree.before.head.clone();
+            record_restore(
+                start,
+                &Restore {
+                    tree,
+                    by: LeftBy::Reviewer,
+                },
+            );
+            head
+        });
         if let Some(host) = self.offline(round, follow_ups).await {
             return Unanswered::Offline(host);
         }
@@ -252,7 +304,8 @@ impl Rounds<'_> {
             title: self.title.clone(),
             follow_ups: follow_ups.to_vec(),
         };
-        if issues.iter().any(is_blocking) && hold(start, round, issues, &progress, why) {
+        let restoring = head.as_deref();
+        if self.holds(round, issues) && hold(start, round, issues, (&progress, why, restoring)) {
             let message = format!(
                 "failed: {why}; {}{also}; held for the operator",
                 tally(issues)
@@ -265,11 +318,23 @@ impl Rounds<'_> {
         Unanswered::Ship(failed(round, why, head, issues), false)
     }
 
+    /// Whether round `round`'s unanswered `issues` hold the fix for the
+    /// operator instead of shipping: any of them in the last round (a
+    /// review still finding something after `review.maxRounds` rounds is
+    /// not converging), else only a blocking one.
+    fn holds(&self, round: u32, issues: &[serde_json::Value]) -> bool {
+        let last = round >= self.cfg.review_max_rounds;
+        (last && !issues.is_empty()) || issues.iter().any(is_blocking)
+    }
+
     /// Whether round `round`'s `issues` get no answer, and what then: none
     /// comes in the last round, or when the grant is spent (a reviewer
-    /// killed at its cap) and leaves nothing to answer them with. A
-    /// blocking issue then holds the fix for the operator; the rest ship
-    /// unresolved. `raised` is the round's tally for the event.
+    /// killed at its cap) and leaves nothing to answer them with. Any issue
+    /// left by the last round holds the fix for the operator: a review that
+    /// still finds something after `review.maxRounds` rounds is not
+    /// converging, and its change is not shipped on the hope that the rest
+    /// is harmless. A spent grant holds it only for a blocking issue; the
+    /// rest ship unresolved. `raised` is the round's tally for the event.
     async fn unanswered(
         &self,
         spent: &RunResult,
@@ -296,7 +361,7 @@ impl Rounds<'_> {
             title: self.title.clone(),
             follow_ups: follow_ups.to_vec(),
         };
-        if issues.iter().any(is_blocking) && hold(start, round, issues, &progress, &stop) {
+        if self.holds(round, issues) && hold(start, round, issues, (&progress, &stop, None)) {
             let message = format!("{raised}, {stop}; held for the operator");
             log_round(self.store(), start, round, &message).await;
             return Unanswered::Held;
@@ -380,8 +445,8 @@ pub(super) async fn review_fix(
         merge_follow_ups(&mut follow_ups, raised_follow_ups);
         let store = rounds.store();
         let (issues, undone) = match verdict {
-            RoundVerdict::Failed { why, head, issues } => {
-                let failure = (why.as_str(), head, issues.as_slice());
+            RoundVerdict::Failed { why, left, issues } => {
+                let failure = (why.as_str(), left, issues.as_slice());
                 match rounds
                     .failed_round(round, failure, &follow_ups, &also)
                     .await
@@ -528,7 +593,7 @@ async fn curated_head(rounds: &Rounds<'_>, lane: &mut Lane, job: &mut RunResult)
         return Curated::Not(None);
     };
     let tree = &start.ws.tree;
-    let curating = Curating {
+    let curating = ReviewedTree {
         before: tree_state(tree).await,
         description: std::fs::read(tree.join(DESCRIPTION)).unwrap_or_default(),
     };
@@ -549,10 +614,6 @@ async fn curated_head(rounds: &Rounds<'_>, lane: &mut Lane, job: &mut RunResult)
         note(format!("skipped (cannot record the reviewed tree: {e})")).await;
         return Curated::Not(None);
     }
-    let Curating {
-        before,
-        description,
-    } = curating;
     let run = rounds
         .backend
         .run(
@@ -570,7 +631,7 @@ async fn curated_head(rounds: &Rounds<'_>, lane: &mut Lane, job: &mut RunResult)
         Ok(rr) => {
             add_spend(job, rr);
             if job_state(rr) == FinishedState::Done {
-                curated(start, &before, &after, &reviewed).await
+                curated(start, &curating.before, &after, &reviewed).await
             } else {
                 Err(format!("the curation {}", run_failure(rr)))
             }
@@ -582,7 +643,7 @@ async fn curated_head(rounds: &Rounds<'_>, lane: &mut Lane, job: &mut RunResult)
             Curated::Accepted
         }
         Err(why) => {
-            let undone = undo(lane, start, &before, &after, &description).await;
+            let undone = undo_or_record(lane, start, curating).await;
             let pin = undone.as_ref().err().map(|_| reviewed);
             let left = undone
                 .err()
@@ -603,20 +664,18 @@ async fn curated_head(rounds: &Rounds<'_>, lane: &mut Lane, job: &mut RunResult)
 /// merge or `am` the curator left in progress, then [`undo`] to the
 /// reviewed tree and description, under the clone's permit. Run first in a
 /// later attempt of the chain, before anything reads the tree; the verdict
-/// saved for the reviewed tree then ships it without another review.
-/// `true` when there was a curation to recover from.
+/// saved for the reviewed tree then ships it without another review. A
+/// tree that could not be put back is recorded for [`restore_reviewed`]
+/// ([`undo_or_record`]), which runs next: no worker runs on it until it is,
+/// and the one that then does is told its curation was undone as if it had
+/// been now. `true` when a curation's changes were undone now.
 pub(super) async fn recover_curation(lane: &mut Lane, store: &Store, start: &FixStart) -> bool {
     let marker = start.ws.root.join(CURATING_FILE);
-    let Some(Curating {
-        before,
-        description,
-    }) = read_json::<Curating>(&marker)
-    else {
+    let Some(curating) = read_json::<ReviewedTree>(&marker) else {
         return false;
     };
-    let tree = start.ws.tree.clone();
     if let Ok(permit) = lane.lock_clone(start.repo.id).await {
-        let at = tree.clone();
+        let at = start.ws.tree.clone();
         let _ = permit
             .blocking(move |hold| {
                 for op in ["rebase", "cherry-pick", "merge", "am"] {
@@ -626,8 +685,8 @@ pub(super) async fn recover_curation(lane: &mut Lane, store: &Store, start: &Fix
             })
             .await;
     }
-    let now = tree_state(&tree).await;
-    let outcome = match undo(lane, start, &before, &now, &description).await {
+    let undone = undo_or_record(lane, start, curating).await;
+    let outcome = match &undone {
         Ok(()) => "the reviewed commit restored".to_owned(),
         Err(e) => format!("restoring the reviewed commit failed: {e}"),
     };
@@ -635,14 +694,15 @@ pub(super) async fn recover_curation(lane: &mut Lane, store: &Store, start: &Fix
     let fid = start.finding.id;
     let message = format!("#{fid} curation: interrupted by a restart; {outcome}");
     let _ = fix_event(store, "review", fid, start.job, message).await;
-    true
+    undone.is_ok()
 }
 
-/// What a fixer resumed after [`recover_curation`] is told: its interrupted
-/// curation was undone, and there is nothing left to do.
-pub(super) const CURATION_UNDONE_PROMPT: &str = "Your rewrite of this branch's history was \
-     interrupted and has been undone: the branch is back at the reviewed commit, which ships as \
-     it is. Do not change the history, the files or PR-DESCRIPTION.md. Stop now.";
+/// What a fixer resumed after its curation's changes were undone
+/// ([`LeftBy::Curator`]) is told: the curation was undone, and there is
+/// nothing left to do.
+pub(super) const CURATION_UNDONE_PROMPT: &str = "Your rewrite of this branch's history has been \
+     undone: the branch is back at the reviewed commit, which ships as it is. Do not change the \
+     history, the files or PR-DESCRIPTION.md. Stop now.";
 
 /// How many commits `start`'s branch has on top of its pinned commit, if
 /// git can say.
@@ -734,7 +794,18 @@ async fn saved_ending(start: &FixStart) -> Option<Ending> {
 /// reviewed commit instead) covers nothing.
 async fn covering_verdict(ws: &Workspace) -> Option<Saved> {
     let saved = read_json::<Saved>(&ws.root.join(ENDING_FILE))?;
-    let covers = saved.tree.head.is_some() && saved.tree == tree_state(&ws.tree).await;
+    let now = tree_state(&ws.tree).await;
+    // A verdict saved by an earlier daemon holds its status trimmed at
+    // both ends, which dropped the first line's leading blank: compare
+    // the statuses as that trim leaves them.
+    let status = |t: &TreeState| t.status.as_deref().map(str::trim_start).map(str::to_owned);
+    let covers = saved.tree.head.is_some()
+        && (
+            &saved.tree.head,
+            &saved.tree.branch,
+            &saved.tree.description,
+        ) == (&now.head, &now.branch, &now.description)
+        && status(&saved.tree) == status(&now);
     covers.then_some(saved)
 }
 
@@ -811,13 +882,40 @@ pub(super) async fn has_kept_verdict(ws: &Workspace) -> bool {
 /// so the operator's `continue` resumes the fixer on its issues.
 const HELD_FILE: &str = "review-held.json";
 
-/// Blocking issues a review left unanswered, held for the operator.
+/// Blocking issues a review left unanswered, held for the operator. They
+/// are pending until a fixer has run on them ([`mark_held_sent`]): every
+/// attempt that follows an operator's `continue` while they are pending
+/// resumes the fixer on them ([`held_resume_prompt`]), whichever hold that
+/// `continue` released. A hold made since on an attempt no fixer ran in
+/// (`stuck` on a tree that could not be put back, say) stands between the
+/// review's hold and the fixer, but the issues are still the work left.
 #[derive(Debug, Serialize, Deserialize)]
 struct Held {
-    /// The hold's report, as `BLOCKED.md` gave it: what the resume plan's
-    /// `after_hold` detail is when the hold is this one.
-    report: String,
     issues: Vec<serde_json::Value>,
+    /// A fixer has run on `issues`: later continues of the chain resume it
+    /// as any other hold's do. Every file this daemon writes has it; one
+    /// without it is a legacy file ([`Held::pending`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sent: Option<bool>,
+    /// A legacy file's hold report, as its `BLOCKED.md` gave it: read to
+    /// decide whether its issues are pending, never written.
+    #[serde(default, skip_serializing)]
+    report: Option<String>,
+}
+
+impl Held {
+    /// Whether `issues` are pending for an attempt resumed after the
+    /// operator continued a hold whose detail is `detail`. A file with
+    /// `sent` says so itself. A legacy one (an earlier daemon's, without
+    /// `sent`) never recorded it: it stayed behind after its issues were
+    /// answered, and was used only on a `continue` of its own hold, whose
+    /// detail is its `report`; so it still is, and only then.
+    fn pending(&self, detail: &str) -> bool {
+        match self.sent {
+            Some(sent) => !sent,
+            None => self.report.as_deref() == Some(detail),
+        }
+    }
 }
 
 /// Hold the fix for the operator on review round `round`'s unanswered
@@ -826,30 +924,44 @@ struct Held {
 /// `prerequisite` hold with this attempt as its checkpoint), and the
 /// issues to [`HELD_FILE`] for the resume. `progress` (round 0, the title
 /// and the follow-ups so far) replaces the loop's progress, so a continued
-/// fix is reviewed from round 1 under the same title and keeps them. `false` when the report could not be
-/// written: the fix ships with the issues unresolved instead.
+/// fix is reviewed from round 1 under the same title and keeps them.
+/// `restoring`: the commit the round's reviewer was shown, when its changes
+/// could not be undone, which every later attempt puts the tree back to
+/// before the fixer resumes ([`RESTORE_FILE`]); the report says so.
+/// `false` when the report could not be written: the fix ships with the
+/// issues unresolved instead.
 fn hold(
     start: &FixStart,
     round: u32,
     issues: &[serde_json::Value],
-    progress: &Progress,
-    stop: &str,
+    (progress, stop, restoring): (&Progress, &str, Option<&str>),
 ) -> bool {
     let follow_ups = &progress.follow_ups;
     let root = &start.ws.root;
     let mut report = format!(
         "# Held by the pre-PR review\n\nThe automated pre-PR review stopped at round \
-         {round} ({stop}) with blocking issues unresolved. Continue to have the fixer \
-         answer them; the review then runs again from round 1.\n\n## Remaining review \
-         issues\n"
+         {round} ({stop}) with issues unresolved. Continue to have the fixer \
+         answer them; the review then runs again from round 1.\n\n"
     );
+    if let Some(commit) = restoring {
+        let _ = write!(
+            report,
+            "The reviewer's changes to the tree could not be undone. Before the fixer \
+             resumes, the fix branch is put back to the reviewed commit `{commit}` and what \
+             the reviewer added is removed; while that fails, the fixer does not run (the \
+             attempt fails as `{TREE_NOT_RESTORED}`), and `{}` needs cleaning up by hand.\n\n",
+            start.ws.tree.display()
+        );
+    }
+    report.push_str("## Remaining review issues\n");
     issue_list(&mut report, issues);
     if !follow_ups.is_empty() {
         let _ = write!(report, "\n\n{}", follow_ups_note(follow_ups));
     }
     let held = Held {
-        report: report.clone(),
         issues: issues.to_vec(),
+        sent: Some(false),
+        report: None,
     };
     let written = serde_json::to_vec(&held)
         .map_err(std::io::Error::other)
@@ -875,19 +987,108 @@ fn hold(
     true
 }
 
-/// The prompt a fix resumed after the operator continued a review hold
-/// ([`hold`]) gets, or `None` when `detail` is not that hold's report:
-/// the follow-up playbook with the issues the review left, so the fixer
-/// answers them before the review runs again.
+/// Why an attempt could not put its tree back to the one an agent whose
+/// changes could not be undone was shown ([`restore_reviewed`]): the
+/// failure its streak counts.
+pub(super) const TREE_NOT_RESTORED: &str = "reviewed tree not restored";
+
+/// Record `left`, the tree an agent (a failed round's reviewer, or a
+/// curator) was shown and could not be undone from, for
+/// [`restore_reviewed`] ([`RESTORE_FILE`]). A failure is logged: the tree
+/// then stays as the agent left it.
+fn record_restore(start: &FixStart, left: &Restore) {
+    let written = serde_json::to_vec(left)
+        .map_err(std::io::Error::other)
+        .and_then(|bytes| std::fs::write(start.ws.root.join(RESTORE_FILE), bytes));
+    if let Err(e) = written {
+        tracing::warn!(
+            "fix #{}: recording the reviewed tree to put back: {e}",
+            start.finding.id
+        );
+    }
+}
+
+/// [`undo`] a curator's changes back to `reviewed`; when that fails, the
+/// tree is recorded as the curator's for [`restore_reviewed`]
+/// ([`record_restore`]), so no later worker runs on, and no later review
+/// ships, what the curator left.
+async fn undo_or_record(
+    lane: &mut Lane,
+    start: &FixStart,
+    reviewed: ReviewedTree,
+) -> Result<(), String> {
+    let undone = undo(lane, start, &reviewed.before, &reviewed.description).await;
+    if undone.is_err() {
+        let left = Restore {
+            tree: reviewed,
+            by: LeftBy::Curator,
+        };
+        record_restore(start, &left);
+    }
+    undone
+}
+
+/// Put `start`'s tree back to the one a failed round's reviewer or a
+/// curator was shown ([`undo`]) when it was left as that agent changed it
+/// ([`RESTORE_FILE`]), whatever the attempt then amounted to: a hold, a
+/// retry kept while a host was unreachable, a pinned commit whose publish
+/// failed. Run first in every later attempt of the chain, before anything
+/// reads the tree, so no worker builds on a reviewer's commit or leftovers
+/// and none of them ships. Done once: the record then goes, so a later
+/// attempt keeps the fixer's own work. Whose changes were undone, if any:
+/// a resumed fixer is told its curation was. An error says what still
+/// differs; no worker may run in the tree then.
+///
+/// A `BLOCKED.md` in the tree is a review hold's own report, which no hold
+/// has recorded yet: the daemon died between [`hold`] writing it and
+/// `conclude_fix` recording it (once recorded it leaves the tree, and no
+/// worker runs before this). [`undo`] removes reports as a reviewer's, so
+/// it is put back whatever undo did: it holds the fix once this attempt
+/// ends, as any report no hold has recorded does.
+pub(super) async fn restore_reviewed(
+    lane: &mut Lane,
+    store: &Store,
+    start: &FixStart,
+) -> Result<Option<LeftBy>, String> {
+    let path = start.ws.root.join(RESTORE_FILE);
+    let Some(Restore { tree: reviewed, by }) = read_json::<Restore>(&path) else {
+        return Ok(None);
+    };
+    let commit = reviewed.before.head.as_deref().unwrap_or_default();
+    let unrecorded = start.ws.tree.join(BLOCKED_REPORT);
+    let report = std::fs::read(&unrecorded).ok();
+    let undone = undo(lane, start, &reviewed.before, &reviewed.description).await;
+    if let Some(report) = report {
+        std::fs::write(&unrecorded, report)
+            .map_err(|e| format!("keeping the review's unrecorded {BLOCKED_REPORT}: {e}"))?;
+    }
+    undone.map_err(|e| format!("putting the tree back to the reviewed commit {commit}: {e}"))?;
+    std::fs::remove_file(&path)
+        .map_err(|e| format!("recording the tree as put back to {commit}: {e}"))?;
+    let fid = start.finding.id;
+    let agent = match by {
+        LeftBy::Reviewer => "a reviewer",
+        LeftBy::Curator => "a curator",
+    };
+    let message =
+        format!("#{fid} the tree {agent} left was put back to the reviewed commit {commit}");
+    let _ = fix_event(store, "review", fid, start.job, message).await;
+    Ok(Some(by))
+}
+
+/// The prompt a fix resumed after an operator's `continue` of a hold whose
+/// detail is `detail` gets while a review hold's issues are pending
+/// ([`Held::pending`]), or `None` when none are: the follow-up playbook
+/// with the issues the review left, so the fixer answers them before the
+/// review runs again. Once a fixer has run on it, [`mark_held_sent`] says
+/// so.
 pub(super) fn held_resume_prompt(
     cfg: &Config,
     start: &FixStart,
     detail: &str,
 ) -> Option<anyhow::Result<String>> {
-    let held = read_json::<Held>(&start.ws.root.join(HELD_FILE))?;
-    if held.report != detail {
-        return None;
-    }
+    let held =
+        read_json::<Held>(&start.ws.root.join(HELD_FILE)).filter(|held| held.pending(detail))?;
     let built = serde_json::to_string_pretty(&held.issues)
         .map_err(anyhow::Error::from)
         .and_then(|issues| {
@@ -902,10 +1103,30 @@ pub(super) fn held_resume_prompt(
     Some(built.map(|prompt| {
         format!(
             "An operator released this fix, which was held because the pre-PR review \
-             left blocking issues unanswered. Preserve the committed work; answer the \
+             left issues unanswered. Preserve the committed work; answer the \
              issues below.\n\n{prompt}"
         )
     }))
+}
+
+/// Record that a fixer ran on the prompt [`held_resume_prompt`] gave: the
+/// review hold's issues are no longer pending. Unrecorded, a later
+/// `continue` sends them again.
+pub(super) fn mark_held_sent(start: &FixStart) {
+    let path = start.ws.root.join(HELD_FILE);
+    let Some(mut held) = read_json::<Held>(&path) else {
+        return;
+    };
+    held.sent = Some(true);
+    let written = serde_json::to_vec(&held)
+        .map_err(std::io::Error::other)
+        .and_then(|bytes| std::fs::write(&path, bytes));
+    if let Err(e) = written {
+        tracing::warn!(
+            "fix #{}: recording the held issues as sent: {e}",
+            start.finding.id
+        );
+    }
 }
 
 /// Where the loop goes once the fixer has been sent a round's issues.
@@ -999,7 +1220,7 @@ async fn no_answer(
             follow_ups: progress.follow_ups.clone(),
         };
         let stop = format!("the fixer could not answer them: {why}");
-        if hold(start, round, issues, &kept, &stop) {
+        if hold(start, round, issues, (&kept, &stop, None)) {
             let message = format!("{}, {stop}; held for the operator", tally(issues));
             log_round(rounds.store(), start, round, &message).await;
             return Answered::Held;
@@ -1096,9 +1317,14 @@ async fn head_subject(tree: &Path) -> Option<String> {
 /// transcript to continue and is metered apart from the fixer's), writing
 /// its issues outside the tree. The run, if one happened, and its verdict.
 ///
-/// A reviewer that changed the tree has its changes undone ([`undo`]).
-/// Its written issues still stand, as a killed reviewer's do; a verdict
-/// of none does not, since it was reached on a tree it changed.
+/// The tree is cleaned first ([`clean_tree`]): the reviewer is shown the
+/// commits alone, and its verdict is about them. One that changed the tree
+/// has its changes undone ([`undo`]). One that left the commits alone
+/// ([`uncommitted_only`]: a test run's artifacts, a lock file or generated
+/// source its build rewrote) changed nothing it reviewed: its changes are
+/// reverted, logged in the round's event, and its verdict stands. One that
+/// changed more keeps its written issues, as a killed reviewer does; a
+/// verdict of none does not, since it was reached on a tree it changed.
 async fn review_round(
     rounds: &Rounds<'_>,
     lane: &mut Lane,
@@ -1110,7 +1336,7 @@ async fn review_round(
     let _phase = crate::activity::job_phase(JobPhase::Reviewing);
     let fail = |why: String| RoundVerdict::Failed {
         why,
-        head: None,
+        left: None,
         issues: Vec::new(),
     };
     let session = start.ws.review_session(start.job, round);
@@ -1131,14 +1357,31 @@ async fn review_round(
         Ok(prompt) => prompt,
         Err(e) => return (None, fail(format!("no reviewer prompt: {e}")), Vec::new()),
     };
+    // The change is the commits: the reviewer is shown them alone, and
+    // whatever it leaves besides is its own. What the clean cannot remove
+    // stays, part of the tree the reviewer is held to, as before there
+    // was a clean: a leftover never costs the fix its review.
+    match clean_tree(lane, start).await {
+        Ok(cleaned) if cleaned.is_empty() => {}
+        Ok(cleaned) => {
+            let message = format!(
+                "the tree was cleaned for the reviewer: {}",
+                cleaned_note(&cleaned)
+            );
+            log_round(rounds.store(), start, round, &message).await;
+        }
+        Err(why) => {
+            let message = format!("{why}; the reviewer is shown it as it is");
+            log_round(rounds.store(), start, round, &message).await;
+        }
+    }
     let before = tree_state(&start.ws.tree).await;
     // A detached `HEAD` (no branch) is a state like any other; only a
     // commit or status git could not report leaves nothing to compare.
     if !before.readable() {
         // Nothing to hold the reviewer's tree against, or to put back to:
-        // no review this round, and nothing in the tree is touched.
-        let why = "the worktree's state could not be read (git failed)".to_owned();
-        return (None, fail(why), Vec::new());
+        // no review this round.
+        return (None, fail(UNREADABLE.to_owned()), Vec::new());
     }
     let ws = Workspace {
         session,
@@ -1159,7 +1402,7 @@ async fn review_round(
     let finished = rr.killed_reason.is_none() && rr.exit_code == Some(0);
     // Follow-ups stand however the round ends, and are never answered: the
     // verdict is the rest's.
-    let (written, follow_ups) = match parse_review(&out) {
+    let (mut written, follow_ups) = match parse_review(&out) {
         Ok((entries, dropped)) => {
             let (follow_ups, rest): (Vec<_>, Vec<_>) = entries.into_iter().partition(is_follow_up);
             // Entries that were not issues may have meant one: no clean
@@ -1174,23 +1417,14 @@ async fn review_round(
         Err(why) => (Err(why), Vec::new()),
     };
     if before != after {
-        const CHANGED: &str = "the reviewer changed the worktree";
-        let issues = written.unwrap_or_default();
-        let verdict = match undo(lane, start, &before, &after, &description).await {
-            Ok(()) if !issues.is_empty() => RoundVerdict::Issues {
-                issues,
-                undone: true,
-            },
-            Ok(()) => fail(CHANGED.to_owned()),
-            // Not the tree it reviewed, and not one an answer may build
-            // on: what ships is the commit it was shown.
-            Err(why) => RoundVerdict::Failed {
-                why: format!("{CHANGED}, and it could not be undone: {why}"),
-                head: before.head,
-                issues,
-            },
+        let shown = ReviewedTree {
+            before,
+            description,
         };
-        return (Some(rr), verdict, follow_ups);
+        if let Some(verdict) = undo_reviewer(rounds, lane, round, shown, &after, &mut written).await
+        {
+            return (Some(rr), verdict, follow_ups);
+        }
     }
     let verdict = match written {
         Ok(issues) if issues.is_empty() && finished => RoundVerdict::Clean,
@@ -1207,102 +1441,337 @@ async fn review_round(
     (Some(rr), verdict, follow_ups)
 }
 
+/// Undo the changes of round `round`'s reviewer, which left `after` of the
+/// tree it was `shown` ([`undo`]), and give the round's verdict on the
+/// issues it wrote (`written`, taken when the verdict is given here).
+/// `None` when it left the commits alone ([`uncommitted_only`]): its
+/// changes are reverted, the round's event names them, and its verdict
+/// stands. When it changed more, its written issues stand, undone, and a
+/// verdict of none fails the round. One that could not be undone fails the
+/// round, with the tree it was shown to put back and its written issues.
+async fn undo_reviewer(
+    rounds: &Rounds<'_>,
+    lane: &mut Lane,
+    round: u32,
+    shown: ReviewedTree,
+    after: &TreeState,
+    written: &mut Result<Vec<serde_json::Value>, String>,
+) -> Option<RoundVerdict> {
+    const CHANGED: &str = "the reviewer changed the worktree";
+    let start = rounds.start;
+    // Read before the undo reverts them.
+    let left = uncommitted_only(&start.ws.tree, &shown.before, after).await;
+    let undone = undo(lane, start, &shown.before, &shown.description).await;
+    let mut issues = || written.as_mut().map(std::mem::take).unwrap_or_default();
+    match (undone, left) {
+        (Ok(()), Some(left)) => {
+            let message = format!(
+                "the reviewer's uncommitted changes were reverted, and its verdict stands: {}",
+                cleaned_note(&left)
+            );
+            log_round(rounds.store(), start, round, &message).await;
+            None
+        }
+        (Ok(()), None) => {
+            let issues = issues();
+            Some(if issues.is_empty() {
+                RoundVerdict::Failed {
+                    why: CHANGED.to_owned(),
+                    left: None,
+                    issues,
+                }
+            } else {
+                RoundVerdict::Issues {
+                    issues,
+                    undone: true,
+                }
+            })
+        }
+        // Not the tree it reviewed, and not one an answer may build on:
+        // what ships is the commit it was shown, and a hold puts the tree
+        // back to it before the fixer resumes.
+        (Err(why), _) => Some(RoundVerdict::Failed {
+            why: format!("{CHANGED}, and it could not be undone: {why}"),
+            left: Some(shown),
+            issues: issues(),
+        }),
+    }
+}
+
 /// The fixer's description of its change: the PR body.
 const DESCRIPTION: &str = "PR-DESCRIPTION.md";
 
-/// Put `start`'s tree back as it was `before` a reviewer changed it to
-/// `after`: remove the reports and the untracked paths it added; when its
-/// commit, branch or tracked files still differ, check the fix branch out
-/// again at the reviewed commit, discarding the tracked changes
-/// (`checkout --force -B`, under the clone's permit); then write the
-/// fixer's `description` back if it differs. Last, because a reviewer
-/// that committed or staged the untracked description has it removed by
-/// that checkout. Untracked files that were there before stay, as do
-/// ignored ones. An error says what still differs.
+/// Whether `line`, of `git status --porcelain`, is the fixer's description's
+/// own: untracked (`??`), or tracked and changed since its commit (` M`),
+/// as a fixer that committed it and then updated it leaves it. Either way
+/// it belongs in the tree, its bytes are kept across every cleaning, and
+/// it is the PR body.
+fn is_description_status(line: &str) -> bool {
+    matches!(line.split_at_checked(3), Some(("?? " | " M ", DESCRIPTION)))
+}
+
+/// `git clean` of every untracked file and directory that is not ignored,
+/// a nested repository's among them.
+const CLEAN: [&str; 2] = ["clean", "-ffdq"];
+
+/// Every submodule this tree checked out, recursively, put back to the
+/// commit its parent records for it (`$sha1`), its uncommitted changes
+/// discarded and its untracked files deleted ([`CLEAN`]). `foreach` visits
+/// only checked-out submodules, so one this tree never checked out stays
+/// so, even when the clone's shared config marks it active (a sibling
+/// tree initialized it): `submodule update` would clone it here. No fetch:
+/// the commit is the one it was checked out at, or one the worker
+/// committed in it.
+const SUBMODULE_RESET: [&str; 5] = [
+    "submodule",
+    "foreach",
+    "--quiet",
+    "--recursive",
+    "git checkout --force --quiet \"$sha1\" && git clean -ffdq",
+];
+
+/// The git commands that clean a tree once `first` has put its tracked
+/// files back to a commit: [`CLEAN`], then the same for every submodule
+/// ([`SUBMODULE_RESET`]). `reset`, `checkout` and `clean` leave a
+/// submodule's own tree alone, and `status` lists a submodule at another
+/// commit, or with changes or untracked files of its own, as a change of
+/// the tree. One checked out at the recorded commit stays, as a fetched
+/// dependency would.
+fn cleaning(first: Vec<String>) -> Vec<Vec<String>> {
+    let owned = |op: &[&str]| op.iter().map(|&arg| arg.to_owned()).collect();
+    vec![first, owned(&CLEAN), owned(&SUBMODULE_RESET)]
+}
+
+/// How many of the paths a cleaning removed its event names.
+const CLEANED_SHOWN: usize = 10;
+
+/// Why a round failed with no state of the tree to hold a reviewer to.
+const UNREADABLE: &str = "the worktree's state could not be read (git failed)";
+
+/// Clean `start`'s tree for a reviewer: discard the uncommitted changes to
+/// tracked files (`reset --hard`) and delete the untracked files that are
+/// not ignored (`clean`), in every checked-out submodule as well
+/// ([`cleaning`]), under the clone's permit. Only the commits are the
+/// change, so that is all the reviewer is shown, and whatever it then
+/// leaves is its own. The fixer's description stays (written back, as the
+/// clean removes it and the reset a staged one), as do ignored files
+/// (build caches, dependencies). What went, as `git status --porcelain`
+/// listed it; an error says why the round cannot be reviewed.
+async fn clean_tree(lane: &mut Lane, start: &FixStart) -> Result<Vec<String>, String> {
+    let tree = &start.ws.tree;
+    let listed = uncommitted(tree).await?;
+    if listed.is_empty() {
+        return Ok(listed);
+    }
+    let description = std::fs::read(tree.join(DESCRIPTION)).ok();
+    let reset = vec![
+        "reset".to_owned(),
+        "--hard".to_owned(),
+        "--quiet".to_owned(),
+    ];
+    let mut failed = git_ops(lane, start, cleaning(reset)).await;
+    if let Err(e) = write_description(tree, description.as_deref()) {
+        failed.push(e);
+    } else {
+        let left = uncommitted(tree).await?;
+        if left.is_empty() {
+            return Ok(listed);
+        }
+        failed.push(format!("left in the tree: {}", quoted(&left)));
+    }
+    Err(format!(
+        "the worktree could not be cleaned for the reviewer: {}",
+        failed.join("; ")
+    ))
+}
+
+/// What `git status --porcelain` lists in `tree` besides the fixer's
+/// description: uncommitted changes and untracked files that are not
+/// ignored. [`UNREADABLE`] when git cannot say.
+async fn uncommitted(tree: &Path) -> Result<Vec<String>, String> {
+    let tree = tree.to_owned();
+    let (rc, out) = tokio::task::spawn_blocking(move || Unheld::Status.run(&tree, 60))
+        .await
+        .unwrap_or((127, String::new()));
+    if rc != 0 {
+        return Err(UNREADABLE.to_owned());
+    }
+    Ok(leftovers(&out).map(str::to_owned).collect())
+}
+
+/// What a reviewer left uncommitted in `before`, the clean tree it was
+/// shown, as `git status --porcelain` lists it (edits to tracked files,
+/// untracked files, a submodule's changes as the submodule itself), when
+/// that is all that tells `after` from it: the same commit, branch and
+/// description. Its verdict is about the commits, which it left alone,
+/// and [`undo`] reverts the rest. `None` when it changed more, or git
+/// cannot say.
+async fn uncommitted_only(
+    tree: &Path,
+    before: &TreeState,
+    after: &TreeState,
+) -> Option<Vec<String>> {
+    let kept = (&after.head, &after.branch, &after.description)
+        == (&before.head, &before.branch, &before.description);
+    if !kept {
+        return None;
+    }
+    uncommitted(tree).await.ok()
+}
+
+/// The lines of `git status --porcelain` output but the description's
+/// ([`is_description_status`]).
+fn leftovers(status: &str) -> impl Iterator<Item = &str> {
+    status
+        .lines()
+        .filter(|line| !line.is_empty() && !is_description_status(line))
+}
+
+/// `lines`, each in backticks, comma-separated.
+fn quoted<S: AsRef<str>>(lines: &[S]) -> String {
+    let quoted: Vec<String> = lines.iter().map(|l| format!("`{}`", l.as_ref())).collect();
+    quoted.join(", ")
+}
+
+/// What a cleaning removed (`cleaned`, `git status --porcelain` lines),
+/// for its event: the tracked files whose changes were discarded and the
+/// untracked paths deleted, at most [`CLEANED_SHOWN`] named.
+fn cleaned_note(cleaned: &[String]) -> String {
+    let (untracked, tracked): (Vec<&String>, Vec<&String>) =
+        cleaned.iter().partition(|line| line.starts_with("??"));
+    let mut shown = CLEANED_SHOWN;
+    let mut part = |what: &str, lines: &[&String]| {
+        let named: Vec<&str> = lines
+            .iter()
+            .take(shown)
+            .map(|line| line.get(3..).unwrap_or(line))
+            .collect();
+        shown -= named.len();
+        let more = match lines.len() - named.len() {
+            0 => String::new(),
+            more => format!(" and {more} more"),
+        };
+        (!lines.is_empty()).then(|| format!("{what} {}{more}", quoted(&named)))
+    };
+    let parts: Vec<String> = [
+        part("uncommitted changes discarded:", &tracked),
+        part("untracked files deleted:", &untracked),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    parts.join("; ")
+}
+
+/// Run the git commands `ops` in `start`'s tree, every one of them, under
+/// the clone's permit: what failed, each with the first line git said.
+async fn git_ops(lane: &mut Lane, start: &FixStart, ops: Vec<Vec<String>>) -> Vec<String> {
+    let permit = match lane.lock_clone(start.repo.id).await {
+        Ok(permit) => permit,
+        Err(e) => return vec![format!("locking the clone: {e}")],
+    };
+    let at = start.ws.tree.clone();
+    let failed = permit
+        .blocking(move |hold| {
+            let failed = ops.iter().filter_map(|op| {
+                let args: Vec<&str> = op.iter().map(String::as_str).collect();
+                let (rc, out) = hold.git_in(&at, &args, 60);
+                let said = out.lines().find(|line| !line.trim().is_empty());
+                let what = args.first().copied().unwrap_or_default();
+                (rc != 0).then(|| format!("{what} failed: {}", said.unwrap_or_default()))
+            });
+            failed.collect()
+        })
+        .await;
+    failed.unwrap_or_else(|e| vec![e.to_string()])
+}
+
+/// Write the fixer's `description` back into `tree`, unless there was none.
+fn write_description(tree: &Path, description: Option<&[u8]>) -> Result<(), String> {
+    let Some(description) = description else {
+        return Ok(());
+    };
+    std::fs::write(tree.join(DESCRIPTION), description)
+        .map_err(|e| format!("restoring {DESCRIPTION}: {e}"))
+}
+
+/// Put `start`'s tree back to `before`, the clean tree a reviewer was
+/// shown ([`clean_tree`]): remove the reports, check the branch `HEAD` was
+/// on then out again at the reviewed commit, discarding every uncommitted
+/// change (`checkout --force -B`, or `--detach` as the fixer left it; the
+/// fixer may work on a branch of its own, and what ships is the commit),
+/// delete the
+/// untracked files that are not ignored, and do the same in every
+/// checked-out submodule ([`cleaning`]), all under the clone's permit,
+/// then write the fixer's `description` back (the checkout removes it when
+/// it was committed or staged). Ignored files stay. Undone or not is
+/// judged by the tree ([`unrestored`]) once the description is back; an
+/// error says what git could not do and what is still not back.
 async fn undo(
     lane: &mut Lane,
     start: &FixStart,
     before: &TreeState,
-    after: &TreeState,
     description: &[u8],
 ) -> Result<(), String> {
     let tree = &start.ws.tree;
     for report in [BLOCKED_REPORT, "NOT-A-BUG.md", "DECLINED.md"] {
         let _ = std::fs::remove_file(tree.join(report));
     }
-    for path in added_untracked(before, after) {
-        let path = tree.join(path);
-        let _ = std::fs::remove_dir_all(&path).or_else(|_| std::fs::remove_file(&path));
-    }
-    // Written back whenever there was one, before and after the checkout
-    // (which removes it when the reviewer committed or staged it).
-    let restore = || -> Result<(), String> {
-        if before.description.is_none() {
-            return Ok(());
-        }
-        std::fs::write(tree.join(DESCRIPTION), description)
-            .map_err(|e| format!("restoring {DESCRIPTION}: {e}"))
-    };
-    restore()?;
-    if tree_state(tree).await == *before {
-        return Ok(());
-    }
     let head = before.head.clone().ok_or("no commit to go back to")?;
-    let permit = lane
-        .lock_clone(start.repo.id)
-        .await
-        .map_err(|e| format!("locking the clone: {e}"))?;
-    // Back onto the fix branch, or detached as the fixer left it.
-    let mut args = vec!["checkout".to_owned(), "--force".to_owned()];
-    if before.branch.is_some() {
-        args.extend(["-B".to_owned(), start.branch.clone()]);
-    } else {
-        args.push("--detach".to_owned());
+    let mut checkout = vec!["checkout".to_owned(), "--force".to_owned()];
+    match before.branch.as_deref() {
+        Some(branch) => {
+            let name = branch.strip_prefix("refs/heads/").unwrap_or(branch);
+            checkout.extend(["-B".to_owned(), name.to_owned()]);
+        }
+        None => checkout.push("--detach".to_owned()),
     }
-    args.push(head);
-    let at = tree.clone();
-    let (rc, out) = permit
-        .blocking(move |hold| {
-            let args: Vec<&str> = args.iter().map(String::as_str).collect();
-            hold.git_in(&at, &args, 60)
-        })
-        .await
-        .map_err(|e| e.to_string())?;
-    drop(permit);
-    if rc != 0 {
-        return Err(format!("checkout failed: {}", crate::util::tail(&out, 300)));
-    }
-    restore()?;
-    if tree_state(tree).await == *before {
-        Ok(())
-    } else {
-        Err("the tree still differs".to_owned())
-    }
+    checkout.push(head);
+    let mut failed = git_ops(lane, start, cleaning(checkout)).await;
+    let description = before.description.as_ref().map(|_| description);
+    write_description(tree, description).map_err(|e| {
+        failed.push(e);
+        failed.join("; ")
+    })?;
+    let Some(left) = unrestored(before, &tree_state(tree).await) else {
+        return Ok(());
+    };
+    failed.push(left);
+    Err(failed.join("; "))
 }
 
-/// The untracked paths `git status --porcelain` lists `after` and not
-/// `before`, relative to the tree. Only plain relative paths: one that
-/// leaves the tree is never removed. A path git quotes (escaped) names no
-/// file as written, so removing it does nothing.
-fn added_untracked<'a>(before: &TreeState, after: &'a TreeState) -> Vec<&'a str> {
-    // Not knowing what was there is not knowing that nothing was.
-    let Some(had) = before.status.as_deref() else {
-        return Vec::new();
-    };
-    let had: Vec<&str> = had.lines().collect();
-    after
-        .status
-        .as_deref()
-        .unwrap_or("")
-        .lines()
-        .filter(|line| !had.contains(line))
-        .filter_map(|line| line.strip_prefix("?? "))
-        .filter(|path| {
-            Path::new(path)
-                .components()
-                .all(|c| matches!(c, std::path::Component::Normal(_)))
-        })
-        .collect()
+/// What keeps `now` from being `before`, the tree a reviewer was shown,
+/// put back, or `None` when nothing does: the same commit and branch, and
+/// nothing uncommitted or untracked but ignored files, the fixer's
+/// description (written back, so as it was) and what `before` already
+/// listed (a leftover the clean could not remove). Named for the operator
+/// who has to clear it.
+fn unrestored(before: &TreeState, now: &TreeState) -> Option<String> {
+    let mut differs = Vec::new();
+    if now.head != before.head {
+        let head = now.head.as_deref().unwrap_or("unreadable");
+        differs.push(format!("HEAD is at {head}"));
+    }
+    if now.branch != before.branch {
+        let branch = now.branch.as_deref().unwrap_or("none (detached)");
+        differs.push(format!("HEAD's branch is {branch}"));
+    }
+    match now.status.as_deref() {
+        None => differs.push("git could not report the status".to_owned()),
+        Some(status) => {
+            let shown: Vec<&str> = before
+                .status
+                .as_deref()
+                .map_or_else(Vec::new, |s| leftovers(s).collect());
+            let left: Vec<&str> = leftovers(status)
+                .filter(|line| !shown.contains(line))
+                .collect();
+            if !left.is_empty() {
+                differs.push(format!("left in the tree: {}", quoted(&left)));
+            }
+        }
+    }
+    (!differs.is_empty()).then(|| differs.join("; "))
 }
 
 /// Resume the fixer's session on the review's `issues`, under
@@ -1343,8 +1812,8 @@ async fn answer_review(
 
 /// What a reviewer must leave as it found it, and what a saved verdict
 /// covers ([`Saved`]): the commit, the uncommitted state, and the
-/// description that becomes the PR body (untracked, so `status` shows it
-/// the same whatever it says).
+/// description that becomes the PR body (by its bytes: its status line,
+/// untracked or tracked and changed, reads the same whatever it says).
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct TreeState {
     head: Option<String>,
@@ -1369,7 +1838,12 @@ pub(super) async fn tree_state(tree: &Path) -> TreeState {
         TreeState {
             head: ok(Unheld::Commit { rev: "HEAD" }.run(&tree, 30)),
             branch: ok(Unheld::HeadRef.run(&tree, 30)),
-            status: ok(Unheld::Status.run(&tree, 60)),
+            // Only the end is trimmed: a porcelain line's first column is
+            // its index state, a blank for an unstaged edit (` M path`).
+            status: {
+                let (rc, out) = Unheld::Status.run(&tree, 60);
+                (rc == 0).then(|| out.trim_end().to_owned())
+            },
             description: std::fs::read(tree.join("PR-DESCRIPTION.md"))
                 .ok()
                 .map(|bytes| Sha256::digest(bytes).to_vec()),

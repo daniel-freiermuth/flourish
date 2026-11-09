@@ -13,7 +13,7 @@
 mod support;
 
 use hunter::config::Config;
-use hunter::domain::{FindingJobKind, ForgeName, HoldReason, ReleaseAction};
+use hunter::domain::{FindingJobKind, ForgeName, HoldReason, JobKind, JobState, ReleaseAction};
 use hunter::scheduler::{Attempt, Resumed};
 use hunter::store::{FindingInsert, WorkStreak};
 use support::{GitRepo, ScriptedBackend, TempDir, fresh_store, git};
@@ -2300,6 +2300,32 @@ const MORE_FOLLOW_UPS: &str = r#"[
 enum Act {
     /// The fixer: commits the fix, describes it, and leaves a transcript.
     Fix,
+    /// The fixer as [`Act::Fix`], then leaves what its test runs would: an
+    /// uncommitted edit to the tracked `FIX.md`, untracked files and an
+    /// ignored one ([`leave_untidy`]).
+    FixUntidy,
+    /// The fixer as [`Act::Fix`], then leaves the untracked `.coverage` its
+    /// test run wrote.
+    FixCovered,
+    /// The fixer as [`Act::Fix`], but commits its description (`git add
+    /// -A`), then updates it uncommitted.
+    FixTrackedDescription,
+    /// The fixer as [`Act::Fix`], then leaves the tracked `FIX.md`
+    /// rewritten, as a build rewrites a stale `Cargo.lock`.
+    FixRelocked,
+    /// The fixer as [`Act::Fix`], then checks out the submodule `lib`
+    /// ([`vendor_lib`]) and leaves it dirty, as building in it would: at
+    /// its older commit, with an edit to its tracked `a` and an untracked
+    /// `out.o`.
+    FixSubmoduled,
+    /// The fixer as [`Act::Fix`], then marks the submodule `lib` active in
+    /// the clone's shared config, as a sibling tree's `submodule init`
+    /// does, without checking it out here, and leaves an untracked
+    /// `NOTES.md`.
+    FixSubmoduleElsewhere,
+    /// The fixer as [`Act::Fix`], then leaves `HEAD` on a branch of its
+    /// own (`my-fix`) at its commit, and a `.coverage` behind.
+    FixOnOwnBranch,
     /// The fixer commits the fix and describes it, then ends `.0`.
     FixThen(Ending),
     /// The fixer continuing its transcript, with nothing left to do.
@@ -2319,12 +2345,26 @@ enum Act {
     ReviewCrashed(&'static str),
     /// A reviewer that commits in the tree, then writes a clean review.
     CommittingReview,
-    /// A reviewer that commits in the tree and leaves a test artifact
-    /// behind, having written `.0` as its review.
+    /// A reviewer that commits in the tree, edits the tracked `FIX.md` and
+    /// leaves a test artifact behind, having written `.0` as its review.
     TamperingReview(&'static str),
+    /// A reviewer whose test run updates `.coverage` when there is one, and
+    /// writes it afresh when `.0`, then writes a clean review.
+    CoverageReview(bool),
+    /// A reviewer whose build leaves an untracked `out.o` in the submodule
+    /// `lib`, and that also moves `lib` to its older commit when `.0`,
+    /// having written `.1` as its review.
+    SubmoduleReview(bool, &'static str),
+    /// A reviewer that edits the tracked `FIX.md` and leaves an untracked
+    /// `.coverage`, committing nothing, then writes a clean review.
+    EditingReview,
+    /// A reviewer whose test run rewrites the tracked `FIX.md` as the
+    /// fixer's build did ([`Act::FixRelocked`]), then writes a clean
+    /// review.
+    RelockingReview,
     /// A reviewer that leaves the tree detached at the commit it was
-    /// shown, then writes a clean review.
-    DetachingReview,
+    /// shown, having written `.0` as its review.
+    DetachingReview(&'static str),
     /// A reviewer that commits everything in the tree, the fixer's
     /// untracked description included (`git add -A`), then writes a clean
     /// review.
@@ -2344,9 +2384,23 @@ enum Act {
     FixDetached,
     /// A reviewer that exits non-zero before its first call: no provider.
     ReviewUnreached,
-    /// A reviewer that leaves an untracked file git lists quoted, which
-    /// undoing its changes does not remove, having written `.0`.
-    LitteringReview(&'static str),
+    /// A reviewer that commits in the tree, leaves a test artifact behind
+    /// and keeps the index locked, so undoing its changes cannot check the
+    /// fix branch out again, having written `.0`.
+    LockingReview(&'static str),
+    /// A reviewer that leaves `HEAD` detached at the commit it was shown and
+    /// keeps the index locked, so undoing cannot check the fix branch out
+    /// again, having written `.0`.
+    StrandingReview(&'static str),
+    /// A reviewer that leaves `scratch/notes.txt` in a `scratch/` it made
+    /// read-only, which undoing cannot delete, having written `.0`.
+    ScratchingReview(&'static str),
+    /// A reviewer that makes the worktree's index unreadable, so git can
+    /// report no status once it is done, having written `.0`.
+    UnreadingReview(&'static str),
+    /// The fixer as [`Act::Fix`], then leaves `scratch/notes.txt` in a
+    /// `scratch/` it made read-only, which cleaning cannot delete.
+    FixScratched,
     /// The fixer resumed to curate its reviewed history, as `.0` says.
     Curate(Curation),
 }
@@ -2417,6 +2471,12 @@ enum Curation {
     EditsDescription,
     /// Squashes it, and leaves an untracked file behind.
     LeavesFile,
+    /// Squashes it with a change of its own, and keeps the index locked,
+    /// so its rewrite cannot be undone.
+    LockedChange,
+    /// Squashes it with a change of its own, keeps the index locked, and
+    /// the daemon dies with it.
+    LockedDaemonDies,
 }
 
 /// A curation run `how`, from the stub prompt `curate <base> <reviewed>`.
@@ -2435,10 +2495,16 @@ fn curate_as(
             git(tree, &["commit", "-m", "fix: the real bug, curated"]);
             result
         }
-        Curation::ChangeTree => {
+        Curation::ChangeTree | Curation::LockedChange | Curation::LockedDaemonDies => {
             std::fs::write(tree.join("EXTRA.md"), "more\n").unwrap();
             git(tree, &["add", "EXTRA.md"]);
             git(tree, &["commit", "-m", "fix: the real bug, curated"]);
+            if !matches!(how, Curation::ChangeTree) {
+                std::fs::write(index_lock(tree), "").unwrap();
+            }
+            if matches!(how, Curation::LockedDaemonDies) {
+                panic!("the daemon died mid-curation");
+            }
             result
         }
         Curation::Killed => ended(result, Ending::Capped),
@@ -2473,6 +2539,112 @@ fn curate_as(
     }
 }
 
+/// A reviewer run `act` that touches the tree, if at all, without
+/// committing a file of its own. A review it writes is written with the
+/// tree's `git status --porcelain --ignored` as the reviewer found it
+/// ([`seen`]).
+fn review_as(run: &support::Run, act: Act) -> hunter::types::RunResult {
+    let tree = run.tree.as_path();
+    let found = git(tree, &["status", "--porcelain", "--ignored"]);
+    let reviewed = |review: &str| {
+        let out = out_path(&run.prompt);
+        std::fs::write(out.with_extension("seen"), &found).unwrap();
+        if let Ok(description) = std::fs::read(tree.join("PR-DESCRIPTION.md")) {
+            std::fs::write(out.with_extension("description"), description).unwrap();
+        }
+        std::fs::write(out, review).unwrap();
+        support::done()
+    };
+    match act {
+        Act::Review(review) => reviewed(review),
+        Act::ReviewKilled(review) => {
+            let mut result = ended(reviewed(review), Ending::Capped);
+            result.tokens_new = run.cap_tokens.expect("a cap to be killed at");
+            result
+        }
+        Act::ReviewCrashed(review) => {
+            let mut result = reviewed(review);
+            result.exit_code = Some(1);
+            result
+        }
+        Act::SweepingReview => {
+            git(tree, &["add", "-A"]);
+            git(tree, &["commit", "-m", "review: everything"]);
+            reviewed(CLEAN)
+        }
+        Act::DetachingReview(review) => {
+            git(tree, &["checkout", "--detach"]);
+            reviewed(review)
+        }
+        Act::ReviewUnreached => ended(support::done(), Ending::Failed),
+        Act::ReviewSilent => support::done(),
+        Act::StrandingReview(review) => {
+            git(tree, &["checkout", "--detach"]);
+            std::fs::write(index_lock(tree), "").unwrap();
+            reviewed(review)
+        }
+        Act::ScratchingReview(review) => {
+            leave_scratch(tree);
+            reviewed(review)
+        }
+        Act::UnreadingReview(review) => {
+            use std::os::unix::fs::PermissionsExt;
+            let index = git(tree, &["rev-parse", "--git-path", "index"]);
+            let index = tree.join(index.trim());
+            std::fs::set_permissions(index, std::fs::Permissions::from_mode(0o000)).unwrap();
+            reviewed(review)
+        }
+        Act::CoverageReview(creates) => {
+            let coverage = tree.join(".coverage");
+            if coverage.exists() {
+                let had = std::fs::read_to_string(&coverage).unwrap();
+                std::fs::write(&coverage, format!("{had}the reviewer's run\n")).unwrap();
+            } else if creates {
+                std::fs::write(&coverage, "the reviewer's run\n").unwrap();
+            }
+            reviewed(CLEAN)
+        }
+        Act::SubmoduleReview(moves, review) => {
+            let lib = tree.join(LIB);
+            std::fs::write(lib.join("out.o"), "the reviewer's build\n").unwrap();
+            if moves {
+                git(&lib, &["checkout", "-q", "HEAD~1"]);
+            }
+            reviewed(review)
+        }
+        Act::EditingReview => {
+            std::fs::write(tree.join("FIX.md"), "the reviewer's edit\n").unwrap();
+            std::fs::write(tree.join(".coverage"), "the reviewer's run\n").unwrap();
+            reviewed(CLEAN)
+        }
+        Act::RelockingReview => {
+            std::fs::write(tree.join("FIX.md"), RELOCKED).unwrap();
+            reviewed(CLEAN)
+        }
+        _ => unreachable!("not a reviewer that commits nothing of its own"),
+    }
+}
+
+/// What the reviewer of `run` found `git status --porcelain --ignored` to
+/// list.
+fn seen(run: &support::Run) -> String {
+    std::fs::read_to_string(out_path(&run.prompt).with_extension("seen")).unwrap()
+}
+
+/// Make `tree`'s `scratch/` writable, or read-only.
+fn scratch_writable(tree: &std::path::Path, writable: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = if writable { 0o755 } else { 0o555 };
+    std::fs::set_permissions(tree.join("scratch"), std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// Leave `scratch/notes.txt` in `tree`, in a `scratch/` made read-only.
+fn leave_scratch(tree: &std::path::Path) {
+    std::fs::create_dir(tree.join("scratch")).unwrap();
+    std::fs::write(tree.join("scratch/notes.txt"), "scratch\n").unwrap();
+    scratch_writable(tree, false);
+}
+
 /// A backend that runs `acts`, one per run, against the tree.
 fn reviewed_worker(acts: Vec<Act>) -> ScriptedBackend {
     let next = std::sync::atomic::AtomicUsize::new(0);
@@ -2499,6 +2671,18 @@ fn reviewed_worker(acts: Vec<Act>) -> ScriptedBackend {
         };
         match acts[i] {
             Act::Fix => fix(),
+            act @ (Act::FixUntidy
+            | Act::FixCovered
+            | Act::FixRelocked
+            | Act::FixScratched
+            | Act::FixSubmoduled
+            | Act::FixSubmoduleElsewhere
+            | Act::FixOnOwnBranch
+            | Act::FixTrackedDescription) => {
+                let result = fix();
+                leave_behind(tree, act);
+                result
+            }
             Act::FixThen(ending) => ended(fix(), ending),
             Act::Continue => continued(),
             Act::FixMore => {
@@ -2506,37 +2690,30 @@ fn reviewed_worker(acts: Vec<Act>) -> ScriptedBackend {
                 continued()
             }
             Act::ContinueThen(ending) => ended(continued(), ending),
-            Act::Review(review) => {
-                std::fs::write(out_path(&run.prompt), review).unwrap();
-                support::done()
-            }
-            Act::ReviewKilled(review) => {
-                std::fs::write(out_path(&run.prompt), review).unwrap();
-                let mut result = ended(support::done(), Ending::Capped);
-                result.tokens_new = run.cap_tokens.expect("a cap to be killed at");
-                result
-            }
-            Act::ReviewCrashed(review) => {
-                std::fs::write(out_path(&run.prompt), review).unwrap();
-                let mut result = support::done();
-                result.exit_code = Some(1);
-                result
-            }
-            Act::TamperingReview(review) => {
+            act @ (Act::Review(_)
+            | Act::ReviewKilled(_)
+            | Act::ReviewCrashed(_)
+            | Act::SweepingReview
+            | Act::DetachingReview(_)
+            | Act::ReviewUnreached
+            | Act::ReviewSilent
+            | Act::CoverageReview(_)
+            | Act::SubmoduleReview(..)
+            | Act::EditingReview
+            | Act::RelockingReview
+            | Act::StrandingReview(_)
+            | Act::ScratchingReview(_)
+            | Act::UnreadingReview(_)) => review_as(run, act),
+            Act::TamperingReview(review) | Act::LockingReview(review) => {
                 commit("REVIEWER.md", "review: a commit of the reviewer's");
                 std::fs::write(tree.join("artifact.log"), "test output\n").unwrap();
+                if matches!(acts[i], Act::TamperingReview(_)) {
+                    std::fs::write(tree.join("FIX.md"), "the reviewer's edit\n").unwrap();
+                }
+                if matches!(acts[i], Act::LockingReview(_)) {
+                    std::fs::write(index_lock(tree), "").unwrap();
+                }
                 std::fs::write(out_path(&run.prompt), review).unwrap();
-                support::done()
-            }
-            Act::SweepingReview => {
-                git(tree, &["add", "-A"]);
-                git(tree, &["commit", "-m", "review: everything"]);
-                std::fs::write(out_path(&run.prompt), CLEAN).unwrap();
-                support::done()
-            }
-            Act::DetachingReview => {
-                git(tree, &["checkout", "--detach"]);
-                std::fs::write(out_path(&run.prompt), CLEAN).unwrap();
                 support::done()
             }
             Act::CommittingReview => {
@@ -2558,20 +2735,130 @@ fn reviewed_worker(acts: Vec<Act>) -> ScriptedBackend {
                 git(tree, &["checkout", "--detach"]);
                 result
             }
-            Act::ReviewUnreached => ended(support::done(), Ending::Failed),
-            Act::ReviewSilent => support::done(),
             Act::Curate(how) => curate_as(tree, &run.prompt, how, continued()),
-            Act::LitteringReview(review) => {
-                std::fs::write(tree.join("scratch \"notes\".txt"), "scratch\n").unwrap();
-                std::fs::write(out_path(&run.prompt), review).unwrap();
-                support::done()
-            }
             Act::AnswerSuspended => {
                 commit("HALF.md", "fix: half of the answer");
                 ended(continued(), Ending::Capped)
             }
         }
     })
+}
+
+/// What a build rewrites the tracked `FIX.md` to, as `cargo test` without
+/// `--locked` rewrites a stale `Cargo.lock` ([`Act::FixRelocked`]).
+const RELOCKED: &str = "rewritten by the build\n";
+
+/// What the fixer run `act` leaves in `tree` once it committed its fix.
+fn leave_behind(tree: &std::path::Path, act: Act) {
+    match act {
+        Act::FixUntidy => {
+            std::fs::write(tree.join("FIX.md"), "touched by the test run\n").unwrap();
+            leave_untidy(tree);
+        }
+        Act::FixCovered => std::fs::write(tree.join(".coverage"), "the fixer's run\n").unwrap(),
+        Act::FixRelocked => std::fs::write(tree.join("FIX.md"), RELOCKED).unwrap(),
+        Act::FixScratched => leave_scratch(tree),
+        Act::FixTrackedDescription => {
+            git(tree, &["add", "-A"]);
+            git(tree, &["commit", "-m", "docs: describe the fix"]);
+            std::fs::write(tree.join("PR-DESCRIPTION.md"), "the updated body").unwrap();
+        }
+        Act::FixOnOwnBranch => {
+            git(tree, &["switch", "-q", "-c", "my-fix"]);
+            std::fs::write(tree.join(".coverage"), "the fixer's run\n").unwrap();
+        }
+        Act::FixSubmoduleElsewhere => {
+            let url = git(
+                tree,
+                &[
+                    "config",
+                    "-f",
+                    ".gitmodules",
+                    &format!("submodule.{LIB}.url"),
+                ],
+            );
+            git(
+                tree,
+                &["config", &format!("submodule.{LIB}.url"), url.trim()],
+            );
+            git(
+                tree,
+                &["config", &format!("submodule.{LIB}.active"), "true"],
+            );
+            // Something to clean, so the clean runs at all.
+            std::fs::write(tree.join("NOTES.md"), "the fixer's notes\n").unwrap();
+        }
+        Act::FixSubmoduled => {
+            let init = [
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "update",
+                "--init",
+            ];
+            git(tree, &init);
+            let lib = tree.join(LIB);
+            git(&lib, &["checkout", "-q", "HEAD~1"]);
+            std::fs::write(lib.join("a"), "the fixer's edit\n").unwrap();
+            std::fs::write(lib.join("out.o"), "the fixer's build\n").unwrap();
+        }
+        _ => unreachable!("not a fixer that leaves something behind"),
+    }
+}
+
+/// What [`Act::FixUntidy`] leaves in `tree` besides its edit: untracked
+/// `NOTES.md`, `fixtures/case.txt` and `out-01.log` to `out-10.log`, and
+/// `target/cache.bin`, which the clone's `info/exclude` ignores.
+fn leave_untidy(tree: &std::path::Path) {
+    std::fs::write(tree.join("NOTES.md"), "the fixer's notes\n").unwrap();
+    std::fs::create_dir(tree.join("fixtures")).unwrap();
+    std::fs::write(tree.join("fixtures/case.txt"), "the fixer's case\n").unwrap();
+    for n in 1..=10 {
+        std::fs::write(tree.join(format!("out-{n:02}.log")), "test output\n").unwrap();
+    }
+    let exclude = git(tree, &["rev-parse", "--git-path", "info/exclude"]);
+    let exclude = tree.join(exclude.trim());
+    std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+    std::fs::write(&exclude, "/target/\n").unwrap();
+    std::fs::create_dir(tree.join("target")).unwrap();
+    std::fs::write(tree.join("target/cache.bin"), "build cache\n").unwrap();
+}
+
+/// The index lock of the worktree `tree`.
+fn index_lock(tree: &std::path::Path) -> std::path::PathBuf {
+    tree.join(git(tree, &["rev-parse", "--git-path", "index.lock"]).trim())
+}
+
+/// The submodule [`vendor_lib`] puts on the fixture's `main`.
+const LIB: &str = "lib";
+
+/// Vendor a repository of two commits, each writing its `a`, as the
+/// submodule [`LIB`] of the fixture's `main`, at the newer one, and publish
+/// it: every fix tree has it to check out.
+fn vendor_lib(f: &Fixture) {
+    let lib = f.cfg.work_root.with_file_name("lib-origin");
+    std::fs::create_dir(&lib).unwrap();
+    git(&lib, &["init", "-q"]);
+    for text in ["one", "two"] {
+        std::fs::write(lib.join("a"), format!("{text}\n")).unwrap();
+        git(&lib, &["add", "a"]);
+        git(&lib, &["commit", "-q", "-m", text]);
+    }
+    let url = lib.to_string_lossy();
+    git(
+        &f.repo_dir,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            &url,
+            LIB,
+        ],
+    );
+    git(&f.repo_dir, &["commit", "-q", "-m", "chore: vendor lib"]);
+    git(&f.repo_dir, &["push", "-q", "origin", "main"]);
 }
 
 /// Turn the review on for `rounds` rounds, with stub reviewer playbooks.
@@ -2798,10 +3085,12 @@ async fn a_blocking_issue_resumes_the_fixer_and_the_answer_ships_once_clean() {
     );
 }
 
-/// Non-blocking issues left after the last round ship with the fix, in a
-/// section of the PR body that hands them to the human.
+/// Non-blocking issues left after the last round hold the fix as a
+/// blocking one does: a review still finding something after its last
+/// round is not converging, so nothing ships on the hope the rest is
+/// harmless.
 #[tokio::test]
-async fn non_blocking_issues_left_after_the_last_round_ship_in_the_pr_body() {
+async fn non_blocking_issues_left_after_the_last_round_hold_the_fix() {
     let bins = support::FakeBins::acquire("fix-review-exhausted");
     bins.ok("gh", "https://github.com/acme/widget/pull/42");
     let f = reviewed_fixture("fix-review-exhausted", 2).await;
@@ -2814,19 +3103,19 @@ async fn non_blocking_issues_left_after_the_last_round_ship_in_the_pr_body() {
 
     let summary = fix(&f, &worker).await;
 
-    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    assert_eq!(summary.outcome.as_deref(), Some("held"), "{summary:?}");
     assert_eq!(worker.runs().len(), 4, "no answer after the last round");
-    let body = pr_body(&bins);
+    assert_eq!(bins.calls_to("gh").len(), 0, "no PR");
+    let hold = held(&f).await.expect("held");
+    assert_eq!(hold.reason, HoldReason::Prerequisite);
     assert!(
-        body.starts_with("the body\n\n## Review\naddressed\n\n"),
-        "{body}"
+        hold.detail.contains("round 2 (the last of 2 rounds)")
+            && hold
+                .detail
+                .contains("- **the test misses the empty input** (`tests/lib.rs:3`)"),
+        "{}",
+        hold.detail
     );
-    assert!(body.contains("## Unresolved review issues"), "{body}");
-    assert!(
-        body.contains("- **the test misses the empty input** (`tests/lib.rs:3`)"),
-        "{body}"
-    );
-    assert!(!body.contains("[blocking]"), "{body}");
 }
 
 /// A fix whose review stopped with a blocking issue unanswered, at the
@@ -2928,7 +3217,7 @@ async fn a_continued_review_hold_answers_the_issues_and_is_reviewed_again() {
     assert!(
         runs[0]
             .prompt
-            .contains("pre-PR review left blocking issues"),
+            .contains("pre-PR review left issues unanswered"),
         "{}",
         runs[0].prompt
     );
@@ -2950,6 +3239,115 @@ async fn a_continued_review_hold_answers_the_issues_and_is_reviewed_again() {
         pr_title(&bins),
         "fix: the real bug",
         "the hold keeps the title the fix had before round 1"
+    );
+}
+
+/// A review hold's issues go to the fixer once: when the fixer answering
+/// them is held on its own report, the next `continue` resumes it on that
+/// report, not on the review's issues again.
+#[tokio::test]
+async fn a_continued_review_hold_sends_its_issues_once() {
+    let (f, _worker, _bins) = held_by_review("fix-review-sent-once").await;
+    support::release(
+        &f.store,
+        f.fid,
+        FindingJobKind::Fix,
+        ReleaseAction::Continue,
+    )
+    .await;
+    let plan = pending_resume(&f).await;
+    let answering = reviewed_worker(vec![Act::Report(
+        "BLOCKED.md",
+        "needs the vendor's spec",
+        None,
+    )]);
+
+    let summary = resume(&f, &plan, &answering).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("held"), "{summary:?}");
+    let prompt = &answering.runs()[0].prompt;
+    assert!(
+        prompt.contains("the sibling parser still breaks"),
+        "{prompt}"
+    );
+    support::release(
+        &f.store,
+        f.fid,
+        FindingJobKind::Fix,
+        ReleaseAction::Continue,
+    )
+    .await;
+    let plan = pending_resume(&f).await;
+    let resumed = reviewed_worker(vec![Act::Answer, Act::Review(CLEAN)]);
+
+    let summary = resume(&f, &plan, &resumed).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    let prompt = &resumed.runs()[0].prompt;
+    assert!(
+        prompt.contains("needs the vendor's spec")
+            && !prompt.contains("the sibling parser still breaks"),
+        "{prompt}"
+    );
+}
+
+/// A `review-held.json` an earlier daemon wrote (`report` and `issues`,
+/// no `sent`) is pending only for a `continue` of its own hold, as that
+/// daemon read it: left behind once its issues were answered, it does not
+/// send them again on a later hold's `continue`.
+#[tokio::test]
+async fn a_legacy_review_hold_file_sends_its_issues_only_on_its_own_hold() {
+    let legacy = |report: &str| {
+        serde_json::json!({
+            "report": report,
+            "issues": [{"title": "a legacy issue", "blocking": true}],
+        })
+        .to_string()
+    };
+    let (f, worker, _bins) = held_by_review("fix-review-legacy-own").await;
+    let root = worker.runs()[0].tree.parent().unwrap().to_owned();
+    let detail = held(&f).await.expect("held").detail;
+    std::fs::write(root.join("review-held.json"), legacy(&detail)).unwrap();
+    support::release(
+        &f.store,
+        f.fid,
+        FindingJobKind::Fix,
+        ReleaseAction::Continue,
+    )
+    .await;
+    let plan = pending_resume(&f).await;
+    let answering = reviewed_worker(vec![Act::Report(
+        "BLOCKED.md",
+        "needs the vendor's spec",
+        None,
+    )]);
+
+    let summary = resume(&f, &plan, &answering).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("held"), "{summary:?}");
+    let prompt = &answering.runs()[0].prompt;
+    assert!(prompt.contains("a legacy issue"), "its own hold: {prompt}");
+
+    // As the earlier daemon left it after the fixer answered: the file
+    // stays, naming the review's hold, while a later hold is continued.
+    std::fs::write(root.join("review-held.json"), legacy(&detail)).unwrap();
+    support::release(
+        &f.store,
+        f.fid,
+        FindingJobKind::Fix,
+        ReleaseAction::Continue,
+    )
+    .await;
+    let plan = pending_resume(&f).await;
+    let resumed = reviewed_worker(vec![Act::Answer, Act::Review(CLEAN)]);
+
+    let summary = resume(&f, &plan, &resumed).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    let prompt = &resumed.runs()[0].prompt;
+    assert!(
+        prompt.contains("needs the vendor's spec") && !prompt.contains("a legacy issue"),
+        "{prompt}"
     );
 }
 
@@ -3079,6 +3477,22 @@ async fn a_cut_off_reviewers_issues_go_back_only_while_the_grant_can_answer_them
         report.contains("the sibling parser still breaks"),
         "{report}"
     );
+    drop(bins);
+
+    // A spent grant before the last round still ships non-blocking issues.
+    let bins = support::FakeBins::acquire("fix-review-capped");
+    bins.ok("gh", "https://github.com/acme/widget/pull/42");
+    let f = reviewed_fixture("fix-review-capped", 3).await;
+    let worker =
+        reviewed_worker(vec![Act::Fix, Act::ReviewKilled(NOT_BLOCKING)]).granting(Some(10_000));
+
+    let summary = fix(&f, &worker).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    assert_eq!(worker.runs().len(), 2, "no answer without budget");
+    let body = pr_body(&bins);
+    assert!(body.contains("## Unresolved review issues"), "{body}");
+    assert!(body.contains("the test misses the empty input"), "{body}");
 }
 
 /// A review can show the fix is wrong at its root. A fixer that answers
@@ -4434,11 +4848,13 @@ async fn a_refused_fix_after_a_failed_review_ships_on_its_retry() {
     );
 }
 
-/// A refused fix whose verdict pinned a commit (a reviewer changed the
-/// tree in a way that could not be undone: the commit it was shown ships,
-/// not the tree) keeps no verdict, so its retry is reviewed again. No
-/// fixer is resumed for it, but the review costs, so the budget gate
-/// reserves for it as for any resume.
+/// A refused fix whose verdict pinned a commit (a reviewer committed in
+/// the tree and kept the index locked, so its commit could not be undone:
+/// the commit it was shown ships, not the tree) keeps no verdict, so its
+/// retry is reviewed again. No fixer is resumed for it, but the review
+/// costs, so the budget gate reserves for it as for any resume. The retry
+/// puts the tree back to the reviewed commit first, so neither that review
+/// nor the publish sees the reviewer's commit.
 #[tokio::test]
 async fn a_refused_fix_with_a_pinned_verdict_is_reserved_for_and_reviewed_again() {
     let bins = support::FakeBins::acquire("fix-refused-pinned");
@@ -4447,12 +4863,12 @@ async fn a_refused_fix_with_a_pinned_verdict_is_reserved_for_and_reviewed_again(
     review_on(&mut f, 3);
     let nowhere = f.cfg.work_root.join("refusing.git");
     route_push(&f, Some(&nowhere.to_string_lossy()));
-    let refused = fix(
-        &f,
-        &reviewed_worker(vec![Act::Fix, Act::LitteringReview(NOT_BLOCKING)]),
-    )
-    .await;
+    let worker = reviewed_worker(vec![Act::Fix, Act::LockingReview(NOT_BLOCKING)]);
+    let refused = fix(&f, &worker).await;
     assert_eq!(refused.outcome.as_deref(), Some("requeued"), "{refused:?}");
+    // The operator clears the lock that kept the commit from being undone.
+    let tree = worker.runs()[0].tree.clone();
+    std::fs::remove_file(index_lock(&tree)).unwrap();
     let key = format!("url.{}.insteadOf", nowhere.display());
     git(&f.repo_dir, &["config", "--unset-all", &key]);
     route_push(&f, None);
@@ -4473,7 +4889,11 @@ async fn a_refused_fix_with_a_pinned_verdict_is_reserved_for_and_reviewed_again(
 
     assert_eq!(shipped.outcome.as_deref(), Some("pr_open"), "{shipped:?}");
     assert_eq!(retry.runs().len(), 1, "a reviewer, and no fixer");
-    assert_eq!(shipped_subject(&f), "fix: the real bug");
+    assert_eq!(
+        shipped_commits(&f),
+        ["fix: the real bug"],
+        "the reviewer's commit never ships"
+    );
 }
 
 /// Only a saved verdict that covers the kept tree spares its retry the
@@ -4646,13 +5066,13 @@ async fn every_review_run_gets_the_full_per_run_wall_limit() {
     assert_eq!(shipped_subject(&f), "fix: the sibling parser too");
 }
 
-/// A reviewer that changed the tree (a commit of its own, a test artifact
-/// left behind) has its changes undone: the fix branch is checked out
-/// again at the commit it was shown and the artifact removed. Blocking
-/// issues it had verified and written still stand, as a killed
-/// reviewer's do: answered while there are rounds left, else shipped
-/// unresolved, saying the reviewer's changes were undone. Its commit never
-/// ships.
+/// A reviewer that changed the tree (a commit of its own, an edit to a
+/// tracked file, a test artifact left behind) has its changes undone: the
+/// fix branch is checked out again at the commit it was shown and the
+/// artifact removed. Blocking issues it had verified and written still
+/// stand, as a killed reviewer's do: answered while there are rounds left,
+/// else holding the fix with the tree back where the reviewer found it.
+/// Its commit never ships.
 #[tokio::test]
 async fn a_reviewer_that_changed_the_tree_is_undone_and_its_issues_stand() {
     let bins = support::FakeBins::acquire("fix-review-tampered");
@@ -4693,14 +5113,27 @@ async fn a_reviewer_that_changed_the_tree_is_undone_and_its_issues_stand() {
 
     let summary = fix(&f, &worker).await;
 
-    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
-    assert_eq!(shipped_subject(&f), "fix: the real bug");
-    let body = pr_body(&bins);
-    assert!(body.contains("## Unresolved review issues"), "{body}");
-    assert!(body.contains("the test misses the empty input"), "{body}");
+    assert_eq!(summary.outcome.as_deref(), Some("held"), "{summary:?}");
+    assert_eq!(bins.calls_to("gh").len(), 0, "no PR");
+    let hold = held(&f).await.expect("held");
     assert!(
-        body.contains("The reviewer of round 1 changed the worktree; its changes were undone"),
-        "{body}"
+        hold.detail.contains("the test misses the empty input"),
+        "{}",
+        hold.detail
+    );
+    let tree = &worker.runs()[0].tree;
+    assert_eq!(
+        git(tree, &["status", "--porcelain", "--ignored"]),
+        "?? PR-DESCRIPTION.md\n",
+        "nothing of the reviewer's is left"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tree.join("FIX.md")).unwrap(),
+        "fix: the real bug\n"
+    );
+    assert_eq!(
+        git(tree, &["log", "-1", "--format=%s"]).trim(),
+        "fix: the real bug"
     );
 }
 
@@ -4712,7 +5145,7 @@ async fn a_reviewer_that_detaches_head_fails_its_round_and_the_fix_still_ships()
     let bins = support::FakeBins::acquire("fix-review-detached");
     bins.ok("gh", "https://github.com/acme/widget/pull/42");
     let f = reviewed_fixture("fix-review-detached", 3).await;
-    let worker = reviewed_worker(vec![Act::Fix, Act::DetachingReview]);
+    let worker = reviewed_worker(vec![Act::Fix, Act::DetachingReview(CLEAN)]);
 
     let summary = fix(&f, &worker).await;
 
@@ -4722,6 +5155,35 @@ async fn a_reviewer_that_detaches_head_fails_its_round_and_the_fix_still_ships()
     assert!(
         body.contains("Review round 1 failed: the reviewer changed the worktree"),
         "{body}"
+    );
+}
+
+/// The fixer answers a reviewer that detached `HEAD` on the fix branch,
+/// checked out again: its answer is a commit of the branch.
+#[tokio::test]
+async fn a_reviewer_that_detaches_head_has_the_fixer_answer_on_the_branch() {
+    let f = reviewed_fixture("fix-review-detached-answer", 3).await;
+    let worker = reviewed_worker(vec![
+        Act::Fix,
+        Act::DetachingReview(BLOCKING),
+        Act::AnswerSuspended,
+    ]);
+
+    let summary = fix(&f, &worker).await;
+
+    assert_eq!(
+        summary.state,
+        Some(hunter::domain::JobState::Suspended),
+        "{summary:?}"
+    );
+    let tree = &worker.runs()[0].tree;
+    assert_eq!(
+        Some(git(tree, &["branch", "--show-current"]).trim()),
+        summary.branch.as_deref()
+    );
+    assert_eq!(
+        git(tree, &["log", "-1", "--format=%s"]).trim(),
+        "fix: half of the answer"
     );
 }
 
@@ -4756,7 +5218,7 @@ async fn a_review_with_only_non_blocking_issues_is_answered_before_shipping() {
 
 /// By default the review runs up to seven rounds: a reviewer that keeps
 /// finding issues is answered six times, and the seventh round's issues
-/// ship unresolved.
+/// hold the fix for the operator.
 #[tokio::test]
 async fn by_default_a_fix_is_reviewed_up_to_seven_rounds() {
     let bins = support::FakeBins::acquire("fix-review-seven");
@@ -4774,17 +5236,19 @@ async fn by_default_a_fix_is_reviewed_up_to_seven_rounds() {
 
     let summary = fix(&f, &worker).await;
 
-    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    assert_eq!(summary.outcome.as_deref(), Some("held"), "{summary:?}");
     let runs = worker.runs();
     assert_eq!(runs.len(), 14, "the fix, then 7 reviews and 6 answers");
     assert_eq!(
         runs[13].session,
         review_dir(&runs[0].session, summary.job_id, 7)
     );
-    let body = pr_body(&bins);
+    assert_eq!(bins.calls_to("gh").len(), 0, "no PR");
+    let hold = held(&f).await.expect("held");
     assert!(
-        body.contains("Automated pre-PR review round 7 raised these issues"),
-        "{body}"
+        hold.detail.contains("round 7 (the last of 7 rounds)"),
+        "{}",
+        hold.detail
     );
 }
 
@@ -5141,28 +5605,115 @@ async fn a_reviewer_fails_offline(reviewer: Act) {
     );
 }
 
+/// A round cut off while a host is unreachable, whose reviewer committed
+/// and kept the index locked so its commit could not be undone, keeps the
+/// attempt with the tree as the reviewer left it, and the tree it was shown
+/// recorded: the retry puts the tree back to it before any worker runs.
+/// While the lock is in the way no worker runs, and the attempt fails as
+/// `reviewed tree not restored`; once it is gone, the fixer resumes on the
+/// reviewed commit and the reviewer's commit never ships.
+#[tokio::test]
+async fn a_round_cut_off_offline_by_an_undoable_reviewer_resumes_on_the_reviewed_commit() {
+    let bins = support::FakeBins::acquire("fix-review-locked-offline");
+    bins.ok("gh", "https://github.com/acme/widget/pull/42");
+    let mut f = reviewed_fixture("fix-review-locked-offline", 7).await;
+    f.cfg.network_gate = true;
+    let host = "api.provider.example";
+    let worker = reviewed_worker(vec![Act::Fix, Act::LockingReview(NOT_BLOCKING)])
+        .needing(&[host])
+        .offline(&[host]);
+
+    let summary = fix(&f, &worker).await;
+
+    assert_eq!(summary.unreachable.as_deref(), Some(host), "{summary:?}");
+    assert_eq!(bins.calls_to("gh").len(), 0, "nothing ships");
+    assert!(held(&f).await.is_none(), "nothing is held");
+    let tree = worker.runs()[0].tree.clone();
+    assert_eq!(
+        git(&tree, &["log", "-1", "--format=%s"]).trim(),
+        "review: a commit of the reviewer's",
+        "the reviewer's commit could not be undone"
+    );
+    let reviewed = git(&tree, &["rev-parse", "HEAD^"]).trim().to_owned();
+    f.cfg.network_gate = false;
+    let retry = reviewed_worker(vec![Act::Continue, Act::Review(CLEAN)]);
+    let plan = pending_resume(&f).await;
+
+    let blocked = resume(&f, &plan, &retry).await;
+
+    assert!(
+        blocked
+            .failure
+            .as_deref()
+            .is_some_and(|r| r.starts_with("reviewed tree not restored")),
+        "{blocked:?}"
+    );
+    assert!(
+        retry.runs().is_empty(),
+        "no worker runs on the reviewer's leftovers"
+    );
+    std::fs::remove_file(index_lock(&tree)).unwrap();
+    let plan = pending_resume(&f).await;
+
+    let summary = resume(&f, &plan, &retry).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    assert_eq!(retry.runs().len(), 2, "the fixer, then the round again");
+    assert_eq!(
+        shipped_commits(&f),
+        ["fix: the real bug"],
+        "the reviewer's commit never ships"
+    );
+    let events = f.store.recent_events(30).await.unwrap();
+    assert!(
+        events.iter().any(|e| e.kind == "review"
+            && e.message.contains(&format!(
+                "the tree a reviewer left was put back to the reviewed commit {reviewed}"
+            ))),
+        "{events:?}"
+    );
+}
+
 /// A reviewer whose changes to the tree cannot be undone fails its round,
 /// and the fix ships unreviewed with a note, unless the reviewer had
-/// written a blocking issue: that never ships, and holds the fix.
+/// written a blocking issue, or any issue in the last round: those never
+/// ship, and hold the fix, whose report names the commit the tree is put
+/// back to on `continue` ([`continue_locked`]).
 #[tokio::test]
 async fn a_blocking_issue_from_a_reviewer_that_could_not_be_undone_holds_the_fix() {
-    for (review, outcome) in [(BLOCKING, "held"), (NOT_BLOCKING, "pr_open")] {
-        let bins = support::FakeBins::acquire("fix-review-littered");
+    for (review, max_rounds, outcome) in [
+        (BLOCKING, 7, "held"),
+        (NOT_BLOCKING, 7, "pr_open"),
+        (NOT_BLOCKING, 1, "held"),
+    ] {
+        let bins = support::FakeBins::acquire("fix-review-undoable");
         bins.ok("gh", "https://github.com/acme/widget/pull/42");
-        let f = reviewed_fixture("fix-review-littered", 7).await;
-        let worker = reviewed_worker(vec![Act::Fix, Act::LitteringReview(review)]);
+        let f = reviewed_fixture("fix-review-undoable", max_rounds).await;
+        let worker = reviewed_worker(vec![Act::Fix, Act::LockingReview(review)]);
 
         let summary = fix(&f, &worker).await;
 
         assert_eq!(summary.outcome.as_deref(), Some(outcome), "{summary:?}");
         if outcome == "held" {
-            assert_eq!(bins.calls_to("gh").len(), 0, "a blocking issue never ships");
+            assert_eq!(bins.calls_to("gh").len(), 0, "a held fix never ships");
             let report = held(&f).await.expect("held").detail;
             assert!(report.contains("could not be undone"), "{report}");
+            let issue = if review == BLOCKING {
+                "the sibling parser still breaks"
+            } else {
+                "the test misses the empty input"
+            };
+            assert!(report.contains(issue), "{report}");
+            let tree = worker.runs()[0].tree.clone();
+            let reviewed = git(&tree, &["rev-parse", "HEAD^"]);
             assert!(
-                report.contains("the sibling parser still breaks"),
+                report.contains(&format!(
+                    "put back to the reviewed commit `{}`",
+                    reviewed.trim()
+                )),
                 "{report}"
             );
+            continue_locked(&f, &tree, issue).await;
         } else {
             let body = pr_body(&bins);
             assert!(body.contains("could not be undone"), "{body}");
@@ -5170,6 +5721,686 @@ async fn a_blocking_issue_from_a_reviewer_that_could_not_be_undone_holds_the_fix
         }
         drop(bins);
     }
+}
+
+/// The operator's `continue` of a fix held on a reviewer that committed
+/// and keeps the index locked ([`Act::LockingReview`]) in `tree`: its
+/// commit cannot be undone, so every attempt fails without running the
+/// fixer, counted under `reviewed tree not restored` with what is in the
+/// way, and the third holds the fix `stuck`. Once the operator removes the
+/// lock and continues that hold, the next attempt puts the tree back and
+/// resumes the fixer on the held `issue`, which no fixer has run on yet,
+/// not on the stuck hold's failure, and the fix ships without the
+/// reviewer's commit.
+async fn continue_locked(f: &Fixture, tree: &std::path::Path, issue: &str) {
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    let branch = git(tree, &["branch", "--show-current"]).trim().to_owned();
+    support::release(
+        &f.store,
+        f.fid,
+        FindingJobKind::Fix,
+        ReleaseAction::Continue,
+    )
+    .await;
+    let resumed = reviewed_worker(vec![Act::Continue, Act::Review(CLEAN)]);
+    let mut outcomes = Vec::new();
+    for attempt in 1..=3 {
+        let plan = pending_resume(f).await;
+
+        let summary = resume(f, &plan, &resumed).await;
+
+        assert!(
+            summary
+                .failure
+                .as_deref()
+                .is_some_and(|r| r.starts_with("reviewed tree not restored")),
+            "{summary:?}"
+        );
+        assert_eq!(
+            (
+                summary.kind,
+                summary.finding_id,
+                summary.state,
+                summary.branch.as_deref()
+            ),
+            (
+                Some(JobKind::Finding(FindingJobKind::Fix)),
+                Some(f.fid),
+                Some(JobState::Failed),
+                Some(branch.as_str())
+            ),
+            "{summary:?}"
+        );
+        let (state, notes): (String, String) =
+            sqlx::query_as("SELECT state, notes FROM jobs WHERE id = ?1")
+                .bind(summary.job_id.expect("the attempt's job"))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "failed", "attempt {attempt}");
+        assert!(notes.starts_with("reviewed tree not restored"), "{notes}");
+        assert!(
+            resumed.runs().is_empty(),
+            "no worker runs on the reviewer's leftovers"
+        );
+        let streak = fix_streak(f).await;
+        assert_eq!(
+            (streak.streak, streak.last_failure.as_deref()),
+            (
+                attempt % 3,
+                (attempt < 3).then_some("reviewed tree not restored")
+            ),
+            "attempt {attempt}"
+        );
+        outcomes.push(summary.outcome.unwrap_or_default());
+    }
+    assert_eq!(outcomes, ["requeued", "requeued", "held"]);
+    let hold = held(f).await.expect("held stuck at the limit");
+    assert_eq!(hold.reason, HoldReason::Stuck);
+    let lock = index_lock(tree);
+    let locked = format!(
+        "checkout failed: fatal: Unable to create '{}'",
+        lock.display()
+    );
+    for named in ["reviewed tree not restored", &locked, "HEAD is at "] {
+        assert!(hold.detail.contains(named), "{named}: {hold:?}");
+    }
+    std::fs::remove_file(&lock).unwrap();
+    support::release(
+        &f.store,
+        f.fid,
+        FindingJobKind::Fix,
+        ReleaseAction::Continue,
+    )
+    .await;
+    let plan = pending_resume(f).await;
+
+    let summary = resume(f, &plan, &resumed).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    let runs = resumed.runs();
+    assert_eq!(runs.len(), 2, "the fixer, then a clean review");
+    assert!(
+        runs[0].prompt.contains(issue),
+        "the held issues go to the fixer: {}",
+        runs[0].prompt
+    );
+    assert_eq!(shipped_commits(f), ["fix: the real bug"]);
+}
+
+/// A fix held on a reviewer whose commit could not be undone resumes on
+/// the commit the reviewer was shown: the operator's `continue` puts the
+/// fix branch back to it before the fixer runs, so the reviewer's commit
+/// never ships. Whether a blocking issue held it, or any issue in the last
+/// round. Only once: a later attempt of the chain keeps what the fixer
+/// committed since.
+#[tokio::test]
+async fn a_continued_hold_on_an_undoable_reviewer_resumes_on_the_reviewed_commit() {
+    for (review, max_rounds) in [(BLOCKING, 7), (NOT_BLOCKING, 1)] {
+        let bins = support::FakeBins::acquire("fix-review-locked");
+        bins.ok("gh", "https://github.com/acme/widget/pull/42");
+        let f = reviewed_fixture("fix-review-locked", max_rounds).await;
+        let worker = reviewed_worker(vec![Act::Fix, Act::LockingReview(review)]);
+
+        let summary = fix(&f, &worker).await;
+
+        assert_eq!(summary.outcome.as_deref(), Some("held"), "{summary:?}");
+        let tree = worker.runs()[0].tree.clone();
+        assert_eq!(
+            git(&tree, &["log", "-1", "--format=%s"]).trim(),
+            "review: a commit of the reviewer's",
+            "the reviewer's commit could not be undone"
+        );
+        let reviewed = git(&tree, &["rev-parse", "HEAD^"]).trim().to_owned();
+        let report = held(&f).await.expect("held").detail;
+        assert!(
+            report.contains(&format!("put back to the reviewed commit `{reviewed}`")),
+            "{report}"
+        );
+        // The operator clears the lock the report quotes, and continues.
+        std::fs::remove_file(index_lock(&tree)).unwrap();
+        support::release(
+            &f.store,
+            f.fid,
+            FindingJobKind::Fix,
+            ReleaseAction::Continue,
+        )
+        .await;
+        let plan = pending_resume(&f).await;
+        let resumed = reviewed_worker(vec![
+            Act::AnswerSuspended,
+            Act::Continue,
+            Act::Review(CLEAN),
+        ]);
+
+        let summary = resume(&f, &plan, &resumed).await;
+
+        assert_eq!(
+            summary.state,
+            Some(hunter::domain::JobState::Suspended),
+            "{summary:?}"
+        );
+        let plan = pending_resume(&f).await;
+        let summary = resume(&f, &plan, &resumed).await;
+
+        assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+        assert_eq!(
+            shipped_commits(&f),
+            ["fix: half of the answer", "fix: the real bug"],
+            "the fixer built on the reviewed commit, and its answer was kept"
+        );
+        let events = f.store.recent_events(30).await.unwrap();
+        assert!(
+            events.iter().any(|e| e.kind == "review"
+                && e.message
+                    .contains(&format!("put back to the reviewed commit {reviewed}"))),
+            "{events:?}"
+        );
+        drop(bins);
+    }
+}
+
+/// The change is its commits: before a reviewer runs, the daemon discards
+/// the fixer's uncommitted changes to tracked files and deletes its
+/// untracked files, so the reviewer is shown the commits alone. Ignored
+/// files (a build cache) stay, as does the description, the PR body. The
+/// round's event names what went, ten paths at most. A clean verdict on
+/// that tree ships the fix with its body intact.
+#[tokio::test]
+async fn the_reviewer_is_shown_the_commits_alone() {
+    let bins = support::FakeBins::acquire("fix-review-cleaned");
+    bins.ok("gh", "https://github.com/acme/widget/pull/42");
+    let f = reviewed_fixture("fix-review-cleaned", 7).await;
+    let worker = reviewed_worker(vec![Act::FixUntidy, Act::Review(CLEAN)]);
+
+    let summary = fix(&f, &worker).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    assert_eq!(
+        seen(&worker.runs()[1]),
+        "?? PR-DESCRIPTION.md\n!! target/\n",
+        "the reviewer finds the description and the ignored cache, nothing else"
+    );
+    let events = f.store.recent_events(30).await.unwrap();
+    let cleaned = "review round 1: the tree was cleaned for the reviewer: uncommitted \
+                   changes discarded: `FIX.md`; untracked files deleted: `NOTES.md`, \
+                   `fixtures/`, `out-01.log`, `out-02.log`, `out-03.log`, `out-04.log`, \
+                   `out-05.log`, `out-06.log`, `out-07.log` and 3 more";
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "review" && e.message.ends_with(cleaned)),
+        "{events:?}"
+    );
+    assert_eq!(pr_body(&bins), "the body", "the description is the body");
+    assert_eq!(shipped_commits(&f), ["fix: the real bug"]);
+}
+
+/// Issue #20: the fixer's test run leaves an untracked artifact
+/// (`.coverage`), which the reviewer's targeted test run writes again. The
+/// artifact is deleted before the review, so the reviewer's run finds
+/// none. One that writes it afresh has only added a file to the tree it
+/// was shown, which changes nothing it reviewed: the file is deleted
+/// again, the round's event names it, and the clean verdict ships the fix
+/// as reviewed, as it does when the run writes nothing.
+#[tokio::test]
+async fn a_fixers_artifact_is_gone_before_the_reviewers_test_run() {
+    for creates in [false, true] {
+        let bins = support::FakeBins::acquire("fix-review-coverage");
+        bins.ok("gh", "https://github.com/acme/widget/pull/42");
+        let f = reviewed_fixture("fix-review-coverage", 7).await;
+        let worker = reviewed_worker(vec![Act::FixCovered, Act::CoverageReview(creates)]);
+
+        let summary = fix(&f, &worker).await;
+
+        assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+        assert_eq!(seen(&worker.runs()[1]), "?? PR-DESCRIPTION.md\n");
+        assert_eq!(pr_body(&bins), "the body", "{creates}: shipped as reviewed");
+        let events = f.store.recent_events(30).await.unwrap();
+        let removed = "review round 1: the reviewer's uncommitted changes were reverted, and its \
+                       verdict stands: untracked files deleted: `.coverage`";
+        assert_eq!(
+            events
+                .iter()
+                .any(|e| e.kind == "review" && e.message.ends_with(removed)),
+            creates,
+            "{events:?}"
+        );
+        drop(bins);
+    }
+}
+
+/// A fixer may leave `HEAD` on a branch of its own: what ships is the
+/// commit. Undoing a reviewer that only wrote a `.coverage` checks that
+/// branch out again, as the reviewer was shown it, and its verdict stands.
+#[tokio::test]
+async fn a_reviewer_on_the_fixers_own_branch_is_undone_onto_it() {
+    let bins = support::FakeBins::acquire("fix-review-own-branch");
+    bins.ok("gh", "https://github.com/acme/widget/pull/42");
+    let f = reviewed_fixture("fix-review-own-branch", 7).await;
+    let worker = reviewed_worker(vec![Act::FixOnOwnBranch, Act::CoverageReview(true)]);
+
+    let summary = fix(&f, &worker).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    assert_eq!(pr_body(&bins), "the body", "shipped as reviewed");
+    assert_eq!(shipped_commits(&f), ["fix: the real bug"]);
+    let events = f.store.recent_events(30).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "review" && e.message.contains("its verdict stands")),
+        "{events:?}"
+    );
+}
+
+/// Issue #23: a fixer that committed its description and then updated it
+/// uncommitted, as `review_followup.md` asks after every round, leaves it
+/// tracked and changed (` M PR-DESCRIPTION.md`). That is the description's
+/// own status line as much as an untracked one's: the clean keeps it, the
+/// reviewer sees the updated description, and every round, the answer's
+/// update included, is reviewed and ships with the updated body.
+#[tokio::test]
+async fn a_committed_then_updated_description_is_reviewed_every_round() {
+    let bins = support::FakeBins::acquire("fix-review-tracked-description");
+    bins.ok("gh", "https://github.com/acme/widget/pull/42");
+    let f = reviewed_fixture("fix-review-tracked-description", 3).await;
+    let worker = reviewed_worker(vec![
+        Act::FixTrackedDescription,
+        Act::Review(BLOCKING),
+        Act::Answer,
+        // Leaves an edit and a file behind: undone, with the tracked,
+        // edited description as the restored tree's own line.
+        Act::EditingReview,
+    ]);
+
+    let summary = fix(&f, &worker).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    let runs = worker.runs();
+    assert_eq!(runs.len(), 4, "fix, review, answer, review: {summary:?}");
+    let described = |run: &support::Run| {
+        std::fs::read_to_string(out_path(&run.prompt).with_extension("description")).unwrap()
+    };
+    assert_eq!(seen(&runs[1]), " M PR-DESCRIPTION.md\n");
+    assert_eq!(described(&runs[1]), "the updated body");
+    assert_eq!(seen(&runs[3]), " M PR-DESCRIPTION.md\n");
+    let answered = "the updated body\n\n## Review\naddressed";
+    assert_eq!(described(&runs[3]), answered);
+    assert_eq!(pr_body(&bins), answered, "shipped as reviewed");
+    let events = f.store.recent_events(30).await.unwrap();
+    let reviews: Vec<_> = events.iter().filter(|e| e.kind == "review").collect();
+    assert_eq!(reviews.len(), 3, "two rounds and the revert: {events:?}");
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.message.contains("could not be cleaned")),
+        "{events:?}"
+    );
+    assert!(
+        reviews
+            .iter()
+            .any(|e| e.message.contains("its verdict stands")),
+        "{events:?}"
+    );
+}
+
+/// A reviewer that edits a tracked file and adds an untracked one but
+/// commits nothing has left the commits it reviewed alone: both are
+/// reverted, the round's event names them, and its clean verdict ships the
+/// fix as reviewed. One that commits fails its round
+/// (`a_reviewer_that_moves_head_fails_its_review_and_its_commit_does_not_ship`).
+#[tokio::test]
+async fn a_reviewer_that_edits_a_tracked_file_keeps_its_verdict() {
+    let bins = support::FakeBins::acquire("fix-review-edited");
+    bins.ok("gh", "https://github.com/acme/widget/pull/42");
+    let f = reviewed_fixture("fix-review-edited", 7).await;
+    let worker = reviewed_worker(vec![Act::Fix, Act::EditingReview]);
+
+    let summary = fix(&f, &worker).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    assert_eq!(pr_body(&bins), "the body", "shipped as reviewed");
+    let events = f.store.recent_events(30).await.unwrap();
+    let reverted = "review round 1: the reviewer's uncommitted changes were reverted, and its \
+                    verdict stands: uncommitted changes discarded: `FIX.md`; untracked files \
+                    deleted: `.coverage`";
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "review" && e.message.ends_with(reverted)),
+        "{events:?}"
+    );
+}
+
+/// Issue #22: the fixer's build leaves a tracked file rewritten (a stale
+/// `Cargo.lock`), the clean step resets it, and the reviewer's test run
+/// rewrites it again. The reviewer left the commits alone: the file is
+/// reverted after the review, the round's event names it, and the clean
+/// verdict ships the fix as reviewed.
+#[tokio::test]
+async fn a_lock_file_the_reviewers_test_run_rewrites_keeps_its_verdict() {
+    let bins = support::FakeBins::acquire("fix-review-relocked");
+    bins.ok("gh", "https://github.com/acme/widget/pull/42");
+    let f = reviewed_fixture("fix-review-relocked", 7).await;
+    let worker = reviewed_worker(vec![Act::FixRelocked, Act::RelockingReview]);
+
+    let summary = fix(&f, &worker).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    assert_eq!(seen(&worker.runs()[1]), "?? PR-DESCRIPTION.md\n");
+    assert_eq!(pr_body(&bins), "the body", "shipped as reviewed");
+    let events = f.store.recent_events(30).await.unwrap();
+    let reverted = "review round 1: the reviewer's uncommitted changes were reverted, and its \
+                    verdict stands: uncommitted changes discarded: `FIX.md`";
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "review" && e.message.ends_with(reverted)),
+        "{events:?}"
+    );
+    assert_eq!(shipped_commits(&f), ["fix: the real bug"]);
+}
+
+/// Issue #21: a fixer that builds in a submodule leaves it dirty: at
+/// another commit than the tree records, with an edit to a tracked file
+/// and an untracked one. `reset` and `clean` do not enter a submodule, so
+/// the clean step also puts it back to the recorded commit and cleans it:
+/// the reviewer is shown the commits alone, and its clean verdict ships
+/// the fix as reviewed.
+#[tokio::test]
+async fn a_fixers_dirty_submodule_is_cleaned_for_the_reviewer() {
+    let bins = support::FakeBins::acquire("fix-review-submodule");
+    bins.ok("gh", "https://github.com/acme/widget/pull/42");
+    let f = reviewed_fixture("fix-review-submodule", 7).await;
+    vendor_lib(&f);
+    let worker = reviewed_worker(vec![Act::FixSubmoduled, Act::Review(CLEAN)]);
+
+    let summary = fix(&f, &worker).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    assert_eq!(worker.runs().len(), 2, "a reviewer ran");
+    assert_eq!(seen(&worker.runs()[1]), "?? PR-DESCRIPTION.md\n");
+    let events = f.store.recent_events(30).await.unwrap();
+    let cleaned = "review round 1: the tree was cleaned for the reviewer: uncommitted \
+                   changes discarded: `lib`";
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "review" && e.message.ends_with(cleaned)),
+        "{events:?}"
+    );
+    assert_eq!(pr_body(&bins), "the body", "shipped as reviewed");
+    assert_eq!(shipped_commits(&f), ["fix: the real bug"]);
+}
+
+/// A submodule the clone's shared config marks active (a sibling tree
+/// initialized it) but this tree never checked out stays unchecked-out:
+/// cleaning the tree for the reviewer clones nothing into it. The tree is
+/// kept (the last round's issue holds the fix) to look at.
+#[tokio::test]
+async fn a_submodule_this_tree_never_checked_out_is_not_cloned_by_the_clean() {
+    let bins = support::FakeBins::acquire("fix-review-submodule-elsewhere");
+    // A clone the clean may make would succeed, as over the network: only
+    // not trying keeps the submodule unchecked-out.
+    let env = |key, value| bins.env(key, std::path::Path::new(value));
+    let _count = env("GIT_CONFIG_COUNT", "1");
+    let _key = env("GIT_CONFIG_KEY_0", "protocol.file.allow");
+    let _value = env("GIT_CONFIG_VALUE_0", "always");
+    let f = reviewed_fixture("fix-review-submodule-elsewhere", 1).await;
+    vendor_lib(&f);
+    let worker = reviewed_worker(vec![Act::FixSubmoduleElsewhere, Act::Review(NOT_BLOCKING)]);
+
+    let summary = fix(&f, &worker).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("held"), "{summary:?}");
+    let runs = worker.runs();
+    assert_eq!(runs.len(), 2, "a reviewer ran");
+    assert_eq!(seen(&runs[1]), "?? PR-DESCRIPTION.md\n");
+    let lib = std::fs::read_dir(runs[0].tree.join(LIB))
+        .expect("the tree is kept")
+        .count();
+    assert_eq!(lib, 0, "the submodule stays unchecked-out");
+}
+
+/// A reviewer whose build leaves an untracked file in a submodule, or that
+/// also moves the submodule to another commit, left the commits it
+/// reviewed alone: the submodule is cleaned and put back to the recorded
+/// commit, and its verdict stands. Its blocking issues go to the fixer,
+/// and the next round's reviewer finds the submodule as recorded.
+#[tokio::test]
+async fn a_reviewers_changes_to_a_submodule_are_undone() {
+    for moves in [false, true] {
+        let bins = support::FakeBins::acquire("fix-review-submodule-undone");
+        bins.ok("gh", "https://github.com/acme/widget/pull/42");
+        let f = reviewed_fixture("fix-review-submodule-undone", 7).await;
+        vendor_lib(&f);
+        let acts = if moves {
+            vec![
+                Act::FixSubmoduled,
+                Act::SubmoduleReview(true, BLOCKING),
+                Act::Answer,
+                Act::Review(CLEAN),
+            ]
+        } else {
+            vec![Act::FixSubmoduled, Act::SubmoduleReview(false, CLEAN)]
+        };
+        let worker = reviewed_worker(acts);
+
+        let summary = fix(&f, &worker).await;
+
+        assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+        let runs = worker.runs();
+        assert_eq!(runs.len(), if moves { 4 } else { 2 }, "{moves}");
+        if moves {
+            assert_eq!(seen(&runs[3]), "?? PR-DESCRIPTION.md\n");
+        }
+        let events = f.store.recent_events(30).await.unwrap();
+        let said = |what: &str| {
+            events
+                .iter()
+                .any(|e| e.kind == "review" && e.message.contains(what))
+        };
+        assert!(
+            said(
+                "review round 1: the reviewer's uncommitted changes were reverted, and its \
+                 verdict stands: uncommitted changes discarded: `lib`"
+            ),
+            "{moves}: {events:?}"
+        );
+        assert!(
+            !said("the reviewer changed the worktree"),
+            "{moves}: {events:?}"
+        );
+        let body = pr_body(&bins);
+        assert!(!body.contains("failed"), "{moves}: {body}");
+        drop(bins);
+    }
+}
+
+/// A fixer leaving a file the tree cannot be cleaned of (`scratch/notes.txt`
+/// in a read-only `scratch/`) still has its fix reviewed: the round's event
+/// says what is in the way, the reviewer is shown the tree with it, and
+/// that leftover is part of the tree it is held to. A leftover never costs
+/// the fix its review.
+#[tokio::test]
+async fn a_tree_that_cannot_be_cleaned_is_reviewed_as_it_is() {
+    // A reviewer that leaves changes of its own too: undoing them leaves
+    // the tree it was shown, the leftover with it, and its verdict stands.
+    for edits in [false, true] {
+        let bins = support::FakeBins::acquire("fix-review-uncleaned");
+        bins.ok("gh", "https://github.com/acme/widget/pull/42");
+        let f = reviewed_fixture("fix-review-uncleaned", 7).await;
+        let reviewer = if edits {
+            Act::EditingReview
+        } else {
+            Act::Review(CLEAN)
+        };
+        let worker = reviewed_worker(vec![Act::FixScratched, reviewer]);
+
+        let summary = fix(&f, &worker).await;
+        // Before anything can panic: a read-only directory outlives the
+        // fixture's cleanup.
+        let tree = &worker.runs()[0].tree;
+        if tree.join("scratch").exists() {
+            scratch_writable(tree, true);
+        }
+
+        assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+        assert_eq!(worker.runs().len(), 2, "the fix is reviewed");
+        assert!(seen(&worker.runs()[1]).contains("?? scratch/"));
+        assert_eq!(
+            pr_body(&bins),
+            "the body",
+            "edits {edits}: shipped as reviewed"
+        );
+        let events = f.store.recent_events(30).await.unwrap();
+        assert!(
+            events.iter().any(|e| e.kind == "review"
+                && e.message.contains(
+                    "the worktree could not be cleaned for the reviewer: clean failed: warning: \
+                     failed to remove scratch/notes.txt"
+                )
+                && e.message.contains("left in the tree: `?? scratch/`")
+                && e.message.ends_with("the reviewer is shown it as it is")),
+            "{events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .any(|e| e.message.contains("its verdict stands")),
+            edits,
+            "{events:?}"
+        );
+        assert_eq!(shipped_commits(&f), ["fix: the real bug"]);
+        drop(bins);
+    }
+}
+
+/// What keeps a reviewer's changes from being undone is named in the hold
+/// its blocking issue makes: the branch it left (`HEAD` detached, with the
+/// index locked so the fix branch cannot be checked out again), a file it
+/// left that cannot be deleted, with what git said, or a status git can no
+/// longer report.
+#[tokio::test]
+async fn what_keeps_a_reviewer_from_being_undone_is_named() {
+    for (reviewer, named) in [
+        (
+            Act::StrandingReview(BLOCKING),
+            &["HEAD's branch is none (detached)"][..],
+        ),
+        (
+            Act::ScratchingReview(BLOCKING),
+            &[
+                "clean failed: warning: failed to remove scratch/notes.txt",
+                "left in the tree: `?? scratch/`",
+            ],
+        ),
+        (
+            Act::UnreadingReview(BLOCKING),
+            &["git could not report the status"],
+        ),
+    ] {
+        let bins = support::FakeBins::acquire("fix-review-named");
+        bins.ok("gh", "https://github.com/acme/widget/pull/42");
+        let f = reviewed_fixture("fix-review-named", 7).await;
+        let worker = reviewed_worker(vec![Act::Fix, reviewer]);
+
+        let summary = fix(&f, &worker).await;
+        // Before anything can panic: a read-only directory outlives the
+        // fixture's cleanup.
+        let tree = &worker.runs()[0].tree;
+        if tree.join("scratch").exists() {
+            scratch_writable(tree, true);
+        }
+
+        assert_eq!(summary.outcome.as_deref(), Some("held"), "{summary:?}");
+        let report = held(&f).await.expect("held").detail;
+        assert!(report.contains("could not be undone"), "{report}");
+        for named in named {
+            assert!(report.contains(named), "{named}: {report}");
+        }
+        drop(bins);
+    }
+}
+
+/// A daemon that dies between the review's hold and its recording leaves
+/// the hold's report in the tree, which the resumed attempt keeps (the
+/// report holds the work once the attempt ends) while it puts the tree
+/// back to the reviewed commit: the report is the review's, not one the
+/// reviewer left. So the fix is held on it, and does not ship on a fresh
+/// review with the issues never shown to anyone; the operator's `continue`
+/// then resumes the fixer on them.
+#[tokio::test]
+async fn a_review_hold_the_daemon_died_before_recording_survives_the_tree_put_back() {
+    let bins = support::FakeBins::acquire("fix-review-locked-died");
+    bins.ok("gh", "https://github.com/acme/widget/pull/42");
+    let f = reviewed_fixture("fix-review-locked-died", 1).await;
+    let worker = reviewed_worker(vec![Act::Fix, Act::LockingReview(NOT_BLOCKING)]);
+    let summary = fix(&f, &worker).await;
+    assert_eq!(summary.outcome.as_deref(), Some("held"), "{summary:?}");
+    let tree = worker.runs()[0].tree.clone();
+    let reviewed = git(&tree, &["rev-parse", "HEAD^"]).trim().to_owned();
+    let report = held(&f).await.expect("held").detail;
+    // As if the daemon had died before `conclude_fix` recorded the hold:
+    // no hold, the checkpoint the attempt left, and its report in the
+    // tree. The index lock is gone with the reviewer that held it.
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    sqlx::query("DELETE FROM work_holds WHERE finding_id = ?1")
+        .bind(f.fid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    std::fs::write(tree.join("BLOCKED.md"), &report).unwrap();
+    std::fs::remove_file(index_lock(&tree)).unwrap();
+    let plan = pending_resume(&f).await;
+    assert_eq!(plan.after_hold(), None, "no operator released anything");
+    let resumed = reviewed_worker(vec![Act::Continue, Act::Review(CLEAN)]);
+
+    let summary = resume(&f, &plan, &resumed).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("held"), "{summary:?}");
+    assert_eq!(bins.calls_to("gh").len(), 0, "a held fix never ships");
+    let hold = held(&f).await.expect("held on the review's report");
+    assert_eq!(
+        (hold.reason, hold.detail.as_str()),
+        (HoldReason::Prerequisite, report.as_str())
+    );
+    assert_eq!(
+        git(&tree, &["rev-parse", "HEAD"]).trim(),
+        reviewed,
+        "the tree was put back all the same"
+    );
+    let issue = "the test misses the empty input";
+    let runs = resumed.runs();
+    assert_eq!(runs.len(), 1, "no review of a held fix");
+    assert!(
+        !runs[0].prompt.contains(issue),
+        "the issues go to the operator first: {}",
+        runs[0].prompt
+    );
+    // The operator's `continue` then has the fixer answer them.
+    support::release(
+        &f.store,
+        f.fid,
+        FindingJobKind::Fix,
+        ReleaseAction::Continue,
+    )
+    .await;
+    let plan = pending_resume(&f).await;
+    let answering = reviewed_worker(vec![Act::Answer, Act::Review(CLEAN)]);
+
+    let summary = resume(&f, &plan, &answering).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    let prompt = &answering.runs()[0].prompt;
+    assert!(prompt.contains(issue), "{prompt}");
 }
 
 /// A fixer that leaves `HEAD` detached is reviewed like any other: a
@@ -5614,6 +6845,130 @@ async fn a_curation_the_daemon_died_in_is_undone_and_the_reviewed_commits_ship()
     );
 }
 
+/// The attempt after a curation whose rewrite could not be undone fails
+/// as `reviewed tree not restored` without running a worker while what
+/// keeps the tree from being put back is there; once it is gone, the
+/// tree goes back to the reviewed commit and the original commits ship.
+/// The runs of that attempt.
+async fn an_unrestorable_curation_is_put_back_first(
+    f: &Fixture,
+    tree: &std::path::Path,
+    attempt: &[Act],
+) -> Vec<support::Run> {
+    let plan = pending_resume(f).await;
+    let retry = reviewed_worker(attempt.to_vec());
+
+    let blocked = resume(f, &plan, &retry).await;
+
+    assert!(
+        blocked
+            .failure
+            .as_deref()
+            .is_some_and(|r| r.starts_with("reviewed tree not restored")),
+        "{blocked:?}"
+    );
+    assert!(
+        retry.runs().is_empty(),
+        "no worker runs on the curator's rewrite"
+    );
+    std::fs::remove_file(index_lock(tree)).unwrap();
+    let plan = pending_resume(f).await;
+
+    let summary = resume(f, &plan, &retry).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    assert_eq!(
+        shipped_commits(f),
+        ["fix: the sibling parser too", "fix: the real bug"],
+        "the curator's rewrite never ships"
+    );
+    retry.runs()
+}
+
+/// A rejected curation whose rewrite cannot be undone pins the reviewed
+/// commit for its ship; when that publish fails, the retry puts the tree
+/// back to it before anything runs, and neither reviews nor ships the
+/// rewrite.
+#[tokio::test]
+async fn a_rejected_curation_that_could_not_be_undone_is_put_back_on_the_retry() {
+    let bins = support::FakeBins::acquire("fix-curate-locked");
+    bins.ok("gh", "https://github.com/acme/widget/pull/42");
+    let mut f = fixture("fix-curate-locked").await;
+    review_on(&mut f, 7);
+    f.cfg.review_curate = true;
+    let nowhere = f.cfg.work_root.join("refusing.git");
+    route_push(&f, Some(&nowhere.to_string_lossy()));
+    let worker = reviewed_worker(vec![
+        Act::Fix,
+        Act::Review(BLOCKING),
+        Act::Answer,
+        Act::Review(CLEAN),
+        Act::Curate(Curation::LockedChange),
+    ]);
+    let refused = fix(&f, &worker).await;
+    assert_eq!(refused.outcome.as_deref(), Some("requeued"), "{refused:?}");
+    let tree = worker.runs()[0].tree.clone();
+    let key = format!("url.{}.insteadOf", nowhere.display());
+    git(&f.repo_dir, &["config", "--unset-all", &key]);
+    route_push(&f, None);
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
+        .bind(24 * 60 * 60_000_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let runs = an_unrestorable_curation_is_put_back_first(&f, &tree, &[Act::Continue]).await;
+    assert!(runs.is_empty(), "the pinned commit's publish is retried");
+}
+
+/// A curation the daemon died in whose rewrite cannot be undone after the
+/// restart is not resumed on as undone: no fixer runs on the rewrite until
+/// the tree is back at the reviewed commit, and the one that then resumes
+/// is told its rewrite was undone, not to pick it back up.
+#[tokio::test]
+async fn a_curation_the_daemon_died_in_that_could_not_be_undone_is_put_back_first() {
+    use futures_util::FutureExt;
+    let bins = support::FakeBins::acquire("fix-curate-died-locked");
+    bins.ok("gh", "https://github.com/acme/widget/pull/42");
+    let mut f = reviewed_fixture("fix-curate-died-locked", 7).await;
+    f.cfg.review_curate = true;
+    let worker = reviewed_worker(vec![
+        Act::Fix,
+        Act::Review(BLOCKING),
+        Act::Answer,
+        Act::Review(CLEAN),
+        Act::Curate(Curation::LockedDaemonDies),
+    ]);
+    let died = std::panic::AssertUnwindSafe(fix(&f, &worker))
+        .catch_unwind()
+        .await;
+    assert!(died.is_err(), "the daemon died");
+    let tree = worker.runs()[0].tree.clone();
+    support::jobs(&f.store)
+        .settle_unsettled(&f.cfg.work_root)
+        .await
+        .unwrap();
+
+    let runs = an_unrestorable_curation_is_put_back_first(&f, &tree, &[Act::Continue]).await;
+    assert_eq!(runs.len(), 1, "no new review, no new curation");
+    assert!(
+        runs[0].prompt.contains("has been undone"),
+        "{}",
+        runs[0].prompt
+    );
+    let events = f.store.recent_events(40).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.message.contains("the tree a curator left was put back")),
+        "{events:?}"
+    );
+}
+
 /// A saved verdict covers the tree it was reached on and nothing else: a
 /// fixer that commits more on a released retry of an offline push is
 /// reviewed again.
@@ -5642,6 +6997,71 @@ async fn a_saved_verdict_does_not_cover_a_tree_that_changed_since() {
 
     assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
     assert_eq!(retry.runs().len(), 2, "the changed tree is reviewed again");
+}
+
+/// A verdict saved by a daemon from before this change still covers its
+/// unchanged tree: a fix kept only to publish across the upgrade ships on
+/// it, with no run, as it would have before. That daemon saved the tree
+/// as its commit, branch, `git status` (trimmed at both ends, so a first
+/// line's leading blank was lost, as for a tracked, edited description)
+/// and description digest.
+#[tokio::test]
+async fn a_verdict_saved_by_an_earlier_daemon_still_covers_its_tree() {
+    for (label, fixer, status) in [
+        ("fix-review-saved-legacy", Act::Fix, None),
+        (
+            "fix-review-saved-legacy-tracked",
+            Act::FixTrackedDescription,
+            Some(" M PR-DESCRIPTION.md"),
+        ),
+    ] {
+        let bins = support::FakeBins::acquire(label);
+        bins.ok("gh", "https://github.com/acme/widget/pull/42");
+        let mut f = fixture(label).await;
+        review_on(&mut f, 7);
+        f.cfg.network_gate = true;
+        let nowhere = f.cfg.work_root.join("no-such-remote.git");
+        route_push(&f, Some(&nowhere.to_string_lossy()));
+        let host = "github.com";
+        let worker = reviewed_worker(vec![fixer, Act::Review(CLEAN)]).offline(&[host]);
+        let summary = fix(&f, &worker).await;
+        assert_eq!(summary.unreachable.as_deref(), Some(host), "{summary:?}");
+        let nowhere_key = format!("url.{}.insteadOf", nowhere.display());
+        git(&f.repo_dir, &["config", "--unset-all", &nowhere_key]);
+        route_push(&f, None);
+        f.cfg.network_gate = false;
+        let plan = pending_resume(&f).await;
+        // As the earlier daemon wrote it: those four fields, nothing else,
+        // the status trimmed at both ends.
+        let path = plan.workspace().root.join("review-ending.json");
+        let mut saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let tree = &saved["tree"];
+        let mut legacy: serde_json::Map<String, serde_json::Value> =
+            ["head", "branch", "status", "description"]
+                .into_iter()
+                .map(|key| (key.to_owned(), tree[key].clone()))
+                .collect();
+        assert!(legacy["head"].is_string(), "{saved}");
+        let kept = legacy["status"].as_str().expect("a status").to_owned();
+        if let Some(status) = status {
+            assert_eq!(kept, status, "the status this case is about");
+        }
+        legacy.insert("status".to_owned(), kept.trim().into());
+        saved["tree"] = legacy.into();
+        std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        let retry = reviewed_worker(vec![]);
+
+        let summary = resume(&f, &plan, &retry).await;
+
+        assert_eq!(
+            summary.outcome.as_deref(),
+            Some("pr_open"),
+            "{label}: {summary:?}"
+        );
+        assert!(retry.runs().is_empty(), "{label}: no run, no review again");
+        drop(bins);
+    }
 }
 
 /// While the review is on, a finished fixer with nothing to review fails
