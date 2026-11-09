@@ -93,7 +93,8 @@ pub struct ResumePlan {
     handoff: bool,
     /// The hold an operator released with `continue` to get here, if this
     /// is the first attempt since: its reason and detail. The resume prompt
-    /// is chosen from the reason (WORK-MODEL.md §9.1).
+    /// is chosen from the reason (WORK-MODEL.md §9.1), unless a fix's review
+    /// hold left issues no fixer has run on yet ([`fix_prompt`]).
     after_hold: Option<(HoldReason, String)>,
     /// The predecessor finished and was kept only to publish
     /// ([`kept_to_publish`]): a continuation whose own run does no
@@ -5331,15 +5332,18 @@ async fn hold_on_report(
     Ok(true)
 }
 
-/// The worker's prompt. The playbook builders run on a resume too: the
-/// session already holds the playbook, but a builder that fails is a
+/// The worker's prompt, and whether it resumes the fixer on a review
+/// hold's pending issues ([`review::held_resume_prompt`]), which any
+/// operator's `continue` does while they are pending, whichever hold it
+/// released. The playbook builders run on a resume too: the session
+/// already holds the playbook, but a builder that fails is a
 /// configuration fault worth surfacing on either path.
 fn fix_prompt(
     cfg: &Config,
     resume: Option<&ResumePlan>,
     start: &FixStart,
     curation_undone: bool,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, bool)> {
     let finding = &start.finding;
     let worktree = &start.ws.tree;
     let repo_notes = Store::repo_notes(&cfg.work_root, start.repo.id);
@@ -5371,20 +5375,20 @@ fn fix_prompt(
     };
     let prompt = built.map_err(|e| anyhow::anyhow!("{e}"))?;
     if curation_undone && resume.is_some() {
-        return Ok(review::CURATION_UNDONE_PROMPT.to_owned());
+        return Ok((review::CURATION_UNDONE_PROMPT.to_owned(), false));
     }
     if let Some((_, detail)) = resume
         .filter(|r| r.publish_only())
         .and_then(ResumePlan::after_hold)
     {
-        return Ok(publish_only_prompt(detail));
+        return Ok((publish_only_prompt(detail), false));
     }
-    if let Some((HoldReason::Prerequisite, detail)) = resume.and_then(|r| r.after_hold.as_ref())
+    if let Some((_, detail)) = resume.and_then(ResumePlan::after_hold)
         && let Some(held) = review::held_resume_prompt(cfg, start, detail)
     {
-        return held;
+        return held.map(|prompt| (prompt, true));
     }
-    Ok(
+    Ok((
         if let Some((reason, detail)) = resume.and_then(|r| r.after_hold.as_ref()) {
             match reason {
                 HoldReason::Stuck => format!(
@@ -5421,7 +5425,8 @@ fn fix_prompt(
         } else {
             prompt
         },
-    )
+        false,
+    ))
 }
 
 /// What a finished fix attempt amounts to. Exactly one per attempt;
@@ -5961,6 +5966,53 @@ async fn count_unmade_tree(
     summary
 }
 
+/// Count a fix whose tree could not be put back to the one a failed review
+/// round's reviewer was shown ([`review::restore_reviewed`]) as a failed
+/// attempt under the fixed [`review::TREE_NOT_RESTORED`], with `why` as
+/// the detail ([`record_fix_failure`]), and end it. No worker ran: the job
+/// fails unstarted, so the kept checkpoint stays and the next attempt tries
+/// again; the third such failure in a row holds the fix `stuck`, with `why`
+/// in the report, for the operator to clean the tree up. A review hold's
+/// issues stay pending through that hold: its `continue` resumes the fixer
+/// on them.
+async fn count_unrestored_tree(
+    lane: &mut Lane,
+    store: &JobStore,
+    (start, running, claim): (FixStart, RunningJob, FixClaim),
+    why: &str,
+) -> CycleSummary {
+    let (fid, job) = (start.finding.id, start.job);
+    let note = format!("{}: {why}", review::TREE_NOT_RESTORED);
+    log_write_failure(
+        running.fail_unstarted(&note).await,
+        format_args!("job {job}: failing unstarted"),
+    );
+    let mut summary = CycleSummary {
+        kind: Some(FindingJobKind::Fix.into()),
+        finding_id: Some(fid),
+        job_id: Some(job),
+        state: Some(JobState::Failed),
+        branch: Some(start.branch.clone()),
+        ..Default::default()
+    };
+    // Counted while the claim still holds the finding, as a worker's
+    // failure is ([`record_fix_outcome`]).
+    record_fix_failure(
+        store,
+        fid,
+        job,
+        review::TREE_NOT_RESTORED,
+        why,
+        HoldReason::Stuck,
+        &mut summary,
+    )
+    .await;
+    release_claim(claim).await;
+    close_workspace(lane, start.ws).await;
+    summary.failure = Some(note);
+    summary
+}
+
 /// Why a fix did not ship: the failure as the streak counts it, and
 /// whether it came from the forge (the push, the PR's creation), the
 /// failures a network that went away can cause.
@@ -6397,6 +6449,10 @@ async fn worker_run(
 /// Run a fix job (`scheduler.run_fix`): start it ([`start_fix`]), run the
 /// worker, then decide ([`conclude_fix`]) and record
 /// ([`record_fix_outcome`]) what the attempt amounts to.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the attempt's steps in the order they must run, each with its own early end"
+)]
 pub async fn run_fix(
     scope: &CycleScope<'_>,
     lane: &mut Lane,
@@ -6413,10 +6469,24 @@ pub async fn run_fix(
     // Any early return from here on drops `running`: the cycle's settle
     // records the abandoned job.
     // A curation the daemon died in is undone before anything reads the
-    // tree; the resumed fixer is then told it has nothing left to do.
-    let curation_undone = review::recover_curation(lane, store, &start).await;
-    let prompt = match fix_prompt(cfg, resume, &start, curation_undone) {
-        Ok(prompt) => prompt,
+    // tree.
+    let recovered = review::recover_curation(lane, store, &start).await;
+    // A review round's reviewer or a curator whose changes could not be
+    // undone left the tree as it changed it, however the attempt then ended
+    // (a hold, offline, a pinned commit whose publish failed): it is put
+    // back to the reviewed commit before any worker runs in it, or none does.
+    let restored = match review::restore_reviewed(lane, store, &start).await {
+        Ok(restored) => restored,
+        Err(why) => {
+            return Ok(count_unrestored_tree(lane, store, (start, running, claim), &why).await);
+        }
+    };
+    // A curator ran in the fixer's session: once its changes are undone,
+    // now or by this attempt's restore, the resumed fixer is told it has
+    // nothing left to do.
+    let curation_undone = recovered || restored == Some(review::LeftBy::Curator);
+    let (prompt, answers_held) = match fix_prompt(cfg, resume, &start, curation_undone) {
+        Ok(prompted) => prompted,
         Err(e) => {
             release_claim(claim).await;
             return Err(e);
@@ -6451,6 +6521,11 @@ pub async fn run_fix(
             return Ok(denied);
         }
     };
+    // The fixer ran on a review hold's pending issues: no later `continue`
+    // sends them again. Before the review, which may hold on new ones.
+    if answers_held {
+        review::mark_held_sent(&start);
+    }
     // A finished fix is reviewed before it ships, all within this job: the
     // reviewer and the fixer's answers run under the same grant, and the
     // row records what all of them spent.
