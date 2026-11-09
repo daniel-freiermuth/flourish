@@ -1925,7 +1925,8 @@ fn gitlab_split_notes(notes: &[GlNote]) -> Vec<GhComment> {
 
 /// Fetch GitLab MR + notes via `glab api`, returning typed structs. A notes
 /// read that fails leaves the notes empty, unless `strict_notes`
-/// ([`Forge::view_pr_comments`]), when it fails the fetch.
+/// ([`Forge::view_pr_comments`], [`Forge::view_pr_engage`]), when it fails
+/// the fetch.
 fn gitlab_fetch_mr(
     url: &str,
     slug: &str,
@@ -3340,7 +3341,9 @@ impl Forge for GitLabForge {
     ) -> anyhow::Result<PrView> {
         let (_, path) = gitlab_host_path(url)
             .ok_or_else(|| anyhow::anyhow!("cannot parse GitLab URL: {url}"))?;
-        let (mr, notes) = gitlab_fetch_mr(url, path, pr_number, false)?;
+        // Engage acts on the feedback: notes that could not be read are not
+        // an MR without feedback, so the view fails instead.
+        let (mr, notes) = gitlab_fetch_mr(url, path, pr_number, true)?;
         let comments = gitlab_feedback(url, path, &notes, bots)?;
         let state = gitlab_norm_state(&mr.state);
         let mergeable = gitlab_norm_mergeable(&mr);
