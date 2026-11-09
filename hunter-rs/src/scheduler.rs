@@ -8742,14 +8742,22 @@ pub async fn run_harvest(
             );
             num
         } else {
-            let _ = store
-                .log_event(
-                    "error",
-                    &format!("harvest #{fid}: no pr_number and no parseable pr_url"),
-                    None,
-                    Some(fid),
-                )
-                .await;
+            // Counted like a failed prefetch, or the harvest tier would
+            // pick this PR again every cycle and starve all below it.
+            let detail = "no pr_number and no parseable pr_url";
+            if resume.is_some_and(|p| p.handoff) {
+                let _ = store
+                    .log_event(
+                        "error",
+                        &format!("harvest #{fid}: {detail}"),
+                        None,
+                        Some(fid),
+                    )
+                    .await;
+            } else {
+                record_harvest_failure(store, fid, None, "no pr_number", detail, HoldReason::Stuck)
+                    .await;
+            }
             anyhow::bail!("no pr_number");
         }
     };
@@ -8872,6 +8880,19 @@ pub async fn run_harvest(
             .ok()
             .flatten();
         let Some(tip) = tip else {
+            drop(permit);
+            if !handoff {
+                let detail = format!("origin/{db} does not resolve");
+                record_harvest_failure(
+                    store,
+                    fid,
+                    None,
+                    "base unresolved",
+                    &detail,
+                    HoldReason::Stuck,
+                )
+                .await;
+            }
             anyhow::bail!("origin/{db} does not resolve");
         };
         Some(tip)
