@@ -606,6 +606,7 @@ async fn select(
     let mut due_reviews = store.list_due_pr_reviews(now_ms()).await?;
     due_reviews.retain(|r| {
         force_id.is_none_or(|rid| r.repo_id == rid)
+            && !offline.contains(&r.repo_id)
             && !busy(JobPlace::RepoWork {
                 repo_id: r.repo_id,
                 kind: pr_kind,
