@@ -2199,6 +2199,49 @@ async fn a_missing_pr_number_without_a_parseable_url_is_held() {
     assert_held(&f, ReleaseAction::MarkHarvested).await;
 }
 
+/// The same for a fetch that succeeds but leaves `origin/<default>`
+/// unresolved: a clone with no fetch refspec, whose fetch writes only
+/// `FETCH_HEAD`, and whose remote-tracking ref is gone.
+#[tokio::test]
+async fn an_unresolved_default_branch_is_held() {
+    let bins = FakeBins::acquire("harvest-base-unresolved");
+    gh_default(&bins);
+    let f = fixture("harvest-base-unresolved", FindingStatus::Merged).await;
+    f.store.mark_pr_merged(f.fid, 7, 2).await.unwrap();
+    let repo = f.store.list_repos().await.unwrap().remove(0);
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo.path)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    };
+    git(&["config", "--unset-all", "remote.origin.fetch"]);
+    let tracking = format!("refs/remotes/origin/{}", repo.default_branch);
+    git(&["update-ref", "-d", &tracking]);
+    let never_runs = ScriptedBackend::new(|_| panic!("no worker without a base"));
+
+    for attempt in 1..=3 {
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        let err = run_harvest(
+            &support::scope(&f.store),
+            f.store.test_lane(),
+            &f.cfg,
+            Attempt::Cold(&finding),
+            &never_runs,
+        )
+        .await
+        .expect_err("a harvest with no base must refuse");
+        assert!(err.to_string().contains("does not resolve"), "{err}");
+        if attempt < 3 {
+            assert_eq!(harvest_streak(&f).await, attempt, "attempt {attempt}");
+        }
+    }
+    assert_held(&f, ReleaseAction::MarkHarvested).await;
+}
+
 /// A harvest the budget denies ends before the forge and the tree: no
 /// job, no view, no worktree, nothing counted against it, and the PR
 /// stays pending for a window with room.
