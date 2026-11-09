@@ -12,13 +12,17 @@ rewrite that history into a few logical commits a reviewer can read.
   never content. If it does not end identical, your history is thrown away
   and the original commits ship.
 - Leave PR-DESCRIPTION.md untouched and untracked. Add no other files.
-- Do not run test suites: the commits need not each pass the tests, they
-  must tell a clean story.
+- Do not run test suites, but every commit must still build and pass the
+  tests on its own: never leave a commit whose test fails until a later
+  commit, or whose code does not compile without a later one. Nothing
+  checks this for you, so split only where you can see it holds: a commit
+  must not use a name, file or signature that only a later commit adds.
+  When unsure, keep the pieces together; fewer commits beat a broken one.
 
 # The story to tell
 - A few logical commits, each one change a reviewer can follow.
-- Where the change has a proof test, put it in its own commit before the
-  fix it proves.
+- Where the change has a proof test, put it in the same commit as the fix
+  it proves, never in a commit of its own before it.
 - Fold every review answer into the commit it corrects; no "address
   review" commits.
 - Descriptive messages in the convention of this repository's history

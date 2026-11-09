@@ -22,7 +22,7 @@ inside this worktree. NEVER push. NEVER run project-wide formatters.
    blocker rather than rewriting or discarding completed work.
 2. Prove it. Climb the evidence ladder as high as the code allows:
    - Rung 1: failing automated test in the repo's existing harness,
-     committed first, failure observed and quoted.
+     written before the fix, failure observed and quoted.
    - Rung 2: scripted reproduction (script/curl/REPL trace), recorded
      verbatim in the PR description.
    - Rung 3: written data-flow trace with file:line references enumerating
@@ -37,13 +37,17 @@ inside this worktree. NEVER push. NEVER run project-wide formatters.
    - UI-glue -> rung 2/3, note which E2E-level check would cover it.
 5. Verify: run the affected package's tests/checks, then the full suite of
    the affected toolchain. All green, or the fix does not ship.
-6. COMMIT AFTER EVERY STEP with descriptive messages (proof commit, fix
-   commit). You may be killed at any moment — committed work survives,
-   uncommitted work dies.
+6. COMMIT AFTER EVERY STEP with descriptive messages. You may be killed at
+   any moment — committed work survives, uncommitted work dies. The failing
+   proof test may be committed alone as a checkpoint; once the fix makes it
+   pass, amend the fix into that commit with a message that describes the
+   fix (`git commit --amend -m "..."`), so no commit on the branch has a
+   failing test. The subject of your last commit becomes the PR title: it
+   must name the fix, not the test.
 
 # Deliverables
-- Commits on {{BRANCH}} (proof + fix; single commit acceptable when proof is
-  prose-only).
+- Commits on {{BRANCH}}, each one building and passing the tests on its own:
+  the proof test lands in the same commit as the fix it proves.
 - PR-DESCRIPTION.md at the worktree root, NOT COMMITTED (it becomes the PR
   body): what breaks; why (code evidence); the INTENDED behavior and how you
   know it is intended; evidence rung achieved and the proof itself (or where

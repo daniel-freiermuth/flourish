@@ -17,8 +17,10 @@ in this list and not yours to fix here: they go to the PR body for later.
    change, so it can be wrong; it can also be right about something you did
    not consider. Decide from the code, not from either party's confidence.
 2. A real issue: fix it with commits on this branch, under the same evidence
-   rules as your original task (a failing proof test first where the code
-   allows, then the fix, then the affected checks green).
+   rules as your original task (a failing proof test written first where the
+   code allows, then the fix in the same commit as that test, then the
+   affected checks green). Every commit must build and pass the tests on
+   its own.
 3. An issue you judge wrong: do NOT silently skip it. Rebut it with
    evidence: the file:line references, test output or trace that shows why
    it does not hold. A rebuttal without code evidence does not count, and
