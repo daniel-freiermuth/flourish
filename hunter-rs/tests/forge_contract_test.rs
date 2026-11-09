@@ -931,6 +931,24 @@ fn gitlab_comments_view_fails_on_a_failing_notes_endpoint() {
     assert!(view.is_err(), "{view:?}");
 }
 
+/// Engage answers the MR's feedback: notes that could not be read must fail
+/// the view, not start a run that sees no feedback to answer.
+#[test]
+fn gitlab_engage_view_fails_on_a_failing_notes_endpoint() {
+    let bins = FakeBins::acquire("forge-gl-engage-notes-down");
+    bins.script(
+        "glab",
+        &format!(
+            "case \"$*\" in\n  *notes*) echo 'notes endpoint is down' >&2; exit 1 ;;\nesac\ncat <<'__MR_EOF__'\n{GL_MR_JSON}\n__MR_EOF__\nexit 0"
+        ),
+    );
+
+    let view = forge_for(ForgeName::Gitlab).view_pr_engage(GL_REPO, PR, &ReviewBots::default());
+
+    let err = view.expect_err("a failed notes read must fail the engage view");
+    assert!(err.to_string().contains("notes endpoint is down"), "{err}");
+}
+
 /// GitLab project paths are nested and go into the URL path, so every `/`
 /// must be percent-encoded. An unencoded slash silently addresses a
 /// different (usually nonexistent) project.
