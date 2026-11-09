@@ -824,6 +824,57 @@ fn a_resume_that_did_not_take_is_reported() {
     assert_eq!(second.tokens_new, 1000, "still metered, just not continued");
 }
 
+/// A lost resume overwrites only the transcript at the `--resume` path.
+///
+/// omp keeps a session's subagent transcripts in the directory named after
+/// that file (`<stem>/<Agent>.jsonl`) and a fresh session written at the
+/// same path reuses that directory without clearing it, so the
+/// predecessor's subagent spend is still on disk — and already billed to
+/// the predecessor's job row. This attempt is billed for its own
+/// top-level and subagent calls only.
+#[test]
+fn a_lost_resume_is_not_billed_for_the_predecessors_subagents() {
+    let fx = Fixture::new("resume-lost-nested");
+    let ledger = predecessor(&fx);
+    let nested = ledger.with_extension("");
+    std::fs::create_dir_all(&nested).unwrap();
+    let sub = |input: i64| {
+        format!(
+            "{}\n",
+            serde_json::json!({"message": {"role": "assistant",
+                "usage": {"input": input, "output": 0, "cacheWrite": 0}}})
+        )
+    };
+    std::fs::write(nested.join("Recovery.jsonl"), sub(5000)).unwrap();
+
+    // Fresh session over the resume path, plus one subagent of its own
+    // next to the predecessor's.
+    fx.bins.script(
+        "omp",
+        &format!(
+            "RESUME=\"\"\nfor a in \"$@\"; do case \"$a\" in \
+             --resume=*) RESUME=\"${{a#--resume=}}\";; esac\ndone\n\
+             printf '%s\\n' '{record}' > \"$RESUME\"\n\
+             printf '%s' '{sub}' > \"${{RESUME%.jsonl}}/Recovery-2.jsonl\"\nexit 0",
+            record = r#"{"message":{"role":"assistant","usage":{"input":900,"output":100,"cacheWrite":0}}}"#,
+            sub = sub(300),
+        ),
+    );
+    let second = fx.resume(&ledger);
+
+    assert!(
+        second.stdout_tail.starts_with("[resume-lost]"),
+        "got {:?}",
+        second.stdout_tail
+    );
+    assert_eq!(
+        (second.tokens_new, second.calls),
+        (1300, 2),
+        "this attempt's 1000 top-level + 300 subagent; the predecessor's \
+         5000 subagent tokens are its own job row's"
+    );
+}
+
 /// A cold run that leaves the 1250-token, one-call transcript every resume
 /// test below continues.
 fn predecessor(fx: &Fixture) -> PathBuf {

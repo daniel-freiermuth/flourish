@@ -395,9 +395,22 @@ pub fn run_worker(
     // Subtracting the pre-spawn totals is what keeps this attempt's
     // `tokens_new` this attempt's — without it a resumed chain re-bills
     // its own history on every link.
-    let (base_tokens, base_calls) = if resume_from.is_some() {
-        match ledger_dir_usage(&run_dir) {
-            Ok(found) => found.map_or((0, 0), |(_, t, c)| (t, c)),
+    //
+    // The resume source's own share is kept apart: a lost resume overwrites
+    // that one file and nothing else (see `resume_lost` below).
+    let (base_tokens, base_calls, source_tokens, source_calls) = if let Some(sf) = resume_from {
+        let metered = ledger_dir_usage(&run_dir).and_then(|found| {
+            let (t, c) = found.map_or((0, 0), |(_, t, c)| (t, c));
+            // Only part of the baseline when the directory walk saw it.
+            let (st, sc) = if sf.starts_with(&run_dir) {
+                ledger_usage(sf)?
+            } else {
+                (0, 0)
+            };
+            Ok((t, c, st, sc))
+        });
+        match metered {
+            Ok(found) => found,
             // No baseline means this attempt's spend cannot be told from
             // the predecessor's; running it would bill one or the other
             // wrongly.
@@ -415,7 +428,7 @@ pub fn run_worker(
             }
         }
     } else {
-        (0, 0)
+        (0, 0, 0, 0)
     };
     if let Err(e) = fs::create_dir_all(&run_dir) {
         // Without a private directory the worker would fall back to omp's
@@ -643,11 +656,15 @@ pub fn run_worker(
             );
         }
     }
-    // A lost resume took the predecessor's transcript with it, so the
-    // baseline measured against it no longer describes anything on disk:
-    // whatever records remain were all written by this attempt.
+    // A lost resume took the predecessor's transcript with it, so that
+    // file's share of the baseline no longer describes anything on disk:
+    // what is there now was written by this attempt. The rest of the
+    // baseline still is on disk — omp keeps a session's subagent
+    // transcripts in `<stem>/` and a fresh session at the same path
+    // reuses that directory without clearing it — and stays the
+    // predecessor's.
     let (base_tokens, base_calls) = if resume_lost {
-        (0, 0)
+        (base_tokens - source_tokens, base_calls - source_calls)
     } else {
         (base_tokens, base_calls)
     };
