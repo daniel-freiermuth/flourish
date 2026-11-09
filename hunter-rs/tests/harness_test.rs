@@ -28,7 +28,7 @@ fn test_ledger_usage_sums_tokens() {
         ),
     )
     .unwrap();
-    let (tokens, calls) = harness::ledger_usage(&file);
+    let (tokens, calls) = harness::ledger_usage(&file).unwrap();
     assert_eq!(tokens, 525); // (100+50+25) + (200+100+50)
     assert_eq!(calls, 2);
 }
@@ -47,37 +47,74 @@ fn test_ledger_usage_skips_non_assistant() {
         ),
     )
     .unwrap();
-    let (tokens, calls) = harness::ledger_usage(&file);
+    let (tokens, calls) = harness::ledger_usage(&file).unwrap();
     // Only the assistant record counts
     assert_eq!(tokens, 15);
     assert_eq!(calls, 1);
 }
 
+/// omp appends a record and its newline separately, so the meter can
+/// catch the final line half-written. That line is not counted yet, and
+/// is not an error.
 #[test]
-fn test_ledger_usage_handles_malformed_json() {
+fn test_ledger_usage_tolerates_a_torn_final_line() {
+    let dir = TempDir::new("lu-torn");
+    let file = dir.join("test.jsonl");
+    fs::write(
+        &file,
+        concat!(
+            r#"{"timestamp":"2026-07-23T15:38:23.224Z","message":{"role":"assistant","usage":{"input":100,"output":50,"cacheWrite":25}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-07-23T15:38:24.000Z","message":{"role":"assis"#,
+        ),
+    )
+    .unwrap();
+    assert_eq!(harness::ledger_usage(&file).unwrap(), (175, 1));
+}
+
+/// A broken line with records after it is not a write in progress: the
+/// file is not what the meter thinks it is, and skipping the line could
+/// skip a call.
+#[test]
+fn test_ledger_usage_rejects_a_malformed_line_mid_file() {
     let dir = TempDir::new("lu-bad");
     let file = dir.join("test.jsonl");
     fs::write(
         &file,
         concat!(
-            "not json at all\n",
+            "partial{{{json\n",
             r#"{"timestamp":"2026-07-23T15:38:23.224Z","message":{"role":"assistant","usage":{"input":100,"output":50,"cacheWrite":25}}}"#,
             "\n",
-            "partial{{{json\n",
         ),
     )
     .unwrap();
-    let (tokens, calls) = harness::ledger_usage(&file);
-    // Only the valid record counts
-    assert_eq!(tokens, 175);
-    assert_eq!(calls, 1);
+    assert!(harness::ledger_usage(&file).is_err());
+}
+
+/// Schema drift: a renamed usage field must fail the meter, not count
+/// the call at zero tokens — that would disarm the cap and record the
+/// run as free.
+#[test]
+fn test_ledger_usage_rejects_usage_missing_a_token_field() {
+    let dir = TempDir::new("lu-drift");
+    let file = dir.join("test.jsonl");
+    fs::write(
+        &file,
+        concat!(
+            r#"{"timestamp":"2026-07-23T15:38:23.224Z","message":{"role":"assistant","usage":{"input":100,"output":50,"cache_write":25}}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let err = harness::ledger_usage(&file).unwrap_err();
+    assert!(format!("{err:#}").contains("cacheWrite"), "got: {err:#}");
 }
 
 #[test]
-fn test_ledger_usage_missing_file() {
-    let (tokens, calls) =
-        harness::ledger_usage(&PathBuf::from("/nonexistent/path/does-not-exist.jsonl"));
-    assert_eq!((tokens, calls), (0, 0));
+fn test_ledger_usage_missing_file_is_an_error() {
+    assert!(
+        harness::ledger_usage(&PathBuf::from("/nonexistent/path/does-not-exist.jsonl")).is_err()
+    );
 }
 
 #[test]
@@ -85,8 +122,7 @@ fn test_ledger_usage_empty_file() {
     let dir = TempDir::new("lu-empty");
     let file = dir.join("empty.jsonl");
     fs::write(&file, "").unwrap();
-    let (tokens, calls) = harness::ledger_usage(&file);
-    assert_eq!((tokens, calls), (0, 0));
+    assert_eq!(harness::ledger_usage(&file).unwrap(), (0, 0));
 }
 
 #[test]
@@ -98,8 +134,33 @@ fn test_ledger_usage_no_usage_field() {
         r#"{"timestamp":"2026-07-23T15:00:00.000Z","message":{"role":"assistant","content":"hi"}}"#,
     )
     .unwrap();
-    let (tokens, calls) = harness::ledger_usage(&file);
-    assert_eq!((tokens, calls), (0, 0));
+    assert_eq!(harness::ledger_usage(&file).unwrap(), (0, 0));
+}
+
+// ============================================================
+// ledger_dir_usage — "not metered yet" vs "cannot be metered"
+// ============================================================
+
+/// A run directory omp has not created yet is the "not metered yet"
+/// signal the watchdog waits on, not a metering failure.
+#[test]
+fn test_ledger_dir_usage_missing_dir_is_not_metered_yet() {
+    let dir = TempDir::new("ldu-missing");
+    assert!(
+        harness::ledger_dir_usage(&dir.join("absent"))
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// Only a missing directory means "not metered yet": a path that exists
+/// but cannot be listed must fail the meter, not read as zero spend.
+#[test]
+fn test_ledger_dir_usage_unlistable_dir_is_an_error() {
+    let dir = TempDir::new("ldu-notdir");
+    let file = dir.join("not-a-dir");
+    fs::write(&file, "").unwrap();
+    assert!(harness::ledger_dir_usage(&file).is_err());
 }
 
 // ============================================================

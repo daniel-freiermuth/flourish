@@ -460,7 +460,7 @@ async fn verdict_after_selection_stops_the_fix_before_its_job() {
         let session = tree.parent().unwrap().join("session/session.jsonl");
         std::fs::write(
             &session,
-            "{\"message\":{\"role\":\"assistant\",\"usage\":{\"input\":1000,\"output\":100}}}\n",
+            "{\"message\":{\"role\":\"assistant\",\"usage\":{\"input\":1000,\"output\":100,\"cacheWrite\":0}}}\n",
         )
         .unwrap();
         let mut result = support::done();
@@ -571,7 +571,7 @@ async fn held_fixture() -> (
         let session = tree.parent().unwrap().join("session/session.jsonl");
         std::fs::write(
             &session,
-            "{\"message\":{\"role\":\"assistant\",\"usage\":{\"input\":1000,\"output\":100}}}\n",
+            "{\"message\":{\"role\":\"assistant\",\"usage\":{\"input\":1000,\"output\":100,\"cacheWrite\":0}}}\n",
         )
         .unwrap();
         let mut result = support::done();
@@ -777,7 +777,7 @@ async fn an_interrupted_continue_resumes_as_an_ordinary_resume() {
         let session = session.unwrap();
         let mut ledger = std::fs::read_to_string(session).unwrap();
         ledger.push_str(
-            "{\"message\":{\"role\":\"assistant\",\"usage\":{\"input\":500,\"output\":50}}}\n",
+            "{\"message\":{\"role\":\"assistant\",\"usage\":{\"input\":500,\"output\":50,\"cacheWrite\":0}}}\n",
         );
         std::fs::write(session, ledger).unwrap();
         panic!("daemon killed mid-attempt");
@@ -1002,7 +1002,7 @@ async fn a_held_fix_resumes_against_what_held_it() {
         let session = tree.parent().unwrap().join("session/session.jsonl");
         std::fs::write(
             &session,
-            "{\"message\":{\"role\":\"assistant\",\"usage\":{\"input\":1000,\"output\":100}}}\n",
+            "{\"message\":{\"role\":\"assistant\",\"usage\":{\"input\":1000,\"output\":100,\"cacheWrite\":0}}}\n",
         )
         .unwrap();
         let mut result = support::done();
@@ -1050,7 +1050,7 @@ async fn fix_resume_without_a_blocker_runs_the_plain_continuation() {
         let session = tree.parent().unwrap().join("session/session.jsonl");
         std::fs::write(
             &session,
-            "{\"message\":{\"role\":\"assistant\",\"usage\":{\"input\":1000,\"output\":100}}}\n",
+            "{\"message\":{\"role\":\"assistant\",\"usage\":{\"input\":1000,\"output\":100,\"cacheWrite\":0}}}\n",
         )
         .unwrap();
         let mut result = support::done();

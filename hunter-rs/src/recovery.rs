@@ -976,6 +976,10 @@ async fn chain_workspace(store: &Store, work_root: &Path, j: &Job) -> anyhow::Re
 /// (`Workspace::review_sessions`), so those are metered too: without them
 /// an orphan whose ancestors paid for reviews would count too little, or
 /// nothing, and be killed instead of kept.
+///
+/// A ledger that cannot be metered gives no spend to record a
+/// suspension against, so the job is treated as having kept no work
+/// (killed) rather than suspended at a made-up figure.
 async fn orphan_work(
     store: &Store,
     work_root: &Path,
@@ -983,16 +987,27 @@ async fn orphan_work(
 ) -> anyhow::Result<Option<(String, i64)>> {
     use crate::backends::omp_scavenge::harness::ledger_dir_usage;
     let ws = chain_workspace(store, work_root, j).await?;
-    let Some((file, tokens, _)) = ledger_dir_usage(&ws.session) else {
-        return Ok(None);
+    let metered = ledger_dir_usage(&ws.session).and_then(|own| {
+        let Some((file, tokens, _)) = own else {
+            return Ok(None);
+        };
+        let mut reviews: i64 = 0;
+        for dir in ws.review_sessions() {
+            if let Some((_, t, _)) = ledger_dir_usage(&dir)? {
+                reviews += t;
+            }
+        }
+        Ok(Some((file, tokens + reviews)))
+    });
+    let (file, tokens) = match metered {
+        Ok(Some(found)) => found,
+        Ok(None) => return Ok(None),
+        Err(e) => {
+            tracing::warn!("recovery: job #{} transcript unmeterable: {e:#}", j.id);
+            return Ok(None);
+        }
     };
-    let reviews: i64 = ws
-        .review_sessions()
-        .iter()
-        .filter_map(|dir| ledger_dir_usage(dir))
-        .map(|(_, tokens, _)| tokens)
-        .sum();
-    let own = tokens + reviews - store.ancestor_tokens(j.id).await?;
+    let own = tokens - store.ancestor_tokens(j.id).await?;
     if own <= 0 || tree_in_use(&ws.tree) {
         return Ok(None);
     }
@@ -1107,7 +1122,7 @@ mod tests {
         std::fs::create_dir_all(&session).unwrap();
         std::fs::write(
             session.join("s.jsonl"),
-            "{\"message\":{\"role\":\"assistant\",\"usage\":{\"input\":1000,\"output\":100}}}\n",
+            "{\"message\":{\"role\":\"assistant\",\"usage\":{\"input\":1000,\"output\":100,\"cacheWrite\":0}}}\n",
         )
         .unwrap();
         let read = store.list_running_jobs().await.unwrap();

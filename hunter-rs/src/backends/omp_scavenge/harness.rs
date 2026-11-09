@@ -24,11 +24,14 @@
 //! `--resume` argument in `run_worker` for what was measured.
 
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+use anyhow::Context as _;
+use serde::Deserialize;
 
 use crate::config::Config;
 use crate::types::RunResult;
@@ -39,50 +42,86 @@ use crate::workspace::Workspace;
 // Ledger metering (`harness.ledger_usage`, `harness._ledger_dir_usage`)
 // ---------------------------------------------------------------------------
 
+/// One line of omp's session JSONL, as far as metering reads it.
+///
+/// Typed so that a change to omp's schema is an error rather than a
+/// silent zero: a meter that reads a renamed or restringified usage
+/// field as 0 keeps counting calls at no cost, which disarms the cap and
+/// records the run as free. Unknown fields are ignored; records without
+/// a `message` (session headers, model changes, …) are not calls.
+#[derive(Deserialize)]
+struct LedgerRecord {
+    #[serde(default)]
+    message: Option<LedgerMessage>,
+}
+
+/// Only an assistant message is a call; every other role is skipped
+/// without looking at its body.
+#[derive(Deserialize)]
+#[serde(tag = "role")]
+enum LedgerMessage {
+    #[serde(rename = "assistant")]
+    Assistant {
+        #[serde(default)]
+        usage: Option<LedgerUsage>,
+    },
+    #[serde(other)]
+    Other,
+}
+
+/// The "new" token counts of one call. All required: a record that
+/// lacks one is unmeterable, not free.
+#[derive(Deserialize)]
+struct LedgerUsage {
+    input: i64,
+    output: i64,
+    #[serde(rename = "cacheWrite")]
+    cache_write: i64,
+}
+
 /// Sum "new" tokens (input + output + cacheWrite) and call count from a
 /// session JSONL file.
 ///
-/// IO errors → (0, 0).
-pub fn ledger_usage(session_file: &Path) -> (i64, i64) {
-    let Ok(file) = fs::File::open(session_file) else {
-        return (0, 0);
-    };
-    let reader = BufReader::new(file);
+/// The one thing tolerated is a torn final line — omp is mid-write and
+/// the newline has not landed yet. Everything else is an error: a file
+/// that cannot be opened or read, a line that is not JSON anywhere
+/// before the end, or an assistant usage record missing a token field.
+/// Reporting 0 for any of those would tell the cap watchdog the worker
+/// is spending nothing.
+pub fn ledger_usage(session_file: &Path) -> anyhow::Result<(i64, i64)> {
+    let file = fs::File::open(session_file)
+        .with_context(|| format!("opening ledger {}", session_file.display()))?;
+    let mut reader = BufReader::new(file);
     let mut tokens: i64 = 0;
     let mut calls: i64 = 0;
+    let mut line: Vec<u8> = Vec::new();
 
-    for line in reader.lines() {
-        let Ok(line) = line else {
-            continue;
-        };
-        let rec: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue, // partial trailing line mid-write
-        };
-        let Some(msg) = rec.get("message").and_then(|v| v.as_object()) else {
-            continue;
-        };
-        if msg.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+    for lineno in 1.. {
+        line.clear();
+        let n = reader
+            .read_until(b'\n', &mut line)
+            .with_context(|| format!("reading ledger {}", session_file.display()))?;
+        if n == 0 {
+            break;
+        }
+        let terminated = line.last() == Some(&b'\n');
+        if line.trim_ascii().is_empty() {
             continue;
         }
-        if let Some(u) = msg.get("usage").and_then(|v| v.as_object()) {
+        let rec: LedgerRecord = match serde_json::from_slice(&line) {
+            Ok(r) => r,
+            Err(_) if !terminated => break, // torn final line mid-write
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("ledger {} line {lineno}", session_file.display()));
+            }
+        };
+        if let Some(LedgerMessage::Assistant { usage: Some(u) }) = rec.message {
             calls += 1;
-            let inp = u
-                .get("input")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0);
-            let out = u
-                .get("output")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0);
-            let cw = u
-                .get("cacheWrite")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0);
-            tokens += inp + out + cw;
+            tokens += u.input + u.output + u.cache_write;
         }
     }
-    (tokens, calls)
+    Ok((tokens, calls))
 }
 
 /// The context a session had reached when it stopped: the LAST usage
@@ -151,28 +190,41 @@ pub fn ctx_at_suspension(session_file: &Path) -> Option<i64> {
 /// picking one means an extra transcript (a nested session) is counted as
 /// spend instead of silently discounted.
 ///
-/// Returns `None` until the directory holds at least one ledger — that is
-/// the "not metered yet" signal `run_worker` waits on, and kills on.
-pub fn ledger_dir_usage(run_dir: &Path) -> Option<(PathBuf, i64, i64)> {
-    let mut files: Vec<PathBuf> = fs::read_dir(run_dir)
-        .ok()?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
-        .collect();
+/// `Ok(None)` until the directory exists and holds at least one ledger —
+/// that is the "not metered yet" signal `run_worker` waits on, and kills
+/// on. Any ledger that cannot be metered ([`ledger_usage`]) or a
+/// directory that cannot be listed is an error: a partial sum would read
+/// as spend that never happened being free.
+pub fn ledger_dir_usage(run_dir: &Path) -> anyhow::Result<Option<(PathBuf, i64, i64)>> {
+    let entries = match fs::read_dir(run_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(e).with_context(|| format!("listing {}", run_dir.display()));
+        }
+    };
+    let mut files: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let p = entry
+            .with_context(|| format!("listing {}", run_dir.display()))?
+            .path();
+        if p.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            files.push(p);
+        }
+    }
     if files.is_empty() {
-        return None;
+        return Ok(None);
     }
     // omp names sessions by creation instant, so sorting by name puts the
     // run's first — the one worth recording as `session_file`.
     files.sort();
     let (mut tokens, mut calls) = (0, 0);
     for f in &files {
-        let (t, c) = ledger_usage(f);
+        let (t, c) = ledger_usage(f)?;
         tokens += t;
         calls += c;
     }
-    Some((files.swap_remove(0), tokens, calls))
+    Ok(Some((files.swap_remove(0), tokens, calls)))
 }
 
 // ---------------------------------------------------------------------------
@@ -313,7 +365,24 @@ pub fn run_worker(
     // `tokens_new` this attempt's — without it a resumed chain re-bills
     // its own history on every link.
     let (base_tokens, base_calls) = if resume_from.is_some() {
-        ledger_dir_usage(&run_dir).map_or((0, 0), |(_, t, c)| (t, c))
+        match ledger_dir_usage(&run_dir) {
+            Ok(found) => found.map_or((0, 0), |(_, t, c)| (t, c)),
+            // No baseline means this attempt's spend cannot be told from
+            // the predecessor's; running it would bill one or the other
+            // wrongly.
+            Err(e) => {
+                return RunResult {
+                    exit_code: Some(127),
+                    killed_reason: Some("unmetered".to_owned()),
+                    tokens_new: 0,
+                    calls: 0,
+                    session_file: None,
+                    duration_s: 0.0,
+                    stdout_tail: format!("resume baseline unmeterable: {e:#}"),
+                    usage_delta: None,
+                };
+            }
+        }
     } else {
         (0, 0)
     };
@@ -456,14 +525,29 @@ pub fn run_worker(
 
     loop {
         let exited = matches!(proc.try_wait(), Ok(Some(_)));
-        if let Some((path, t, c)) = ledger_dir_usage(&run_dir) {
-            session = Some(path);
-            // Clamped because the subtraction has one way to go negative:
-            // the transcript shrinking, i.e. being replaced rather than
-            // appended to. A negative running total would sit below every
-            // cap and disarm the watchdog outright.
-            tokens = (t - base_tokens).max(0);
-            calls = (c - base_calls).max(0);
+        match ledger_dir_usage(&run_dir) {
+            Ok(Some((path, t, c))) => {
+                session = Some(path);
+                // Clamped because the subtraction has one way to go
+                // negative: the transcript shrinking, i.e. being replaced
+                // rather than appended to. A negative running total would
+                // sit below every cap and disarm the watchdog outright.
+                tokens = (t - base_tokens).max(0);
+                calls = (c - base_calls).max(0);
+            }
+            Ok(None) => {}
+            // A ledger the meter cannot read is a worker the cap cannot
+            // see. Stop it as unmetered and keep the last good total.
+            Err(e) => {
+                tracing::warn!(
+                    "harness: cannot meter {}: {e:#} — killing worker rather \
+                     than running it unmetered",
+                    run_dir.display()
+                );
+                killed = Some("unmetered".to_owned());
+                kill_tree(&mut proc);
+                break;
+            }
         }
         if exited {
             // Reap the group even though the worker left of its own
@@ -537,11 +621,26 @@ pub fn run_worker(
         (base_tokens, base_calls)
     };
 
-    // Final ledger read after exit.
-    if let Some((path, t, c)) = ledger_dir_usage(&run_dir) {
-        session = Some(path);
-        tokens = (t - base_tokens).max(0);
-        calls = (c - base_calls).max(0);
+    // Final ledger read after exit. A metering error here keeps the last
+    // good running total and marks the run unmetered, unless a more
+    // specific reason already did.
+    match ledger_dir_usage(&run_dir) {
+        Ok(Some((path, t, c))) => {
+            session = Some(path);
+            tokens = (t - base_tokens).max(0);
+            calls = (c - base_calls).max(0);
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(
+                "harness: cannot meter {} after exit: {e:#} — keeping the last \
+                 running total ({tokens} tok) and marking the run unmetered",
+                run_dir.display()
+            );
+            if killed.is_none() {
+                killed = Some("unmetered".to_owned());
+            }
+        }
     }
 
     // Exited before the grace period with no ledger: `tokens_new = 0` here

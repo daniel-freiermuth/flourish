@@ -639,7 +639,7 @@ pub fn done_with_transcript(tree: &Path) -> RunResult {
     let session = tree.parent().unwrap().join("session/session.jsonl");
     std::fs::write(
         &session,
-        "{\"message\":{\"role\":\"assistant\",\"usage\":{\"input\":1000,\"output\":100}}}\n",
+        "{\"message\":{\"role\":\"assistant\",\"usage\":{\"input\":1000,\"output\":100,\"cacheWrite\":0}}}\n",
     )
     .unwrap();
     RunResult {
