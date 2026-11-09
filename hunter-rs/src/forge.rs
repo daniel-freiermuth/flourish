@@ -2804,9 +2804,17 @@ impl Forge for GitHubForge {
         if rc != 0 {
             anyhow::bail!("gh pr create failed (rc={rc}): {out}");
         }
-        // PR URL is the last non-empty line of output.
-        let url = out.trim().lines().last().unwrap_or("").to_owned();
-        Ok(url)
+        // The PR URL is the last line `parse_pr_url` accepts: `out` carries
+        // stderr too, so the last line may be a warning.
+        match out
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|l| self.parse_pr_url(l).is_some())
+        {
+            Some(url) => Ok(url.to_owned()),
+            None => anyhow::bail!("gh pr create succeeded but printed no PR URL: {out}"),
+        }
     }
 
     fn view_pr_sync(&self, url: &str, pr_number: i64, bots: &ReviewBots) -> anyhow::Result<PrView> {
@@ -3299,13 +3307,16 @@ impl Forge for GitLabForge {
             }
             anyhow::bail!("glab mr create failed (rc={rc}): {out}");
         }
-        // glab prints the MR URL; search for it.
-        for line in out.trim().lines().rev() {
-            if line.contains("/-/merge_requests/") {
-                return Ok(line.trim().to_owned());
-            }
+        // glab prints the MR URL and keeps talking; search for it.
+        match out
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|l| self.parse_pr_url(l).is_some())
+        {
+            Some(url) => Ok(url.to_owned()),
+            None => anyhow::bail!("glab mr create succeeded but printed no MR URL: {out}"),
         }
-        Ok(out.trim().lines().last().unwrap_or("").to_owned())
     }
 
     fn view_pr_sync(&self, url: &str, pr_number: i64, bots: &ReviewBots) -> anyhow::Result<PrView> {
