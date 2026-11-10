@@ -1475,7 +1475,12 @@ async fn engage_pr_moved(
     let Some(ps) = store.get_pr_state(fid).await? else {
         return Ok(false);
     };
-    let started = job.started_at.unwrap_or(0);
+    // A publish-only retry runs no worker, yet a refused one becomes the
+    // checkpoint with its own later start: judge against the chain's.
+    let started = match store.chain_started_at(job.id).await? {
+        Some(at) => at,
+        None => job.started_at.unwrap_or(0),
+    };
     if ps.last_activity_at.is_some_and(|at| at > started) {
         return Ok(true);
     }

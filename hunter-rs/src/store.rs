@@ -3195,6 +3195,20 @@ impl Store {
         .await
     }
 
+    /// When `job_id`'s chain began: the `started_at` of its
+    /// [`Self::resume_origin_job`], the attempt whose worker was shown the
+    /// PR. Every later link continues that worker's view (or publishes
+    /// it), so feedback since this instant is feedback the chain never saw.
+    pub async fn chain_started_at(&self, job_id: i64) -> sqlx::Result<Option<i64>> {
+        let origin = self.resume_origin_job(job_id).await?;
+        Ok(
+            sqlx::query_scalar!("SELECT started_at FROM jobs WHERE id = ?1", origin)
+                .fetch_optional(&self.pool)
+                .await?
+                .flatten(),
+        )
+    }
+
     /// Tokens recorded by every strict ancestor of `job_id`, of any kind.
     ///
     /// That is everything already metered out of the transcript directory

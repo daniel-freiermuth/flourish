@@ -3326,6 +3326,67 @@ async fn a_kept_engage_that_pushed_is_redecided_only_when_its_pr_moved() {
     }
 }
 
+/// Feedback that arrived after the chain's worker started is a PR that
+/// moved on even when the sync records it only after a publish-only retry
+/// of that worker's result was refused again: the retry saw no PR, so its
+/// own later start is not where the chain's view of the PR ends. Feedback
+/// from before the worker started is what it was shown, and is no move.
+#[tokio::test]
+async fn a_kept_engage_is_redecided_after_feedback_its_refused_retry_never_saw() {
+    for (case, offset, moved) in [("after-start", 1, true), ("before-start", -1, false)] {
+        let label = format!("engage-kept-retry-feedback-{case}");
+        let f = fixture(&label).await;
+        let bins = FakeBins::acquire(&label);
+        let redecided = redecided_after_refused_retry(&f, &bins, offset).await;
+        assert_eq!(redecided, moved, "{case}");
+        drop(bins);
+    }
+}
+
+/// Whether the fixture's kept engage is given up once a publish-only retry
+/// of it was refused again and the sync then recorded feedback at the
+/// chain's first start plus `offset` ms.
+async fn redecided_after_refused_retry(f: &Fixture, bins: &FakeBins, offset: i64) -> bool {
+    let origin = kept_after_its_push(f, bins).await;
+    let pushed = git(&origin, &["rev-parse", BRANCH]);
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    let first_start: i64 = sqlx::query_scalar("SELECT MIN(started_at) FROM jobs")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    bins.ok_unless_action("gh", "pr comment", PR_VIEW_JSON);
+    let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
+            .await
+            .unwrap()
+    else {
+        panic!("the kept engage is retried");
+    };
+    let refused = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
+        &ScriptedBackend::new(support::done_with_transcript),
+    )
+    .await
+    .unwrap();
+    assert_eq!(refused.outcome.as_deref(), Some("retry"), "{refused:?}");
+    sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
+        .bind(24 * 60 * 60_000_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+    bins.ok("gh", PR_VIEW_JSON);
+
+    let now = hunter::util::now_ms();
+    redecided(f, pushed.trim(), now, Some(first_start + offset)).await
+}
+
 /// A kept engage that has not pushed is where it left its PR while the
 /// branch is at the commit its tree was created at; any other head is a
 /// PR that moved on.
