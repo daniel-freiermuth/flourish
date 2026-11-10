@@ -1390,6 +1390,83 @@ async fn test_prio_7d_override_cap_bounded_by_5h_headroom() {
     );
 }
 
+/// A later window with no hard-limit headroom left denies prioritized
+/// work in its own name, even when it is not `exhausted`: its reset is
+/// when the denial lifts, not the waived 7d row's ramp crossing.
+///
+/// 7d at .60 (ramp .50) is waived; 5h at 1.0 but still "ok" has a prio
+/// cap of (1 − 1.0) × capacity = 0 and is not waived. The 7d row's retry
+/// is ~0.1 week away, the 5h reset 2h.
+#[tokio::test]
+async fn test_prio_7d_override_denied_by_full_5h_with_its_reset() {
+    let now = now_ms();
+    let resets_5h = now + 2 * HOUR_MS;
+    let mut w = BTreeMap::new();
+    w.insert(
+        "anthropic:7d".to_owned(),
+        ws("anthropic:7d", 0.60, "ok", now + WEEK_MS / 2, 60.0),
+    );
+    w.insert(
+        "anthropic:5h".to_owned(),
+        ws("anthropic:5h", 1.0, "ok", resets_5h, 60.0),
+    );
+    let b = make_backend(FakeLedger::new(0, 0));
+    let o = b.decide_with_windows(&w, 0, now).await.unwrap();
+
+    assert!(is_denied(&o.prioritized), "{:?}", o.prioritized);
+    assert!(
+        reason(&o.prioritized).contains("anthropic:5h"),
+        "the full 5h row must name the denial: {:?}",
+        o.prioritized
+    );
+    let rt = retry_at(&o.prioritized).expect("retry_at should be Some");
+    assert!((rt - resets_5h as f64).abs() < 1.0, "retry_at {rt}");
+}
+
+/// A prio override whose min hard-limit headroom rounds to zero tokens
+/// is denied, not granted with a zero cap.
+///
+/// 7d at .60 (ramp .50) is waived with 4M of its own; 5h at .97 passes
+/// its ramp (≈ .98) but at a capacity of 20 tokens has (1 − .97) × 20 =
+/// 0.6, i.e. 0 tokens, left.
+#[tokio::test]
+async fn test_prio_override_without_token_headroom_is_denied() {
+    let now = now_ms();
+    let mut w = BTreeMap::new();
+    w.insert(
+        "anthropic:7d".to_owned(),
+        ws("anthropic:7d", 0.60, "ok", now + WEEK_MS / 2, 60.0),
+    );
+    w.insert(
+        "anthropic:5h".to_owned(),
+        ws(
+            "anthropic:5h",
+            0.97,
+            "ok",
+            now + (0.1 * HOUR_MS as f64) as i64,
+            60.0,
+        ),
+    );
+    let mut ledger = FakeLedger::new(0, 0);
+    ledger.capacity.insert("anthropic:5h".to_owned(), 20.0);
+    ledger
+        .capacity
+        .insert("anthropic:7d".to_owned(), 10_000_000.0);
+    let b = make_backend(ledger);
+    let o = b.decide_with_windows(&w, 0, now).await.unwrap();
+
+    assert!(
+        is_denied(&o.prioritized),
+        "no token headroom left must deny prioritized work: {:?}",
+        o.prioritized
+    );
+    assert!(
+        reason(&o.prioritized).contains("anthropic:7d"),
+        "{:?}",
+        o.prioritized
+    );
+}
+
 /// The 7d token cap uses the 7d capacity estimate when one exists.
 ///
 /// An earlier revision of BACKEND-CONTRACT.md asserted the opposite —
