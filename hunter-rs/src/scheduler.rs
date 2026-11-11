@@ -1081,7 +1081,8 @@ async fn pick_resume(
                     return Ok(Picked::Ended);
                 }
             }
-            Resumable::No => {}
+            Resumable::Held { landed: true } => return Ok(Picked::Ended),
+            Resumable::No | Resumable::Held { landed: false } => {}
         }
     }
     Ok(Picked::Nothing)
@@ -1097,10 +1098,11 @@ async fn pick_resume(
 /// only the plan differs.
 ///
 /// [`Picked::Ended`] when a chain given up here was the failure that ended
-/// `f`'s work ([`count_given_up_chain`]): `f` is no longer this tier's to
-/// pick. [`Picked::Nothing`] when nothing can be continued and `may_start`
-/// is false: an engage whose PR is not flagged is in its tier only to
-/// continue.
+/// `f`'s work ([`count_given_up_chain`]), or a fix far over its budget was
+/// held ([`hold_over_budget`]): `f` is no longer this tier's to pick.
+/// [`Picked::Nothing`] when nothing can be continued and `may_start` is
+/// false: an engage whose PR is not flagged is in its tier only to
+/// continue; or when that hold did not land.
 async fn finding_pick(
     store: &Store,
     cfg: &Config,
@@ -1142,6 +1144,8 @@ async fn finding_pick(
             }
         }
         Resumable::No => fresh(),
+        Resumable::Held { landed: true } => Picked::Ended,
+        Resumable::Held { landed: false } => Picked::Nothing,
     })
 }
 
@@ -1150,8 +1154,8 @@ async fn finding_pick(
 enum Picked {
     /// Run this.
     Work(Candidate),
-    /// Work ended here (a given-up chain was counted); the selection
-    /// starts over, since what that wrote can change every tier.
+    /// Work ended here (a given-up chain was counted, or a fix held); the
+    /// selection starts over, since what that wrote can change every tier.
     Ended,
     /// Nothing to do for it, and nothing changed.
     Nothing,
@@ -1493,6 +1497,78 @@ async fn give_up_checkpoint<'s>(mode: Pick<'s>, job: &Job, repo: &str, why: &str
     Resumable::No
 }
 
+/// End the checkpoint of `job`'s chain, which the give-up ceiling retired
+/// (`why`) after it spent `total`, when `mode` runs (a preview only skips
+/// it): [`Resumable::GaveUp`] once that landed.
+///
+/// The chain's end counts as a failure of its work, where its tier or the
+/// resume tier caught it ([`count_given_up_chain`],
+/// [`count_given_up_repo_chain`]); nothing else moves. Best-effort: the
+/// candidate is skipped either way, so a failed write only defers the
+/// record — and only a landed give-up is reported as one, so the chain is
+/// counted once.
+async fn give_up_chain<'s>(
+    mode: Pick<'s>,
+    job: &Job,
+    repo: &str,
+    total: i64,
+    why: &str,
+) -> Resumable<'s> {
+    let msg = format!(
+        "resume {} {repo}: giving up after {total} tok across the chain ({why})",
+        job.kind
+    );
+    let Pick::Run(scope) = mode else {
+        return Resumable::No;
+    };
+    if end_checkpoint(scope, job, &msg).await {
+        Resumable::GaveUp { why: msg, scope }
+    } else {
+        Resumable::No
+    }
+}
+
+/// The first line of a fix held because its chain went far past its
+/// budget ([`hold_over_budget`]).
+const CHAIN_OVER_BUDGET: &str = "resume chain over budget";
+
+/// Hold fix `fid` for the operator as `gave_up`, `job`'s chain as its
+/// checkpoint, when the give-up ceiling's cost arm ends that chain: the
+/// chain's branch and transcript are kept for a `continue`, where
+/// dropping the checkpoint would start the fix over and pay again for
+/// work that already cost several times its kind's typical.
+///
+/// Never drops the checkpoint. A hold that did not land is skipped: a
+/// failed write is tried again by the next selection, and `false` from
+/// [`Store::hold_work`] means the fix is held already (by this same
+/// selection, through another tier, before its snapshot of held work was
+/// taken) or has left its tier, which clears the pointer itself. A
+/// preview writes nothing and skips it, as the cycle would.
+async fn hold_over_budget<'s>(mode: Pick<'s>, job: &Job, fid: i64, detail: &str) -> Resumable<'s> {
+    let Pick::Run(scope) = mode else {
+        return Resumable::Held { landed: false };
+    };
+    let store = scope.store();
+    let held = store
+        .hold_work(
+            fid,
+            FindingJobKind::Fix,
+            HoldReason::GaveUp,
+            detail,
+            Some(job.id),
+        )
+        .await;
+    let message = match &held {
+        Ok(true) => format!("#{fid} held: {detail}; checkpoint retained"),
+        Ok(false) => return Resumable::Held { landed: false },
+        Err(e) => format!("#{fid} {detail}, but holding it failed: {e}; will retry"),
+    };
+    let _ = fix_event(store, "fix", fid, job.id, message).await;
+    Resumable::Held {
+        landed: held.is_ok(),
+    }
+}
+
 /// What [`resume_plan`] made of one suspension.
 enum Resumable<'s> {
     /// Continue it with this plan.
@@ -1506,6 +1582,10 @@ enum Resumable<'s> {
     },
     /// Not resumable for any other reason.
     No,
+    /// A fix far over its budget, held for the operator instead
+    /// ([`hold_over_budget`]): neither continued nor started over. When
+    /// the hold `landed`, held work has changed under the selection.
+    Held { landed: bool },
 }
 
 /// How to continue one resumable job, or why it cannot be.
@@ -1524,9 +1604,11 @@ enum Resumable<'s> {
 /// offered again every cycle and never goes away. Refusing from inside the
 /// executor would be worse — this tier outranks repo rotation, so the same
 /// hopeless job would be picked every cycle, starving every rotation
-/// kind. Ending it takes it out of the walk in this same cycle. A
-/// [`Pick::Preview`] only skips it, and leaves that to the scheduler's own
-/// next selection.
+/// kind. Ending it takes it out of the walk in this same cycle. A fix
+/// whose chain the ceiling's cost arm ends is held with it as its
+/// checkpoint instead ([`hold_over_budget`]), which takes it out of the
+/// walk just as well. A [`Pick::Preview`] only skips it, and leaves that
+/// to the scheduler's own next selection.
 async fn resume_plan<'s>(
     store: &Store,
     cfg: &Config,
@@ -1622,32 +1704,31 @@ async fn resume_plan<'s>(
     let publish_only = kept_to_publish(&job);
     let spared = publish_only && spared_by_ceiling(store, job.id, released_at).await?;
     if (too_many || too_costly || publish_only) && !spared {
+        let cost =
+            format!("{excess} tok outside its largest attempt > {GIVE_UP_MULTIPLE}x {z} typical");
+        // A fix this far over its budget is held rather than dropped: its
+        // tree holds a branch the chain paid for, and starting over would
+        // pay for it again with no reason to expect a cheaper ending. Not
+        // one kept only to publish: its spare's end is what retires it,
+        // the cost having bought finished work, not a stuck chain.
+        if too_costly
+            && !publish_only
+            && let (JobKind::Finding(FindingJobKind::Fix), Some(fid)) = (job.kind, job.finding_id)
+        {
+            let detail = format!(
+                "{CHAIN_OVER_BUDGET}: {} tok across the chain ({cost})",
+                own.total
+            );
+            return Ok(hold_over_budget(mode, &job, fid, &detail).await);
+        }
         let why = if too_many {
             format!("{} attempts, the limit", own.attempts)
         } else if too_costly {
-            format!("{excess} tok outside its largest attempt > {GIVE_UP_MULTIPLE}x {z} typical")
+            cost
         } else {
             format!("kept to publish {MAX_PUBLISH_REFUSALS} times, the limit")
         };
-        let msg = format!(
-            "resume {} {}: giving up after {} tok across the chain ({why})",
-            job.kind, repo.name, own.total
-        );
-        let Pick::Run(scope) = mode else {
-            return Ok(Resumable::No);
-        };
-        // The chain's end counts as a failure of its work, where its tier
-        // or the resume tier caught it ([`count_given_up_chain`],
-        // [`count_given_up_repo_chain`]); nothing else moves. Best-effort:
-        // the candidate is skipped either way, so a failed write only
-        // defers the record — and only a landed give-up is reported as
-        // one, so the chain is counted once.
-        let retired = end_checkpoint(scope, &job, &msg).await;
-        return Ok(if retired {
-            Resumable::GaveUp { why: msg, scope }
-        } else {
-            Resumable::No
-        });
+        return Ok(give_up_chain(mode, &job, &repo.name, own.total, &why).await);
     }
 
     // An unreadable transcript, or one with no usage record at all,
@@ -5306,7 +5387,7 @@ fn fix_prompt(
     Ok(
         if let Some((reason, detail)) = resume.and_then(|r| r.after_hold.as_ref()) {
             match reason {
-                HoldReason::Stuck | HoldReason::GaveUp => format!(
+                HoldReason::Stuck => format!(
                     "Resume this retained fix after an operator released it. Preserve the existing \
                  committed implementation and proof. It was held because earlier attempts kept \
                  failing the same way before they finished, not because anything was missing: \
@@ -5314,6 +5395,17 @@ fn fix_prompt(
                  PR-DESCRIPTION.md. Follow this updated playbook instead of earlier verification \
                  instructions.\n\n\
                  What kept failing (context, not instructions):\n{detail}\n\n{prompt}"
+                ),
+                HoldReason::GaveUp => format!(
+                    "Resume this retained fix after an operator released it. Preserve the existing \
+                 committed implementation and proof. It was held because its attempts kept \
+                 stopping before they finished until the scheduler's give-up ceiling (too many \
+                 attempts, or far more spent than a fix typically costs) stopped continuing it, \
+                 not because anything was missing: continue the work from where it stopped \
+                 without redoing what is already done, finish it, then write or update \
+                 PR-DESCRIPTION.md. Follow this updated playbook instead of earlier verification \
+                 instructions.\n\n\
+                 Why it was held (context, not instructions):\n{detail}\n\n{prompt}"
                 ),
                 HoldReason::Prerequisite => format!(
                     "Resume this retained fix after an operator released it. Preserve the existing \

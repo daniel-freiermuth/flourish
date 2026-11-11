@@ -2867,6 +2867,129 @@ async fn only_a_release_gives_a_chain_a_fresh_budget() {
     );
 }
 
+/// Finding 1 in `status`, its `kind` work typically costing [`Z`], and a
+/// suspended chain of that work, two attempts (jobs 30 and 31) that spent
+/// `400_000` each: `400_000` outside its largest attempt, past
+/// `GIVE_UP_MULTIPLE` (3) times `Z`, and short of the attempt limit.
+async fn over_budget_chain(kind: &str, status: &str) -> (TempDir, PathBuf, SqlitePool) {
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo(&pool, &dir).await;
+    seed_finding_in(&pool, status).await;
+    for id in 4..=6_i64 {
+        sqlx::query(
+            "INSERT INTO jobs (id, kind, repo_id, finding_id, state, tokens_new, started_at, \
+             finished_at) VALUES (?1, ?2, 1, 1, 'done', ?3, 1000, 2000)",
+        )
+        .bind(id)
+        .bind(kind)
+        .bind(Z)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let session = seed_session_in(&dir, 30, CTX);
+    for id in [30_i64, 31] {
+        sqlx::query(
+            "INSERT INTO jobs \
+             (id, kind, repo_id, finding_id, state, session_file, killed_reason, tokens_new, \
+              resumed_from, started_at, finished_at, pinned_sha) \
+             VALUES (?1, ?2, 1, 1, 'suspended', ?3, 'cap', 400000, ?4, 3000, 4000, 'pinned')",
+        )
+        .bind(id)
+        .bind(kind)
+        .bind(session.to_string_lossy().to_string())
+        .bind((id == 31).then_some(30_i64))
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    support::point_checkpoint(&pool, 1, kind, 31).await;
+    (dir, path, pool)
+}
+
+/// A fix chain that went far past its budget is held for the operator,
+/// the chain kept as its checkpoint, instead of dropped for a fresh fix
+/// that pays again for the branch the chain already built. A `continue`
+/// resumes that chain. The preview writes nothing and offers neither.
+#[tokio::test]
+async fn a_fix_chain_far_over_its_budget_is_held_not_dropped() {
+    let (dir, path, pool) = over_budget_chain("fix", "queued").await;
+    let store = rw_store(&path).await;
+    let cfg = test_config(dir.path());
+
+    let previewed = preview_next(&store, &cfg).await.unwrap();
+    let held_by_preview = support::hold_of(&store, 1, FindingJobKind::Fix).await;
+    let picked = pick_next(&support::scope(&store), &cfg, None)
+        .await
+        .unwrap();
+    let hold = support::hold_of(&store, 1, FindingJobKind::Fix).await;
+    let checkpoint = checkpoint_of(&store, 1, FindingJobKind::Fix).await;
+    let state = job_row(&pool, 31).await.0;
+
+    assert!(
+        !matches!(
+            previewed,
+            Some(Candidate::Finding { finding_id: 1, .. } | Candidate::Resume { .. })
+        ),
+        "{previewed:?}"
+    );
+    assert!(held_by_preview.is_none());
+    assert!(
+        !matches!(
+            picked,
+            Some(Candidate::Finding { finding_id: 1, .. } | Candidate::Resume { .. })
+        ),
+        "a held fix is neither started over nor continued: {picked:?}"
+    );
+    let hold = hold.expect("the fix is held");
+    assert_eq!(hold.reason, hunter::domain::HoldReason::GaveUp);
+    assert!(
+        hold.detail.contains("over budget") && hold.detail.contains("400000 tok outside"),
+        "{}",
+        hold.detail
+    );
+    assert_eq!(checkpoint, Some(31), "the chain is the hold's checkpoint");
+    assert_eq!(state, "suspended", "the job row is left as it ended");
+
+    support::release(
+        &store,
+        1,
+        FindingJobKind::Fix,
+        hunter::domain::ReleaseAction::Continue,
+    )
+    .await;
+    let plan = resume_plan_of(
+        pick_next(&support::scope(&store), &cfg, None)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(plan.predecessor_id(), 31);
+}
+
+/// Only a fix is held for going over its budget: other work's chain is
+/// given up and counted as before, and the work starts over.
+#[tokio::test]
+async fn an_over_budget_recheck_chain_is_still_given_up() {
+    let (dir, path, _pool) = over_budget_chain("recheck", "rechecking").await;
+    let store = rw_store(&path).await;
+    let cfg = test_config(dir.path());
+
+    let picked = pick_next(&support::scope(&store), &cfg, None)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(picked, Some(Candidate::Finding { finding_id: 1, .. })),
+        "{picked:?}"
+    );
+    assert!(
+        support::hold_of(&store, 1, FindingJobKind::Recheck)
+            .await
+            .is_none()
+    );
+    assert_eq!(streak(&store, 1, FindingJobKind::Recheck).await, 1);
+}
+
 /// The failure streak of finding `fid`'s `kind` work.
 async fn streak(store: &Store, fid: i64, kind: FindingJobKind) -> i64 {
     store.work_streak(fid, kind).await.unwrap().streak
