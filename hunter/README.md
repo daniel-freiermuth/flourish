@@ -144,10 +144,15 @@ new ──recheck──> new / superseded / rejected
   issues as the hold's report: a review still finding something after
   `review.maxRounds` rounds is not converging. `continue` resumes the
   fixer on them and the review runs again. When the grant is spent before
-  the fixer can answer them, or its answer fails without doing work while
-  the forge is reachable (offline, the attempt is kept and retried), a
-  blocking one holds the fix the same way and non-blocking ones ship in an
-  "Unresolved review issues" section of the PR body; a review that fails
+  the review is through (before a round, by a reviewer killed at its cap,
+  or before the fixer can answer a round), the job is suspended, and its
+  resume, under a fresh grant, answers the issues left or has the
+  cut-off round again, without first resuming the finished fixer: a
+  review cut short never ships as one. When the fixer's answer fails
+  without doing work while the forge is reachable (offline, the attempt
+  is kept and retried), a blocking issue holds the fix the same way and
+  non-blocking ones ship in an "Unresolved review issues" section of the
+  PR body; a review that fails
   (a reviewer that ended early or left
   no valid output without writing an issue) ships the fix with a note
   saying so. The change is its commits: before every round the fixer's
@@ -179,7 +184,9 @@ new ──recheck──> new / superseded / rejected
   curated into a few logical commits of the same tree (`review.curate`); a
   curation whose changes cannot be undone is put back the same way as
   a reviewer's before any later attempt runs a worker, and the fixer
-  resumed then is told its rewrite was undone, not to pick it back up.
+  resumed then is told its rewrite was undone, not to pick it back up. A
+  grant that runs out before or during the curation suspends the fix,
+  and the resume curates it, as for any other part of the fix.
 - **Held work** is not a status. When a worker writes `BLOCKED.md`
   (a verification prerequisite, dependency, or human decision is
   missing; every finding kind's playbook says when: a recheck that cannot

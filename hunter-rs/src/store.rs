@@ -384,8 +384,14 @@ const RESUME_CHAIN_MAX_DEPTH: i64 = 64;
 pub struct ResumeChainStats {
     /// Every token the chain has spent.
     pub total: i64,
-    /// How many attempts the chain contains, this one included.
+    /// How many attempts the chain contains, this one included, for the
+    /// attempt arm of the give-up ceiling: not a stop the daemon's
+    /// shutdown or a spent grant made between a fix's review runs.
     pub attempts: i64,
+    /// [`Self::attempts`] with the review's grant suspensions counted, for
+    /// the cost arm: a chain that keeps running out of grant in its review
+    /// is held there for its cost rather than resumed for ever.
+    pub runs: i64,
     /// The costliest single attempt in it. 0 when nothing in the chain
     /// has a metered cost yet.
     pub max_single: i64,
@@ -3056,8 +3062,13 @@ impl Store {
     /// An attempt the daemon's own shutdown stopped between two worker
     /// runs (`killed_reason = 'shutdown'`, a fix's pre-PR review) is not
     /// counted as an attempt: a stop the daemon chose costs the work no
-    /// try, as a stop during a single run never did. Its spend is real and
-    /// counts like any other, in `total` and `max_single`.
+    /// try, as a stop during a single run never did. Nor is one the review
+    /// suspended between its runs because its grant was spent
+    /// (`killed_reason = 'grant'`): the work is done up to that point, and
+    /// the resume only carries on with it. Either one's spend is real and
+    /// counts like any other, in `total` and `max_single`, and a grant
+    /// suspension counts in `runs`, which gates the cost arm of the
+    /// ceiling, so that arm still bounds a chain of them.
     pub async fn resume_chain_stats(
         &self,
         job_id: i64,
@@ -3076,9 +3087,12 @@ impl Store {
                   AND (j.id = c.resumed_from OR j.resumed_from = c.id)
             )
             SELECT COALESCE(SUM(tokens_new), 0) AS "total!: i64",
-                   COALESCE(SUM(killed_reason IS NOT 'shutdown'
+                   COALESCE(SUM(killed_reason IS NOT 'shutdown' AND killed_reason IS NOT 'grant'
                                 AND (resumed_from IS NULL OR killed_reason = 'cap'
                                      OR COALESCE(tokens_new, 0) > 0)), 0) AS "attempts!: i64",
+                   COALESCE(SUM(killed_reason IS NOT 'shutdown'
+                                AND (resumed_from IS NULL OR killed_reason IN ('cap', 'grant')
+                                     OR COALESCE(tokens_new, 0) > 0)), 0) AS "runs!: i64",
                    COALESCE(MAX(tokens_new), 0) AS "max_single!: i64"
             FROM jobs WHERE id IN (SELECT id FROM chain)
               AND (?3 IS NULL OR started_at > ?3)
