@@ -1707,7 +1707,9 @@ async fn resume_plan<'s>(
     // either: without this, a flapping network would retry it forever.
     let excess = own.total - own.max_single;
     let too_many = own.attempts >= MAX_RESUME_ATTEMPTS;
-    let too_costly = z > 0 && own.attempts >= 2 && excess > GIVE_UP_MULTIPLE * z;
+    // A review's grant suspensions are no attempt, but they are runs: a
+    // chain that keeps running out of grant in its review is bounded here.
+    let too_costly = z > 0 && own.runs >= 2 && excess > GIVE_UP_MULTIPLE * z;
     let publish_only = kept_to_publish(&job);
     let spared = publish_only && spared_by_ceiling(store, job.id, released_at).await?;
     if (too_many || too_costly || publish_only) && !spared {
@@ -2010,13 +2012,15 @@ const MAX_CONSECUTIVE_SAME_FAILURE: i64 = 3;
 /// `resume-unavailable` is `Failed` rather than `Killed` because nothing
 /// was spawned — there was no run to kill, the attempt could not start.
 ///
-/// `shutdown` is no run's end: it is a fix job the daemon's shutdown
-/// stopped between its worker runs (the pre-PR review,
-/// [`review::review_fix`]), with the fixer's transcript to continue. It is
-/// a pause, as a cap is.
+/// `shutdown` and `grant` are no run's end: a fix job the daemon's
+/// shutdown, or a spent grant, stopped between its worker runs (the
+/// pre-PR review, [`review::review_fix`]), with the fixer's transcript to
+/// continue. Each is a pause, as a cap is.
 fn job_state(rr: &RunResult) -> FinishedState {
     match rr.killed_reason.as_deref() {
-        Some("cap" | review::STOPPED) if rr.session_file.is_some() => FinishedState::Suspended,
+        Some("cap" | review::STOPPED | review::GRANT) if rr.session_file.is_some() => {
+            FinishedState::Suspended
+        }
         Some("wallclock") if rr.session_file.is_some() && rr.tokens_new > 0 => {
             FinishedState::Suspended
         }
@@ -6452,18 +6456,20 @@ async fn record_unpublished_fix(
 
 /// Run a fix's or an engage's worker on `prompt`, continuing `resume`'s
 /// session, if any: unless that continuation only publishes the tree
-/// its predecessor was kept with ([`ResumePlan::publishes_as_kept`]).
-/// Then no worker runs: resuming the session would re-send its whole
-/// transcript only to be told to change nothing and end. The attempt
-/// finishes at once, having spent nothing, on the predecessor's
-/// transcript, which a later continuation of the chain resumes.
+/// its predecessor was kept with ([`ResumePlan::publishes_as_kept`]), or
+/// `paused`, its predecessor was suspended between its runs with its
+/// worker finished ([`review::suspended_between_runs`]). Then no worker runs:
+/// resuming the session would re-send its whole transcript only to be
+/// told to change nothing and end. The attempt finishes at once, having
+/// spent nothing, on the predecessor's transcript, which a later
+/// continuation of the chain resumes.
 async fn worker_run(
     backend: &dyn Backend,
     ws: &Workspace,
     (prompt, cap, max_wall_s): (&str, Option<i64>, i64),
-    resume: Option<&ResumePlan>,
+    (resume, paused): (Option<&ResumePlan>, bool),
 ) -> anyhow::Result<RunResult> {
-    if let Some(plan) = resume.filter(|r| r.publishes_as_kept()) {
+    if let Some(plan) = resume.filter(|r| r.publishes_as_kept() || paused) {
         return Ok(RunResult {
             exit_code: Some(0),
             killed_reason: None,
@@ -6526,6 +6532,13 @@ pub async fn run_fix(
     // now or by this attempt's restore, the resumed fixer is told it has
     // nothing left to do.
     let curation_undone = recovered || restored == Some(review::LeftBy::Curator);
+    // A fix the review suspended between its runs goes straight back to
+    // the review, its fixer having finished; unless an operator released
+    // a hold since, whose prompt the fixer has to act on.
+    let paused = !curation_undone
+        && resume.is_some_and(|r| {
+            r.after_hold().is_none() && review::suspended_between_runs(&start, r.predecessor_id())
+        });
     let (prompt, answers_held) = match fix_prompt(cfg, resume, &start, curation_undone) {
         Ok(prompted) => prompted,
         Err(e) => {
@@ -6538,7 +6551,7 @@ pub async fn run_fix(
         backend,
         &start.ws,
         (&prompt, start.cap, cfg.fix_max_wall_s),
-        resume,
+        (resume, paused),
     )
     .await
     {
@@ -8403,7 +8416,7 @@ pub async fn run_engage(
         backend,
         &start.ws,
         (&prompt, start.cap, cfg.fix_max_wall_s),
-        resume,
+        (resume, false),
     )
     .await
     {
