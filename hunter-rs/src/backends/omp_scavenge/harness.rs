@@ -298,18 +298,31 @@ fn tail_str(s: &str) -> &str {
     crate::util::tail(s, TAIL_BYTES)
 }
 
-/// First line of a file, or empty on any IO error.
+/// The `id` of a transcript's `{"type":"session"…}` header, or `None`
+/// when the file is unreadable or its opening records hold no header.
 ///
-/// Only ever compared against itself: omp writes a `{"type":"title"…}`
-/// header as a session's opening record and never rewrites it, so that
-/// line is a cheap identity for "still the same session".
-fn first_line(path: &Path) -> Vec<u8> {
-    let Ok(file) = fs::File::open(path) else {
-        return Vec::new();
-    };
-    let mut line = Vec::new();
-    let _ = BufReader::new(file).read_until(b'\n', &mut line);
-    line
+/// Only ever compared against itself, as the identity of "still the same
+/// session". omp mints a new `id` for every new session, including one it
+/// starts over a `--resume` path it will not continue. The first line is
+/// not that identity: omp 18.12.3 opens a transcript with a fixed-width
+/// `{"type":"title"…}` slot and rewrites it in place whenever it
+/// re-titles the session — in print mode on every todo `init` — so a
+/// real continuation changes its first line too. Title records are
+/// skipped, and so is a line that does not parse — a slot caught mid
+/// rewrite; any other record before the header means there is none.
+fn session_id(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    for line in BufReader::new(file).split(b'\n') {
+        let Ok(rec) = serde_json::from_slice::<serde_json::Value>(&line.ok()?) else {
+            continue;
+        };
+        match rec.get("type").and_then(|v| v.as_str()) {
+            Some("title") => {}
+            Some("session") => return rec.get("id")?.as_str().map(str::to_owned),
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// A resume that cannot happen, reported rather than silently downgraded.
@@ -377,7 +390,7 @@ pub fn run_worker(
     // omp writes a continued session at the `--resume` path and
     // `--session-dir` does not move it (see the argument below), so the
     // source must still be there for the continuation to be the one meant.
-    let mut resume_head: Option<Vec<u8>> = None;
+    let mut resume_head: Option<String> = None;
     let mut resume_len: u64 = 0;
     if let Some(sf) = resume_from {
         if !run_dir.is_dir() {
@@ -389,7 +402,7 @@ pub fn run_worker(
         if resume_len == 0 {
             return resume_unavailable(sf, "session file is missing or empty");
         }
-        resume_head = Some(first_line(sf));
+        resume_head = session_id(sf);
     }
     // Attribution baseline. A resumed worker appends to the predecessor's
     // ledger and `ledger_dir_usage` sums the whole directory, so every
@@ -432,6 +445,23 @@ pub fn run_worker(
     } else {
         (0, 0, 0, 0)
     };
+    // A lost resume took the predecessor's transcript with it, so that
+    // file's share of the baseline no longer describes anything on disk:
+    // what is there now was written by this attempt. The rest of the
+    // baseline still is on disk — omp keeps a session's subagent
+    // transcripts in `<stem>/` and a fresh session at the same path
+    // reuses that directory without clearing it — and stays the
+    // predecessor's.
+    let lost_base = (base_tokens - source_tokens, base_calls - source_calls);
+    let (mut base_tokens, mut base_calls) = (base_tokens, base_calls);
+    // Did the resume take? omp answers in the one place it costs nothing
+    // to look: a fresh session written at the `--resume` path carries a
+    // new header `id`, where a real continuation appends under the same
+    // one. Nothing in the exit code distinguishes the two, and missing it
+    // means believing work was continued that was in fact redone from
+    // scratch at full price.
+    let resume_replaced = || resume_from.is_some_and(|sf| session_id(sf) != resume_head);
+    let mut resume_lost = false;
     if let Err(e) = fs::create_dir_all(&run_dir) {
         // Without a private directory the worker would fall back to omp's
         // cwd-keyed session and resume it. Refusing is cheaper than the
@@ -571,6 +601,14 @@ pub fn run_worker(
 
     loop {
         let exited = matches!(proc.try_wait(), Ok(Some(_)));
+        // Checked every tick, not only after exit: a lost resume that keeps
+        // running is metered against a file far smaller than the baseline,
+        // which would read as "no call yet" (killed unmetered) and hold
+        // the cap at zero. Re-based on `lost_base` the moment it is seen.
+        if !resume_lost && resume_replaced() {
+            resume_lost = true;
+            (base_tokens, base_calls) = lost_base;
+        }
         match ledger_dir_usage(&run_dir) {
             Ok(Some((path, t, c))) => {
                 session = Some(path);
@@ -619,15 +657,16 @@ pub fn run_worker(
         // written only once it completes, and a resume's first call
         // re-sends the whole transcript, so it is the slowest one.
         //
-        // Appended means grown with its opening record intact. A changed
-        // opening record is a lost resume: omp wrote a fresh session over
-        // the file, whose spend reads as 0 against the predecessor's
-        // baseline until it passes the whole inherited total, so the cap
-        // cannot fire and this kill is the only bound left.
+        // Appended means grown while still the same session, i.e. not
+        // `resume_lost`, which this tick has already checked. A lost
+        // resume has appended to nothing: what grew is a fresh session omp
+        // started over the file. Its first call has no transcript to
+        // re-send, so the slow-first-call allowance does not apply, and
+        // until it records a call it is held to the grace period like a
+        // resume that writes nothing.
         let unmetered = match resume_from {
             Some(sf) => {
-                let appended = fs::metadata(sf).map_or(0, |m| m.len()) > resume_len
-                    && resume_head.as_ref() == Some(&first_line(sf));
+                let appended = !resume_lost && fs::metadata(sf).map_or(0, |m| m.len()) > resume_len;
                 calls == 0 && !appended
             }
             None => session.is_none(),
@@ -653,36 +692,22 @@ pub fn run_worker(
 
     let exit_code = proc.wait().ok().and_then(|s| s.code());
 
-    // Did the resume take? omp answers in the one place it costs nothing
-    // to look: a fresh session written at the `--resume` path replaces the
-    // file's opening record, where a real continuation appends and leaves
-    // it untouched. Nothing in the exit code distinguishes the two, and
-    // missing it means believing work was continued that was in fact
-    // redone from scratch at full price.
-    let mut resume_lost = false;
-    if let (Some(sf), Some(head)) = (resume_from, &resume_head) {
-        resume_lost = first_line(sf) != *head;
-        if resume_lost {
-            tracing::warn!(
-                "harness: --resume {} did not continue that session — omp \
-                 started a fresh one at the same path, so this attempt \
-                 redid the work it was meant to continue",
-                sf.display()
-            );
-        }
+    // Once more after exit: the worker may have replaced the file after
+    // the last tick looked. Unguarded by `resume_lost`: a replaced header
+    // never turns back into `resume_head`, so after a tick has latched
+    // the loss this repeats the same verdict and the same reset.
+    if resume_replaced() {
+        resume_lost = true;
+        (base_tokens, base_calls) = lost_base;
     }
-    // A lost resume took the predecessor's transcript with it, so that
-    // file's share of the baseline no longer describes anything on disk:
-    // what is there now was written by this attempt. The rest of the
-    // baseline still is on disk — omp keeps a session's subagent
-    // transcripts in `<stem>/` and a fresh session at the same path
-    // reuses that directory without clearing it — and stays the
-    // predecessor's.
-    let (base_tokens, base_calls) = if resume_lost {
-        (base_tokens - source_tokens, base_calls - source_calls)
-    } else {
-        (base_tokens, base_calls)
-    };
+    if let Some(sf) = resume_from.filter(|_| resume_lost) {
+        tracing::warn!(
+            "harness: --resume {} did not continue that session — omp \
+             started a fresh one at the same path, so this attempt \
+             redid the work it was meant to continue",
+            sf.display()
+        );
+    }
 
     // Final ledger read after exit. A metering error here keeps the last
     // good running total and marks the run unmetered, unless a more

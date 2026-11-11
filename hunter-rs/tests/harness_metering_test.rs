@@ -124,8 +124,29 @@ impl Fixture {
     }
 }
 
+/// The fixed-width title slot omp 18.12.3 writes as a transcript's first
+/// line (`@AT@` is the session's creation time, 30 characters), and the
+/// same slot after `updateSessionTitle` rewrote it in place: a pwrite at
+/// offset 0, same width, new title and `updatedAt`.
+const TITLE_SLOT: &str = r#"{"type":"title","v":1,"title":"","source":"auto","updatedAt":"@AT@","pad":"                                "}"#;
+const RETITLED_SLOT: &str = r#"{"type":"title","v":1,"title":"renamed","source":"auto","updatedAt":"2026-01-01T00:00:09.000000000Z","pad":"                         "}"#;
+
+/// Shell that starts a new session in the file named by `$<var>`, the way
+/// omp does: truncate, title slot, then a `session` header whose `id` is
+/// fresh for every new session.
+fn session_head_sh(var: &str) -> String {
+    let slot = TITLE_SLOT.replace("@AT@", "%s");
+    format!(
+        "AT=$(date -u '+%Y-%m-%dT%H:%M:%S.%NZ')\n\
+         printf '{slot}\\n' \"$AT\" > \"${var}\"\n\
+         printf '{{\"type\":\"session\",\"version\":3,\"id\":\"%s\"}}\\n' \
+         \"$$-$(date +%s%N)\" >> \"${var}\"\n"
+    )
+}
+
 /// Shell that writes an omp-style session ledger, one assistant record per
-/// `(input, output, cacheWrite)` triple.
+/// `(input, output, cacheWrite)` triple, opening a new session (title slot
+/// and header) when the target does not hold one yet.
 ///
 /// Target resolution mirrors what omp actually does (measured against
 /// v18.2.6): with `--resume=<path>` the records are appended to that file
@@ -145,8 +166,11 @@ fn ledger_sh(records: &[(i64, i64, i64)]) -> String {
                   --session-dir=*) SDIR=\"${a#--session-dir=}\";; \
                   --resume=*) RESUME=\"${a#--resume=}\";; esac\ndone\n\
                   mkdir -p \"$SDIR\"\nLEDGER=\"${RESUME:-$SDIR/session-01.jsonl}\"\n\
-                  TS=$(date -u '+%Y-%m-%dT%H:%M:%S.000Z')\n"
+                  TS=$(date -u '+%Y-%m-%dT%H:%M:%S.000Z')\n\
+                  [ -s \"$LEDGER\" ] || {\n"
         .to_owned();
+    sh.push_str(&session_head_sh("LEDGER"));
+    sh.push_str("}\n");
     for &(input, output, cache_write) in records {
         let record = serde_json::json!({
             "timestamp": "@TS@",
@@ -791,8 +815,8 @@ fn a_missing_resume_source_is_refused_rather_than_restarted() {
 /// The source existed, so the pre-check passed, but omp began a new
 /// session over it anyway — a corrupt or unparseable transcript does this.
 /// Exit code and session path are identical to a real continuation; the
-/// opening record is not, because a continuation appends and leaves it
-/// alone.
+/// session header is not — here it is gone, where a continuation appends
+/// under the predecessor's.
 #[test]
 fn a_resume_that_did_not_take_is_reported() {
     let fx = Fixture::new("resume-lost");
@@ -872,6 +896,128 @@ fn a_lost_resume_is_not_billed_for_the_predecessors_subagents() {
         (1300, 2),
         "this attempt's 1000 top-level + 300 subagent; the predecessor's \
          5000 subagent tokens are its own job row's"
+    );
+}
+
+/// Shell that does what omp does to a `--resume` file it will not
+/// continue: truncate it and start a fresh session there (new header
+/// `id`), one record per `(input, output, cacheWrite)` triple, then run
+/// `tail` before exiting.
+fn lost_resume_sh(records: &[(i64, i64, i64)], tail: &str) -> String {
+    let mut sh = "RESUME=\"\"\nfor a in \"$@\"; do case \"$a\" in \
+                  --resume=*) RESUME=\"${a#--resume=}\";; esac\ndone\n"
+        .to_owned();
+    sh.push_str(&session_head_sh("RESUME"));
+    for &(input, output, cache_write) in records {
+        let record = serde_json::json!({
+            "message": {
+                "role": "assistant",
+                "usage": { "input": input, "output": output, "cacheWrite": cache_write },
+            },
+        });
+        let _ = writeln!(sh, "printf '%s\\n' '{record}' >> \"$RESUME\"");
+    }
+    sh.push_str(tail);
+    sh
+}
+
+/// A lost resume that keeps running is metered while it runs, not only
+/// once it exits.
+///
+/// The fresh session omp wrote over the source holds fewer calls than the
+/// predecessor's transcript did, so measured against the pre-spawn
+/// baseline this attempt has "recorded no call yet" — and a worker that
+/// is spending is killed as unmetered at the grace period.
+#[test]
+fn a_lost_resume_that_keeps_running_is_metered_from_the_fresh_session() {
+    let mut fx = Fixture::new("resume-lost-running");
+    let ledger = predecessor(&fx);
+    fx.cfg.session_grace_s = 1;
+    fx.bins
+        .script("omp", &lost_resume_sh(&[(900, 100, 0)], "sleep 3\nexit 0"));
+
+    let res = fx.resume_bounded(&ledger, Some(1_000_000), 300);
+
+    assert_eq!(res.killed_reason, None, "{:?}", res.stdout_tail);
+    assert_eq!(res.exit_code, Some(0));
+    assert_eq!((res.tokens_new, res.calls), (1000, 1));
+    assert!(
+        res.stdout_tail.starts_with("[resume-lost]"),
+        "{:?}",
+        res.stdout_tail
+    );
+}
+
+/// The cap stays armed on a lost resume that keeps running.
+///
+/// Against the predecessor's 1250-token baseline, a fresh session's first
+/// 1250 tokens read as zero, so a cap below that never fires.
+#[test]
+fn a_lost_resume_that_keeps_running_is_still_capped() {
+    let fx = Fixture::new("resume-lost-cap");
+    let ledger = predecessor(&fx);
+    fx.bins.script(
+        "omp",
+        &lost_resume_sh(&[(500, 0, 0), (500, 0, 0)], "sleep 10\nexit 0"),
+    );
+
+    let res = fx.resume_bounded(&ledger, Some(500), 30);
+
+    assert_eq!(
+        res.killed_reason.as_deref(),
+        Some("cap"),
+        "{:?}",
+        res.stdout_tail
+    );
+    assert_eq!((res.tokens_new, res.calls), (1000, 2));
+    assert!(
+        res.duration_s < 5.0,
+        "killed on crossing the cap, not after the worker's own sleep: {}s",
+        res.duration_s
+    );
+}
+
+/// A continuation that re-titles its session is still a continuation.
+///
+/// omp 18.12.3 rewrites the title slot — the transcript's first line — in
+/// place on every todo `init` (`title.refreshOnReplan`, on by default and
+/// not gated by `-p`). The session itself, and its header `id`, are
+/// unchanged, so this is not a lost resume: the predecessor's 1250 tokens
+/// must stay subtracted, and a cap far below them must not fire.
+#[test]
+fn a_continuation_that_retitles_its_session_is_not_a_lost_resume() {
+    let fx = Fixture::new("resume-retitle");
+    let ledger = predecessor(&fx);
+    let opening = std::fs::read_to_string(&ledger).unwrap();
+    let opening = opening.lines().next().unwrap();
+    assert_eq!(
+        opening.len(),
+        RETITLED_SLOT.len(),
+        "the rewrite must fit the slot"
+    );
+    fx.bins.script(
+        "omp",
+        &format!(
+            "{ledger}printf '%s' '{RETITLED_SLOT}' 1<> \"$LEDGER\"\nsleep 2\nexit 0",
+            ledger = ledger_sh(&[(100, 0, 0)])
+        ),
+    );
+
+    let res = fx.resume_bounded(&ledger, Some(500), 30);
+
+    let after = std::fs::read_to_string(&ledger).unwrap();
+    assert_eq!(
+        after.lines().next(),
+        Some(RETITLED_SLOT),
+        "the worker re-titled in place"
+    );
+    assert_eq!(res.killed_reason, None, "{:?}", res.stdout_tail);
+    assert_eq!(res.exit_code, Some(0));
+    assert_eq!((res.tokens_new, res.calls), (100, 1));
+    assert!(
+        !res.stdout_tail.starts_with("[resume-lost]"),
+        "{:?}",
+        res.stdout_tail
     );
 }
 
@@ -1004,30 +1150,36 @@ fn a_resumed_worker_whose_first_call_outlasts_the_grace_period_is_not_killed() {
 
 /// The limit of the test above: a transcript that changed is not one that
 /// was continued. When a resume does not take, omp writes a fresh session
-/// over the `--resume` path. Until the worker exits the cap still meters
-/// against the predecessor's baseline, so the fresh session's spend reads
-/// as 0 until it passes the whole inherited total and the cap cannot fire.
-/// The grace kill is then the only bound, and a replaced opening record
-/// must not count as this attempt writing to its transcript.
+/// over the `--resume` path. That fresh session has no transcript to
+/// re-send, so the slow-first-call allowance does not cover it: until it
+/// records a call it is killed at the grace period, even once the file it
+/// wrote is longer than the one it replaced.
 #[test]
 fn a_resume_that_replaced_its_transcript_is_still_killed_at_the_grace_period() {
     let mut fx = Fixture::new("resume-replaced-grace");
     let ledger = predecessor(&fx);
+    let replaced_len = std::fs::metadata(&ledger).unwrap().len();
     fx.cfg.session_grace_s = 1;
-    let header = serde_json::json!({"type": "title", "title": "fresh"});
-    // A fresh header over the file, then one call worth ten times the cap.
+    let prompt = serde_json::json!({
+        "type": "message",
+        "message": {"role": "user", "content": [{"type": "text", "text": "x".repeat(2000)}]},
+    });
+    // A fresh session and its prompt over the file, then no call.
     fx.bins.script(
         "omp",
-        &format!(
-            "{start}printf '%s\\n' '{header}' > \"$LEDGER\"\n{call}sleep 10\nexit 0",
-            start = ledger_sh(&[]),
-            call = ledger_sh(&[(1000, 0, 0)]),
+        &lost_resume_sh(
+            &[],
+            &format!("printf '%s\\n' '{prompt}' >> \"$RESUME\"\nsleep 10\nexit 0"),
         ),
     );
 
     // max_wall_s is far larger, so a kill cannot be the wall-clock branch.
-    let res = fx.resume_bounded(&ledger, Some(100), 300);
+    let res = fx.resume_bounded(&ledger, Some(1_000_000), 300);
 
+    assert!(
+        std::fs::metadata(&ledger).unwrap().len() > replaced_len,
+        "the fresh session must outgrow the transcript it replaced"
+    );
     assert_eq!(
         res.killed_reason.as_deref(),
         Some("unmetered"),
@@ -1038,6 +1190,11 @@ fn a_resume_that_replaced_its_transcript_is_still_killed_at_the_grace_period() {
         res.duration_s < 5.0,
         "must be killed at the grace period, not after the worker's own sleep: {}s",
         res.duration_s
+    );
+    assert!(
+        res.stdout_tail.starts_with("[resume-lost]"),
+        "{:?}",
+        res.stdout_tail
     );
 }
 
