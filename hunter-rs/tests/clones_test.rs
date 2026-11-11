@@ -27,10 +27,7 @@ async fn store_with_two_repos(dir: &TempDir) -> Store {
             .await
             .unwrap();
     }
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&path))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&path).await;
     sqlx::query(
         "INSERT INTO jobs (id, kind, repo_id, state, started_at, finished_at) VALUES \
          (7, 'hunt', 1, 'done', 1000, 2000), (8, 'hunt', 2, 'done', 1000, 2000)",

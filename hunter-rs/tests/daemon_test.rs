@@ -512,11 +512,7 @@ impl EngageFixture {
             .await
             .unwrap();
         std::fs::rename(&git.work, hunter::store::Store::repo_dir(&repos, alpha)).unwrap();
-        let pool = sqlx::SqlitePool::connect_with(
-            sqlx::sqlite::SqliteConnectOptions::new().filename(&cfg.db_path),
-        )
-        .await
-        .unwrap();
+        let pool = support::open_pool(&cfg.db_path).await;
         sqlx::query(
             "UPDATE repos SET last_hunt_at = ?1, last_test_gap_at = 1000, \
              last_dep_update_at = ?1, last_refactor_at = ?1, \

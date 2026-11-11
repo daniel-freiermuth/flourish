@@ -669,11 +669,7 @@ async fn test_read_windows_empty_sources_log_nothing() {
 /// leaves a non-numeric string as TEXT, which is what makes the cell
 /// undecodable as `i64`.
 async fn insert_undecodable_row(path: &std::path::Path) {
-    use sqlx::sqlite::SqliteConnectOptions;
-
-    let pool = sqlx::SqlitePool::connect_with(SqliteConnectOptions::new().filename(path))
-        .await
-        .unwrap();
+    let pool = support::open_pool(path).await;
     sqlx::raw_sql(
         "INSERT INTO usage_history \
          (recorded_at, provider, account_key, limit_id, label, \

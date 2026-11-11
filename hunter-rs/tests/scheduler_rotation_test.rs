@@ -1079,11 +1079,7 @@ async fn a_held_hunt_takes_its_full_rehunt_request_out_of_the_queue() {
 async fn a_running_hunt_takes_its_full_rehunt_request_out_of_the_queue() {
     let (dir, store, cfg) = two_repos_for_selection("rotation-urgent-running", true).await;
     assert!(store.request_full_hunt(1).await.unwrap());
-    let pool = sqlx::SqlitePool::connect_with(
-        sqlx::sqlite::SqliteConnectOptions::new().filename(dir.join("rotation-select.db")),
-    )
-    .await
-    .unwrap();
+    let pool = support::open_pool(dir.join("rotation-select.db")).await;
     sqlx::query(
         "INSERT INTO jobs (id, kind, repo_id, finding_id, state, started_at) \
          VALUES (30, 'hunt', 1, NULL, 'running', 1000)",
@@ -1119,11 +1115,7 @@ async fn a_held_sync_keeps_the_resume_tier_off_the_repos_chains() {
     std::fs::create_dir_all(&ws.session).unwrap();
     let session = ws.session.join("session.jsonl");
     std::fs::write(&session, "{}\n").unwrap();
-    let pool = sqlx::SqlitePool::connect_with(
-        sqlx::sqlite::SqliteConnectOptions::new().filename(dir.join("rotation-select.db")),
-    )
-    .await
-    .unwrap();
+    let pool = support::open_pool(dir.join("rotation-select.db")).await;
     sqlx::query(
         "INSERT INTO jobs (id, kind, repo_id, state, session_file, killed_reason, tokens_new, \
                            started_at, finished_at, pinned_sha) \

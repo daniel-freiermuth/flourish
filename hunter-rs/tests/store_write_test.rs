@@ -24,7 +24,6 @@ use hunter::store::{
     StoreWriteError,
 };
 use sqlx::SqlitePool;
-use sqlx::sqlite::SqliteConnectOptions;
 use support::{TempDir, pr_ref, pr_sync};
 
 /// Copy dev.db (WAL, checkpointed, no rows) into a scratch directory and
@@ -1238,9 +1237,7 @@ async fn connect_creates_and_migrates_a_brand_new_database() {
         .expect("insert into the freshly created schema");
     assert!(store.get_repo_by_id(repo_id).await.unwrap().is_some());
 
-    let pool = SqlitePool::connect_with(SqliteConnectOptions::new().filename(&path))
-        .await
-        .unwrap();
+    let pool = support::open_pool(&path).await;
     // Compare against the directory rather than a hardcoded list, so
     // adding a migration cannot silently stop being covered here.
     let mut on_disk: Vec<i64> =

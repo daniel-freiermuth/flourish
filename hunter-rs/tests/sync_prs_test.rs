@@ -371,10 +371,7 @@ async fn a_merge_that_cannot_be_recorded_is_retried_by_the_next_sync() {
     let f = fixture("sync-merged-unrecorded").await;
     let bins = FakeBins::acquire("sync-merged-unrecorded");
     serve_pr(&bins, &pr(&json!({ "state": "MERGED" })));
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     for trigger in [
         "CREATE TRIGGER no_merge_insert BEFORE INSERT ON pr_state \
          WHEN NEW.state = 'MERGED' \
@@ -417,10 +414,7 @@ async fn an_open_pr_that_cannot_be_recorded_is_an_error_and_retried() {
     let f = fixture("sync-open-unrecorded").await;
     let bins = FakeBins::acquire("sync-open-unrecorded");
     serve_pr(&bins, &pr(&json!({})));
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     sqlx::query(
         "CREATE TRIGGER no_open_insert BEFORE INSERT ON pr_state \
          BEGIN SELECT RAISE(ABORT, 'injected pr_state failure'); END",
@@ -497,10 +491,7 @@ async fn a_read_that_cannot_be_begun_is_an_error_and_retried() {
     let f = fixture("sync-read-unbegun").await;
     let bins = FakeBins::acquire("sync-read-unbegun");
     serve_pr(&bins, &pr(&json!({})));
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     sqlx::query("ALTER TABLE pr_state RENAME TO pr_state_away")
         .execute(&pool)
         .await
@@ -531,10 +522,7 @@ async fn a_finding_moved_off_pr_open_during_the_sync_keeps_that_move() {
     let f = fixture("sync-merged-moved").await;
     let bins = FakeBins::acquire("sync-merged-moved");
     serve_pr(&bins, &pr(&json!({ "state": "MERGED" })));
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     sqlx::query(
         "CREATE TRIGGER moved_first BEFORE UPDATE OF status ON findings \
          WHEN NEW.status = 'merged' \
@@ -640,10 +628,7 @@ async fn a_failing_pr_view_is_an_error_and_stays_pr_open() {
 #[tokio::test]
 async fn a_finding_whose_repo_is_gone_is_an_error_and_stays_pr_open() {
     let f = fixture("sync-repo-gone").await;
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     sqlx::query("UPDATE repos SET deleted_at = 1")
         .execute(&pool)
         .await
