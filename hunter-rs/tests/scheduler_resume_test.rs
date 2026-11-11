@@ -2963,8 +2963,46 @@ async fn a_fix_chain_far_over_its_budget_is_held_not_dropped() {
     assert_eq!(plan.predecessor_id(), 31);
 }
 
-/// Only a fix is held for going over its budget: other work's chain is
-/// given up and counted as before, and the work starts over.
+/// An engage chain far over its budget is held too, the chain kept as its
+/// checkpoint: its tree holds commits its review paid for and that were
+/// not pushed yet, and starting over would pay for the worker run and the
+/// whole review again.
+#[tokio::test]
+async fn an_engage_chain_far_over_its_budget_is_held_not_dropped() {
+    let (dir, path, pool) = over_budget_chain("engage", "pr_open").await;
+    sqlx::query("UPDATE pr_state SET state = 'OPEN' WHERE finding_id = 1")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let store = rw_store(&path).await;
+    let cfg = test_config(dir.path());
+
+    let picked = pick_next(&support::scope(&store), &cfg, None)
+        .await
+        .unwrap();
+
+    assert!(
+        !matches!(
+            picked,
+            Some(Candidate::Finding { finding_id: 1, .. } | Candidate::Resume { .. })
+        ),
+        "a held engage is neither started over nor continued: {picked:?}"
+    );
+    let hold = support::hold_of(&store, 1, FindingJobKind::Engage)
+        .await
+        .expect("the engage is held");
+    assert_eq!(hold.reason, hunter::domain::HoldReason::GaveUp);
+    assert!(hold.detail.contains("over budget"), "{}", hold.detail);
+    assert_eq!(
+        checkpoint_of(&store, 1, FindingJobKind::Engage).await,
+        Some(31),
+        "the chain is the hold's checkpoint"
+    );
+    assert_eq!(streak(&store, 1, FindingJobKind::Engage).await, 0);
+}
+
+/// Only a fix or an engage is held for going over its budget: other work's
+/// chain is given up and counted as before, and the work starts over.
 #[tokio::test]
 async fn an_over_budget_recheck_chain_is_still_given_up() {
     let (dir, path, _pool) = over_budget_chain("recheck", "rechecking").await;

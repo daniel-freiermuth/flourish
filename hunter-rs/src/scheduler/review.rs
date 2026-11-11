@@ -1,20 +1,28 @@
-//! The pre-PR review of a finished fix (WORK-MODEL.md §5.7).
+//! The review of a finished change before it goes out (WORK-MODEL.md
+//! §5.7): a fix before its PR is opened, or an engage's commits before
+//! they are pushed to its open PR ([`Change`]).
 //!
-//! A fixer that finished with commits and a `PR-DESCRIPTION.md` is not
-//! shipped at once. A fresh reviewer session, told to distrust the change,
-//! reads the whole `<pinned>..HEAD` and writes its issues to a file outside
-//! the tree. Its issues go back to the fixer, resumed in its own session,
-//! which fixes or rebuts each; then the whole change is reviewed again,
-//! until a review raises none or `review.maxRounds` reviews have run. Issues
-//! outside the change's scope (`follow-up`s) are never answered: they ship
-//! in the PR body for later work. Replayed over 88 shipped fixes,
-//! such a reviewer named most of the bugs later hunts traced back to
-//! hunter's own PRs, and flagged few clean ones.
+//! A worker that finished with commits (a fixer with a `PR-DESCRIPTION.md`
+//! too) is not shipped at once. A fresh reviewer session, told to distrust
+//! the change, reads the whole `<pinned>..HEAD` and writes its issues to a
+//! file outside the tree. Its issues go back to the worker, resumed in its
+//! own session, which fixes or rebuts each; then the whole change is
+//! reviewed again, until a review raises none or `review.maxRounds`
+//! reviews have run. Issues outside the change's scope (`follow-up`s) are
+//! never answered: they ship in the PR body (or the engage's reply) for
+//! later work. Replayed over 88 shipped fixes, such a reviewer named most
+//! of the bugs later hunts traced back to hunter's own PRs, and flagged
+//! few clean ones.
 //!
-//! All of it runs inside the fix job: the finding stays `fixing` under the
-//! same claim, and the job row records every run's spend under the one
-//! budget grant. The reviewer never holds the fix hostage: a review that
-//! cannot be had ships the fix as before, saying so in the PR body.
+//! All of it runs inside the worker's job: a fix's finding stays `fixing`
+//! under the same claim, and the job row records every run's spend under
+//! the one budget grant. The reviewer never holds the change hostage: a
+//! review that cannot be had ships it as before, saying so. A grant spent
+//! before the review is through suspends the job instead, for its resume
+//! to finish the review under a fresh grant.
+//!
+//! "The fixer" below is the worker that wrote the change: an engage's
+//! worker in an engage's review.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -22,7 +30,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{BLOCKED_REPORT, FixStart, decline_report, fix_event, job_state};
+use super::{BLOCKED_REPORT, decline_report, fix_event, job_state};
 use crate::backend::{Backend, JobClass};
 use crate::clones::{Lane, Unheld};
 use crate::config::Config;
@@ -30,8 +38,122 @@ use crate::domain::FinishedState;
 use crate::playbooks;
 use crate::recovery::CycleScope;
 use crate::store::Store;
-use crate::types::{JobPhase, RunResult};
+use crate::transition::PrRef;
+use crate::types::{Finding, JobPhase, Repo, RunResult};
 use crate::workspace::Workspace;
+
+/// What a review loop reviews.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Change {
+    /// A finished fix, before its PR is opened.
+    Fix,
+    /// An engage's commits, before they are pushed to its open PR.
+    Engage,
+}
+
+/// The change a review loop reviews, and the job it runs in.
+pub(super) struct Subject<'a> {
+    pub finding: &'a Finding,
+    pub repo: &'a Repo,
+    pub job: i64,
+    pub ws: &'a Workspace,
+    /// A fix's pinned commit, which `<pinned>..HEAD` is reviewed against;
+    /// an engage's PR head its tree was created at, from which the
+    /// reviewed base is worked out as the tree now stands ([`Self::base`]).
+    pub pinned: &'a str,
+    /// The branch the tree has checked out, when it is not detached.
+    pub branch: &'a str,
+    /// The job's token grant.
+    pub cap: Option<i64>,
+    pub change: Change,
+    /// An engage's PR: once it is no longer the finding's open PR (merged,
+    /// closed, replaced), the review stops before its next run
+    /// ([`Rounds::stopped`]), as nothing it reviews can be published.
+    pub pr: Option<&'a PrRef>,
+}
+
+/// The commit an engage's change, in `tree`, is reviewed against: `pinned`,
+/// the PR head its tree was created at, while `HEAD` descends from it and
+/// the PR's fork from `default` (the default branch) has not moved past it,
+/// so the change is the worker's own commits. A worker that rebased or
+/// squashed the branch (`pinned` no longer below `HEAD`), or merged the
+/// default branch into it (the fork moved past `pinned`, and
+/// `<pinned>..HEAD` would hold every upstream commit the merge brought in),
+/// is reviewed from that fork, the whole PR as it now stands, as a PR review
+/// takes its base (`pr_review`). `pinned` when git cannot say.
+pub(super) async fn engage_base(tree: &Path, pinned: &str, default: &str) -> String {
+    let (tree, pinned_owned) = (tree.to_owned(), pinned.to_owned());
+    let default = format!("refs/remotes/origin/{default}");
+    let fork = tokio::task::spawn_blocking(move || {
+        let (rc, out) = Unheld::MergeBase {
+            a: "HEAD",
+            b: &default,
+        }
+        .run(&tree, 30);
+        // `merge-base` succeeds only with a commit to print, and exits 1
+        // without one when the two have no common ancestor.
+        if rc != 0 {
+            return None;
+        }
+        let fork = out.trim().to_owned();
+        let descends =
+            |ancestor: &str, rev: &str| Unheld::IsAncestor { ancestor, rev }.run(&tree, 30).0 == 0;
+        let own = descends(&pinned_owned, "HEAD") && descends(&fork, &pinned_owned);
+        (!own).then_some(fork)
+    })
+    .await;
+    fork.ok().flatten().unwrap_or_else(|| pinned.to_owned())
+}
+
+impl Subject<'_> {
+    /// The commit the change is reviewed against, as the tree stands now:
+    /// a fix's pinned commit, or an engage's base ([`engage_base`]), which
+    /// a rebase or merge in any of its runs moves. Taken afresh for every
+    /// round and every answer.
+    pub(super) async fn base(&self) -> String {
+        match self.change {
+            Change::Fix => self.pinned.to_owned(),
+            Change::Engage => {
+                engage_base(&self.ws.tree, self.pinned, &self.repo.default_branch).await
+            }
+        }
+    }
+
+    /// The worker's untracked account of its change, which belongs in the
+    /// tree: a fix's PR body, or an engage's reply on its PR.
+    const fn description(&self) -> &'static str {
+        match self.change {
+            Change::Fix => DESCRIPTION,
+            Change::Engage => REPLY,
+        }
+    }
+
+    /// The report with which the worker refuses the change outright: a
+    /// fix's decline, or an engage's withdrawal of its PR.
+    fn decline(&self) -> &'static str {
+        match self.change {
+            Change::Fix => decline_report(self.finding.kind),
+            Change::Engage => WITHDRAWAL,
+        }
+    }
+
+    /// The reviewer's playbook, and the one the worker answers it with.
+    const fn playbooks(&self) -> (&'static str, &'static str) {
+        match self.change {
+            Change::Fix => ("review.md", "review_followup.md"),
+            Change::Engage => ("review_engage.md", "review_engage_followup.md"),
+        }
+    }
+
+    /// The review's name, and what it holds, for the operator and the
+    /// worker.
+    const fn names(&self) -> (&'static str, &'static str) {
+        match self.change {
+            Change::Fix => ("pre-PR review", "fix"),
+            Change::Engage => ("pre-push review", "engage"),
+        }
+    }
+}
 
 /// The `killed_reason` of a fix job the daemon's shutdown stopped between
 /// two of its runs: a pause on the fixer's transcript (`job_state`).
@@ -225,7 +347,7 @@ struct Rounds<'a> {
     scope: &'a CycleScope<'a>,
     cfg: &'a Config,
     backend: &'a dyn Backend,
-    start: &'a FixStart,
+    start: &'a Subject<'a>,
     /// [`Ending::title`], kept across attempts and holds.
     title: Option<String>,
 }
@@ -244,15 +366,29 @@ impl Rounds<'_> {
         Ok((remaining(self.start.cap, spent)?, self.cfg.fix_max_wall_s))
     }
 
-    /// Stop the job for the daemon's shutdown, before another run starts
-    /// ([`Self::suspend`]). `owed`: the round reviewed last, and its
-    /// issues the fixer has not been sent yet.
+    /// Stop the job before another run starts, when nothing is to come of
+    /// it: the engage's PR ended (merged, closed or replaced, as the PR
+    /// sync recorded it while the review ran), so nothing reviewed could be
+    /// published, and the loop ends with nothing to ship, its runner taking
+    /// the PR's end as its outcome; or the daemon is stopping, which
+    /// suspends the job ([`Self::suspend`]). `owed`: the round reviewed
+    /// last, and its issues the fixer has not been sent yet.
     async fn stopped(
         &self,
         job: &mut Reviewed,
         owed: (u32, &[serde_json::Value]),
         follow_ups: &[serde_json::Value],
     ) -> bool {
+        let start = self.start;
+        if let Some(pr) = start.pr
+            && let Some(now) = super::pr_ended(self.store(), start.finding.id, pr).await
+        {
+            let fid = start.finding.id;
+            let message =
+                format!("#{fid} review: the PR ended ({now}); stopped, nothing to publish");
+            let _ = fix_event(self.store(), "review", fid, start.job, message).await;
+            return true;
+        }
         if !self.scope.stopping() {
             return false;
         }
@@ -522,31 +658,33 @@ impl Rounds<'_> {
     }
 }
 
-/// Review the fixer's finished work in `start`'s tree, and send every
+/// Review the worker's finished change in `start`'s tree, and send every
 /// issue the reviewer raises back to it, until a review raises none or
 /// `review.maxRounds` reviews have run. Whether an issue is `blocking` only
 /// orders it and marks it for the human; every one is answered but a
-/// follow-up, which is collected across rounds and shipped in the PR body
+/// follow-up, which is collected across rounds and shipped with the change
 /// ([`follow_ups_note`]). `fixer` is the attempt's first run; the result
 /// sums it with every run after it.
 ///
 /// A saved verdict that covers the tree exactly as it is ships it, however
 /// this attempt's fixer run ended: a retried offline push whose resume
 /// failed before doing anything changed nothing that was reviewed.
-/// Otherwise nothing is reviewed unless the fixer would ship as it stands
-/// ([`ready_to_ship`]). A fixer that is suspended or writes a report while
-/// answering a review ends the loop there: the job is recorded on its
-/// state and `conclude_fix` reads its report, as for any fix. So does the
-/// daemon's shutdown, checked before every run ([`Rounds::stopped`]), and a
-/// grant spent before the review is through ([`Rounds::spent`]): either
-/// suspends the job, and its resume carries on with the issues a round
-/// left unanswered, or else with the round that did not run to its end.
-pub(super) async fn review_fix(
+/// Otherwise nothing is reviewed unless the change would go out as it
+/// stands ([`ready_to_ship`]); an engage that committed nothing has no
+/// change to review, and its reply goes out as it is. A fixer that is
+/// suspended or writes a report while answering a review ends the loop
+/// there: the job is recorded on its state and its runner reads the
+/// report, as for any attempt. So does the daemon's shutdown, checked
+/// before every run ([`Rounds::stopped`]), and a grant spent before the
+/// review is through ([`Rounds::spent`]): either suspends the job, and its
+/// resume carries on with the issues a round left unanswered, or else with
+/// the round that did not run to its end.
+pub(super) async fn review_change(
     scope: &CycleScope<'_>,
     lane: &mut Lane,
     cfg: &Config,
     backend: &dyn Backend,
-    start: &FixStart,
+    start: &Subject<'_>,
     fixer: RunResult,
 ) -> Reviewed {
     let mut job = Reviewed {
@@ -564,14 +702,21 @@ pub(super) async fn review_fix(
         let rounds = (scope, cfg, backend, start);
         return ship_saved(rounds, lane, job, ending).await;
     }
-    if !ready_to_ship(start, &job.rr).await {
-        return job;
+    match ready_to_ship(start, &job.rr).await {
+        Ready::Review => {}
+        Ready::Unchanged => {
+            job.ending = Some(Ending::default());
+            return job;
+        }
+        Ready::Not => return job,
     }
     let root = &start.ws.root;
     let progress = read_json::<Progress>(&root.join(PROGRESS_FILE)).unwrap_or_default();
-    let title = match progress.title {
-        Some(title) => Some(title),
-        None => head_subject(&start.ws.tree).await,
+    // An engage's PR keeps the title it has.
+    let title = match (progress.title, start.change) {
+        (Some(title), _) => Some(title),
+        (None, Change::Fix) => head_subject(&start.ws.tree).await,
+        (None, Change::Engage) => None,
     };
     let rounds = Rounds {
         scope,
@@ -649,7 +794,7 @@ pub(super) async fn review_fix(
 /// owed ([`Progress::curate`]). The mark is taken here: a later attempt
 /// curates only if this one is suspended again.
 async fn ship_saved(
-    (scope, cfg, backend, start): (&CycleScope<'_>, &Config, &dyn Backend, &FixStart),
+    (scope, cfg, backend, start): (&CycleScope<'_>, &Config, &dyn Backend, &Subject<'_>),
     lane: &mut Lane,
     mut job: Reviewed,
     mut ending: Ending,
@@ -849,13 +994,14 @@ enum Curated {
 }
 
 /// Whether a curation is due, and what it starts from: the commit count
-/// and the fixer's transcript. Not when curation is off, for a single
-/// commit, or with no transcript to resume (logged).
+/// and the fixer's transcript. Not when curation is off, for an engage
+/// (its history is the PR's, published and reviewed as it is), for a
+/// single commit, or with no transcript to resume (logged).
 async fn curation_due(rounds: &Rounds<'_>, job: &Reviewed) -> Option<(usize, String)> {
     let (cfg, start) = (rounds.cfg, rounds.start);
     let commits = commit_count(start)
         .await
-        .filter(|n| cfg.review_curate && *n > 1)?;
+        .filter(|n| cfg.review_curate && start.change == Change::Fix && *n > 1)?;
     let Some(session) = job.rr.session_file.clone() else {
         let fid = start.finding.id;
         let message = format!(
@@ -887,7 +1033,7 @@ async fn curated_head(
     let tree = &start.ws.tree;
     let curating = ReviewedTree {
         before: tree_state(tree).await,
-        description: std::fs::read(tree.join(DESCRIPTION)).unwrap_or_default(),
+        description: std::fs::read(tree.join(start.description())).unwrap_or_default(),
     };
     let (Some(reviewed), Ok((cap, wall))) =
         (curating.before.head.clone(), rounds.allowance(&job.rr))
@@ -895,7 +1041,7 @@ async fn curated_head(
         return Curated::Not;
     };
     let Ok(prompt) =
-        playbooks::build_curate_prompt(&cfg.root, tree, &start.pinned, &start.branch, &reviewed)
+        playbooks::build_curate_prompt(&cfg.root, tree, start.pinned, start.branch, &reviewed)
     else {
         return Curated::Not;
     };
@@ -910,7 +1056,7 @@ async fn curated_head(
     let run = rounds
         .backend
         .run(
-            &start.ws,
+            start.ws,
             &prompt,
             cap,
             wall,
@@ -973,7 +1119,7 @@ async fn curated_head(
 /// is had again. A tree that could not be put back is recorded for
 /// [`restore_reviewed`] ([`undo_or_record`]), which runs next: no worker
 /// runs on it until it is.
-pub(super) async fn recover_curation(lane: &mut Lane, store: &Store, start: &FixStart) {
+pub(super) async fn recover_curation(lane: &mut Lane, store: &Store, start: &Subject<'_>) {
     let marker = start.ws.root.join(CURATING_FILE);
     let Some(curating) = read_json::<ReviewedTree>(&marker) else {
         return;
@@ -994,7 +1140,7 @@ pub(super) async fn recover_curation(lane: &mut Lane, store: &Store, start: &Fix
 /// Record that `start`'s fix owes its curation again ([`Owed::Curation`]),
 /// its review through and its verdict saved for the reviewed tree: a
 /// curation cut short by a restart, or whose changes had to be put back.
-fn owe_curation(start: &FixStart) {
+fn owe_curation(start: &Subject<'_>) {
     let progress = read_json::<Progress>(&start.ws.root.join(PROGRESS_FILE)).unwrap_or_default();
     write_progress(
         start,
@@ -1010,14 +1156,14 @@ fn owe_curation(start: &FixStart) {
 /// Whether `start`'s fix owes only its curation ([`Owed::Curation`]): its
 /// review is through, so the attempt runs no fixer, whatever the hold an
 /// operator released, and goes straight to the curation.
-pub(super) fn owes_curation(start: &FixStart) -> bool {
+pub(super) fn owes_curation(start: &Subject<'_>) -> bool {
     read_json::<Progress>(&start.ws.root.join(PROGRESS_FILE))
         .is_some_and(|progress| matches!(progress.owed, Some(Owed::Curation)))
 }
 
 /// How many commits `start`'s branch has on top of its pinned commit, if
 /// git can say.
-async fn commit_count(start: &FixStart) -> Option<usize> {
+async fn commit_count(start: &Subject<'_>) -> Option<usize> {
     let range = format!("{}..HEAD", start.pinned);
     let tree = start.ws.tree.clone();
     let (rc, commits) =
@@ -1030,7 +1176,7 @@ async fn commit_count(start: &FixStart) -> Option<usize> {
 /// Whether a curation that ended the tree as `after` (from `before`, at
 /// the `reviewed` commit) may ship: the commit count it left, or why not.
 async fn curated(
-    start: &FixStart,
+    start: &Subject<'_>,
     before: &TreeState,
     after: &TreeState,
     reviewed: &str,
@@ -1047,7 +1193,7 @@ async fn curated(
     let (tree, reviewed, pinned) = (
         start.ws.tree.clone(),
         reviewed.to_owned(),
-        start.pinned.clone(),
+        start.pinned.to_owned(),
     );
     let (same, descends) = tokio::task::spawn_blocking(move || {
         let same = Unheld::SameTree {
@@ -1090,8 +1236,8 @@ fn with_follow_ups(ending: &mut Ending, follow_ups: &[serde_json::Value]) {
 
 /// The saved verdict ([`ENDING_FILE`]), if it covers `start`'s tree
 /// exactly as it is now.
-async fn saved_ending(start: &FixStart) -> Option<Ending> {
-    let saved = covering_verdict(&start.ws).await?;
+async fn saved_ending(start: &Subject<'_>) -> Option<Ending> {
+    let saved = covering_verdict(start.ws).await?;
     Some(Ending {
         note: saved.note,
         head: None,
@@ -1126,7 +1272,7 @@ async fn covering_verdict(ws: &Workspace) -> Option<Saved> {
 /// round 1 again, under the same title and with them. `ending` is saved
 /// for the tree as it is when `keep` (a reviewer's own verdict).
 async fn end_loop(
-    start: &FixStart,
+    start: &Subject<'_>,
     ending: &Ending,
     follow_ups: Vec<serde_json::Value>,
     keep: bool,
@@ -1155,7 +1301,7 @@ async fn end_loop(
 }
 
 /// Save `ending` ([`ENDING_FILE`]) for `start`'s tree as it is now.
-async fn save_ending(start: &FixStart, ending: &Ending) {
+async fn save_ending(start: &Subject<'_>, ending: &Ending) {
     let saved = Saved {
         note: ending.note.clone(),
         title: ending.title.clone(),
@@ -1177,7 +1323,7 @@ async fn save_ending(start: &FixStart, ending: &Ending) {
 /// is reviewed afresh, as for any saved verdict. One that ships a
 /// reviewer-pinned commit in place of `HEAD` is not kept, and is reviewed
 /// again: a verdict is saved for `HEAD` only.
-pub(super) async fn keep_for_publish(start: &FixStart, ending: &Ending) {
+pub(super) async fn keep_for_publish(start: &Subject<'_>, ending: &Ending) {
     if ending.head.is_none() {
         save_ending(start, ending).await;
     }
@@ -1256,15 +1402,16 @@ impl Held {
 /// `false` when the report could not be written: the fix ships with the
 /// issues unresolved instead.
 fn hold(
-    start: &FixStart,
+    start: &Subject<'_>,
     round: u32,
     issues: &[serde_json::Value],
     (progress, stop, restoring): (&Progress, &str, Option<&str>),
 ) -> bool {
     let follow_ups = &progress.follow_ups;
     let root = &start.ws.root;
+    let (review, _) = start.names();
     let mut report = format!(
-        "# Held by the pre-PR review\n\nThe automated pre-PR review stopped at round \
+        "# Held by the {review}\n\nThe automated {review} stopped at round \
          {round} ({stop}) with issues unresolved. Continue to have the fixer \
          answer them; the review then runs again from round 1.\n\n"
     );
@@ -1321,7 +1468,7 @@ pub(super) const TREE_NOT_RESTORED: &str = "reviewed tree not restored";
 /// curator) was shown and could not be undone from, for
 /// [`restore_reviewed`] ([`RESTORE_FILE`]). A failure is logged: the tree
 /// then stays as the agent left it.
-fn record_restore(start: &FixStart, left: &Restore) {
+fn record_restore(start: &Subject<'_>, left: &Restore) {
     let written = serde_json::to_vec(left)
         .map_err(std::io::Error::other)
         .and_then(|bytes| std::fs::write(start.ws.root.join(RESTORE_FILE), bytes));
@@ -1339,7 +1486,7 @@ fn record_restore(start: &FixStart, left: &Restore) {
 /// ships, what the curator left.
 async fn undo_or_record(
     lane: &mut Lane,
-    start: &FixStart,
+    start: &Subject<'_>,
     reviewed: ReviewedTree,
 ) -> Result<(), String> {
     let undone = undo(lane, start, &reviewed.before, &reviewed.description).await;
@@ -1373,7 +1520,7 @@ async fn undo_or_record(
 pub(super) async fn restore_reviewed(
     lane: &mut Lane,
     store: &Store,
-    start: &FixStart,
+    start: &Subject<'_>,
 ) -> Result<(), String> {
     let path = start.ws.root.join(RESTORE_FILE);
     let Some(Restore { tree: reviewed, by }) = read_json::<Restore>(&path) else {
@@ -1412,7 +1559,8 @@ pub(super) async fn restore_reviewed(
 /// so.
 pub(super) fn held_resume_prompt(
     cfg: &Config,
-    start: &FixStart,
+    start: &Subject<'_>,
+    base: &str,
     detail: &str,
 ) -> Option<anyhow::Result<String>> {
     let held =
@@ -1422,15 +1570,17 @@ pub(super) fn held_resume_prompt(
         .and_then(|issues| {
             playbooks::build_review_followup_prompt(
                 &cfg.root,
+                start.playbooks().1,
                 &start.ws.tree,
-                &start.pinned,
+                base,
                 &issues,
-                decline_report(start.finding.kind),
+                start.decline(),
             )
         });
+    let (review, work) = start.names();
     Some(built.map(|prompt| {
         format!(
-            "An operator released this fix, which was held because the pre-PR review \
+            "An operator released this {work}, which was held because the {review} \
              left issues unanswered. Preserve the committed work; answer the \
              issues below.\n\n{prompt}"
         )
@@ -1440,7 +1590,7 @@ pub(super) fn held_resume_prompt(
 /// Record that a fixer ran on the prompt [`held_resume_prompt`] gave: the
 /// review hold's issues are no longer pending. Unrecorded, a later
 /// `continue` sends them again.
-pub(super) fn mark_held_sent(start: &FixStart) {
+pub(super) fn mark_held_sent(start: &Subject<'_>) {
     let path = start.ws.root.join(HELD_FILE);
     let Some(mut held) = read_json::<Held>(&path) else {
         return;
@@ -1500,8 +1650,12 @@ async fn send_back(
     match job_state(&fx) {
         FinishedState::Done => {
             take_run(&mut job.rr, &fx);
-            if ready_to_ship(start, &job.rr).await {
-                return Answered::ReviewAgain;
+            match ready_to_ship(start, &job.rr).await {
+                Ready::Review => return Answered::ReviewAgain,
+                // The answer took back every commit: the reply goes out
+                // alone, with no change to review.
+                Ready::Unchanged => return Answered::Ship(Ending::default()),
+                Ready::Not => {}
             }
             // A report (or a broken branch) ends the loop: `conclude_fix`
             // decides, and restarts the rounds on a report.
@@ -1558,14 +1712,15 @@ async fn no_answer(
     Answered::Ship(unresolved(round, issues, Some(why)))
 }
 
-/// A fix that concludes on a report (`BLOCKED.md`, a decline) starts any
+/// A change that concludes on a report (`BLOCKED.md`, a decline) starts any
 /// later review from round 1, keeping the title and follow-ups and nothing
 /// else (no issues owed from before the report, no stop): the
 /// operator's `continue` of a hold is a fresh start, however the report
 /// came to be (an answer, a suspended one, the attempt that finished it,
-/// or the review's own hold). Called from the one place every report is
-/// read, `conclude_fix`. Nothing to do without a review in progress.
-pub(super) fn restart_rounds(start: &FixStart) {
+/// or the review's own hold). Called from the one place each runner reads
+/// every report: `conclude_fix`, and an engage's hold on its `BLOCKED.md`.
+/// Nothing to do without a review in progress.
+pub(super) fn restart_rounds(start: &Subject<'_>) {
     if let Some(progress) = read_json::<Progress>(&start.ws.root.join(PROGRESS_FILE)) {
         write_progress(
             start,
@@ -1579,7 +1734,7 @@ pub(super) fn restart_rounds(start: &FixStart) {
 }
 
 /// Write `progress` to [`PROGRESS_FILE`]; a failure is logged.
-fn write_progress(start: &FixStart, progress: &Progress) {
+fn write_progress(start: &Subject<'_>, progress: &Progress) {
     let written = serde_json::to_vec(progress)
         .map_err(std::io::Error::other)
         .and_then(|bytes| std::fs::write(start.ws.root.join(PROGRESS_FILE), bytes));
@@ -1597,7 +1752,7 @@ fn write_progress(start: &FixStart, progress: &Progress) {
 /// re-send the transcript to be told to carry on, and goes straight back
 /// to the review loop. Only that job's own continuation does: an attempt
 /// that continues a later one runs its fixer.
-pub(super) fn suspended_between_runs(start: &FixStart, job: i64) -> bool {
+pub(super) fn suspended_between_runs(start: &Subject<'_>, job: i64) -> bool {
     read_json::<Progress>(&start.ws.root.join(PROGRESS_FILE))
         .is_some_and(|progress| progress.paused_by == Some(job))
 }
@@ -1606,7 +1761,7 @@ pub(super) fn suspended_between_runs(start: &FixStart, job: i64) -> bool {
 /// ([`ready_to_ship`] was false and no report concludes it): what
 /// `ship_pr` would say for nothing to ship, or that its commits could not
 /// be listed. Nothing unreviewed ships while the review is on.
-pub(super) async fn unshippable(start: &FixStart) -> String {
+pub(super) async fn unshippable(start: &Subject<'_>) -> String {
     let range = format!("{}..HEAD", start.pinned);
     let tree = start.ws.tree.clone();
     let (rc, commits) =
@@ -1620,25 +1775,42 @@ pub(super) async fn unshippable(start: &FixStart) -> String {
     }
 }
 
-/// Whether the fixer's run left a fix `conclude_fix` would ship: it
-/// finished, wrote no report, committed on top of the pinned commit, and
-/// described the change.
-async fn ready_to_ship(start: &FixStart, rr: &RunResult) -> bool {
+/// Whether the worker's run left a change to review ([`ready_to_ship`]).
+#[derive(Debug, PartialEq, Eq)]
+enum Ready {
+    /// It finished with commits on top of the pinned commit, wrote no
+    /// report, and a fixer described the change.
+    Review,
+    /// An engage that finished, wrote no report, and committed nothing: a
+    /// reply alone, with no change to review.
+    Unchanged,
+    /// Anything else: it did not finish, wrote a report, a fixer left no
+    /// description or committed nothing, or its commits could not be
+    /// listed.
+    Not,
+}
+
+/// Whether the worker's run left a change that would go out as it stands.
+async fn ready_to_ship(start: &Subject<'_>, rr: &RunResult) -> Ready {
     let tree = &start.ws.tree;
     if job_state(rr) != FinishedState::Done
-        || !tree.join("PR-DESCRIPTION.md").exists()
+        || (start.change == Change::Fix && !tree.join(DESCRIPTION).exists())
         || tree.join(BLOCKED_REPORT).exists()
-        || tree.join(decline_report(start.finding.kind)).exists()
+        || tree.join(start.decline()).exists()
     {
-        return false;
+        return Ready::Not;
     }
-    let range = format!("{}..HEAD", start.pinned);
+    let range = format!("{}..HEAD", start.base().await);
     let tree = tree.clone();
     let (rc, commits) =
         tokio::task::spawn_blocking(move || Unheld::Commits { range: &range }.run(&tree, 30))
             .await
             .unwrap_or((127, String::new()));
-    rc == 0 && !commits.trim().is_empty()
+    match (rc, commits.trim().is_empty(), start.change) {
+        (0, false, _) => Ready::Review,
+        (0, true, Change::Engage) => Ready::Unchanged,
+        _ => Ready::Not,
+    }
 }
 
 /// The subject of `tree`'s `HEAD`, if it has one.
@@ -1679,19 +1851,21 @@ async fn review_round(
         left: None,
         issues: Vec::new(),
     };
+    let base = start.base().await;
     let session = start.ws.review_session(start.job, round);
     let out = session.with_extension("json");
-    // The fixer's description, put back if the reviewer touches it: it is
-    // the PR body, and untracked, so no commit protects it.
-    let description = std::fs::read(start.ws.tree.join(DESCRIPTION)).unwrap_or_default();
+    // The worker's description, put back if the reviewer touches it: it
+    // goes out with the change, and untracked, so no commit protects it.
+    let description = std::fs::read(start.ws.tree.join(start.description())).unwrap_or_default();
     let prompt = match playbooks::build_review_prompt(
         &cfg.root,
-        &start.finding,
+        start.playbooks().0,
+        start.finding,
         &start.ws.tree,
-        &start.pinned,
+        &base,
         &String::from_utf8_lossy(&description),
         &out,
-        &start.repo,
+        start.repo,
         &Store::repo_notes(&cfg.work_root, start.repo.id),
     ) {
         Ok(prompt) => prompt,
@@ -1838,16 +2012,27 @@ async fn undo_reviewer(
     }
 }
 
-/// The fixer's description of its change: the PR body.
+/// A fixer's description of its change: the PR body.
 const DESCRIPTION: &str = "PR-DESCRIPTION.md";
 
-/// Whether `line`, of `git status --porcelain`, is the fixer's description's
-/// own: untracked (`??`), or tracked and changed since its commit (` M`),
-/// as a fixer that committed it and then updated it leaves it. Either way
-/// it belongs in the tree, its bytes are kept across every cleaning, and
-/// it is the PR body.
+/// An engage's reply on its PR: what it changed and why.
+const REPLY: &str = "PR-REPLY.md";
+
+/// An engage worker's withdrawal of its PR.
+const WITHDRAWAL: &str = "WITHDRAW.md";
+
+/// Every worker's description ([`Subject::description`]). A tree holds
+/// at most one: a fix's never has a reply, and an engage's, made at the
+/// PR's head, never has the fix's uncommitted description.
+const DESCRIPTIONS: [&str; 2] = [DESCRIPTION, REPLY];
+
+/// Whether `line`, of `git status --porcelain`, is the worker's
+/// description's own ([`DESCRIPTIONS`]): untracked (`??`), or tracked and
+/// changed since its commit (` M`), as a fixer that committed it and then
+/// updated it leaves it. Either way it belongs in the tree, its bytes are
+/// kept across every cleaning, and it goes out with the change.
 fn is_description_status(line: &str) -> bool {
-    matches!(line.split_at_checked(3), Some(("?? " | " M ", DESCRIPTION)))
+    matches!(line.split_at_checked(3), Some(("?? " | " M ", name)) if DESCRIPTIONS.contains(&name))
 }
 
 /// `git clean` of every untracked file and directory that is not ignored,
@@ -1897,20 +2082,21 @@ const UNREADABLE: &str = "the worktree's state could not be read (git failed)";
 /// clean removes it and the reset a staged one), as do ignored files
 /// (build caches, dependencies). What went, as `git status --porcelain`
 /// listed it; an error says why the round cannot be reviewed.
-async fn clean_tree(lane: &mut Lane, start: &FixStart) -> Result<Vec<String>, String> {
+async fn clean_tree(lane: &mut Lane, start: &Subject<'_>) -> Result<Vec<String>, String> {
     let tree = &start.ws.tree;
     let listed = uncommitted(tree).await?;
     if listed.is_empty() {
         return Ok(listed);
     }
-    let description = std::fs::read(tree.join(DESCRIPTION)).ok();
+    let name = start.description();
+    let description = std::fs::read(tree.join(name)).ok();
     let reset = vec![
         "reset".to_owned(),
         "--hard".to_owned(),
         "--quiet".to_owned(),
     ];
     let mut failed = git_ops(lane, start, cleaning(reset)).await;
-    if let Err(e) = write_description(tree, description.as_deref()) {
+    if let Err(e) = write_description(tree, name, description.as_deref()) {
         failed.push(e);
     } else {
         let left = uncommitted(tree).await?;
@@ -2005,7 +2191,7 @@ fn cleaned_note(cleaned: &[String]) -> String {
 
 /// Run the git commands `ops` in `start`'s tree, every one of them, under
 /// the clone's permit: what failed, each with the first line git said.
-async fn git_ops(lane: &mut Lane, start: &FixStart, ops: Vec<Vec<String>>) -> Vec<String> {
+async fn git_ops(lane: &mut Lane, start: &Subject<'_>, ops: Vec<Vec<String>>) -> Vec<String> {
     let permit = match lane.lock_clone(start.repo.id).await {
         Ok(permit) => permit,
         Err(e) => return vec![format!("locking the clone: {e}")],
@@ -2026,13 +2212,13 @@ async fn git_ops(lane: &mut Lane, start: &FixStart, ops: Vec<Vec<String>>) -> Ve
     failed.unwrap_or_else(|e| vec![e.to_string()])
 }
 
-/// Write the fixer's `description` back into `tree`, unless there was none.
-fn write_description(tree: &Path, description: Option<&[u8]>) -> Result<(), String> {
+/// Write the worker's `description` back into `tree` as `name`, unless
+/// there was none.
+fn write_description(tree: &Path, name: &str, description: Option<&[u8]>) -> Result<(), String> {
     let Some(description) = description else {
         return Ok(());
     };
-    std::fs::write(tree.join(DESCRIPTION), description)
-        .map_err(|e| format!("restoring {DESCRIPTION}: {e}"))
+    std::fs::write(tree.join(name), description).map_err(|e| format!("restoring {name}: {e}"))
 }
 
 /// Put `start`'s tree back to `before`, the clean tree a reviewer was
@@ -2052,7 +2238,7 @@ fn write_description(tree: &Path, description: Option<&[u8]>) -> Result<(), Stri
 /// error says what git could not do and what is still not back.
 async fn undo(
     lane: &mut Lane,
-    start: &FixStart,
+    start: &Subject<'_>,
     before: &TreeState,
     description: &[u8],
 ) -> Result<(), String> {
@@ -2068,7 +2254,7 @@ async fn undo(
             })
             .await;
     }
-    for report in [BLOCKED_REPORT, "NOT-A-BUG.md", "DECLINED.md"] {
+    for report in [BLOCKED_REPORT, "NOT-A-BUG.md", "DECLINED.md", WITHDRAWAL] {
         let _ = std::fs::remove_file(tree.join(report));
     }
     let head = before.head.clone().ok_or("no commit to go back to")?;
@@ -2083,7 +2269,7 @@ async fn undo(
     checkout.push(head);
     let mut failed = git_ops(lane, start, cleaning(checkout)).await;
     let description = before.description.as_ref().map(|_| description);
-    write_description(tree, description).map_err(|e| {
+    write_description(tree, start.description(), description).map_err(|e| {
         failed.push(e);
         failed.join("; ")
     })?;
@@ -2142,18 +2328,20 @@ async fn answer_review(
         .ok_or("the fixer left no transcript to resume")?;
     let (cap, wall) = rounds.allowance(job)?;
     let issues = serde_json::to_string_pretty(issues).map_err(|e| e.to_string())?;
+    let base = start.base().await;
     let prompt = playbooks::build_review_followup_prompt(
         &cfg.root,
+        start.playbooks().1,
         &start.ws.tree,
-        &start.pinned,
+        &base,
         &issues,
-        decline_report(start.finding.kind),
+        start.decline(),
     )
     .map_err(|e| format!("no follow-up prompt: {e}"))?;
     rounds
         .backend
         .run(
-            &start.ws,
+            start.ws,
             &prompt,
             cap,
             wall,
@@ -2198,8 +2386,9 @@ pub(super) async fn tree_state(tree: &Path) -> TreeState {
                 let (rc, out) = Unheld::Status.run(&tree, 60);
                 (rc == 0).then(|| out.trim_end().to_owned())
             },
-            description: std::fs::read(tree.join("PR-DESCRIPTION.md"))
-                .ok()
+            description: DESCRIPTIONS
+                .iter()
+                .find_map(|name| std::fs::read(tree.join(name)).ok())
                 .map(|bytes| Sha256::digest(bytes).to_vec()),
         }
     })
@@ -2336,7 +2525,7 @@ fn run_failure(rr: &RunResult) -> String {
     }
 }
 
-async fn log_round(store: &Store, start: &FixStart, round: u32, outcome: &str) {
+async fn log_round(store: &Store, start: &Subject<'_>, round: u32, outcome: &str) {
     let fid = start.finding.id;
     let message = format!("#{fid} review round {round}: {outcome}");
     let _ = fix_event(store, "review", fid, start.job, message).await;

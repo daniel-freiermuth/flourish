@@ -228,27 +228,34 @@ fn apply_prompts_render() {
 fn review_prompts_render() {
     let repo = sample_repo();
     let finding = sample_finding(FindingType::Bug);
-    let prompt = playbooks::build_review_prompt(
-        &root(),
-        &finding,
-        Path::new("/tmp/worktree"),
-        "abc123",
-        "the author's description",
-        &out_path(),
-        &repo,
-        "repo notes",
-    )
-    .expect("review.md must render with the slots build_review_prompt supplies");
-    assert_usable("review", &prompt);
-    let prompt = playbooks::build_review_followup_prompt(
-        &root(),
-        Path::new("/tmp/worktree"),
-        "abc123",
-        "[{\"blocking\": true, \"summary\": \"an issue\"}]",
-        "NOT-A-BUG.md",
-    )
-    .expect("review_followup.md must render with its builder's slots");
-    assert_usable("review_followup", &prompt);
+    for (reviewer, answer, decline) in [
+        ("review", "review_followup", "NOT-A-BUG.md"),
+        ("review_engage", "review_engage_followup", "WITHDRAW.md"),
+    ] {
+        let prompt = playbooks::build_review_prompt(
+            &root(),
+            &format!("{reviewer}.md"),
+            &finding,
+            Path::new("/tmp/worktree"),
+            "abc123",
+            "the author's description",
+            &out_path(),
+            &repo,
+            "repo notes",
+        )
+        .unwrap_or_else(|e| panic!("{reviewer}.md must render with its builder's slots: {e}"));
+        assert_usable(reviewer, &prompt);
+        let prompt = playbooks::build_review_followup_prompt(
+            &root(),
+            &format!("{answer}.md"),
+            Path::new("/tmp/worktree"),
+            "abc123",
+            "[{\"blocking\": true, \"summary\": \"an issue\"}]",
+            decline,
+        )
+        .unwrap_or_else(|e| panic!("{answer}.md must render with its builder's slots: {e}"));
+        assert_usable(answer, &prompt);
+    }
     let prompt = playbooks::build_curate_prompt(
         &root(),
         Path::new("/tmp/worktree"),
@@ -592,6 +599,8 @@ fn every_playbook_is_covered_by_this_test() {
         "pr_review",
         "review",
         "review_followup",
+        "review_engage",
+        "review_engage_followup",
         "curate",
     ]
     .iter()

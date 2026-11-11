@@ -240,9 +240,10 @@ pub struct Config {
     pub hunt_rehunt_days: i64,
     pub fix_max_wall_s: i64,
     /// review.maxRounds — how many times a finished fix is reviewed by a
-    /// fresh reviewer before it ships (`scheduler::review_fix`); the
-    /// fixer answers every round but the last, whose issues hold the fix
-    /// for the operator. 0 ships unreviewed.
+    /// fresh reviewer before it ships, and an engage's commits before they
+    /// are pushed (`scheduler::review::review_change`); the worker answers
+    /// every round but the last, whose issues hold the work for the
+    /// operator. 0 ships unreviewed.
     pub review_max_rounds: u32,
     /// review.curate — once a review ends in a ship with more than one
     /// commit, the fixer rewrites them into a few logical ones of the same
