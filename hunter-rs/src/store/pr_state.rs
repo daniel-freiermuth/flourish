@@ -247,7 +247,10 @@ impl PrRead<'_> {
 /// An observation whose activity is unknown (the forge could not read all
 /// the feedback) keeps the activity recorded for the same PR: taken for
 /// none, it would clear `new_comments`, and the next full read would raise
-/// it again with a fresh `attention_since`.
+/// it again with a fresh `attention_since`. With none recorded for that PR
+/// it records 0, never NULL: NULL is a PR never observed open, which
+/// [`record_dismiss`] answers up to the dismiss, and a dismiss must not
+/// answer feedback nobody read.
 pub(super) async fn record_open(
     tx: &mut ImmediateTx,
     finding_id: i64,
@@ -269,7 +272,7 @@ pub(super) async fn record_open(
         "INSERT INTO pr_state (finding_id, pr_number, state, mergeable, changes_requested, \
          checks, failing_checks, head_ref, head_sha, last_activity_at, synced_at, \
          observed_push_count) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, COALESCE(?10, 0), ?11, ?12) \
          ON CONFLICT(finding_id) DO UPDATE SET \
          pr_number = excluded.pr_number, \
          state = excluded.state, \
@@ -279,9 +282,9 @@ pub(super) async fn record_open(
          failing_checks = excluded.failing_checks, \
          head_ref = excluded.head_ref, \
          head_sha = excluded.head_sha, \
-         last_activity_at = CASE WHEN excluded.last_activity_at IS NULL \
+         last_activity_at = CASE WHEN ?10 IS NULL \
              AND pr_state.pr_number = excluded.pr_number \
-             THEN pr_state.last_activity_at ELSE excluded.last_activity_at END, \
+             THEN COALESCE(pr_state.last_activity_at, 0) ELSE excluded.last_activity_at END, \
          synced_at = excluded.synced_at, \
          observed_push_count = excluded.observed_push_count, \
          harvested_at = CASE WHEN pr_state.pr_number <> excluded.pr_number \
