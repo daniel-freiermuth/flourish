@@ -25,7 +25,7 @@ use hunter::attention::{
     ProblemsAnswer,
 };
 use hunter::config::Config;
-use hunter::domain::{FindingStatus, ForgeName};
+use hunter::domain::{FindingJobKind, FindingStatus, ForgeName, HoldReason, ReleaseAction};
 use hunter::forge::Mergeable;
 use hunter::store::{FindingInsert, RecordedPrState, SeenActivity, Store};
 use serde_json::{Value, json};
@@ -738,6 +738,31 @@ async fn activity_after_the_watermark_is_new_comments() {
     assert_eq!(ps.attention_fingerprint, None);
 }
 
+const GL_REPO_URL: &str = "https://gitlab.com/acme/widget";
+const GL_MR_URL: &str = "https://gitlab.com/acme/widget/-/merge_requests/7";
+
+/// Script `glab` to serve [`GL_MR_URL`], open and passing, with `notes`
+/// as the shell that answers its notes request; project member 5 is a
+/// developer.
+fn serve_mr(bins: &FakeBins, notes: &str) {
+    const MR: &str = r#"{"state":"opened","detailed_merge_status":"mergeable","source_branch":"fix/some-bug","sha":"deadbeef","updated_at":"2026-01-02T03:04:05Z","title":"t","description":"d","head_pipeline":{"status":"success"}}"#;
+    bins.script(
+        "glab",
+        &format!(
+            "case \"$*\" in\n\
+             \x20 *members/all/5*) echo '{{\"access_level\":30}}'; exit 0 ;;\n\
+             \x20 *notes*) {notes} ;;\n\
+             esac\n\
+             cat <<'__MR_EOF__'\n{MR}\n__MR_EOF__\nexit 0"
+        ),
+    );
+}
+
+/// [`serve_mr`]'s notes request failing.
+const NOTES_DOWN: &str = "echo 'notes endpoint is down' >&2; exit 1";
+/// [`serve_mr`]'s notes: one by member 5 at [`LATER_MS`].
+const NOTE_AT_LATER: &str = r#"echo '[{"body":"please rename","created_at":"2026-01-02T04:00:00Z","author":{"id":5,"username":"dev"}}]'; exit 0"#;
+
 /// A GitLab MR's notes are a second request, and the sync view tolerates
 /// it failing: the MR's state is still worth having. The notes are then
 /// unknown, not absent, so a pass that cannot read them leaves the
@@ -747,9 +772,6 @@ async fn activity_after_the_watermark_is_new_comments() {
 /// `attention_since`, at the back of the attention order.
 #[tokio::test]
 async fn a_gitlab_pass_that_cannot_read_the_notes_keeps_the_recorded_activity() {
-    const GL_REPO_URL: &str = "https://gitlab.com/acme/widget";
-    const GL_MR_URL: &str = "https://gitlab.com/acme/widget/-/merge_requests/7";
-    const MR: &str = r#"{"state":"opened","detailed_merge_status":"mergeable","source_branch":"fix/some-bug","sha":"deadbeef","updated_at":"2026-01-02T03:04:05Z","title":"t","description":"d","head_pipeline":{"status":"success"}}"#;
     let f = fixture_on(
         "sync-gl-notes-down",
         ForgeName::Gitlab,
@@ -758,28 +780,14 @@ async fn a_gitlab_pass_that_cannot_read_the_notes_keeps_the_recorded_activity() 
     )
     .await;
     let bins = FakeBins::acquire("sync-gl-notes-down");
-    let serve_mr = |notes: &str| {
-        bins.script(
-            "glab",
-            &format!(
-                "case \"$*\" in\n\
-                 \x20 *members/all/5*) echo '{{\"access_level\":30}}'; exit 0 ;;\n\
-                 \x20 *notes*) {notes} ;;\n\
-                 esac\n\
-                 cat <<'__MR_EOF__'\n{MR}\n__MR_EOF__\nexit 0"
-            ),
-        );
-    };
-    serve_mr(
-        r#"echo '[{"body":"please rename","created_at":"2026-01-02T04:00:00Z","author":{"id":5,"username":"dev"}}]'; exit 0"#,
-    );
+    serve_mr(&bins, NOTE_AT_LATER);
     let first = f.sync().await;
     assert_eq!((first.synced, first.attention), (1, 1), "{first:?}");
     let flagged = f.pr_state().await;
     assert_eq!(flagged.last_activity_at, Some(LATER_MS));
     assert_eq!(flagged.needs_attention.as_deref(), Some("new_comments"));
 
-    serve_mr("echo 'notes endpoint is down' >&2; exit 1");
+    serve_mr(&bins, NOTES_DOWN);
     let second = f.sync().await;
 
     assert_eq!((second.synced, second.errors), (1, 0), "{second:?}");
@@ -787,6 +795,64 @@ async fn a_gitlab_pass_that_cannot_read_the_notes_keeps_the_recorded_activity() 
     assert_eq!(ps.last_activity_at, Some(LATER_MS), "{ps:?}");
     assert_eq!(ps.needs_attention.as_deref(), Some("new_comments"));
     assert_eq!(ps.attention_since, flagged.attention_since);
+}
+
+/// Dismissing a held engage answers the feedback read so far, not every
+/// note up to the dismiss: an MR first seen while its notes could not be
+/// read has none read, so a note from before the dismiss is still
+/// `new_comments` once the notes can be read.
+#[tokio::test]
+async fn a_dismiss_during_a_notes_outage_leaves_the_unread_notes_new() {
+    let f = fixture_on(
+        "sync-gl-dismiss-unread",
+        ForgeName::Gitlab,
+        GL_REPO_URL,
+        GL_MR_URL,
+    )
+    .await;
+    let bins = FakeBins::acquire("sync-gl-dismiss-unread");
+    serve_mr(&bins, NOTES_DOWN);
+    let first = f.sync().await;
+    assert_eq!((first.synced, first.errors), (1, 0), "{first:?}");
+    assert!(
+        support::scope(&f.store)
+            .store()
+            .hold_work(
+                f.fid,
+                FindingJobKind::Engage,
+                HoldReason::Stuck,
+                "pr view failed",
+                None
+            )
+            .await
+            .unwrap()
+    );
+    let by = support::operator(&f.store).await;
+    f.store
+        .release_hold(
+            f.fid,
+            FindingJobKind::Engage,
+            &hunter::store::HoldRelease {
+                action: ReleaseAction::Dismiss,
+                reason: None,
+                classification: None,
+                by: &by,
+            },
+        )
+        .await
+        .unwrap();
+    serve_mr(&bins, NOTE_AT_LATER);
+
+    let result = f.sync().await;
+
+    assert_eq!((result.synced, result.errors), (1, 0), "{result:?}");
+    let ps = f.pr_state().await;
+    assert_eq!(ps.last_activity_at, Some(LATER_MS));
+    assert_eq!(
+        ps.needs_attention.as_deref(),
+        Some("new_comments"),
+        "the dismiss answered no note: none had been read ({ps:?})"
+    );
 }
 
 // ---------------------------------------------------------------------------
