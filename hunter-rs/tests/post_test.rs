@@ -3,7 +3,6 @@
 //! `NullBackend` over a WRITABLE tempdir copy of dev.db, with a scheduler
 //! handle standing in for the daemon's loop.
 
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -79,11 +78,8 @@ fn require_enforced_permissions() {
 /// - repo 1 "demo" with findings 1 (new, fp-1), 2 (queued, fp-2),
 ///   3 (new, fp-3) — delete must refuse;
 /// - repo 2 "clean" with no findings/jobs — delete must succeed.
-async fn seeded_store(dir: &Path) -> Store {
-    let db = dir.join("hunter.db");
-    std::fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/dev.db"), &db).unwrap();
-    let opts = sqlx::sqlite::SqliteConnectOptions::new().filename(&db);
-    let pool = sqlx::SqlitePool::connect_with(opts).await.unwrap();
+async fn seeded_store(dir: &support::TempDir) -> Store {
+    let (db, pool) = support::fresh_pool(dir, "hunter").await;
     sqlx::query(
         "INSERT INTO repos (id, name, url, path, forge, default_branch, enabled, added_at) VALUES \
          (1, 'demo', 'https://example.com/demo.git', '/tmp/demo', 'github', 'main', 1, 1000), \
@@ -116,7 +112,7 @@ async fn seeded_store(dir: &Path) -> Store {
 async fn test_state() -> TestState {
     let dir = support::TempDir::new("post");
     dir.subdir("ui");
-    let store = seeded_store(dir.path()).await;
+    let store = seeded_store(&dir).await;
     let config = Config {
         root: dir.path().to_path_buf(),
         work_root: dir.join("data"),
@@ -2665,11 +2661,7 @@ async fn verdicts_follow_the_finding_state_machine() {
 #[tokio::test]
 async fn operator_writes_lose_to_a_status_change_after_their_check() {
     let state = test_state().await;
-    let pool = sqlx::SqlitePool::connect_with(
-        sqlx::sqlite::SqliteConnectOptions::new().filename(state.dir.join("hunter.db")),
-    )
-    .await
-    .unwrap();
+    let pool = support::open_pool(state.dir.join("hunter.db")).await;
     // A verdict with a reason and one without take different writes
     // (`Store::transition` writes the reason and anchor only for the
     // first), so both are staged.

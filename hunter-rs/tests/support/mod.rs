@@ -113,12 +113,19 @@ pub fn db_copy(dir: &TempDir, name: &str) -> PathBuf {
     dst
 }
 
+/// Raw writable pool over the existing database at `db`, for fixtures
+/// that seed rows, install triggers, or age timestamps the `Store` API
+/// does not reach.
+pub async fn open_pool(db: impl AsRef<Path>) -> SqlitePool {
+    SqlitePool::connect_with(SqliteConnectOptions::new().filename(db))
+        .await
+        .expect("open pool")
+}
+
 /// Raw pool over a fresh database copy, for seeding fixtures.
 pub async fn fresh_pool(dir: &TempDir, name: &str) -> (PathBuf, SqlitePool) {
     let path = db_copy(dir, name);
-    let pool = SqlitePool::connect_with(SqliteConnectOptions::new().filename(&path))
-        .await
-        .expect("open pool");
+    let pool = open_pool(&path).await;
     (path, pool)
 }
 
@@ -135,9 +142,7 @@ pub async fn fresh_store(dir: &TempDir, name: &str) -> (PathBuf, Store) {
 /// `CycleScope::claim_fix` may take that claim. The status triggers fire
 /// as for any write.
 pub async fn seed_status(db: &Path, id: i64, status: hunter::domain::FindingStatus) {
-    let pool = SqlitePool::connect_with(SqliteConnectOptions::new().filename(db))
-        .await
-        .expect("open pool");
+    let pool = open_pool(db).await;
     sqlx::query("UPDATE findings SET status = ?1 WHERE id = ?2")
         .bind(status.as_str())
         .bind(id)

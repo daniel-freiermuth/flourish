@@ -1148,10 +1148,7 @@ async fn a_fix_held_as_gave_up_resumes_told_why() {
     }
     // The scheduler's over-budget hold, on the attempt that left a
     // transcript: what `hold_over_budget` writes.
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     sqlx::query(
         "UPDATE work_holds SET reason = 'gave_up', \
          detail = 'resume chain over budget: 900000 tok across the chain' \
@@ -1604,10 +1601,7 @@ async fn a_verdict_after_selection_wins_over_a_stale_report() {
 #[tokio::test]
 async fn a_hold_that_cannot_be_recorded_returns_the_finding_to_queued() {
     let f = fixture("fix-block-not-recorded").await;
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     sqlx::raw_sql(
         "CREATE TRIGGER refuse_hold BEFORE INSERT ON work_holds \
          BEGIN SELECT RAISE(ABORT, 'injected'); END;",
@@ -2237,10 +2231,7 @@ async fn a_runner_error_while_the_provider_is_unreachable_counts_nothing() {
     .await;
     let forge = support::FORGE_HOST;
     let provider = support::PROVIDER_HOST;
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     sqlx::query("UPDATE repos SET url = ?1")
         .bind(format!("https://{forge}/acme/widget"))
         .execute(&pool)
@@ -4208,10 +4199,7 @@ async fn a_fix_the_forge_refused_waits_then_publishes_without_redoing_it() {
         route_push(&f, Some(&nowhere.to_string_lossy()));
         format!("url.{}.insteadOf", nowhere.display())
     };
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     let age_jobs = async || {
         sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
             .bind(hunter::scheduler::PUBLISH_RETRY_MS)
@@ -4327,10 +4315,7 @@ async fn continuing_a_held_refused_fix_does_not_wait() {
     )
     .await;
     // Released the very millisecond the refusal ended: still since then.
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     sqlx::query(
         "UPDATE work_holds SET released_at = (SELECT finished_at FROM jobs WHERE id = ?1)
          WHERE finding_id = ?2",
@@ -4423,10 +4408,7 @@ async fn a_released_fix_retry_whose_run_failed_stays_kept_when_refused_again() {
     assert_eq!(again.outcome.as_deref(), Some("requeued"), "{again:?}");
     assert_eq!(failing.runs().len(), 1, "the released fixer ran");
     assert_eq!(checkpoint(&f).await, again.job_id, "still kept");
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     let (state, notes): (String, Option<String>) =
         sqlx::query_as("SELECT state, notes FROM jobs WHERE id = ?1")
             .bind(again.job_id)
@@ -4456,10 +4438,7 @@ async fn a_kept_fix_publishes_past_a_spent_budget_and_an_unreachable_provider() 
     let key = format!("url.{}.insteadOf", nowhere.display());
     git(&f.repo_dir, &["config", "--unset-all", &key]);
     route_push(&f, None);
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
         .bind(24 * 60 * 60_000_i64)
         .execute(&pool)
@@ -4551,11 +4530,7 @@ async fn a_kept_fix_keeps_its_rank() {
         let plan = if released {
             released_resume(&f).await
         } else {
-            let pool = sqlx::SqlitePool::connect_with(
-                sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db),
-            )
-            .await
-            .unwrap();
+            let pool = support::open_pool(&f.db).await;
             sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
                 .bind(24 * 60 * 60_000_i64)
                 .execute(&pool)
@@ -4620,10 +4595,7 @@ async fn the_free_fallback_offers_each_kept_fix_in_turn() {
         .unwrap();
         assert_eq!(refused.outcome.as_deref(), Some("requeued"), "{refused:?}");
     }
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
         .bind(24 * 60 * 60_000_i64)
         .execute(&pool)
@@ -4662,10 +4634,7 @@ async fn publishes_past_a_down_forge(overridden_first: bool) {
     review_on(&mut f, 3);
     let gitlab = bystander_on_gitlab(&f).await;
     let older = f.fid - 1;
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     f.store
         .set_finding_status(older, hunter::domain::FindingStatus::Queued)
         .await
@@ -4738,10 +4707,7 @@ async fn bystander_on_gitlab(f: &Fixture) -> &'static str {
         hunter::store::Store::repo_dir(&repos_root, rid),
     )
     .unwrap();
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     sqlx::query("UPDATE findings SET repo_id = ?1 WHERE id = ?2")
         .bind(rid)
         .bind(f.fid - 1)
@@ -4878,10 +4844,7 @@ async fn hold_bystander(f: &Fixture) {
 
 /// Take every repo out of the rotation.
 async fn disable_repos(f: &Fixture) {
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     sqlx::query("UPDATE repos SET enabled = 0")
         .execute(&pool)
         .await
@@ -4910,10 +4873,7 @@ async fn refuse_both(f: &Fixture, aged: i64) -> [i64; 2] {
             "--add",
         ],
     );
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     let mut ends = [0; 2];
     for (end, (fid, aged)) in ends.iter_mut().zip([(older, aged), (f.fid, 0)]) {
         let finding = f.store.get_finding(fid).await.unwrap().unwrap();
@@ -4958,10 +4918,7 @@ async fn the_summary_previews_a_free_retry_as_allowed_with_the_budget_spent() {
     route_push(&f, Some(&nowhere.to_string_lossy()));
     let refused = fix(&f, &reviewed_worker(vec![Act::Fix, Act::Review(CLEAN)])).await;
     assert_eq!(refused.outcome.as_deref(), Some("requeued"), "{refused:?}");
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
         .bind(24 * 60 * 60_000_i64)
         .execute(&pool)
@@ -5024,10 +4981,7 @@ async fn a_refusal_while_the_provider_is_down_counts_as_a_refusal() {
     route_push(&f, Some(&nowhere.to_string_lossy()));
     let refused = fix(&f, &reviewed_worker(vec![Act::Fix, Act::Review(CLEAN)])).await;
     assert_eq!(refused.outcome.as_deref(), Some("requeued"), "{refused:?}");
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
         .bind(24 * 60 * 60_000_i64)
         .execute(&pool)
@@ -5071,10 +5025,7 @@ async fn a_slow_refusal_waits_from_when_it_came() {
     let returned = hunter::util::now_ms();
 
     assert_eq!(refused.outcome.as_deref(), Some("requeued"), "{refused:?}");
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     let (started, finished): (i64, i64) =
         sqlx::query_as("SELECT started_at, finished_at FROM jobs WHERE id = ?1")
             .bind(refused.job_id)
@@ -5116,10 +5067,7 @@ async fn a_refused_fix_at_the_resume_ceiling_is_still_continued() {
     let finished = reviewed_worker(vec![Act::Continue, Act::Review(CLEAN)]);
     let refused = resume(&f, &plan, &finished).await;
     assert_eq!(refused.outcome.as_deref(), Some("requeued"), "{refused:?}");
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     // Every link spent (four attempts, the ceiling), and the wait is over.
     sqlx::query("UPDATE jobs SET tokens_new = 1000, finished_at = finished_at - ?1")
         .bind(hunter::scheduler::PUBLISH_RETRY_MS)
@@ -5177,10 +5125,7 @@ async fn a_fix_kept_offline_is_given_up_when_its_spare_ends() {
     route_push(&f, Some(&nowhere.to_string_lossy()));
     let refused = fix(&f, &reviewed_worker(vec![Act::Fix, Act::Review(CLEAN)])).await;
     assert_eq!(refused.outcome.as_deref(), Some("requeued"), "{refused:?}");
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
         .bind(hunter::scheduler::PUBLISH_RETRY_MS)
         .execute(&pool)
@@ -5219,10 +5164,7 @@ async fn a_continued_refused_fix_gets_the_spare_again() {
     review_on(&mut f, 3);
     let nowhere = f.cfg.work_root.join("refusing.git");
     route_push(&f, Some(&nowhere.to_string_lossy()));
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     // Every link spent, and every wait over.
     let age = async || {
         sqlx::query("UPDATE jobs SET tokens_new = 1000, finished_at = finished_at - ?1")
@@ -5317,10 +5259,7 @@ async fn a_refused_fix_after_a_failed_review_ships_on_its_retry() {
     let key = format!("url.{}.insteadOf", nowhere.display());
     git(&f.repo_dir, &["config", "--unset-all", &key]);
     route_push(&f, None);
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
         .bind(24 * 60 * 60_000_i64)
         .execute(&pool)
@@ -5364,10 +5303,7 @@ async fn a_refused_fix_with_a_pinned_verdict_is_reserved_for_and_reviewed_again(
     let key = format!("url.{}.insteadOf", nowhere.display());
     git(&f.repo_dir, &["config", "--unset-all", &key]);
     route_push(&f, None);
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
         .bind(24 * 60 * 60_000_i64)
         .execute(&pool)
@@ -5401,10 +5337,7 @@ async fn a_saved_verdict_for_another_tree_does_not_spare_the_reservation() {
     route_push(&f, Some(&nowhere.to_string_lossy()));
     let refused = fix(&f, &reviewed_worker(vec![Act::Fix, Act::Review(CLEAN)])).await;
     assert_eq!(refused.outcome.as_deref(), Some("requeued"), "{refused:?}");
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
         .bind(24 * 60 * 60_000_i64)
         .execute(&pool)
@@ -7949,11 +7882,7 @@ async fn a_fix_with_nothing_to_review_fails_with_what_it_lacks() {
 
         assert_eq!(summary.failure.as_deref(), Some(failure), "{summary:?}");
         assert_eq!(worker.runs().len(), 1, "{failure}: no reviewer");
-        let pool = sqlx::SqlitePool::connect_with(
-            sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db),
-        )
-        .await
-        .unwrap();
+        let pool = support::open_pool(&f.db).await;
         let job: (String, Option<String>) =
             sqlx::query_as("SELECT state, notes FROM jobs WHERE id = ?1")
                 .bind(summary.job_id)

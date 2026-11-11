@@ -48,9 +48,7 @@ struct Fixture {
 impl Fixture {
     /// A writable side connection, for columns no Store method writes.
     async fn pool(&self) -> sqlx::SqlitePool {
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&self.db))
-            .await
-            .unwrap()
+        support::open_pool(&self.db).await
     }
 }
 

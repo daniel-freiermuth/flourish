@@ -96,10 +96,7 @@ impl Rig {
                 done()
             }
         });
-        let pool =
-            sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&db))
-                .await
-                .unwrap();
+        let pool = support::open_pool(&db).await;
         Self {
             bins,
             _dir: dir,

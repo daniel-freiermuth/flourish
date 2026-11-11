@@ -50,22 +50,14 @@ impl Fixture {
     /// A raw read-only look at the database, for columns the Store API has
     /// no reader for.
     async fn scalar(&self, sql: &'static str) -> Option<i64> {
-        let pool = sqlx::SqlitePool::connect_with(
-            sqlx::sqlite::SqliteConnectOptions::new().filename(&self.db),
-        )
-        .await
-        .unwrap();
+        let pool = support::open_pool(&self.db).await;
         let row: Option<(Option<i64>,)> = sqlx::query_as(sql).fetch_optional(&pool).await.unwrap();
         row.and_then(|r| r.0)
     }
 
     /// A raw write, for states the Store API never produces.
     async fn exec(&self, sql: &'static str) {
-        let pool = sqlx::SqlitePool::connect_with(
-            sqlx::sqlite::SqliteConnectOptions::new().filename(&self.db),
-        )
-        .await
-        .unwrap();
+        let pool = support::open_pool(&self.db).await;
         sqlx::query(sql).execute(&pool).await.unwrap();
     }
 }
@@ -821,10 +813,7 @@ async fn a_classification_that_cannot_be_recorded_is_retried() {
     let bins = FakeBins::acquire("harvest-record-fails");
     gh_default(&bins);
     let f = fixture("harvest-record-fails", FindingStatus::Closed).await;
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     sqlx::query(
         "CREATE TRIGGER no_harvest_stamp BEFORE UPDATE OF harvested_at ON pr_state \
          BEGIN SELECT RAISE(ABORT, 'injected harvested_at failure'); END",
@@ -911,11 +900,7 @@ async fn a_classification_that_cannot_be_recorded_spends_only_a_once_override() 
             .set_budget_override(f.fid, Some(mode))
             .await
             .unwrap();
-        let pool = sqlx::SqlitePool::connect_with(
-            sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db),
-        )
-        .await
-        .unwrap();
+        let pool = support::open_pool(&f.db).await;
         sqlx::query(
             "CREATE TRIGGER no_harvest_stamp BEFORE UPDATE OF harvested_at ON pr_state \
              BEGIN SELECT RAISE(ABORT, 'injected harvested_at failure'); END",
@@ -1610,10 +1595,7 @@ async fn a_resumed_harvest_keeps_its_chains_base_while_origin_moves() {
 /// on, so failures are re-probed (#95 layer 2). Whether `host` answers is
 /// up to the test backend (`ScriptedBackend::offline`).
 async fn served_at(f: &mut Fixture, host: &str) {
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     sqlx::query("UPDATE repos SET url = ?1")
         .bind(format!("https://{host}/acme/widget"))
         .execute(&pool)

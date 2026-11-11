@@ -246,10 +246,7 @@ async fn a_failed_settle_is_the_cycles_error_and_is_retried_before_the_next() {
     let jobs = store.list_jobs(10).await.unwrap();
     assert_eq!(jobs.len(), 1, "no work starts while a settle is owed");
 
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&path))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&path).await;
     sqlx::raw_sql("DROP TRIGGER no_settle")
         .execute(&pool)
         .await

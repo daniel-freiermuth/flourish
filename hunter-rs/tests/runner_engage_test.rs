@@ -109,11 +109,7 @@ impl Fixture {
     /// `pr_state.addressed_fingerprint` — set when an engage cycle has
     /// taken its shot at the current attention reason.
     async fn addressed_fp(&self) -> Option<String> {
-        let pool = sqlx::SqlitePool::connect_with(
-            sqlx::sqlite::SqliteConnectOptions::new().filename(&self.db),
-        )
-        .await
-        .unwrap();
+        let pool = support::open_pool(&self.db).await;
         let row: Option<(Option<String>,)> =
             sqlx::query_as("SELECT addressed_fingerprint FROM pr_state WHERE finding_id = ?1")
                 .bind(self.fid)
@@ -127,11 +123,7 @@ impl Fixture {
     /// own Store API exposes no reader for it, and the point of the test
     /// is what was persisted.
     async fn pr_state(&self) -> Option<String> {
-        let pool = sqlx::SqlitePool::connect_with(
-            sqlx::sqlite::SqliteConnectOptions::new().filename(&self.db),
-        )
-        .await
-        .unwrap();
+        let pool = support::open_pool(&self.db).await;
         let row: Option<(String,)> =
             sqlx::query_as("SELECT state FROM pr_state WHERE finding_id = ?1")
                 .bind(self.fid)
@@ -143,11 +135,7 @@ impl Fixture {
 
     /// `pr_state.needs_attention` as `sync_prs` persisted it.
     async fn attention(&self) -> Option<String> {
-        let pool = sqlx::SqlitePool::connect_with(
-            sqlx::sqlite::SqliteConnectOptions::new().filename(&self.db),
-        )
-        .await
-        .unwrap();
+        let pool = support::open_pool(&self.db).await;
         let row: Option<(Option<String>,)> =
             sqlx::query_as("SELECT needs_attention FROM pr_state WHERE finding_id = ?1")
                 .bind(self.fid)
@@ -160,11 +148,7 @@ impl Fixture {
     /// Every job row, oldest first: `(id, kind, state, resumed_from,
     /// estimated_tokens, pinned_sha)`.
     async fn jobs(&self) -> Vec<JobRow> {
-        let pool = sqlx::SqlitePool::connect_with(
-            sqlx::sqlite::SqliteConnectOptions::new().filename(&self.db),
-        )
-        .await
-        .unwrap();
+        let pool = support::open_pool(&self.db).await;
         sqlx::query_as(
             "SELECT id, kind, state, resumed_from, estimated_tokens, pinned_sha \
              FROM jobs ORDER BY id",
@@ -177,11 +161,7 @@ impl Fixture {
     /// `(state, killed_reason, notes)` of one job, straight from the
     /// database: what a retirement rewrote and what it kept.
     async fn job_row(&self, id: i64) -> (String, Option<String>, Option<String>) {
-        let pool = sqlx::SqlitePool::connect_with(
-            sqlx::sqlite::SqliteConnectOptions::new().filename(&self.db),
-        )
-        .await
-        .unwrap();
+        let pool = support::open_pool(&self.db).await;
         sqlx::query_as("SELECT state, killed_reason, notes FROM jobs WHERE id = ?1")
             .bind(id)
             .fetch_one(&pool)
@@ -192,11 +172,7 @@ impl Fixture {
     /// Run a statement against the fixture database, to put `pr_state`
     /// or the finding into a shape the store has no writer for.
     async fn exec(&self, sql: &'static str) {
-        let pool = sqlx::SqlitePool::connect_with(
-            sqlx::sqlite::SqliteConnectOptions::new().filename(&self.db),
-        )
-        .await
-        .unwrap();
+        let pool = support::open_pool(&self.db).await;
         sqlx::query(sql).execute(&pool).await.unwrap();
     }
 
@@ -520,10 +496,7 @@ async fn a_closure_that_cannot_be_recorded_is_retried_by_the_next_sync() {
     let f = fixture("sync-closed-unrecorded").await;
     let bins = FakeBins::acquire("sync-closed-unrecorded");
     bins.ok("gh", PR_CLOSED_JSON);
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     sqlx::query(
         "CREATE TRIGGER no_close BEFORE UPDATE OF state ON pr_state \
          WHEN NEW.state = 'CLOSED' \
@@ -1958,10 +1931,7 @@ async fn an_unrecorded_closed_verdict_starts_no_harvest_and_waits_for_the_sync()
     let f = fixture("handoff-verdict-unrecorded").await;
     let bins = FakeBins::acquire("handoff-verdict-unrecorded");
     gh_for_handoff(&bins);
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     sqlx::query(
         "CREATE TRIGGER no_closed_verdict BEFORE UPDATE OF status ON findings \
          WHEN NEW.status = 'closed' \
@@ -2029,10 +1999,7 @@ async fn a_withdrawal_whose_finding_another_decision_closed_keeps_that_verdict()
     let f = fixture("handoff-other-first").await;
     let bins = FakeBins::acquire("handoff-other-first");
     gh_for_handoff(&bins);
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     sqlx::query(
         "CREATE TRIGGER other_first BEFORE UPDATE OF status ON findings \
          WHEN NEW.status = 'closed' AND NEW.verdict_reason IS NOT 'operator: closed' \
@@ -2087,10 +2054,7 @@ async fn a_withdrawal_the_sync_recorded_first_still_continues_into_its_harvest()
     let f = fixture("handoff-sync-first").await;
     let bins = FakeBins::acquire("handoff-sync-first");
     gh_for_handoff(&bins);
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     assert_eq!(
         hunter::transition::PR_CLOSED_AWAITING_HARVEST,
         "PR closed without merge; awaiting harvest",
@@ -2199,10 +2163,7 @@ async fn an_unrecorded_close_starts_no_harvest_and_waits_for_the_sync() {
     let f = fixture("handoff-unrecorded").await;
     let bins = FakeBins::acquire("handoff-unrecorded");
     gh_for_handoff(&bins);
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     sqlx::query(
         "CREATE TRIGGER no_close BEFORE UPDATE OF state ON pr_state \
          WHEN NEW.state = 'CLOSED' \
@@ -2915,10 +2876,7 @@ async fn a_kept_engage_retries_its_publish_without_a_worker_run() {
     });
     let refused = f.run(&finished).await.unwrap();
     assert_eq!(refused.outcome.as_deref(), Some("retry"), "{refused:?}");
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     let idle = ScriptedBackend::new(support::done_with_transcript);
     let retry = async || {
         // Past any wait, however many refusals came before.
@@ -3023,10 +2981,7 @@ async fn an_engage_whose_reply_was_refused_after_its_push_only_replies_again() {
         "neither continued nor redone before the wait: {waits:?}"
     );
 
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
         .bind(hunter::scheduler::PUBLISH_RETRY_MS)
         .execute(&pool)
@@ -3060,10 +3015,7 @@ async fn an_engage_whose_reply_was_refused_after_its_push_only_replies_again() {
         pushed,
         "no second push"
     );
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     let push_count: i64 =
         sqlx::query_scalar("SELECT push_count FROM pr_state WHERE finding_id = ?1")
             .bind(f.fid)
@@ -3085,10 +3037,7 @@ async fn kept_after_its_push(f: &Fixture, bins: &FakeBins) -> std::path::PathBuf
     });
     let refused = f.run(&finished).await.unwrap();
     assert_eq!(refused.outcome.as_deref(), Some("retry"), "{refused:?}");
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
         .bind(24 * 60 * 60_000_i64)
         .execute(&pool)
@@ -3140,10 +3089,7 @@ async fn a_kept_engage_that_cannot_read_the_branch_does_not_push_again() {
 
     assert_eq!(replied.outcome.as_deref(), Some("engaged"), "{replied:?}");
     assert_eq!(git(&origin, &["rev-parse", BRANCH]), pushed);
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     let push_count: i64 =
         sqlx::query_scalar("SELECT push_count FROM pr_state WHERE finding_id = ?1")
             .bind(f.fid)
@@ -3268,10 +3214,7 @@ async fn a_kept_engage_is_redecided_after_new_feedback() {
 /// started on no recorded head, so only the commit its tree was created
 /// at counts as its start.
 async fn redecided(f: &Fixture, head: &str, synced_at: i64, activity: Option<i64>) -> bool {
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     sqlx::query(
         "UPDATE pr_state SET head_sha = ?1, synced_at = ?2, last_activity_at = ?3 \
          WHERE finding_id = ?4",
@@ -3406,11 +3349,7 @@ async fn a_kept_reply_is_redecided_when_its_branch_moved() {
         });
         let refused = f.run(&replying).await.unwrap();
         assert_eq!(refused.outcome.as_deref(), Some("retry"), "{refused:?}");
-        let pool = sqlx::SqlitePool::connect_with(
-            sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db),
-        )
-        .await
-        .unwrap();
+        let pool = support::open_pool(&f.db).await;
         sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
             .bind(24 * 60 * 60_000_i64)
             .execute(&pool)
@@ -3738,10 +3677,7 @@ async fn withdrawal_reason_posted_once(comment_errs: bool) {
         Some("withdraw-failed"),
         "{refused:?}"
     );
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
         .bind(24 * 60 * 60_000_i64)
         .execute(&pool)
@@ -3833,11 +3769,7 @@ async fn a_reply_that_landed_despite_an_error_is_not_posted_again() {
         });
         let refused = f.run(&replying).await.unwrap();
         assert_eq!(refused.outcome.as_deref(), Some("retry"), "{refused:?}");
-        let pool = sqlx::SqlitePool::connect_with(
-            sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db),
-        )
-        .await
-        .unwrap();
+        let pool = support::open_pool(&f.db).await;
         sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
             .bind(24 * 60 * 60_000_i64)
             .execute(&pool)
@@ -4691,11 +4623,7 @@ async fn a_failed_pr_view_counts_only_while_the_forge_is_reachable() {
     let host = support::FORGE_HOST;
     for counted in [false, true] {
         let mut f = fixture("engage-view-offline").await;
-        let pool = sqlx::SqlitePool::connect_with(
-            sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db),
-        )
-        .await
-        .unwrap();
+        let pool = support::open_pool(&f.db).await;
         sqlx::query("UPDATE repos SET url = ?1")
             .bind(format!("https://{host}/acme/widget"))
             .execute(&pool)
@@ -4741,10 +4669,7 @@ async fn paused_then_served_at(
         .await
         .unwrap();
     assert_eq!(paused.outcome.as_deref(), Some("suspended"), "{paused:?}");
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     sqlx::query("UPDATE repos SET url = ?1, forge = ?2")
         .bind(format!("https://{host}/acme/widget"))
         .bind(forge)
@@ -5006,10 +4931,7 @@ async fn an_engage_that_needs_a_maintainer_is_held_on_its_report() {
 /// the admin lane's PR sync writes when it sees the merge, done here
 /// without a sync pass so the test can place it exactly.
 async fn merge_finding(db: &Path, fid: i64) {
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(db).await;
     sqlx::query("UPDATE findings SET status = 'merged' WHERE id = ?1")
         .bind(fid)
         .execute(&pool)

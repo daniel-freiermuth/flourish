@@ -1,10 +1,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Router-level tests: `tower::util::ServiceExt::oneshot` against
 //! `hunter::server::router` with a Store over a tempdir copy of dev.db
-//! (seeded writable, then reopened read-only — same helper pattern as the
-//! store tests, deliberately duplicated rather than shared).
+//! (seeded writable through `support::fresh_pool`, then reopened
+//! read-only).
 
-use std::path::Path;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -40,11 +39,8 @@ impl std::ops::Deref for TestState {
 
 /// Copy dev.db into `dir`, seed one repo + one finding + one event through
 /// a writable pool, then reopen the file strictly read-only.
-async fn seeded_store(dir: &Path) -> Store {
-    let db = dir.join("hunter.db");
-    std::fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/dev.db"), &db).unwrap();
-    let opts = sqlx::sqlite::SqliteConnectOptions::new().filename(&db);
-    let pool = sqlx::SqlitePool::connect_with(opts).await.unwrap();
+async fn seeded_store(dir: &support::TempDir) -> Store {
+    let (db, pool) = support::fresh_pool(dir, "hunter").await;
     sqlx::query(
         "INSERT INTO repos (id, name, url, path, forge, default_branch, enabled, added_at) \
          VALUES (1, 'demo', 'https://example.com/demo.git', '/tmp/demo', 'github', 'main', 1, 1000)",
@@ -85,7 +81,7 @@ async fn seeded_store(dir: &Path) -> Store {
 async fn test_state() -> TestState {
     let dir = support::TempDir::new("server");
     dir.subdir("ui");
-    let store = seeded_store(dir.path()).await;
+    let store = seeded_store(&dir).await;
     let config = Config {
         root: dir.path().to_path_buf(),
         work_root: dir.join("data"),
@@ -311,11 +307,7 @@ async fn stats_horizon_windows_every_aggregate() {
             .as_millis(),
     )
     .unwrap();
-    let pool = sqlx::SqlitePool::connect_with(
-        sqlx::sqlite::SqliteConnectOptions::new().filename(&state.config.db_path),
-    )
-    .await
-    .unwrap();
+    let pool = support::open_pool(&state.config.db_path).await;
     sqlx::query(
         "INSERT INTO findings (id, type, repo_id, fingerprint, severity, confidence, summary, \
          status, created_at, updated_at) \
