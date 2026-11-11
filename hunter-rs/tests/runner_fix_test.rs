@@ -1041,6 +1041,64 @@ async fn a_held_fix_resumes_against_what_held_it() {
     );
 }
 
+/// A fix held as `gave_up` (its chain went far over its budget) resumes
+/// told why it was held, not that it kept failing the same way: nothing
+/// failed, the scheduler only stopped continuing it.
+#[tokio::test]
+async fn a_fix_held_as_gave_up_resumes_told_why() {
+    let f = fixture("fix-gave-up-resume").await;
+    let unfinished = ScriptedBackend::new(|tree| {
+        std::fs::write(tree.join("candidate.txt"), "partial fix\n").unwrap();
+        git(tree, &["add", "candidate.txt"]);
+        git(tree, &["commit", "-m", "partial candidate"]);
+        let session = tree.parent().unwrap().join("session/session.jsonl");
+        std::fs::write(
+            &session,
+            "{\"message\":{\"role\":\"assistant\",\"usage\":{\"input\":1000,\"output\":100,\"cacheWrite\":0}}}\n",
+        )
+        .unwrap();
+        let mut result = support::done();
+        result.session_file = Some(session.to_string_lossy().into_owned());
+        result
+    });
+    for _ in 0..3 {
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        hunter::scheduler::run_fix(
+            &support::scope(&f.store),
+            f.store.test_lane(),
+            &f.cfg,
+            Attempt::Cold(&finding),
+            &unfinished,
+        )
+        .await
+        .unwrap();
+    }
+    // The scheduler's over-budget hold, on the attempt that left a
+    // transcript: what `hold_over_budget` writes.
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    sqlx::query(
+        "UPDATE work_holds SET reason = 'gave_up', \
+         detail = 'resume chain over budget: 900000 tok across the chain' \
+         WHERE released_at IS NULL",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let prompt = resumed_hold_prompt(&f).await;
+
+    assert!(
+        prompt.contains("give-up ceiling")
+            && prompt.contains("Why it was held")
+            && prompt.contains("resume chain over budget: 900000 tok"),
+        "{prompt}"
+    );
+    assert!(!prompt.contains("kept failing the same way"), "{prompt}");
+}
+
 /// A resume of a chain that was never blocked (a cap suspension) is the
 /// plain continuation, and ending without an outcome is a plain requeue.
 #[tokio::test]
