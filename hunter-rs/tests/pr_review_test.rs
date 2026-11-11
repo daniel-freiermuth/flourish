@@ -146,6 +146,16 @@ fn set_view(f: &Fixture, state: &str, head: &str, author: &str) {
 
 /// [`set_view`] of a PR whose head is in `owner`'s fork.
 fn set_fork_view(f: &Fixture, state: &str, (head, author): (&str, &str), owner: &str) {
+    write_view(f, state, (head, author), &json!({ "login": owner }));
+}
+
+/// [`set_view`] of a PR from a fork GitHub names no owner of
+/// (`headRepositoryOwner` null: the fork is gone).
+fn set_ownerless_view(f: &Fixture, (head, author): (&str, &str)) {
+    write_view(f, "OPEN", (head, author), &Value::Null);
+}
+
+fn write_view(f: &Fixture, state: &str, (head, author): (&str, &str), owner: &Value) {
     let view = json!({
         "state": state,
         "headRefOid": head,
@@ -155,7 +165,7 @@ fn set_fork_view(f: &Fixture, state: &str, (head, author): (&str, &str), owner: 
         "title": "make the widget faster",
         "body": "it is faster now",
         "isCrossRepository": true,
-        "headRepositoryOwner": { "login": owner },
+        "headRepositoryOwner": owner,
     });
     std::fs::write(f.dir.join("view.json"), view.to_string()).unwrap();
 }
@@ -3462,6 +3472,207 @@ esac"#,
             (None, Some(owner))
         );
     }
+}
+
+/// A fork the forge names no owner of (GitHub's `headRepositoryOwner`
+/// null on a cross-repo PR) has nobody to ask whether they can push: its
+/// code runs only on a vouch, for "the fork's unnamed owner", and the forge
+/// is never asked about an empty login. A vouched review of it runs; one
+/// vouched for a named owner whose fork then reads owner-less has changed
+/// hands and runs nothing.
+#[tokio::test]
+async fn a_pr_from_a_fork_with_no_named_owner_needs_a_vouch() {
+    let bins = FakeBins::acquire("prr-fork-unnamed");
+    let f = fixture("prr-fork-unnamed").await;
+    gh_maintainer_pushes(&bins, &f);
+    let head = rev(&f.origin_work, "HEAD");
+    set_ownerless_view(&f, (&head, "maintainer"));
+    let state = app_state(&f);
+    let ask = |pr: i64, vouch: bool| {
+        let state = state.clone();
+        async move {
+            post(
+                &state,
+                "/api/pr-review",
+                json!({ "repo_id": f.rid, "pr": pr, "watch": true, "vouch": vouch }),
+            )
+            .await
+        }
+    };
+
+    let (status, body) = ask(7, false).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        (
+            &body["needs_vouch"],
+            &body["vouch_for"],
+            &body["head_owner"],
+            &body["cross_repo"]
+        ),
+        (
+            &json!(true),
+            &json!(["the fork's unnamed owner"]),
+            &json!(""),
+            &json!(true)
+        ),
+        "the author can push; nobody can be asked about the fork"
+    );
+    let error = body["error"].as_str().unwrap();
+    assert!(
+        error.contains("the fork's unnamed owner cannot push")
+            && error.contains("a fork the forge names no owner of"),
+        "{body}"
+    );
+    assert!(f.store.list_pr_reviews().await.unwrap().is_empty());
+    let asked: Vec<String> = bins
+        .calls_to("gh")
+        .into_iter()
+        .filter(|c| c.get(1).is_some_and(|a| a == "api"))
+        .map(|c| c.join(" "))
+        .collect();
+    assert!(
+        asked
+            .iter()
+            .all(|c| c.contains("collaborators/maintainer/")),
+        "only the author is asked about: {asked:?}"
+    );
+
+    let (status, body) = ask(7, true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id = body["id"].as_i64().unwrap();
+    let review = f.store.get_pr_review(id).await.unwrap().unwrap();
+    assert_eq!(
+        (
+            review.vouched_author.as_deref(),
+            review.vouched_head_owner.as_deref(),
+            review.decided_head_owner.as_deref(),
+            review.head_owner.as_deref(),
+        ),
+        (None, Some(""), Some(""), Some(""))
+    );
+    assert_eq!(
+        events(&f, "pr_review").await.last().map(String::as_str),
+        Some("review of widget PR #7 requested (vouched for the fork's unnamed owner)")
+    );
+    let backend = reporting();
+    let summary = run_cycle(&mut support::jobs(&f.store), &f.cfg, &backend, None).await;
+    assert_eq!(
+        backend.runs().len(),
+        1,
+        "the vouched-for fork's code is reviewed: {summary:?}"
+    );
+
+    // PR #8 is vouched for as stranger's fork, which then reads owner-less.
+    set_fork_view(&f, "OPEN", (&head, "maintainer"), "stranger");
+    let (status, body) = ask(8, true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let eight = body["id"].as_i64().unwrap();
+    set_ownerless_view(&f, (&head, "maintainer"));
+    let summary = run_cycle(&mut support::jobs(&f.store), &f.cfg, &backend, None).await;
+    assert_eq!(backend.runs().len(), 1, "no reviewer ran: {summary:?}");
+    assert!(
+        summary
+            .skipped
+            .as_deref()
+            .is_some_and(|why| why.contains("a fork the forge names no owner of")),
+        "{summary:?}"
+    );
+    let review = f.store.get_pr_review(eight).await.unwrap().unwrap();
+    assert!(review.fork_changed_hands(), "{review:?}");
+}
+
+/// A GitLab MR's source project that reads 404 (deleted, or hidden from
+/// hunter's login) is a fork GitLab names no owner of: the MR still reads,
+/// and its code runs only on a vouch. Any other failed read of the project
+/// fails the request, recording nothing.
+#[tokio::test]
+async fn a_gitlab_mr_from_a_gone_project_needs_a_vouch() {
+    let bins = FakeBins::acquire("prr-gl-fork-gone");
+    let f = fixture("prr-gl-fork-gone").await;
+    let mr = |iid: i64, source: i64| {
+        json!({
+            "iid": iid, "state": "opened", "sha": "a".repeat(40), "title": format!("mr {iid}"),
+            "description": "d", "source_branch": "feature", "target_branch": "main",
+            "author": { "id": 6, "username": "dev" },
+            "source_project_id": source, "target_project_id": 1, "draft": false,
+            "web_url": format!("https://gitlab.com/acme/widget/-/merge_requests/{iid}"),
+        })
+    };
+    let (seven, eight) = (f.dir.join("mr7.json"), f.dir.join("mr8.json"));
+    std::fs::write(&seven, mr(7, 2).to_string()).unwrap();
+    std::fs::write(&eight, mr(8, 3).to_string()).unwrap();
+    bins.script(
+        "glab",
+        &format!(
+            r#"case "$2" in
+  */merge_requests/7) cat '{seven}';;
+  */merge_requests/8) cat '{eight}';;
+  projects/2) echo 'glab: 404 Project Not Found (HTTP 404)' >&2; exit 1;;
+  projects/3) echo 'glab: 500 Internal Server Error (HTTP 500)' >&2; exit 1;;
+  users\?username=dev) echo '[{{"id":6,"username":"dev"}}]';;
+  */members/all/6) echo '{{"access_level":30}}';;
+  user) echo '{{"id":1,"username":"hunter-bot"}}';;
+  */members/all/1) echo '{{"access_level":30}}';;
+  *) echo "unexpected glab $*" >&2; exit 1;;
+esac"#,
+            seven = seven.display(),
+            eight = eight.display(),
+        ),
+    );
+    let rid = f
+        .store
+        .add_repo(
+            "gl-widget",
+            "https://gitlab.com/acme/widget",
+            &f.dir.subdir("gl-repos"),
+            "main",
+            ForgeName::Gitlab,
+        )
+        .await
+        .unwrap();
+    let state = app_state(&f);
+    let ask = |pr: i64, vouch: bool| {
+        let state = state.clone();
+        async move {
+            post(
+                &state,
+                "/api/pr-review",
+                json!({ "repo_id": rid, "pr": pr, "watch": true, "vouch": vouch }),
+            )
+            .await
+        }
+    };
+
+    let (status, body) = ask(7, false).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        (&body["vouch_for"], &body["head_owner"], &body["cross_repo"]),
+        (
+            &json!(["the fork's unnamed owner"]),
+            &json!(""),
+            &json!(true)
+        ),
+    );
+    let (status, body) = ask(7, true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let review = f
+        .store
+        .get_pr_review(body["id"].as_i64().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            review.vouched_author.as_deref(),
+            review.vouched_head_owner.as_deref()
+        ),
+        (None, Some(""))
+    );
+
+    let (status, body) = ask(8, true).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.to_string().contains("cannot read PR #8"), "{body}");
+    assert_eq!(f.store.list_pr_reviews().await.unwrap().len(), 1);
 }
 
 /// The Reviews page lists every review with a link to its PR, and a
