@@ -187,6 +187,9 @@ fn read_template(root: &Path, name: &str) -> Result<String> {
         .with_context(|| format!("failed to read playbook template {}", path.display()))
 }
 
+/// Default `{{REPO_NOTES}}` when the repo has none.
+const NO_NOTES: &str = "(No notes yet)";
+
 /// Substitute a default when the repo has no notes.
 ///
 /// Despite the name it once had, this does *not* escape anything: the
@@ -415,7 +418,10 @@ fn decline_instructions() -> String {
     format!("{DECLINE_CLASSIFICATION}\n\n{VERDICT_CONDITION}")
 }
 
-pub fn build_fix_prompt(
+/// Shared body of the prompts that work a finding on its own branch
+/// (`fix.md` and the `apply_*.md` playbooks).
+fn build_branch_prompt(
+    template: &str,
     root: &Path,
     finding: &Finding,
     worktree: &Path,
@@ -423,8 +429,8 @@ pub fn build_fix_prompt(
     repo: &Repo,
     repo_notes: &str,
 ) -> Result<String> {
-    let notes = notes_or_default(repo_notes, "(No notes yet)");
-    let template = read_template(root, "fix.md")?;
+    let notes = notes_or_default(repo_notes, NO_NOTES);
+    let template = read_template(root, template)?;
     let mut slots = HashMap::new();
     slots.insert("WORKTREE", worktree.display().to_string());
     slots.insert("BRANCH", branch.to_owned());
@@ -435,26 +441,15 @@ pub fn build_fix_prompt(
     render(&template, &slots)
 }
 
-/// The three apply playbooks take the same slots.
-fn build_apply_prompt(
+pub fn build_fix_prompt(
     root: &Path,
-    template_name: &str,
     finding: &Finding,
     worktree: &Path,
     branch: &str,
     repo: &Repo,
     repo_notes: &str,
 ) -> Result<String> {
-    let notes = notes_or_default(repo_notes, "(No notes yet)");
-    let template = read_template(root, template_name)?;
-    let mut slots = HashMap::new();
-    slots.insert("WORKTREE", worktree.display().to_string());
-    slots.insert("BRANCH", branch.to_owned());
-    slots.insert("FINDING_JSON", finding_json(finding));
-    slots.insert("REPO_NAME", repo.name.clone());
-    slots.insert("REPO_NOTES", notes);
-    slots.insert("DECLINE_CLASSIFICATION", decline_instructions());
-    render(&template, &slots)
+    build_branch_prompt("fix.md", root, finding, worktree, branch, repo, repo_notes)
 }
 
 pub fn build_apply_improvement_prompt(
@@ -465,9 +460,9 @@ pub fn build_apply_improvement_prompt(
     repo: &Repo,
     repo_notes: &str,
 ) -> Result<String> {
-    build_apply_prompt(
-        root,
+    build_branch_prompt(
         "apply_improvement.md",
+        root,
         finding,
         worktree,
         branch,
@@ -484,9 +479,9 @@ pub fn build_apply_modernization_prompt(
     repo: &Repo,
     repo_notes: &str,
 ) -> Result<String> {
-    build_apply_prompt(
-        root,
+    build_branch_prompt(
         "apply_modernization.md",
+        root,
         finding,
         worktree,
         branch,
@@ -503,9 +498,9 @@ pub fn build_apply_simplification_prompt(
     repo: &Repo,
     repo_notes: &str,
 ) -> Result<String> {
-    build_apply_prompt(
-        root,
+    build_branch_prompt(
         "apply_simplification.md",
+        root,
         finding,
         worktree,
         branch,
@@ -527,7 +522,7 @@ pub fn build_review_prompt(
     repo: &Repo,
     repo_notes: &str,
 ) -> Result<String> {
-    let notes = notes_or_default(repo_notes, "(No notes yet)");
+    let notes = notes_or_default(repo_notes, NO_NOTES);
     let template = read_template(root, "review.md")?;
     let mut slots = HashMap::new();
     slots.insert("WORKTREE", worktree.display().to_string());
@@ -592,7 +587,7 @@ pub fn build_pr_review_prompt(
     earlier: &[EarlierIssue],
     new_commits: bool,
 ) -> Result<String> {
-    let notes = notes_or_default(repo_notes, "(No notes yet)");
+    let notes = notes_or_default(repo_notes, NO_NOTES);
     let template = read_template(root, "pr_review.md")?;
     let mut slots = HashMap::new();
     slots.insert("REPO_NAME", repo.name.clone());
@@ -673,7 +668,7 @@ pub fn build_engage_prompt(
     repo_notes: &str,
 ) -> Result<String> {
     let _ = finding; // engage template does not embed the finding JSON
-    let notes = notes_or_default(repo_notes, "(No notes yet)");
+    let notes = notes_or_default(repo_notes, NO_NOTES);
     let attention = ps
         .needs_attention
         .as_deref()
@@ -718,7 +713,7 @@ pub fn build_harvest_prompt(
     repo_notes: &str,
 ) -> Result<String> {
     let _ = branch; // harvest template does not use branch directly
-    let notes = notes_or_default(repo_notes, "(No notes yet)");
+    let notes = notes_or_default(repo_notes, NO_NOTES);
     let template = read_template(root, "harvest.md")?;
     let mut slots = HashMap::new();
     slots.insert("WORKTREE", worktree.display().to_string());
@@ -810,7 +805,7 @@ pub fn build_harvest_closed_prompt(
     base: &str,
     repo_notes: &str,
 ) -> Result<String> {
-    let notes = notes_or_default(repo_notes, "(No notes yet)");
+    let notes = notes_or_default(repo_notes, NO_NOTES);
     let db = &repo.default_branch;
     let state = match tree {
         ClosedTree::DefaultBranch => format!(
@@ -855,7 +850,7 @@ pub fn build_recheck_prompt(
     out_path: &Path,
     repo_notes: &str,
 ) -> Result<String> {
-    let notes = notes_or_default(repo_notes, "(No notes yet)");
+    let notes = notes_or_default(repo_notes, NO_NOTES);
     let template = read_template(root, "recheck.md")?;
     let mut slots = HashMap::new();
     slots.insert("REPO_PATH", tree.display().to_string());
@@ -883,7 +878,7 @@ fn build_analysis_prompt(
     known_slot: &str,
     max_slot: &str,
 ) -> Result<String> {
-    let notes = notes_or_default(repo_notes, "(No notes yet)");
+    let notes = notes_or_default(repo_notes, NO_NOTES);
     let template = read_template(root, template_name)?;
     let mut slots = HashMap::new();
     slots.insert("REPO_PATH", tree.display().to_string());
@@ -1049,7 +1044,7 @@ pub fn build_standards_prompt(
     max_findings: i64,
     repo_notes: &str,
 ) -> Result<String> {
-    let notes = notes_or_default(repo_notes, "(No notes yet)");
+    let notes = notes_or_default(repo_notes, NO_NOTES);
     let template = read_template(root, "standards.md")?;
     // CODING_STANDARDS.md is the entire point of this job type — refuse to
     // build a prompt without it rather than waste tokens on a blind audit.
