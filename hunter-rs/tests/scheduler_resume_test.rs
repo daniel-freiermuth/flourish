@@ -15,7 +15,6 @@ use std::sync::{Arc, OnceLock};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use hunter::backend::{Backend, JobClass, Outlook, Verdict};
-use hunter::config::Config;
 use hunter::domain::{FindingJobKind, FindingStatus, JobKind, JobState, RepoJobKind};
 use hunter::scheduler::{
     Attempt, Candidate, ResumePlan, Resumed, kind, pick_next, preview_next, record_job, run_fix,
@@ -55,44 +54,6 @@ async fn fresh_db() -> (TempDir, PathBuf, SqlitePool) {
 /// the selection path under test writes.
 async fn rw_store(path: &Path) -> Store {
     Store::connect(path).await.unwrap()
-}
-
-fn test_config(root: &Path) -> Config {
-    Config {
-        root: root.to_path_buf(),
-        work_root: root.join("data"),
-        db_path: root.join("hunter.db"),
-        serve_port: 0,
-        serve_host: std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST),
-        allowed_hosts: hunter::config::HostAllowList::default(),
-        ui_dir: root.join("ui"),
-        omp_bin: "omp".to_owned(),
-        stale_after_s: 300.0,
-        cache_ttl_s: 3600.0,
-        poll_s: 2.0,
-        session_grace_s: 120,
-        min_free_disk_bytes: 0,
-        model_default: None,
-        model_smol: None,
-        model_hunt: None,
-        model_fix: None,
-        backend_type: "omp-scavenge".to_owned(),
-        llm_provider: hunter::backends::omp_scavenge::LlmProvider::Anthropic,
-        provider_hosts: None,
-        network_gate: false,
-        hunt_max_wall_s: 1800,
-        hunt_max_findings: 8,
-        fix_max_wall_s: 2700,
-        review_max_rounds: 0,
-        review_curate: false,
-        hunt_rehunt_days: 90,
-        scan_interval_days: 1.0,
-        modernization_interval_days: 30,
-        standards_interval_days: 30,
-        simplification_interval_days: 30,
-        renovate_github_token: None,
-        review_bots: hunter::forge::ReviewBots::default(),
-    }
 }
 
 /// One enabled repo whose clone directory really exists.
@@ -146,7 +107,7 @@ fn seed_session(dir: &TempDir) -> PathBuf {
 /// expects to find it: a tree directory and a session directory. Returns
 /// the session directory.
 fn seed_workspace(dir: &TempDir, origin: i64) -> PathBuf {
-    let root = test_config(dir.path())
+    let root = support::test_config(dir.path())
         .work_root
         .join("jobs")
         .join(origin.to_string());
@@ -365,7 +326,7 @@ async fn resume_reserves_context_plus_the_remaining_estimate() {
     let spent = 40_000;
     seed_suspension(&pool, 10, &session, spent).await;
     let store = rw_store(&path).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
 
     let plan = resume_plan_of(
         pick_next(&support::scope(&store), &cfg, None)
@@ -407,7 +368,7 @@ async fn a_resume_reserves_at_least_as_much_work_as_it_resends_context() {
     let spent = Z + 30_000;
     seed_suspension(&pool, 10, &session, spent).await;
     let store = rw_store(&path).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
 
     let plan = resume_plan_of(
         pick_next(&support::scope(&store), &cfg, None)
@@ -436,7 +397,7 @@ async fn resume_falls_back_to_the_per_kind_estimate_when_the_transcript_is_unrea
     let spent = 40_000;
     seed_suspension(&pool, 10, &missing, spent).await;
     let store = rw_store(&path).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
 
     let plan = resume_plan_of(
         pick_next(&support::scope(&store), &cfg, None)
@@ -497,7 +458,7 @@ async fn resume_measures_context_from_the_last_real_call_not_the_killed_one() {
     let spent = 40_000;
     seed_suspension(&pool, 10, &session, spent).await;
     let store = rw_store(&path).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
 
     let plan = resume_plan_of(
         pick_next(&support::scope(&store), &cfg, None)
@@ -533,7 +494,7 @@ async fn resume_falls_back_to_the_per_kind_estimate_when_every_call_was_killed()
     let spent = 40_000;
     seed_suspension(&pool, 10, &session, spent).await;
     let store = rw_store(&path).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
 
     let plan = resume_plan_of(
         pick_next(&support::scope(&store), &cfg, None)
@@ -581,9 +542,13 @@ async fn zero_progress_handoffs_do_not_exhaust_the_useful_work_retry_limit() {
     let stats = store.resume_chain_stats(newest, None).await.unwrap();
     assert_eq!(stats.attempts, 2);
     assert_eq!(stats.total, 230_000);
-    let picked = pick_next(&support::scope(&store), &test_config(dir.path()), None)
-        .await
-        .unwrap();
+    let picked = pick_next(
+        &support::scope(&store),
+        &support::test_config(dir.path()),
+        None,
+    )
+    .await
+    .unwrap();
     assert!(
         matches!(picked, Some(Candidate::Resume { plan, .. }) if plan.predecessor_id() == newest)
     );
@@ -608,9 +573,13 @@ async fn zero_spend_cap_kills_still_exhaust_the_attempt_limit() {
         4
     );
 
-    let picked = pick_next(&support::scope(&store), &test_config(dir.path()), None)
-        .await
-        .unwrap();
+    let picked = pick_next(
+        &support::scope(&store),
+        &support::test_config(dir.path()),
+        None,
+    )
+    .await
+    .unwrap();
 
     assert!(
         !matches!(picked, Some(Candidate::Resume { .. })),
@@ -638,7 +607,7 @@ async fn a_chain_out_of_attempts_is_given_up_and_counted() {
     // typical, so only the attempt count can end this.
     let newest = seed_chain(&pool, &session, &[10_000; 4]).await;
     let store = rw_store(&path).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
 
     let picked = pick_next(&support::scope(&store), &cfg, None)
         .await
@@ -688,7 +657,7 @@ async fn a_chain_that_outspends_the_typical_outside_its_biggest_attempt_is_retir
     // which 400_000 is outside the larger attempt, against 3x 100_000.
     let newest = seed_chain(&pool, &session, &[400_000, 400_000]).await;
     let store = rw_store(&path).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
 
     let picked = pick_next(&support::scope(&store), &cfg, None)
         .await
@@ -721,7 +690,7 @@ async fn a_chain_of_one_attempt_is_never_retired() {
     // not work, because continuing has not been tried.
     seed_suspension(&pool, 10, &session, 50 * Z).await;
     let store = rw_store(&path).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
 
     let plan = resume_plan_of(
         pick_next(&support::scope(&store), &cfg, None)
@@ -750,7 +719,7 @@ async fn the_biggest_attempt_is_set_aside_before_the_chain_is_judged() {
     let session = seed_session(&dir);
     let newest = seed_chain(&pool, &session, &[500_000, 10_000]).await;
     let store = rw_store(&path).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
 
     let plan = resume_plan_of(
         pick_next(&support::scope(&store), &cfg, None)
@@ -777,7 +746,7 @@ async fn the_give_up_ceiling_is_exclusive() {
     let session = seed_session(&dir);
     let newest = seed_chain(&pool, &session, &[400_000, 3 * Z]).await;
     let store = rw_store(&path).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
 
     let plan = resume_plan_of(
         pick_next(&support::scope(&store), &cfg, None)
@@ -811,7 +780,7 @@ async fn a_queued_fix_outranks_a_resume_which_outranks_rotation() {
     .await
     .unwrap();
     let store = rw_store(&path).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
 
     let picked = pick_next(&support::scope(&store), &cfg, None)
         .await
@@ -851,7 +820,7 @@ async fn a_suspension_whose_working_directory_is_gone_is_given_up() {
     seed_history(&pool).await;
     let session = seed_session(&dir);
     seed_suspension(&pool, 10, &session, 10_000).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
     let workspace = cfg.work_root.join("jobs").join("10");
     std::fs::remove_dir_all(workspace.join("tree")).unwrap();
     let store = rw_store(&path).await;
@@ -900,7 +869,7 @@ async fn a_suspension_whose_working_directory_is_gone_is_given_up() {
 async fn a_flagged_pr_resumes_its_suspended_engage_instead_of_starting_fresh() {
     let (dir, path, pool) = fresh_db().await;
     seed_repo(&pool, &dir).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
     seed_flagged_finding(&pool, 5).await;
     seed_quiet_finding(&pool, 6).await;
     for (id, kind, finding) in [(20, "engage", 5), (21, "engage", 6), (22, "fix", 5)] {
@@ -935,7 +904,7 @@ async fn a_flagged_pr_resumes_its_suspended_engage_instead_of_starting_fresh() {
 async fn a_plan_loads_only_as_its_own_kind() {
     let (dir, path, pool) = fresh_db().await;
     seed_repo(&pool, &dir).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
     seed_flagged_finding(&pool, 5).await;
     let session = seed_session_in(&dir, 20, CTX);
     seed_finding_suspension(&pool, 20, "engage", 5, &session).await;
@@ -967,7 +936,7 @@ async fn a_plan_loads_only_as_its_own_kind() {
 async fn an_overridden_finding_resumes_its_suspended_attempt_under_the_override() {
     let (dir, path, pool) = fresh_db().await;
     seed_repo(&pool, &dir).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
     let session = seed_session_in(&dir, 20, CTX);
     seed_flagged_finding(&pool, 5).await;
     sqlx::query("UPDATE findings SET budget_override = 'once' WHERE id = 5")
@@ -999,7 +968,7 @@ async fn an_overridden_finding_resumes_its_suspended_attempt_under_the_override(
 async fn a_flagged_pr_whose_suspended_engage_lost_its_worktree_starts_fresh() {
     let (dir, path, pool) = fresh_db().await;
     seed_repo(&pool, &dir).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
     let session = seed_session_in(&dir, 20, CTX);
     let workspace = cfg.work_root.join("jobs").join("20");
     std::fs::remove_dir_all(workspace.join("tree")).unwrap();
@@ -1196,7 +1165,7 @@ async fn a_forced_cycle_resumes_only_the_forced_repos_suspension() {
     .unwrap();
     support::point_repo_checkpoint(&pool, 2, "hunt", Some(20)).await;
     let store = rw_store(&path).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
 
     for (forced, repo_id, suspended) in [("alpha", 1, 10), ("beta", 2, 20)] {
         let picked = pick_next(&support::scope(&store), &cfg, Some(forced))
@@ -1223,7 +1192,7 @@ async fn a_resume_is_labelled_with_its_repos_name() {
     let session = seed_session(&dir);
     seed_suspension(&pool, 10, &session, 10_000).await;
     let store = rw_store(&path).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
 
     let picked = pick_next(&support::scope(&store), &cfg, None)
         .await
@@ -1257,9 +1226,13 @@ async fn resume_unavailable_fails_the_attempt_and_gives_up_the_checkpoint() {
     // Picked before the attempt exists: selection skips a place a running
     // job holds.
     let plan = resume_plan_of(
-        pick_next(&support::scope(&store), &test_config(dir.path()), None)
-            .await
-            .unwrap(),
+        pick_next(
+            &support::scope(&store),
+            &support::test_config(dir.path()),
+            None,
+        )
+        .await
+        .unwrap(),
     );
 
     let attempt = support::scope(&store)
@@ -1473,7 +1446,7 @@ async fn a_resumed_hunt_continues_the_session_and_ingests_the_origin_output_path
     let (dir, path, pool) = fresh_db().await;
     let (_repo, session) = executable_repo(&dir, &pool, 10).await;
     let store = rw_store(&path).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
 
     let plan = match pick_next(&support::scope(&store), &cfg, None)
         .await
@@ -1551,7 +1524,7 @@ async fn a_resumed_hunt_does_not_sync_the_clone() {
     let (dir, path, pool) = fresh_db().await;
     let (repo, _session) = executable_repo(&dir, &pool, 10).await;
     let store = rw_store(&path).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
     let plan = match pick_next(&support::scope(&store), &cfg, None)
         .await
         .unwrap()
@@ -1598,7 +1571,7 @@ async fn a_resume_whose_checkpoint_moved_on_skips_the_cycle() {
     let (dir, path, pool) = fresh_db().await;
     executable_repo(&dir, &pool, 10).await;
     let store = rw_store(&path).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
     let plan = match pick_next(&support::scope(&store), &cfg, None)
         .await
         .unwrap()
@@ -1649,7 +1622,7 @@ async fn a_cycle_dispatches_a_resume_to_the_suspended_kinds_executor() {
     let (dir, path, pool) = fresh_db().await;
     executable_repo(&dir, &pool, 10).await;
     let store = rw_store(&path).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
     let backend = RecordingBackend::new(
         cfg.work_root.join("out").join("job10.findings.json"),
         one_finding(),
@@ -1739,7 +1712,7 @@ async fn a_cold_start_reserves_at_least_the_efficiency_floor() {
     cloned_repo(&dir, &pool).await;
     seed_history_at(&pool, 1_876).await;
     let store = rw_store(&path).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
     let row = store.get_repo_by_id(1).await.unwrap().unwrap();
 
     let collapsed = GateProbe::default();
@@ -1780,7 +1753,7 @@ async fn a_cold_start_reserves_at_least_the_efficiency_floor() {
 /// previewed the next candidate.
 async fn previewed_reservation(store: &Arc<Store>, root: &Path) -> Option<i64> {
     let probe = Arc::new(GateProbe::default());
-    let mut config = test_config(root);
+    let mut config = support::test_config(root);
     config.ui_dir = root.join("ui");
     std::fs::create_dir_all(&config.ui_dir).unwrap();
     let state = AppState {
@@ -1911,7 +1884,7 @@ async fn repeated_suspensions_of_a_fix_are_not_a_stuck_streak() {
     let (dir, path, pool) = fresh_db().await;
     let store = rw_store(&path).await;
     let fid = repo_with_finding(&dir, &pool, &store, FindingStatus::Queued).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
     // The transcript is in the session directory of the chain being run.
     let suspending = ScriptedBackend::new(|tree| {
         suspended_at_cap(&tree.parent().unwrap().join("session").join("session.jsonl"))
@@ -1947,7 +1920,7 @@ async fn repeated_suspensions_of_a_recheck_are_not_a_stuck_streak() {
     let (dir, path, pool) = fresh_db().await;
     let store = rw_store(&path).await;
     let fid = repo_with_finding(&dir, &pool, &store, FindingStatus::Rechecking).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
     // The transcript is in the session directory of the chain being run.
     let suspending = ScriptedBackend::new(|tree| {
         suspended_at_cap(&tree.parent().unwrap().join("session").join("session.jsonl"))
@@ -1982,7 +1955,7 @@ async fn confirmed_recheck_with_severity(raw: &'static str) -> hunter::types::Fi
     let (dir, path, pool) = fresh_db().await;
     let store = rw_store(&path).await;
     let fid = repo_with_finding(&dir, &pool, &store, FindingStatus::Rechecking).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
     let out = cfg.work_root.join("out").join(format!("recheck{fid}.json"));
     let worker = ScriptedBackend::new(move |_| {
         let verdict = serde_json::json!({
@@ -2051,7 +2024,7 @@ async fn a_stale_recheck_supersedes_and_only_an_invalid_one_suppresses() {
         let (dir, path, pool) = fresh_db().await;
         let store = rw_store(&path).await;
         let fid = repo_with_finding(&dir, &pool, &store, FindingStatus::Rechecking).await;
-        let cfg = test_config(dir.path());
+        let cfg = support::test_config(dir.path());
         let out = cfg.work_root.join("out").join(format!("recheck{fid}.json"));
         let worker = ScriptedBackend::new(move |_| {
             let body = serde_json::json!({
@@ -2120,7 +2093,7 @@ async fn a_recheck_without_a_verdict_retries_then_is_held() {
     let (dir, path, pool) = fresh_db().await;
     let store = rw_store(&path).await;
     let fid = repo_with_finding(&dir, &pool, &store, FindingStatus::Rechecking).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
     let silent = ScriptedBackend::new(|_| support::done());
 
     let mut seen = Vec::new();
@@ -2168,7 +2141,7 @@ async fn a_recheck_whose_tree_can_never_be_made_is_held() {
         .execute(&pool)
         .await
         .unwrap();
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
     let never = ScriptedBackend::new(|_| panic!("nothing may run without a tree"));
 
     let mut seen = Vec::new();
@@ -2229,7 +2202,7 @@ async fn every_end_of_a_recheck_attempt_spends_only_a_once_override() {
             let store = rw_store(&path).await;
             let fid = repo_with_finding(&dir, &pool, &store, FindingStatus::Rechecking).await;
             store.set_budget_override(fid, Some(mode)).await.unwrap();
-            let cfg = test_config(dir.path());
+            let cfg = support::test_config(dir.path());
             let out = cfg.work_root.join("out").join(format!("recheck{fid}.json"));
             let worker = ScriptedBackend::new(move |tree| match end {
                 "suspended" => {
@@ -2289,7 +2262,7 @@ async fn repeated_suspensions_of_a_harvest_are_not_a_stuck_streak() {
     .execute(&pool)
     .await
     .unwrap();
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
     // The transcript is in the session directory of the chain being run.
     let suspending = ScriptedBackend::new(|tree| {
         suspended_at_cap(&tree.parent().unwrap().join("session").join("session.jsonl"))
@@ -2343,7 +2316,7 @@ async fn a_checkpoint_whose_finding_moved_on_is_dropped_and_its_tree_released() 
                 .execute(&pool)
         };
         set_status(at).await.unwrap();
-        let cfg = test_config(dir.path());
+        let cfg = support::test_config(dir.path());
         let tree = cfg.work_root.join("jobs").join("20").join("tree");
         let store = rw_store(&path).await;
 
@@ -2410,7 +2383,7 @@ async fn a_no_commit_hunt_whose_watermark_cannot_be_written_fails() {
     .await
     .unwrap();
     let store = rw_store(&path).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
     let row = store.get_repo_by_id(1).await.unwrap().unwrap();
     let never = ScriptedBackend::new(|_| panic!("no new commits: nothing may run"));
 
@@ -2449,7 +2422,7 @@ async fn resume_with_a_zero_cost_estimate_uses_the_attempt_limit_not_a_zero_cost
     assert_eq!(
         hunter::scheduler::anticipated_tokens(
             &store,
-            &test_config(dir.path()),
+            &support::test_config(dir.path()),
             1,
             JobKind::Repo(RepoJobKind::Hunt)
         )
@@ -2457,9 +2430,13 @@ async fn resume_with_a_zero_cost_estimate_uses_the_attempt_limit_not_a_zero_cost
         .unwrap(),
         0
     );
-    let picked = pick_next(&support::scope(&store), &test_config(dir.path()), None)
-        .await
-        .unwrap();
+    let picked = pick_next(
+        &support::scope(&store),
+        &support::test_config(dir.path()),
+        None,
+    )
+    .await
+    .unwrap();
     assert!(
         matches!(picked, Some(Candidate::Resume { plan, .. }) if plan.predecessor_id() == newest)
     );
@@ -2492,7 +2469,7 @@ async fn a_recheck_that_keeps_overrunning_is_held_instead_of_restarting_forever(
     let (dir, path, pool) = fresh_db().await;
     let store = rw_store(&path).await;
     let fid = repo_with_finding(&dir, &pool, &store, FindingStatus::Rechecking).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
     // The transcript is in the session directory of the chain being run.
     let overrunning = ScriptedBackend::new(|tree| {
         suspended_at_wallclock(&tree.parent().unwrap().join("session").join("session.jsonl"))
@@ -2596,7 +2573,7 @@ async fn give_up_three_chains(
         .unwrap();
     }
     let store = rw_store(&path).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
 
     let mut seen = Vec::new();
     for first in [10, 20, 30] {
@@ -2691,7 +2668,7 @@ async fn a_given_up_chains_streak_events_say_why_it_was_given_up() {
         seed_history(&pool).await;
         seed_finding_in(&pool, status).await;
         let store = rw_store(&path).await;
-        let cfg = test_config(dir.path());
+        let cfg = support::test_config(dir.path());
         for first in [10, 20, 30] {
             seed_finding_chain(&pool, &dir, kind, 1, first).await;
             pick_next(&support::scope(&store), &cfg, None)
@@ -2762,7 +2739,7 @@ async fn fix_one_give_up_from_blocked() -> (TempDir, PathBuf, SqlitePool) {
 async fn the_summary_preview_neither_retires_nor_counts_a_given_up_chain() {
     let (dir, path, pool) = fix_one_give_up_from_blocked().await;
     let store = rw_store(&path).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
 
     let previewed = preview_next(&store, &cfg).await.unwrap();
     let after_preview = (
@@ -2802,7 +2779,7 @@ async fn the_summary_preview_neither_retires_nor_counts_a_given_up_chain() {
 async fn a_continued_fix_resumes_past_the_ceiling() {
     let (dir, path, pool) = fix_one_give_up_from_blocked().await;
     let store = rw_store(&path).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
     pick_next(&support::scope(&store), &cfg, None)
         .await
         .unwrap();
@@ -2841,7 +2818,7 @@ async fn only_a_release_gives_a_chain_a_fresh_budget() {
     seed_finding_in(&pool, "queued").await;
     seed_finding_chain(&pool, &dir, "fix", 1, 30).await;
     let store = rw_store(&path).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
     // A chain of four, its attempts long before any release.
     sqlx::query("UPDATE jobs SET started_at = 1000 WHERE id BETWEEN 30 AND 33")
         .execute(&pool)
@@ -2912,7 +2889,7 @@ async fn over_budget_chain(kind: &str, status: &str) -> (TempDir, PathBuf, Sqlit
 async fn a_fix_chain_far_over_its_budget_is_held_not_dropped() {
     let (dir, path, pool) = over_budget_chain("fix", "queued").await;
     let store = rw_store(&path).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
 
     let previewed = preview_next(&store, &cfg).await.unwrap();
     let held_by_preview = support::hold_of(&store, 1, FindingJobKind::Fix).await;
@@ -2969,7 +2946,7 @@ async fn a_fix_chain_far_over_its_budget_is_held_not_dropped() {
 async fn an_over_budget_recheck_chain_is_still_given_up() {
     let (dir, path, _pool) = over_budget_chain("recheck", "rechecking").await;
     let store = rw_store(&path).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
 
     let picked = pick_next(&support::scope(&store), &cfg, None)
         .await
@@ -3006,7 +2983,7 @@ async fn checkpoint_of(store: &Store, fid: i64, kind: FindingJobKind) -> Option<
 async fn a_dismissed_engage_does_not_resume() {
     let (dir, path, pool) = fresh_db().await;
     seed_repo(&pool, &dir).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
     seed_flagged_finding(&pool, 5).await;
     let session = seed_session_in(&dir, 20, CTX);
     seed_finding_suspension(&pool, 20, "engage", 5, &session).await;
@@ -3060,7 +3037,7 @@ async fn a_dismissed_engage_does_not_resume() {
 async fn a_paused_engage_continues_while_its_pr_is_open_whatever_the_flag() {
     let (dir, path, pool) = fresh_db().await;
     seed_repo(&pool, &dir).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
     seed_quiet_finding(&pool, 5).await;
     let session = seed_session_in(&dir, 20, CTX);
     seed_finding_suspension(&pool, 20, "engage", 5, &session).await;
@@ -3091,7 +3068,7 @@ async fn a_paused_engage_continues_while_its_pr_is_open_whatever_the_flag() {
 async fn a_held_back_engage_is_not_resumed_by_any_tier() {
     let (dir, path, pool) = fresh_db().await;
     seed_repo(&pool, &dir).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
     seed_quiet_finding(&pool, 5).await;
     let session = seed_session_in(&dir, 20, CTX);
     seed_finding_suspension(&pool, 20, "engage", 5, &session).await;
@@ -3120,7 +3097,7 @@ async fn a_held_back_engage_is_not_resumed_by_any_tier() {
 async fn a_flagless_pr_never_starts_a_fresh_engage() {
     let (dir, path, pool) = fresh_db().await;
     seed_repo(&pool, &dir).await;
-    let cfg = test_config(dir.path());
+    let cfg = support::test_config(dir.path());
     seed_quiet_finding(&pool, 5).await;
     let session = seed_session_in(&dir, 20, CTX);
     std::fs::remove_dir_all(cfg.work_root.join("jobs").join("20").join("tree")).unwrap();

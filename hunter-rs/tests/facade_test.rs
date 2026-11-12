@@ -9,7 +9,7 @@
 //! `refresh/keep_fresh` (49-57). Skip 5 server-prober tests (round 3).
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use hunter::backend::{Backend, Prober, SpendLedger, Verdict};
@@ -35,39 +35,9 @@ fn now_ms() -> i64 {
 
 fn cfg_with(stale_after_s: f64, omp_bin: &str) -> Config {
     Config {
-        root: PathBuf::from("/tmp"),
-        work_root: PathBuf::from("/tmp"),
-        db_path: PathBuf::from("/tmp/test.db"),
-        serve_port: 8378,
-        serve_host: std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST),
-        allowed_hosts: hunter::config::HostAllowList::default(),
-        ui_dir: PathBuf::from("/tmp/ui"),
-        omp_bin: omp_bin.to_owned(),
         stale_after_s,
-        cache_ttl_s: 3600.0,
-        poll_s: 2.0,
-        session_grace_s: 120,
-        min_free_disk_bytes: 0,
-        model_default: None,
-        model_smol: None,
-        model_hunt: None,
-        model_fix: None,
-        backend_type: "omp-scavenge".to_owned(),
-        llm_provider: hunter::backends::omp_scavenge::LlmProvider::Anthropic,
-        provider_hosts: None,
-        network_gate: false,
-        hunt_max_wall_s: 1800,
-        hunt_max_findings: 8,
-        hunt_rehunt_days: 90,
-        fix_max_wall_s: 2700,
-        review_max_rounds: 0,
-        review_curate: false,
-        scan_interval_days: 1.0,
-        modernization_interval_days: 30,
-        standards_interval_days: 30,
-        simplification_interval_days: 30,
-        renovate_github_token: None,
-        review_bots: hunter::forge::ReviewBots::default(),
+        omp_bin: omp_bin.to_owned(),
+        ..support::test_config(Path::new("/tmp"))
     }
 }
 
