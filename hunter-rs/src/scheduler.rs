@@ -6228,8 +6228,7 @@ async fn record_declined_fix(
     let first_line: String = reason
         .lines()
         .next()
-        .map(|l| l.chars().take(120).collect())
-        .unwrap_or_default();
+        .map_or_default(|l| l.chars().take(120).collect());
     let message = match class {
         Some(class) => format!("#{fid} declined by worker as {class} -> {status}: {first_line}"),
         None => {
@@ -7553,8 +7552,7 @@ async fn withdraw_pr(
     let first_line: String = reason
         .lines()
         .next()
-        .map(|l| l.chars().take(120).collect())
-        .unwrap_or_default();
+        .map_or_default(|l| l.chars().take(120).collect());
     let _ = store
         .log_event(
             "verdict",

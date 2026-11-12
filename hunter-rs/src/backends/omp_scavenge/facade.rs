@@ -291,7 +291,7 @@ impl OmpScavengeBackend {
     /// Max `used_fraction` across the rows the longest quota window gates,
     /// or None (`facade.OmpScavengeBackend._usage_snapshot`).
     /// Blocking — meant for `spawn_blocking`.
-    fn _usage_snapshot_sync(agent_db: &std::path::Path, provider: LlmProvider) -> Option<f64> {
+    fn usage_snapshot_sync(agent_db: &std::path::Path, provider: LlmProvider) -> Option<f64> {
         let now = crate::util::now_ms();
         let longest = provider.quota().windows.first()?;
         let windows = capacity::read_windows(agent_db, provider, now);
@@ -713,7 +713,7 @@ impl Backend for OmpScavengeBackend {
         let pre = {
             let db = self.agent_db.clone();
             let provider = self.cfg.llm_provider;
-            tokio::task::spawn_blocking(move || Self::_usage_snapshot_sync(&db, provider)).await?
+            tokio::task::spawn_blocking(move || Self::usage_snapshot_sync(&db, provider)).await?
         };
 
         let model = self
@@ -740,7 +740,7 @@ impl Backend for OmpScavengeBackend {
         let post = {
             let db = self.agent_db.clone();
             let provider = self.cfg.llm_provider;
-            tokio::task::spawn_blocking(move || Self::_usage_snapshot_sync(&db, provider)).await?
+            tokio::task::spawn_blocking(move || Self::usage_snapshot_sync(&db, provider)).await?
         };
 
         rr.usage_delta = match (pre, post) {

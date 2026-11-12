@@ -1462,7 +1462,7 @@ async fn undo_reviewer(
     // Read before the undo reverts them.
     let left = uncommitted_only(&start.ws.tree, &shown.before, after).await;
     let undone = undo(lane, start, &shown.before, &shown.description).await;
-    let mut issues = || written.as_mut().map(std::mem::take).unwrap_or_default();
+    let mut issues = || written.as_mut().map_or_default(std::mem::take);
     match (undone, left) {
         (Ok(()), Some(left)) => {
             let message = format!(

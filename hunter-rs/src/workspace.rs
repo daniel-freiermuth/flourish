@@ -805,8 +805,7 @@ async fn sweep_legacy_trees(
     for entry in entries {
         let name = entry
             .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+            .map_or_default(|n| n.to_string_lossy().into_owned());
         let referenced = live.iter().any(|j| {
             j.session_file
                 .as_deref()
@@ -869,8 +868,7 @@ async fn sweep_legacy_sessions(
     for dir in dirs {
         let name = dir
             .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+            .map_or_default(|n| n.to_string_lossy().into_owned());
         let jobs = refs.get(&name).map_or(&[][..], Vec::as_slice);
         if jobs
             .iter()

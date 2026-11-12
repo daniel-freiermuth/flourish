@@ -30,9 +30,7 @@ pub struct WindowState {
 
 /// Default agent.db location (`capacity.OMP_AGENT_DB`); callers may override.
 pub fn default_agent_db() -> std::path::PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default();
+    let home = std::env::var_os("HOME").map_or_default(std::path::PathBuf::from);
     home.join(".omp/agent/agent.db")
 }
 

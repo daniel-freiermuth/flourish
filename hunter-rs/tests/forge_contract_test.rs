@@ -1091,7 +1091,7 @@ fn authored(view: &hunter::forge::PrView) -> Vec<(String, Voice)> {
     let reviews = view.reviews.iter().map(|r| (r.author.clone(), r.voice));
     comments
         .chain(reviews)
-        .map(|(a, v)| (a.map(|a| a.login).unwrap_or_default(), v))
+        .map(|(a, v)| (a.map_or_default(|a| a.login), v))
         .collect()
 }
 
