@@ -53,6 +53,11 @@ triage verdicts, notes, pausing repos, manual cycle/recheck triggers —
 happens in the UI; the binary itself takes only `--root`, `--port` and the
 `user` commands (`USAGE` in hunter-rs/src/main.rs).
 
+Hunter clones, fetches and pushes fix branches over that URL exactly as
+given, so it must be one you can push over: an `https://` URL through a
+git credential helper (`gh auth setup-git` installs `gh`'s), or an ssh
+`git@host:owner/repo.git` URL through your SSH keys.
+
 ## How it works
 
 ### Finding types

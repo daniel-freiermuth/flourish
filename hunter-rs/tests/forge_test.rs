@@ -1,57 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-//! Forge tests — URL parsing, SSH transform, `detect_forge`.
+//! Forge tests — URL parsing, `detect_forge`.
 
 use hunter::domain::ForgeName;
 use hunter::forge::*;
-
-// ============================================================
-// GitHub — ssh_url
-// ============================================================
-
-#[test]
-fn test_github_ssh_url_basic() {
-    let gh = GitHubForge;
-    assert_eq!(
-        gh.ssh_url("https://github.com/owner/repo"),
-        "git@github.com:owner/repo.git"
-    );
-}
-
-#[test]
-fn test_github_ssh_url_strips_dotgit() {
-    let gh = GitHubForge;
-    assert_eq!(
-        gh.ssh_url("https://github.com/owner/repo.git"),
-        "git@github.com:owner/repo.git"
-    );
-}
-
-#[test]
-fn test_github_ssh_url_strips_trailing_slash() {
-    let gh = GitHubForge;
-    assert_eq!(
-        gh.ssh_url("https://github.com/owner/repo/"),
-        "git@github.com:owner/repo.git"
-    );
-}
-
-#[test]
-fn test_github_ssh_url_non_github_passthrough() {
-    let gh = GitHubForge;
-    assert_eq!(
-        gh.ssh_url("https://gitlab.com/owner/repo"),
-        "https://gitlab.com/owner/repo"
-    );
-}
-
-#[test]
-fn test_github_ssh_url_already_ssh_passthrough() {
-    let gh = GitHubForge;
-    assert_eq!(
-        gh.ssh_url("git@github.com:owner/repo.git"),
-        "git@github.com:owner/repo.git"
-    );
-}
 
 // ============================================================
 // GitHub — owner_repo
@@ -92,47 +43,6 @@ fn test_github_owner_repo_invalid() {
     // A path with an empty owner or repo names no repository.
     assert_eq!(gh.owner_repo("https://github.com//widgets"), None);
     assert_eq!(gh.owner_repo("https://github.com/acme/.git"), None);
-}
-
-// ============================================================
-// GitLab — ssh_url
-// ============================================================
-
-#[test]
-fn test_gitlab_ssh_url_basic() {
-    let gl = GitLabForge;
-    assert_eq!(
-        gl.ssh_url("https://gitlab.com/group/repo"),
-        "git@gitlab.com:group/repo.git"
-    );
-}
-
-#[test]
-fn test_gitlab_ssh_url_nested_group() {
-    let gl = GitLabForge;
-    assert_eq!(
-        gl.ssh_url("https://gitlab.com/group/sub/repo.git"),
-        "git@gitlab.com:group/sub/repo.git"
-    );
-}
-
-#[test]
-fn test_gitlab_ssh_url_self_hosted() {
-    let gl = GitLabForge;
-    assert_eq!(
-        gl.ssh_url("https://git.example.com/team/proj"),
-        "git@git.example.com:team/proj.git"
-    );
-}
-
-#[test]
-fn test_gitlab_ssh_url_already_ssh_passthrough() {
-    let gl = GitLabForge;
-    // Already SSH — no https:// prefix, returned as-is
-    assert_eq!(
-        gl.ssh_url("git@gitlab.com:group/repo.git"),
-        "git@gitlab.com:group/repo.git"
-    );
 }
 
 // ============================================================
@@ -203,24 +113,6 @@ fn test_detect_forge_gitlab() {
 // ============================================================
 // forge_for factory
 // ============================================================
-
-#[test]
-fn test_forge_for_github() {
-    let f = forge_for(ForgeName::Github);
-    assert_eq!(
-        f.ssh_url("https://github.com/a/b"),
-        "git@github.com:a/b.git"
-    );
-}
-
-#[test]
-fn test_forge_for_gitlab() {
-    let f = forge_for(ForgeName::Gitlab);
-    assert_eq!(
-        f.ssh_url("https://gitlab.com/a/b"),
-        "git@gitlab.com:a/b.git"
-    );
-}
 
 #[test]
 fn test_forge_for_all_variants_covered() {
@@ -393,16 +285,6 @@ fn github_enterprise_hosts_survive_the_whole_chain() {
         Some(("acme/widget".to_owned(), 7))
     );
 
-    // Pushing must target the internal host, not github.com.
-    assert_eq!(
-        gh.ssh_url("https://github.corp.com/acme/widget"),
-        "git@github.corp.com:acme/widget.git"
-    );
-    assert_eq!(
-        gh.ssh_url("https://github.com/acme/widget"),
-        "git@github.com:acme/widget.git"
-    );
-
     // Still not a blanket accept: a non-GitHub host stays rejected, or
     // GitHubForge would claim every self-hosted GitLab.
     assert_eq!(gh.owner_repo("https://gitlab.com/acme/widget"), None);
@@ -410,11 +292,6 @@ fn github_enterprise_hosts_survive_the_whole_chain() {
     assert_eq!(
         gh.parse_pr_url("https://gitlab.com/acme/widget/pull/7"),
         None
-    );
-    assert_eq!(
-        gh.ssh_url("https://code.corp.com/acme/widget"),
-        "https://code.corp.com/acme/widget",
-        "an unrecognised host must be handed back untouched, not rewritten"
     );
 }
 
@@ -487,23 +364,6 @@ fn uppercase_scheme_parses_pr_urls() {
     assert_eq!(
         GitLabForge.parse_pr_url("HTTPS://gitlab.example.com/Group/Widget/-/merge_requests/42"),
         Some(("Group/Widget".to_owned(), 42))
-    );
-}
-
-#[test]
-fn uppercase_scheme_rewrites_to_ssh() {
-    let gh = GitHubForge;
-    assert_eq!(
-        gh.ssh_url("HTTPS://github.com/Acme/Widget"),
-        "git@github.com:Acme/Widget.git"
-    );
-    assert_eq!(
-        gh.ssh_url("Https://github.corp.com/Acme/Widget.git"),
-        "git@github.corp.com:Acme/Widget.git"
-    );
-    assert_eq!(
-        GitLabForge.ssh_url("Https://gitlab.example.com/Group/Sub/Widget"),
-        "git@gitlab.example.com:Group/Sub/Widget.git"
     );
 }
 
