@@ -183,10 +183,10 @@ new ──recheck──> new / superseded / rejected
   `hunter-rs/WORK-MODEL.md` §5.7. Before the push, a multi-commit fix is
   curated into a few logical commits of the same tree (`review.curate`); a
   curation whose changes cannot be undone is put back the same way as
-  a reviewer's before any later attempt runs a worker, and the fixer
-  resumed then is told its rewrite was undone, not to pick it back up. A
-  grant that runs out before or during the curation suspends the fix,
-  and the resume curates it, as for any other part of the fix.
+  a reviewer's before any later attempt runs a worker. A curation cut
+  short (a grant that runs out before or during it, a restart, a rewrite
+  that had to be put back) is owed: the next attempt runs no fixer and
+  curates before it ships, as for any other part of the fix.
 - **Held work** is not a status. When a worker writes `BLOCKED.md`
   (a verification prerequisite, dependency, or human decision is
   missing; every finding kind's playbook says when: a recheck that cannot

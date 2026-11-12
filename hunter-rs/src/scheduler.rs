@@ -984,11 +984,16 @@ fn resume_prompt(kind: JobKind, plan: &ResumePlan) -> String {
 ///   could not be undone) has none, so its retry is reviewed afresh,
 ///   which may send it back to the fixer or curate it, and is reserved
 ///   for as any resume is. With the review off, a kept fix's (empty)
-///   verdict is saved all the same.
+///   verdict is saved all the same;
+/// - it is a fix whose next attempt will curate ([`review::curation_pending`]):
+///   a curation owed, or one the daemon died in or whose changes are to be
+///   put back, which owes it once recovered. The curator is a model run,
+///   capped and reserved for as any resume is.
 async fn publishes_for_free(job: &Job, ws: &Workspace, as_kept: bool) -> bool {
+    let fix = job.kind == JobKind::Finding(FindingJobKind::Fix);
     as_kept
         && !ws.tree.join("WITHDRAW.md").exists()
-        && (job.kind != JobKind::Finding(FindingJobKind::Fix) || review::has_kept_verdict(ws).await)
+        && (!fix || (review::has_kept_verdict(ws).await && !review::curation_pending(ws)))
 }
 
 /// What to reserve for a resumed attempt.
@@ -5377,7 +5382,6 @@ fn fix_prompt(
     cfg: &Config,
     resume: Option<&ResumePlan>,
     start: &FixStart,
-    curation_undone: bool,
 ) -> anyhow::Result<(String, bool)> {
     let finding = &start.finding;
     let worktree = &start.ws.tree;
@@ -5417,9 +5421,6 @@ fn fix_prompt(
         ),
     };
     let prompt = built.map_err(|e| anyhow::anyhow!("{e}"))?;
-    if curation_undone && resume.is_some() {
-        return Ok((review::CURATION_UNDONE_PROMPT.to_owned(), false));
-    }
     if let Some((_, detail)) = resume
         .filter(|r| r.publish_only())
         .and_then(ResumePlan::after_hold)
@@ -6516,30 +6517,26 @@ pub async fn run_fix(
     // Any early return from here on drops `running`: the cycle's settle
     // records the abandoned job.
     // A curation the daemon died in is undone before anything reads the
-    // tree.
-    let recovered = review::recover_curation(lane, store, &start).await;
+    // tree, and owed again.
+    review::recover_curation(lane, store, &start).await;
     // A review round's reviewer or a curator whose changes could not be
     // undone left the tree as it changed it, however the attempt then ended
     // (a hold, offline, a pinned commit whose publish failed): it is put
     // back to the reviewed commit before any worker runs in it, or none does.
-    let restored = match review::restore_reviewed(lane, store, &start).await {
-        Ok(restored) => restored,
-        Err(why) => {
-            return Ok(count_unrestored_tree(lane, store, (start, running, claim), &why).await);
-        }
-    };
-    // A curator ran in the fixer's session: once its changes are undone,
-    // now or by this attempt's restore, the resumed fixer is told it has
-    // nothing left to do.
-    let curation_undone = recovered || restored == Some(review::LeftBy::Curator);
-    // A fix the review suspended between its runs goes straight back to
-    // the review, its fixer having finished; unless an operator released
-    // a hold since, whose prompt the fixer has to act on.
-    let paused = !curation_undone
-        && resume.is_some_and(|r| {
-            r.after_hold().is_none() && review::suspended_between_runs(&start, r.predecessor_id())
-        });
-    let (prompt, answers_held) = match fix_prompt(cfg, resume, &start, curation_undone) {
+    if let Err(why) = review::restore_reviewed(lane, store, &start).await {
+        return Ok(count_unrestored_tree(lane, store, (start, running, claim), &why).await);
+    }
+    // A fix owing only its curation runs no fixer, whatever hold an
+    // operator released: its review is through, and the curation runs with
+    // its own checks. One the review suspended between its runs goes
+    // straight back to the review, its fixer having finished; unless an
+    // operator released a hold since, whose prompt the fixer has to act on.
+    let paused = resume.is_some_and(|r| {
+        review::owes_curation(&start)
+            || (r.after_hold().is_none()
+                && review::suspended_between_runs(&start, r.predecessor_id()))
+    });
+    let (prompt, answers_held) = match fix_prompt(cfg, resume, &start) {
         Ok(prompted) => prompted,
         Err(e) => {
             release_claim(claim).await;

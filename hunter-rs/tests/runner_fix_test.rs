@@ -3635,6 +3635,7 @@ async fn an_owed_curation_keeps_the_title_and_follow_ups() {
     use futures_util::FutureExt;
     for (label, curation) in [
         ("fix-curate-owed-keeps-grant", Curation::Killed),
+        ("fix-curate-owed-keeps-died", Curation::DaemonDies),
     ] {
         let bins = support::FakeBins::acquire(label);
         bins.ok("gh", "https://github.com/acme/widget/pull/42");
@@ -7295,6 +7296,39 @@ async fn a_curation_the_grant_cut_short_is_had_by_the_resume() {
     }
 }
 
+/// A fix owed only its curation runs no fixer even after an operator's
+/// `continue` of a hold on it: the fixer's session ends inside the
+/// interrupted `curate.md`, and resuming it would invite a rewrite with
+/// none of the curation's checks. The attempt curates and ships.
+#[tokio::test]
+async fn a_continued_fix_owed_its_curation_curates_without_the_fixer() {
+    let bins = support::FakeBins::acquire("fix-curate-owed-continued");
+    bins.ok("gh", "https://github.com/acme/widget/pull/42");
+    let mut f = reviewed_fixture("fix-curate-owed-continued", 7).await;
+    f.cfg.review_curate = true;
+    let worker = reviewed_worker(vec![
+        Act::Fix,
+        Act::Review(BLOCKING),
+        Act::Answer,
+        Act::Review(CLEAN),
+        Act::Curate(Curation::Killed),
+    ])
+    .granting(Some(10_000));
+    let summary = fix(&f, &worker).await;
+    assert_eq!(summary.outcome.as_deref(), Some("suspended"), "{summary:?}");
+    let plan = released_resume(&f).await;
+    assert!(plan.after_hold().is_some(), "a continued hold");
+    let resumed = reviewed_worker(vec![Act::Curate(Curation::Squash)]);
+
+    let summary = resume(&f, &plan, &resumed).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    let runs = resumed.runs();
+    assert_eq!(runs.len(), 1, "no fixer: the curation");
+    assert!(runs[0].prompt.starts_with("curate"), "{}", runs[0].prompt);
+    assert_eq!(shipped_commits(&f), ["fix: the real bug, curated"]);
+}
+
 /// Nothing to curate in a single commit, and nothing is curated with
 /// `review.curate` off.
 #[tokio::test]
@@ -7368,11 +7402,11 @@ async fn a_curated_fix_retried_after_an_offline_push_ships_on_its_saved_verdict(
 
 /// A daemon that dies during a curation leaves the branch half rewritten,
 /// mid-rebase. The next attempt puts it back to the reviewed commit before
-/// anything reads the tree, tells the resumed fixer there is nothing left
-/// to do, and ships the original commits on the verdict saved for the
-/// reviewed tree, without another review.
+/// anything reads the tree and owes the curation again: it runs no fixer,
+/// curates on the verdict saved for the reviewed tree, without another
+/// review, and ships the curated history.
 #[tokio::test]
-async fn a_curation_the_daemon_died_in_is_undone_and_the_reviewed_commits_ship() {
+async fn a_curation_the_daemon_died_in_is_undone_and_had_again() {
     use futures_util::FutureExt;
     let bins = support::FakeBins::acquire("fix-curate-died");
     bins.ok("gh", "https://github.com/acme/widget/pull/42");
@@ -7400,28 +7434,21 @@ async fn a_curation_the_daemon_died_in_is_undone_and_the_reviewed_commits_ship()
         .await
         .unwrap();
     let plan = pending_resume(&f).await;
-    let resumed = reviewed_worker(vec![Act::Continue]);
+    let resumed = reviewed_worker(vec![Act::Curate(Curation::Squash)]);
 
     let summary = resume(&f, &plan, &resumed).await;
 
     assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
     let runs = resumed.runs();
-    assert_eq!(runs.len(), 1, "no new review, no new curation");
-    assert!(
-        runs[0].prompt.contains("has been undone"),
-        "{}",
-        runs[0].prompt
-    );
-    assert_eq!(
-        shipped_commits(&f),
-        ["fix: the sibling parser too", "fix: the real bug"]
-    );
+    assert_eq!(runs.len(), 1, "no fixer, no new review: the curation");
+    assert!(runs[0].prompt.starts_with("curate"), "{}", runs[0].prompt);
+    assert_eq!(shipped_commits(&f), ["fix: the real bug, curated"]);
     assert_eq!(pr_body(&bins), "the body\n\n## Review\naddressed");
     let events = f.store.recent_events(40).await.unwrap();
     assert!(
-        events.iter().any(|e| e
-            .message
-            .contains("interrupted by a restart; the reviewed commit restored")),
+        events.iter().any(|e| e.message.contains(
+            "interrupted by a restart; the reviewed commit restored; to be curated again"
+        )),
         "{events:?}"
     );
 }
@@ -7429,8 +7456,8 @@ async fn a_curation_the_daemon_died_in_is_undone_and_the_reviewed_commits_ship()
 /// The attempt after a curation whose rewrite could not be undone fails
 /// as `reviewed tree not restored` without running a worker while what
 /// keeps the tree from being put back is there; once it is gone, the
-/// tree goes back to the reviewed commit and the original commits ship.
-/// The runs of that attempt.
+/// tree goes back to the reviewed commit, the curation is had again, and
+/// the curated history ships. The runs of that attempt.
 async fn an_unrestorable_curation_is_put_back_first(
     f: &Fixture,
     tree: &std::path::Path,
@@ -7460,16 +7487,16 @@ async fn an_unrestorable_curation_is_put_back_first(
     assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
     assert_eq!(
         shipped_commits(f),
-        ["fix: the sibling parser too", "fix: the real bug"],
-        "the curator's rewrite never ships"
+        ["fix: the real bug, curated"],
+        "the curation is had again; the stuck rewrite never ships"
     );
     retry.runs()
 }
 
 /// A rejected curation whose rewrite cannot be undone pins the reviewed
 /// commit for its ship; when that publish fails, the retry puts the tree
-/// back to it before anything runs, and neither reviews nor ships the
-/// rewrite.
+/// back to it before anything runs, never ships the rewrite, and has the
+/// curation again, as for any part of the fix cut short.
 #[tokio::test]
 async fn a_rejected_curation_that_could_not_be_undone_is_put_back_on_the_retry() {
     let bins = support::FakeBins::acquire("fix-curate-locked");
@@ -7502,14 +7529,79 @@ async fn a_rejected_curation_that_could_not_be_undone_is_put_back_on_the_retry()
         .await
         .unwrap();
 
-    let runs = an_unrestorable_curation_is_put_back_first(&f, &tree, &[Act::Continue]).await;
-    assert!(runs.is_empty(), "the pinned commit's publish is retried");
+    let runs =
+        an_unrestorable_curation_is_put_back_first(&f, &tree, &[Act::Curate(Curation::Squash)])
+            .await;
+    assert_eq!(runs.len(), 1, "no fixer, no new review: the curation");
+}
+
+/// A kept fix whose next attempt will curate is no free retry, even while
+/// its saved verdict covers the tree: a rejected curation whose rewrite
+/// could not be undone, its publish refused, and the tree since put back
+/// to the reviewed commit by hand. The retry curates, a model run, so it
+/// is planned as any resume, through the budget gate and under a cap.
+#[tokio::test]
+async fn a_retry_that_will_curate_is_not_free() {
+    let bins = support::FakeBins::acquire("fix-curate-not-free");
+    bins.ok("gh", "https://github.com/acme/widget/pull/42");
+    let mut f = fixture("fix-curate-not-free").await;
+    review_on(&mut f, 7);
+    f.cfg.review_curate = true;
+    let nowhere = f.cfg.work_root.join("refusing.git");
+    route_push(&f, Some(&nowhere.to_string_lossy()));
+    let worker = reviewed_worker(vec![
+        Act::Fix,
+        Act::Review(BLOCKING),
+        Act::Answer,
+        Act::Review(CLEAN),
+        Act::Curate(Curation::LockedChange),
+    ]);
+    let refused = fix(&f, &worker).await;
+    assert_eq!(refused.outcome.as_deref(), Some("requeued"), "{refused:?}");
+    let tree = worker.runs()[0].tree.clone();
+    let key = format!("url.{}.insteadOf", nowhere.display());
+    git(&f.repo_dir, &["config", "--unset-all", &key]);
+    route_push(&f, None);
+    // The operator clears the lock and puts the branch back by hand.
+    std::fs::remove_file(index_lock(&tree)).unwrap();
+    let restore: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(tree.parent().unwrap().join("review-restore.json")).unwrap(),
+    )
+    .unwrap();
+    let reviewed = restore["before"]["head"].as_str().unwrap().to_owned();
+    let description = std::fs::read(tree.join("PR-DESCRIPTION.md")).unwrap();
+    git(
+        &tree,
+        &["checkout", "-q", "--force", "-B", BRANCH, &reviewed],
+    );
+    git(&tree, &["clean", "-ffdq"]);
+    std::fs::write(tree.join("PR-DESCRIPTION.md"), description).unwrap();
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
+        .bind(24 * 60 * 60_000_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let plan = pending_resume(&f).await;
+    assert!(!plan.free(), "a retry that will curate is not free");
+    let retry = reviewed_worker(vec![Act::Curate(Curation::Squash)]).granting(Some(50_000));
+
+    let summary = resume(&f, &plan, &retry).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    let runs = retry.runs();
+    assert_eq!(runs.len(), 1, "the curation");
+    assert!(runs[0].cap_tokens.is_some(), "the curator runs under a cap");
+    assert_eq!(shipped_commits(&f), ["fix: the real bug, curated"]);
 }
 
 /// A curation the daemon died in whose rewrite cannot be undone after the
-/// restart is not resumed on as undone: no fixer runs on the rewrite until
-/// the tree is back at the reviewed commit, and the one that then resumes
-/// is told its rewrite was undone, not to pick it back up.
+/// restart is not resumed on: no worker runs on the rewrite until the tree
+/// is back at the reviewed commit, and then no fixer resumes the session
+/// the curator ran in; the curation is had again, with its checks.
 #[tokio::test]
 async fn a_curation_the_daemon_died_in_that_could_not_be_undone_is_put_back_first() {
     use futures_util::FutureExt;
@@ -7534,13 +7626,11 @@ async fn a_curation_the_daemon_died_in_that_could_not_be_undone_is_put_back_firs
         .await
         .unwrap();
 
-    let runs = an_unrestorable_curation_is_put_back_first(&f, &tree, &[Act::Continue]).await;
-    assert_eq!(runs.len(), 1, "no new review, no new curation");
-    assert!(
-        runs[0].prompt.contains("has been undone"),
-        "{}",
-        runs[0].prompt
-    );
+    let runs =
+        an_unrestorable_curation_is_put_back_first(&f, &tree, &[Act::Curate(Curation::Squash)])
+            .await;
+    assert_eq!(runs.len(), 1, "no fixer, no new review: the curation");
+    assert!(runs[0].prompt.starts_with("curate"), "{}", runs[0].prompt);
     let events = f.store.recent_events(40).await.unwrap();
     assert!(
         events
