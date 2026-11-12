@@ -861,7 +861,7 @@ async fn point_checkpoint(tx: &mut ImmediateTx, job_id: i64, paused: bool) -> sq
          FROM jobs j \
          WHERE j.id = ?1 AND j.finding_id IS NULL \
            AND j.kind IN ('hunt', 'test_gap', 'dep_update', 'refactor', 'modernization', \
-                          'standards') \
+                          'standards', 'simplification') \
          ON CONFLICT (repo_id, kind) DO UPDATE SET \
              checkpoint_job_id = excluded.checkpoint_job_id",
         job_id,
@@ -1111,6 +1111,15 @@ impl Store {
             RepoJobKind::Standards => {
                 sqlx::query!(
                     "UPDATE repos SET last_standards_at = ?1 WHERE id = ?2",
+                    now,
+                    repo_id
+                )
+                .execute(&self.pool)
+                .await?;
+            }
+            RepoJobKind::Simplification => {
+                sqlx::query!(
+                    "UPDATE repos SET last_simplification_at = ?1 WHERE id = ?2",
                     now,
                     repo_id
                 )
@@ -2318,7 +2327,8 @@ impl Store {
             SELECT id, name, url, path, forge AS "forge: ForgeName", default_branch, last_hunt_sha,
                    last_hunt_at, enabled, added_at, last_full_hunt_at,
                    last_test_gap_at, last_dep_update_at, last_refactor_at,
-                   last_modernization_at, last_standards_at, full_hunt_requested_at,
+                   last_modernization_at, last_standards_at, last_simplification_at,
+                   full_hunt_requested_at,
                    full_hunt_request_attempted
             FROM repos
             WHERE deleted_at IS NULL
@@ -2336,7 +2346,8 @@ impl Store {
             SELECT id, name, url, path, forge AS "forge: ForgeName", default_branch, last_hunt_sha,
                    last_hunt_at, enabled, added_at, last_full_hunt_at,
                    last_test_gap_at, last_dep_update_at, last_refactor_at,
-                   last_modernization_at, last_standards_at, full_hunt_requested_at,
+                   last_modernization_at, last_standards_at, last_simplification_at,
+                   full_hunt_requested_at,
                    full_hunt_request_attempted
             FROM repos
             WHERE id = ?1 AND deleted_at IS NULL
@@ -2354,7 +2365,8 @@ impl Store {
             SELECT id, name, url, path, forge AS "forge: ForgeName", default_branch, last_hunt_sha,
                    last_hunt_at, enabled, added_at, last_full_hunt_at,
                    last_test_gap_at, last_dep_update_at, last_refactor_at,
-                   last_modernization_at, last_standards_at, full_hunt_requested_at,
+                   last_modernization_at, last_standards_at, last_simplification_at,
+                   full_hunt_requested_at,
                    full_hunt_request_attempted
             FROM repos
             WHERE name = ?1 AND deleted_at IS NULL

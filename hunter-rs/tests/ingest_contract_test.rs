@@ -154,6 +154,65 @@ async fn a_non_bug_entry_cannot_smuggle_in_a_bug_class() {
     );
 }
 
+/// A harvest may defer work as a `simplification` follow-up, shaped as its
+/// playbooks spell out. It must be stored as one: filed as anything else
+/// it reaches an apply playbook that declines design changes, and
+/// rejected it is lost.
+#[tokio::test]
+async fn a_follow_up_declaring_simplification_is_stored_as_one() {
+    let dir = TempDir::new("ingest-simplification");
+    let store = Store::connect(&dir.join("hunter.db"))
+        .await
+        .expect("bootstrap");
+    let repo_id = store
+        .add_repo(
+            "widget",
+            "git@github.com:acme/widget.git",
+            std::path::Path::new("/tmp/wr/repos"),
+            "main",
+            ForgeName::Github,
+        )
+        .await
+        .unwrap();
+    let entry = serde_json::json!([{
+        "fingerprint": "widget:src/lib.rs:Codec:one-impl",
+        "type": "simplification",
+        "file": "src/lib.rs",
+        "severity": "low",
+        "confidence": 0.8,
+        "summary": "the Codec trait has one implementation left",
+        "detail": "…",
+        "smell_type": "vestigial-generality",
+        "current_approach": "a trait with one impl",
+        "proposed_approach": "call the impl directly",
+        "introduced_by": "deferred from PR #7"
+    }]);
+    let path = dir.join("findings.json");
+    std::fs::write(&path, serde_json::to_string(&entry).unwrap()).unwrap();
+    let res = hunter::ingest::ingest_findings(
+        &store,
+        repo_id,
+        Path::new(&path),
+        hunter::ingest::EntryTypes::Declared,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(res.invalid, 0);
+    assert_eq!(res.inserted, 1);
+
+    let all = store
+        .list_findings(&FindingFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].kind, FindingType::Simplification);
+    assert_eq!(
+        all[0].category(),
+        Some(Some("vestigial-generality".to_owned()))
+    );
+}
+
 /// Two bug entries, ingested as `job`. Returns how many were inserted; the
 /// ids come from `produced_by`.
 async fn hunt_producing_two(dir: &TempDir, store: &Store, repo_id: i64, job: i64) -> i64 {

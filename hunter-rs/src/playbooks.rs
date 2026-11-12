@@ -435,8 +435,10 @@ pub fn build_fix_prompt(
     render(&template, &slots)
 }
 
-pub fn build_apply_improvement_prompt(
+/// The three apply playbooks take the same slots.
+fn build_apply_prompt(
     root: &Path,
+    template_name: &str,
     finding: &Finding,
     worktree: &Path,
     branch: &str,
@@ -444,7 +446,7 @@ pub fn build_apply_improvement_prompt(
     repo_notes: &str,
 ) -> Result<String> {
     let notes = notes_or_default(repo_notes, "(No notes yet)");
-    let template = read_template(root, "apply_improvement.md")?;
+    let template = read_template(root, template_name)?;
     let mut slots = HashMap::new();
     slots.insert("WORKTREE", worktree.display().to_string());
     slots.insert("BRANCH", branch.to_owned());
@@ -455,6 +457,25 @@ pub fn build_apply_improvement_prompt(
     render(&template, &slots)
 }
 
+pub fn build_apply_improvement_prompt(
+    root: &Path,
+    finding: &Finding,
+    worktree: &Path,
+    branch: &str,
+    repo: &Repo,
+    repo_notes: &str,
+) -> Result<String> {
+    build_apply_prompt(
+        root,
+        "apply_improvement.md",
+        finding,
+        worktree,
+        branch,
+        repo,
+        repo_notes,
+    )
+}
+
 pub fn build_apply_modernization_prompt(
     root: &Path,
     finding: &Finding,
@@ -463,16 +484,34 @@ pub fn build_apply_modernization_prompt(
     repo: &Repo,
     repo_notes: &str,
 ) -> Result<String> {
-    let notes = notes_or_default(repo_notes, "(No notes yet)");
-    let template = read_template(root, "apply_modernization.md")?;
-    let mut slots = HashMap::new();
-    slots.insert("WORKTREE", worktree.display().to_string());
-    slots.insert("BRANCH", branch.to_owned());
-    slots.insert("FINDING_JSON", finding_json(finding));
-    slots.insert("REPO_NAME", repo.name.clone());
-    slots.insert("REPO_NOTES", notes);
-    slots.insert("DECLINE_CLASSIFICATION", decline_instructions());
-    render(&template, &slots)
+    build_apply_prompt(
+        root,
+        "apply_modernization.md",
+        finding,
+        worktree,
+        branch,
+        repo,
+        repo_notes,
+    )
+}
+
+pub fn build_apply_simplification_prompt(
+    root: &Path,
+    finding: &Finding,
+    worktree: &Path,
+    branch: &str,
+    repo: &Repo,
+    repo_notes: &str,
+) -> Result<String> {
+    build_apply_prompt(
+        root,
+        "apply_simplification.md",
+        finding,
+        worktree,
+        branch,
+        repo,
+        repo_notes,
+    )
 }
 
 /// The pre-PR reviewer's prompt (`review.md`): a fresh session that reviews
@@ -829,7 +868,7 @@ pub fn build_recheck_prompt(
 }
 
 /// Analysis-job prompt builders (`test_gap`, `dep_update`, refactor, modernization,
-/// standards) share a common signature via the `AnalysisSpec` pattern.
+/// standards, simplification) share a common signature via the `AnalysisSpec` pattern.
 fn build_analysis_prompt(
     root: &Path,
     template_name: &str,
@@ -969,6 +1008,33 @@ pub fn build_modernization_prompt(
         repo_notes,
         "KNOWN_MODERNIZATIONS",
         "MAX_MODERNIZATIONS",
+    )
+}
+
+pub fn build_simplification_prompt(
+    root: &Path,
+    repo: &Repo,
+    tree: &Path,
+    scope_note: &str,
+    suppressions: &[Suppression],
+    known: &[Finding],
+    out_path: &Path,
+    max_findings: i64,
+    repo_notes: &str,
+) -> Result<String> {
+    build_analysis_prompt(
+        root,
+        "simplification.md",
+        repo,
+        tree,
+        scope_note,
+        suppressions,
+        known,
+        out_path,
+        max_findings,
+        repo_notes,
+        "KNOWN_SIMPLIFICATIONS",
+        "MAX_SIMPLIFICATIONS",
     )
 }
 

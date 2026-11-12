@@ -2677,6 +2677,46 @@ async fn a_resume_that_never_ran_keeps_the_repo_checkpoint() {
     );
 }
 
+/// Every repo kind's work keeps a checkpoint and can be held. The kinds
+/// are spelled out in SQL (`point_checkpoint`'s filter, the CHECKs on
+/// `repo_work` and `work_holds`), where no exhaustive match guards them:
+/// a kind missing there would run, and never be resumed or held.
+#[tokio::test]
+async fn every_repo_kind_keeps_a_checkpoint_and_can_be_held() {
+    for kind in RepoJobKind::ALL {
+        let (_dir, path, pool) = fresh_db().await;
+        seed_repo(&pool).await;
+        insert_job_with_session(
+            &pool,
+            10,
+            (1, kind.as_str()),
+            "suspended",
+            Some("/s/10/session.jsonl"),
+        )
+        .await;
+        let store = rw_store(&path).await;
+        let jobs = support::scope(&store);
+        let jobs = jobs.store();
+
+        jobs.keep_attempt_as_checkpoint(10).await.unwrap();
+        assert_eq!(
+            store
+                .repo_checkpoint_job(1, kind)
+                .await
+                .unwrap()
+                .map(|j| j.id),
+            Some(10),
+            "{kind}"
+        );
+        assert!(
+            jobs.hold_repo_work(1, kind.into(), HoldReason::Stuck, "kept failing", None)
+                .await
+                .unwrap(),
+            "{kind}"
+        );
+    }
+}
+
 /// Dropping a repo checkpoint that has moved on since it was read drops
 /// nothing and says so: the caller must not count a give-up that did not
 /// land.

@@ -1152,7 +1152,7 @@ async fn release_repo_hold(
         .ok_or_else(|| {
             ApiError::BadRequest(
                 "kind must be one of hunt, test_gap, dep_update, refactor, modernization, \
-                 standards, sync"
+                 standards, simplification, sync"
                     .to_owned(),
             )
         })?;

@@ -187,7 +187,7 @@ fn test_defaults_load_without_config_file() {
 /// Cadences are validated at the precision the scheduler uses.
 ///
 /// `scan.intervalDays` is multiplied by `86_400_000` and cast to `i64`;
-/// the modernization and standards cadences are cast to `i64` days
+/// the modernization, standards and simplification cadences are cast to `i64` days
 /// first. So a value that rounds to a non-positive interval does not
 /// mean "never" or "rarely" — it makes that job eligible on every cycle,
 /// the opposite of what a small number is meant to express.
@@ -197,6 +197,7 @@ fn cadences_that_round_to_no_interval_are_rejected() {
         // Truncates to 0 days -> eligible every cycle.
         ("modernization", "0.5"),
         ("standards", "0.5"),
+        ("simplification", "0.5"),
         ("modernization", "-0.5"),
         // Zero and negative outright.
         ("modernization", "0"),
@@ -232,7 +233,8 @@ fn ordinary_cadences_load() {
         dir.join("config.json"),
         r#"{"scan": {"intervalDays": 0.5},
             "modernization": {"intervalDays": 30},
-            "standards": {"intervalDays": 14}}"#,
+            "standards": {"intervalDays": 14},
+            "simplification": {"intervalDays": 60}}"#,
     )
     .unwrap();
     let cfg = Config::load(dir.path()).expect("valid cadences");
@@ -241,6 +243,7 @@ fn ordinary_cadences_load() {
     assert!((cfg.scan_interval_days - 0.5).abs() < f64::EPSILON);
     assert_eq!(cfg.modernization_interval_days, 30);
     assert_eq!(cfg.standards_interval_days, 14);
+    assert_eq!(cfg.simplification_interval_days, 60);
 }
 
 // -- serve.host / serve.allowedHosts ------------------------------------------

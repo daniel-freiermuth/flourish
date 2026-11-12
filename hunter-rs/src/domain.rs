@@ -483,16 +483,18 @@ pub enum FindingType {
     Refactor,
     Modernization,
     Standards,
+    Simplification,
 }
 
 impl FindingType {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Bug,
         Self::DepUpdate,
         Self::TestGap,
         Self::Refactor,
         Self::Modernization,
         Self::Standards,
+        Self::Simplification,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -503,6 +505,7 @@ impl FindingType {
             Self::Refactor => "refactor",
             Self::Modernization => "modernization",
             Self::Standards => "standards",
+            Self::Simplification => "simplification",
         }
     }
 }
@@ -523,6 +526,7 @@ impl std::str::FromStr for FindingType {
             "refactor" => Ok(Self::Refactor),
             "modernization" => Ok(Self::Modernization),
             "standards" => Ok(Self::Standards),
+            "simplification" => Ok(Self::Simplification),
             _ => Err(format!("unknown finding type: {s:?}")),
         }
     }
@@ -542,16 +546,18 @@ pub enum RepoJobKind {
     Refactor,
     Modernization,
     Standards,
+    Simplification,
 }
 
 impl RepoJobKind {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Hunt,
         Self::TestGap,
         Self::DepUpdate,
         Self::Refactor,
         Self::Modernization,
         Self::Standards,
+        Self::Simplification,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -562,6 +568,7 @@ impl RepoJobKind {
             Self::Refactor => "refactor",
             Self::Modernization => "modernization",
             Self::Standards => "standards",
+            Self::Simplification => "simplification",
         }
     }
 }
@@ -581,6 +588,7 @@ impl std::str::FromStr for RepoJobKind {
             "refactor" => Ok(Self::Refactor),
             "modernization" => Ok(Self::Modernization),
             "standards" => Ok(Self::Standards),
+            "simplification" => Ok(Self::Simplification),
             _ => Err(format!("unknown repo job kind: {s:?}")),
         }
     }
@@ -604,6 +612,7 @@ pub enum RepoWorkKind {
     Refactor,
     Modernization,
     Standards,
+    Simplification,
     Sync,
 }
 
@@ -617,6 +626,7 @@ impl RepoWorkKind {
             Self::Refactor => RepoJobKind::Refactor.as_str(),
             Self::Modernization => RepoJobKind::Modernization.as_str(),
             Self::Standards => RepoJobKind::Standards.as_str(),
+            Self::Simplification => RepoJobKind::Simplification.as_str(),
         }
     }
 }
@@ -630,6 +640,7 @@ impl From<RepoJobKind> for RepoWorkKind {
             RepoJobKind::Refactor => Self::Refactor,
             RepoJobKind::Modernization => Self::Modernization,
             RepoJobKind::Standards => Self::Standards,
+            RepoJobKind::Simplification => Self::Simplification,
         }
     }
 }

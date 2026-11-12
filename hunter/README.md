@@ -70,8 +70,10 @@ refused: a push over it would send your credentials unencrypted.
 | `dep_update` | Outdated dependencies, one finding per Renovate branch (see below) | `playbooks/dep_update.md` |
 | `refactor` | Conservative, safe, mechanical refactoring opportunities | `playbooks/refactor.md` |
 | `modernization` | SOTA-drift — deprecated deps, language-feature gaps, format/protocol shifts, CI/CD gaps, platform EOL | `playbooks/modernization.md` |
+| `standards` | Structural deviations from `CODING_STANDARDS.md` | `playbooks/standards.md` |
+| `simplification` | Complexity the code no longer needs — generality with one user, unreachable variants, over-powered data structures, accreted special cases, duplicated state, scaffolding of removed features, custom constructs where the conventional one would do. Never by loosening types | `playbooks/simplification.md` |
 
-All five share one `findings` table (see [Data model](#data-model)) and one
+All seven share one `findings` table (see [Data model](#data-model)) and one
 triage/fix pipeline; the UI's type filter and colored badges are the only
 place the distinction usually matters day to day.
 
@@ -296,10 +298,12 @@ what actually runs):
    already carrying.
 7. Otherwise, **hunt/test_gap/dep_update/refactor** — whichever is most
    overdue for the least-recently-scanned enabled repo (a never-cloned repo
-   always hunts first). **Modernization** joins this rotation too, but only
-   once `modernization.intervalDays` (config, default 30) has passed since it last ran for that
-   repo — a periodic strategic check, not a tight-loop scan competing for
-   every cycle. A repo with a **full re-hunt** queued from the Repos page
+   always hunts first). **Modernization**, **standards** and
+   **simplification** join this rotation too, but each only once its own
+   `modernization.intervalDays` / `standards.intervalDays` /
+   `simplification.intervalDays` (config, default 30) has passed since it
+   last ran for that repo — periodic strategic checks, not tight-loop scans
+   competing for every cycle. A repo with a **full re-hunt** queued from the Repos page
    goes first, and its hunt runs ahead of its other scans and of the scan
    interval — until a hunt has attempted that request, so a failing hunt
    is not retried back to back.

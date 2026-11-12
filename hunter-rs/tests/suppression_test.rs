@@ -57,8 +57,8 @@ async fn fixture(label: &str) -> Fixture {
     sqlx::query(
         "INSERT INTO repos (id, name, url, path, forge, default_branch, enabled, added_at, \
          last_test_gap_at, last_dep_update_at, last_refactor_at, last_modernization_at, \
-         last_standards_at) \
-         VALUES (1, 'alpha', ?1, ?2, 'github', 'main', 1, 1000, ?3, ?3, ?3, ?3, ?3)",
+         last_standards_at, last_simplification_at) \
+         VALUES (1, 'alpha', ?1, ?2, 'github', 'main', 1, 1000, ?3, ?3, ?3, ?3, ?3, ?3)",
     )
     .bind(repo.origin.to_string_lossy().to_string())
     .bind(clone.to_string_lossy().to_string())

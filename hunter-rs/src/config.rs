@@ -44,6 +44,7 @@ struct RawConfig {
     scan: RawScan,
     modernization: RawScan,
     standards: RawScan,
+    simplification: RawScan,
     renovate: RawRenovate,
     feedback: RawFeedback,
     network: RawNetwork,
@@ -255,6 +256,8 @@ pub struct Config {
     pub modernization_interval_days: i64,
     /// standards.intervalDays — per-repo standards audit cadence gate.
     pub standards_interval_days: i64,
+    /// simplification.intervalDays — per-repo simplification scan cadence gate.
+    pub simplification_interval_days: i64,
     /// renovate.githubToken — the token Renovate's github.com lookups use
     /// for GitHub-hosted repos, in place of the operator's `gh` login
     /// (see `dep_scan::github_token`).
@@ -370,7 +373,7 @@ impl Config {
              (got {scan_interval_days})",
             cfg_path.display()
         );
-        // These two are whole days by the time the scheduler sees them, so
+        // These three are whole days by the time the scheduler sees them, so
         // a fraction is truncated — 0.5 silently becomes 0, i.e. every
         // cycle. Reject it rather than reinterpret it.
         let whole_days = |field: &str, raw_days: Option<f64>| -> anyhow::Result<i64> {
@@ -390,6 +393,10 @@ impl Config {
         )?;
         let standards_interval_days =
             whole_days("standards.intervalDays", raw.standards.interval_days)?;
+        let simplification_interval_days = whole_days(
+            "simplification.intervalDays",
+            raw.simplification.interval_days,
+        )?;
         // An empty token would win over the `gh` login and then fail every
         // lookup, which is worse than not setting it.
         let renovate_github_token = match raw.renovate.github_token {
@@ -518,6 +525,7 @@ impl Config {
             scan_interval_days,
             modernization_interval_days,
             standards_interval_days,
+            simplification_interval_days,
             renovate_github_token,
             review_bots,
         })

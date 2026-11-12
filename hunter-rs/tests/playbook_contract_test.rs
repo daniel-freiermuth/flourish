@@ -107,6 +107,7 @@ fn analysis_cases() -> Vec<(&'static str, FindingType)> {
         ("refactor", FindingType::Refactor),
         ("modernization", FindingType::Modernization),
         ("standards", FindingType::Standards),
+        ("simplification", FindingType::Simplification),
     ]
 }
 
@@ -145,6 +146,7 @@ fn analysis_prompts_render() {
             FindingType::Refactor => playbooks::build_refactor_prompt,
             FindingType::Modernization => playbooks::build_modernization_prompt,
             FindingType::Standards => playbooks::build_standards_prompt,
+            FindingType::Simplification => playbooks::build_simplification_prompt,
             other @ FindingType::Bug => panic!("unhandled analysis kind {other:?}"),
         };
         let prompt = build(
@@ -160,6 +162,15 @@ fn analysis_prompts_render() {
         )
         .unwrap_or_else(|e| panic!("{name}.md must render with its builder's slots: {e}"));
         assert_usable(name, &prompt);
+        // Ingest drops an entry that lacks one of its type's required
+        // fields, so a playbook that never names one loses every finding
+        // of the scan while the job still reports success.
+        for field in hunter::ingest::type_required_fields(kind) {
+            assert!(
+                prompt.contains(&format!("\"{field}\"")),
+                "{name}.md never names its required field {field:?}"
+            );
+        }
     }
 }
 
@@ -180,7 +191,7 @@ fn fix_prompt_renders() {
 }
 
 #[test]
-fn improvement_and_modernization_apply_prompts_render() {
+fn apply_prompts_render() {
     let repo = sample_repo();
     for (name, kind, build) in [
         (
@@ -192,6 +203,11 @@ fn improvement_and_modernization_apply_prompts_render() {
             "apply_modernization",
             FindingType::Modernization,
             playbooks::build_apply_modernization_prompt,
+        ),
+        (
+            "apply_simplification",
+            FindingType::Simplification,
+            playbooks::build_apply_simplification_prompt,
         ),
     ] {
         let finding = sample_finding(kind);
@@ -513,6 +529,13 @@ fn followup_playbooks_name_every_required_field_they_ask_workers_to_emit() {
         // `FindingType` without matching playbook instructions is exactly
         // the failure this test exists to catch.
         for ft in FindingType::ALL {
+            // A type sharing its fields with another passes the field
+            // check without ever being offered, and its follow-ups are
+            // then filed as the wrong type.
+            assert!(
+                template.contains(&format!("`{ft}`")),
+                "{name} never offers {ft} follow-ups"
+            );
             for field in hunter::ingest::type_required_fields(ft) {
                 assert!(
                     template.contains(field),
@@ -561,6 +584,7 @@ fn every_playbook_is_covered_by_this_test() {
         "fix",
         "apply_improvement",
         "apply_modernization",
+        "apply_simplification",
         "recheck",
         "engage",
         "harvest",

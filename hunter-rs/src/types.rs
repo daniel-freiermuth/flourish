@@ -61,6 +61,7 @@ pub struct Repo {
     pub last_refactor_at: Option<i64>,
     pub last_modernization_at: Option<i64>,
     pub last_standards_at: Option<i64>,
+    pub last_simplification_at: Option<i64>,
     /// A pending operator request for a full re-hunt (migration 020).
     pub full_hunt_requested_at: Option<i64>,
     /// The request a hunt last started to answer (migration 020).
@@ -211,7 +212,8 @@ impl Finding {
             FindingType::Bug => Some(self.bug_class.map(|b| b.to_string())),
             FindingType::DepUpdate => Some(self.update_type.clone()),
             FindingType::TestGap => Some(Some("coverage".to_owned())),
-            FindingType::Refactor => Some(self.smell_type.clone()),
+            // A simplification's class is a smell, so it shares the column.
+            FindingType::Refactor | FindingType::Simplification => Some(self.smell_type.clone()),
             FindingType::Modernization => Some(self.modernization_class.clone()),
             FindingType::Standards => Some(self.standard_section.clone()),
         }

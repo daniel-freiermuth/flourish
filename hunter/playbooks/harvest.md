@@ -92,7 +92,8 @@ genuinely remains open.
   finding instead of prose buried in a merged PR nobody re-reads. Empty
   array or omit the file entirely otherwise. Each entry MUST set its own
   "type" (bug | dep_update | test_gap | refactor | modernization |
-  standards) to whichever shape actually fits, e.g. for a leftover
+  standards | simplification) to whichever shape actually fits, e.g. for a
+  leftover
   cleanup item:
   ```json
   {
@@ -120,6 +121,9 @@ genuinely remains open.
     `proposed_approach`.
   - `standards`: `standard_section` (the heading it violates, e.g.
     "Type safety / Domain types over primitives"), `current_approach`,
+    `proposed_approach`.
+  - `simplification` (a design that no longer needs its complexity, not a
+    mechanical cleanup): `smell_type`, `current_approach`,
     `proposed_approach`.
   - `bug`: `bug_class`, exactly one of
     `boundary|error-path|race|contract-drift|leak|logic`.
