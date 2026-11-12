@@ -101,6 +101,8 @@ export function typeLabel(t: string): string {
       return "\ud83d\udd2c Modern";
     case "standards":
       return "\ud83d\udcd0 Standards";
+    case "simplification":
+      return "\u2702\ufe0f Simplify";
     default:
       return t || "?";
   }
@@ -121,6 +123,8 @@ export function typeEmoji(t: string): string {
       return "\ud83d\udd2c";
     case "standards":
       return "\ud83d\udcd0";
+    case "simplification":
+      return "\u2702\ufe0f";
     default:
       return "\u2753";
   }

@@ -49,7 +49,7 @@ async fn fixture(label: &str) -> (TempDir, PathBuf, Config) {
     let clone = dir.path().join("repo-1");
     std::fs::rename(&repo.work, &clone).unwrap();
 
-    // modernization and standards are parked in the future so their much
+    // modernization, standards and simplification are parked in the future so their much
     // longer intervals cannot make them eligible; hunt/dep_update/
     // refactor are eligible but newer than test_gap.
     let future = hunter::util::now_ms() + 999_999;
@@ -57,8 +57,8 @@ async fn fixture(label: &str) -> (TempDir, PathBuf, Config) {
         "INSERT INTO repos \
          (id, name, url, path, forge, default_branch, enabled, added_at, \
           last_hunt_at, last_test_gap_at, last_dep_update_at, last_refactor_at, \
-          last_modernization_at, last_standards_at) \
-         VALUES (1, 'alpha', ?1, ?2, 'github', 'main', 1, 1000, ?3, ?4, ?5, ?6, ?7, ?7)",
+          last_modernization_at, last_standards_at, last_simplification_at) \
+         VALUES (1, 'alpha', ?1, ?2, 'github', 'main', 1, 1000, ?3, ?4, ?5, ?6, ?7, ?7, ?7)",
     )
     .bind(repo.origin.to_string_lossy().to_string())
     .bind(clone.to_string_lossy().to_string())
@@ -667,10 +667,10 @@ async fn two_hunts_due(label: &str) -> (TempDir, Store, Config) {
         "INSERT INTO repos \
          (id, name, url, path, forge, default_branch, enabled, added_at, last_hunt_at, \
           last_test_gap_at, last_dep_update_at, last_refactor_at, last_modernization_at, \
-          last_standards_at) VALUES \
-         (1, 'alpha', ?1, ?2, 'github', 'main', 1, 1000, ?4, ?6, ?6, ?6, ?6, ?6), \
+          last_standards_at, last_simplification_at) VALUES \
+         (1, 'alpha', ?1, ?2, 'github', 'main', 1, 1000, ?4, ?6, ?6, ?6, ?6, ?6, ?6), \
          (2, 'beta', 'https://example.com/beta.git', ?3, 'github', 'main', 1, 1000, ?5, \
-          ?6, ?6, ?6, ?6, ?6)",
+          ?6, ?6, ?6, ?6, ?6, ?6)",
     )
     .bind(alpha.origin.to_string_lossy().to_string())
     .bind(alpha_clone.to_string_lossy().to_string())
@@ -926,11 +926,11 @@ async fn two_repos_for_selection(label: &str, alpha_cloned: bool) -> (TempDir, S
         "INSERT INTO repos \
          (id, name, url, path, forge, default_branch, enabled, added_at, last_hunt_at, \
           last_test_gap_at, last_dep_update_at, last_refactor_at, last_modernization_at, \
-          last_standards_at) VALUES \
+          last_standards_at, last_simplification_at) VALUES \
          (1, 'alpha', 'https://example.com/alpha.git', ?1, 'github', 'main', 1, 1000, ?3, \
-          NULL, ?4, ?4, ?4, ?4), \
+          NULL, ?4, ?4, ?4, ?4, ?4), \
          (2, 'beta', 'https://example.com/beta.git', ?2, 'github', 'main', 1, 1000, 1000, \
-          ?4, ?4, ?4, ?4, ?4)",
+          ?4, ?4, ?4, ?4, ?4, ?4)",
     )
     .bind(alpha.to_string_lossy().to_string())
     .bind(beta.to_string_lossy().to_string())

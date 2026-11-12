@@ -57,6 +57,8 @@ pub fn type_required_fields(finding_type: FindingType) -> &'static [&'static str
             "proposed_approach",
         ],
         FindingType::Standards => &["standard_section", "current_approach", "proposed_approach"],
+        // A simplification's class is a smell, so it shares the column.
+        FindingType::Simplification => &["smell_type", "current_approach", "proposed_approach"],
         FindingType::Bug => &[],
     }
 }

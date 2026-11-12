@@ -311,7 +311,7 @@ async fn a_repo_renovate_cannot_read_is_handed_to_the_job_lanes_ai_scan() {
     // Every other kind ran just now, so `dep_update` is the one due.
     sqlx::query(
         "UPDATE repos SET last_hunt_at = ?1, last_test_gap_at = ?1, last_refactor_at = ?1, \
-         last_modernization_at = ?1, last_standards_at = ?1",
+         last_modernization_at = ?1, last_standards_at = ?1, last_simplification_at = ?1",
     )
     .bind(hunter::util::now_ms())
     .execute(&rig.pool)

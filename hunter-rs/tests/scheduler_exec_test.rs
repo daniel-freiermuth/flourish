@@ -1505,6 +1505,7 @@ async fn an_analysis_job_whose_suppressions_cannot_be_read_is_refused() {
         RepoJobKind::Refactor,
         RepoJobKind::Modernization,
         RepoJobKind::Standards,
+        RepoJobKind::Simplification,
     ] {
         let dir = TempDir::new("analysis-bad-suppressions");
         let (_path, store, row, cfg) = repo_with_an_undecodable_finding(&dir, kind.as_str()).await;
@@ -1524,6 +1525,16 @@ async fn an_analysis_job_whose_suppressions_cannot_be_read_is_refused() {
             }
             RepoJobKind::Modernization => {
                 hunter::scheduler::run_modernize(
+                    &scope,
+                    store.test_lane(),
+                    &cfg,
+                    Attempt::Cold(&row),
+                    &backend,
+                )
+                .await
+            }
+            RepoJobKind::Simplification => {
+                hunter::scheduler::run_simplification(
                     &scope,
                     store.test_lane(),
                     &cfg,

@@ -7,4 +7,4 @@
  * breaks all of them at once, so it is counted, and held, once for the
  * repo (WORK-MODEL.md §17).
  */
-export type RepoWorkKind = "hunt" | "test_gap" | "dep_update" | "refactor" | "modernization" | "standards" | "sync";
+export type RepoWorkKind = "hunt" | "test_gap" | "dep_update" | "refactor" | "modernization" | "standards" | "simplification" | "sync";

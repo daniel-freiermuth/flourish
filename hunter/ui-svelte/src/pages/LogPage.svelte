@@ -38,6 +38,7 @@
       case "refactor":
       case "modernization":
       case "standards":
+      case "simplification":
       case "override": return "kind-warn";
       // Nothing ran, or queued work was withdrawn.
       case "deny":

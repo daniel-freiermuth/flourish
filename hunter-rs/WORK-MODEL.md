@@ -600,7 +600,7 @@ Steps 5–9 are independent of each other once step 4 is in. Step 3 fixes a prob
 
 ## 17. Repo-level work
 
-Hunt and the analysis scans (`test_gap`, `dep_update`, `refactor`, `modernization`, `standards`) run on the same machine as finding work (§6.2). Where this section is silent, the finding rules apply unchanged: §4 facts vs. state, §6.3 transitions, §7 failures, §8 checkpoints and the ceiling since the last release, §9 holds and their invariants.
+Hunt and the analysis scans (`test_gap`, `dep_update`, `refactor`, `modernization`, `standards`, `simplification`) run on the same machine as finding work (§6.2). Where this section is silent, the finding rules apply unchanged: §4 facts vs. state, §6.3 transitions, §7 failures, §8 checkpoints and the ceiling since the last release, §9 holds and their invariants.
 
 ### 17.1 Work items
 

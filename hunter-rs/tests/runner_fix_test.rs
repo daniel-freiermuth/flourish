@@ -1583,6 +1583,7 @@ async fn each_fix_kind_gets_its_branch_and_playbook_with_the_decline_classes() {
         ("bug", "fix.md", "fix"),
         ("refactor", "apply_improvement.md", "improve"),
         ("modernization", "apply_modernization.md", "modernize"),
+        ("simplification", "apply_simplification.md", "simplify"),
     ] {
         let f = fixture("fix-kinds").await;
         std::fs::write(

@@ -520,7 +520,8 @@ impl EngageFixture {
         sqlx::query(
             "UPDATE repos SET last_hunt_at = ?1, last_test_gap_at = 1000, \
              last_dep_update_at = ?1, last_refactor_at = ?1, \
-             last_modernization_at = ?1, last_standards_at = ?1 WHERE id = ?2",
+             last_modernization_at = ?1, last_standards_at = ?1, \
+             last_simplification_at = ?1 WHERE id = ?2",
         )
         .bind(hunter::util::now_ms() + 999_999)
         .bind(alpha)

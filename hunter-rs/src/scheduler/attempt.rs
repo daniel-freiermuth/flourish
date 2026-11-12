@@ -85,6 +85,7 @@ pub mod kind {
         Refactor: JobKind::Repo(RepoJobKind::Refactor) => Repo;
         Modernization: JobKind::Repo(RepoJobKind::Modernization) => Repo;
         Standards: JobKind::Repo(RepoJobKind::Standards) => Repo;
+        Simplification: JobKind::Repo(RepoJobKind::Simplification) => Repo;
         Recheck: JobKind::Finding(FindingJobKind::Recheck) => Finding;
         Fix: JobKind::Finding(FindingJobKind::Fix) => Finding;
         Engage: JobKind::Finding(FindingJobKind::Engage) => Finding;

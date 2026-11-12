@@ -49,6 +49,7 @@ fn stub_root(dir: &TempDir) -> PathBuf {
         ("dep_update.md", "MAX_UPDATES"),
         ("refactor.md", "MAX_REFACTORS"),
         ("modernization.md", "MAX_MODERNIZATIONS"),
+        ("simplification.md", "MAX_SIMPLIFICATIONS"),
     ] {
         std::fs::write(
             playbooks.join(name),
@@ -102,6 +103,7 @@ fn analysis_prompts_send_the_worker_to_the_chains_tree() {
         ("dep_update", playbooks::build_dep_update_prompt),
         ("refactor", playbooks::build_refactor_prompt),
         ("modernization", playbooks::build_modernization_prompt),
+        ("simplification", playbooks::build_simplification_prompt),
         ("standards", playbooks::build_standards_prompt),
     ] {
         let prompt = build(&root, &repo, &tree, "scope", &[], &[], &out, 5, "notes").unwrap();

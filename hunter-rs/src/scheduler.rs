@@ -426,8 +426,8 @@ fn engage_held_back(mode: Pick<'_>, fid: i64) -> bool {
 /// most stale-of-rotation job type for the least-recently-hunted enabled
 /// repo (hunt if never cloned, else whichever of
 /// `hunt/test_gap/dep_update/refactor` is oldest/never-run subject to
-/// `cfg.scan_interval_days`; modernization gated by
-/// `cfg.modernization_interval_days`). All types gated for one repo ->
+/// `cfg.scan_interval_days`; modernization, standards and simplification
+/// gated by their own `cfg.*_interval_days`). All types gated for one repo ->
 /// the next-stalest repo is tried. None = nothing to do.
 ///
 /// Each finding tier continues a suspended attempt at its own
@@ -749,6 +749,7 @@ fn rotation_kind(
     let scan_interval_ms = (cfg.scan_interval_days * 86_400_000.0) as i64;
     let mod_interval_ms = cfg.modernization_interval_days * 86_400_000;
     let std_interval_ms = cfg.standards_interval_days * 86_400_000;
+    let simp_interval_ms = cfg.simplification_interval_days * 86_400_000;
 
     // Eligible job types with their last-run timestamps, in
     // RepoJobKind::ALL insertion order (mirrors Python's dict).
@@ -779,6 +780,11 @@ fn rotation_kind(
             RepoJobKind::Standards,
             target.last_standards_at,
             std_interval_ms,
+        ),
+        (
+            RepoJobKind::Simplification,
+            target.last_simplification_at,
+            simp_interval_ms,
         ),
     ] {
         let last = last.unwrap_or(0);
@@ -4330,6 +4336,18 @@ const STANDARDS_SPEC: AnalysisSpec = AnalysisSpec {
     scope_note: "Full repository audit against coding standards.",
     prompt_builder: playbooks::build_standards_prompt,
 };
+// Not `refactor` with more classes: a refactor is mechanical and local,
+// and its apply playbook declines a design change. This scan asks whether
+// the design still earns its complexity, so its findings are proposals.
+const SIMPLIFICATION_SPEC: AnalysisSpec = AnalysisSpec {
+    kind: RepoJobKind::Simplification,
+    finding_type: FindingType::Simplification,
+    also_files: &[],
+    out_plural: "simplifications",
+    no_output_noun: "simplifications",
+    scope_note: "Scan for complexity the code no longer needs: generality with one user, unreachable variants and states, over-powered data structures, accreted special cases, duplicated state, scaffolding of removed features, custom constructs where the conventional one would do.",
+    prompt_builder: playbooks::build_simplification_prompt,
+};
 
 /// A repo kind run by [`run_analysis_job`], with its spec. The spec comes
 /// from the attempt's kind rather than from the caller, so the body cannot
@@ -4352,6 +4370,9 @@ impl AnalysisKind for kind::Modernization {
 }
 impl AnalysisKind for kind::Standards {
     const SPEC: &'static AnalysisSpec = &STANDARDS_SPEC;
+}
+impl AnalysisKind for kind::Simplification {
+    const SPEC: &'static AnalysisSpec = &SIMPLIFICATION_SPEC;
 }
 
 /// Shared body for the four repo-level analysis job types (`scheduler._run_analysis_job`).
@@ -5049,6 +5070,15 @@ pub async fn run_standards(
 ) -> anyhow::Result<CycleSummary> {
     run_analysis_job(scope, lane, cfg, attempt, backend).await
 }
+pub async fn run_simplification(
+    scope: &CycleScope<'_>,
+    lane: &mut Lane,
+    cfg: &Config,
+    attempt: Attempt<'_, kind::Simplification>,
+    backend: &dyn Backend,
+) -> anyhow::Result<CycleSummary> {
+    run_analysis_job(scope, lane, cfg, attempt, backend).await
+}
 
 fn extract_pr_url(text: &str) -> Option<String> {
     for word in text.split_whitespace() {
@@ -5072,7 +5102,7 @@ fn extract_pr_url(text: &str) -> Option<String> {
     None
 }
 
-/// `fix/<slug>-<id>` (`modernize/`, `improve/` for the other types): the
+/// `fix/<slug>-<id>` (`modernize/`, `simplify/`, `improve/` for the other types): the
 /// branch every attempt at this finding works on.
 fn fix_branch(finding: &Finding) -> String {
     let slug: String = finding
@@ -5096,6 +5126,7 @@ fn fix_branch(finding: &Finding) -> String {
     let prefix = match finding.kind {
         FindingType::Bug => "fix",
         FindingType::Modernization => "modernize",
+        FindingType::Simplification => "simplify",
         _ => "improve",
     };
     format!("{prefix}/{slug}-{}", finding.id)
@@ -5357,6 +5388,14 @@ fn fix_prompt(
             &repo_notes,
         ),
         FindingType::Modernization => playbooks::build_apply_modernization_prompt(
+            &cfg.root,
+            finding,
+            worktree,
+            &start.branch,
+            &start.repo,
+            &repo_notes,
+        ),
+        FindingType::Simplification => playbooks::build_apply_simplification_prompt(
             &cfg.root,
             finding,
             worktree,
@@ -9904,6 +9943,10 @@ async fn run_resume(
             let resumed = Resumed::<kind::Standards>::load(store, plan).await?;
             run_standards(scope, lane, cfg, Attempt::Resume(&resumed), backend).await
         }
+        JobKind::Repo(RepoJobKind::Simplification) => {
+            let resumed = Resumed::<kind::Simplification>::load(store, plan).await?;
+            run_simplification(scope, lane, cfg, Attempt::Resume(&resumed), backend).await
+        }
         JobKind::Finding(FindingJobKind::Recheck) => {
             let resumed = Resumed::<kind::Recheck>::load(store, plan).await?;
             run_recheck(scope, lane, cfg, Attempt::Resume(&resumed), backend).await
@@ -9957,6 +10000,9 @@ async fn run_repo_job(
         }
         RepoJobKind::Standards => {
             run_standards(scope, lane, cfg, Attempt::Cold(&repo), backend).await
+        }
+        RepoJobKind::Simplification => {
+            run_simplification(scope, lane, cfg, Attempt::Cold(&repo), backend).await
         }
     }
 }

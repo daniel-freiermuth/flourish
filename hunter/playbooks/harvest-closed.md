@@ -152,7 +152,8 @@ not read the line, cite the file and the symbol instead.
 - FOLLOW-UPS.json at the worktree root, NOT COMMITTED, OPTIONAL: only if
   step 5 verified real, still-open work. A JSON array; the scheduler ingests
   it into the finding queue. Each entry MUST set its own "type" (bug |
-  dep_update | test_gap | refactor | modernization | standards) plus the
+  dep_update | test_gap | refactor | modernization | standards |
+  simplification) plus the
   common fields `fingerprint` ("{{REPO_NAME}}:path/file.ext:short-slug"),
   `file`, `severity`, `confidence`, `summary`, `detail` (why it is real, with
   file:line evidence from the CURRENT code), and
@@ -169,3 +170,6 @@ not read the line, cite the file and the symbol instead.
   - `modernization`: `modernization_class`, `current_approach`,
     `proposed_approach`.
   - `standards`: `standard_section`, `current_approach`, `proposed_approach`.
+  - `simplification` (a design that no longer needs its complexity, not a
+    mechanical cleanup): `smell_type`, `current_approach`,
+    `proposed_approach`.
