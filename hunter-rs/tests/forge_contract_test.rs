@@ -596,15 +596,17 @@ fn gitlab_create_pr_conflict_with_a_failed_lookup_keeps_the_diagnostics() {
 // push
 // ---------------------------------------------------------------------------
 
-/// Pushes go to a raw SSH URL, never a named remote: `--force-with-lease`
-/// cannot resolve a tracking ref for a bare URL, so the pair (raw URL,
-/// plain `--force`) has to stay together.
+/// Pushes go to the repo's URL as stored, never a named remote:
+/// `--force-with-lease` cannot resolve a tracking ref for a bare URL, so
+/// the pair (raw URL, plain `--force`) has to stay together.
 ///
-/// `http://` remotes are rewritten too. They are accepted by
-/// `valid_repo_url`, and pushing to one unrewritten would carry a force
-/// push over an unauthenticated, unencrypted hop instead of SSH.
+/// The URL is not rewritten to another transport. The clone fetches over
+/// it, so it is the one the operator's credentials are set up for: an
+/// https remote pushed as `git@<host>:<path>.git` instead needed SSH keys
+/// and a known host key that a machine logged in through `gh`'s
+/// credential helper does not have, and no fix could be published.
 #[test]
-fn push_forces_to_a_raw_ssh_url_for_both_forges() {
+fn push_forces_to_the_url_as_stored_for_both_forges() {
     let bins = FakeBins::acquire("forge-push-ok");
     let dir = TempDir::new("forge-push-ok-cwd");
     bins.ok("git", "");
@@ -614,12 +616,6 @@ fn push_forces_to_a_raw_ssh_url_for_both_forges() {
         .unwrap();
     forge_for(ForgeName::Gitlab)
         .push(dir.path(), GL_REPO, "fix/x")
-        .unwrap();
-    forge_for(ForgeName::Github)
-        .push(dir.path(), "http://github.com/acme/widget", "fix/x")
-        .unwrap();
-    forge_for(ForgeName::Gitlab)
-        .push(dir.path(), "http://gitlab.com/group/widget", "fix/x")
         .unwrap();
 
     let calls = bins.calls_to("git");
@@ -633,8 +629,8 @@ fn push_forces_to_a_raw_ssh_url_for_both_forges() {
                 d.as_str(),
                 "push",
                 "--force",
-                "git@github.com:acme/widget.git",
-                "HEAD:fix/x",
+                GH_REPO,
+                "HEAD:fix/x"
             ],
             vec![
                 "git",
@@ -642,26 +638,8 @@ fn push_forces_to_a_raw_ssh_url_for_both_forges() {
                 d.as_str(),
                 "push",
                 "--force",
-                "git@gitlab.com:group/widget.git",
-                "HEAD:fix/x",
-            ],
-            vec![
-                "git",
-                "-C",
-                d.as_str(),
-                "push",
-                "--force",
-                "git@github.com:acme/widget.git",
-                "HEAD:fix/x",
-            ],
-            vec![
-                "git",
-                "-C",
-                d.as_str(),
-                "push",
-                "--force",
-                "git@gitlab.com:group/widget.git",
-                "HEAD:fix/x",
+                GL_REPO,
+                "HEAD:fix/x"
             ],
         ]
     );

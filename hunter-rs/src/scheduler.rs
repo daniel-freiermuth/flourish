@@ -6084,7 +6084,10 @@ async fn ship_pr(
     }
 
     let f = forge::forge_for(repo.forge);
-    let push_url = f.ssh_url(&repo.url);
+    // The URL as stored, which the clone fetches over too: whatever
+    // credentials the operator set up for it (an https remote's credential
+    // helper, an ssh remote's keys) are the ones that can push.
+    let push_url = repo.url.clone();
     let wt = worktree.to_owned();
     // Always to the branch by name: a symbolic `HEAD` would push whatever
     // ref the tree has checked out, and nothing at all from a detached one.
@@ -7726,7 +7729,7 @@ async fn push_then_reply(
     if already {
         *pushed_before = true;
     } else if has_commits {
-        let push_url = fg.ssh_url(&repo.url);
+        let push_url = repo.url.clone();
         let wt = worktree.clone();
         let refspec = format!("HEAD:{head_ref}");
         // Leased to the PR head the chain's tree was created at, with the
@@ -8089,7 +8092,7 @@ fn failure_key(fail: &str) -> &str {
 /// The PR branch's commit on the forge, or `None` when the forge would
 /// not say (or has no such branch: empty).
 async fn remote_head(start: &EngageStart) -> Option<String> {
-    let url = forge::forge_for(start.repo.forge).ssh_url(&start.repo.url);
+    let url = start.repo.url.clone();
     let (tree, branch) = (start.ws.tree.clone(), start.head_ref.clone());
     let (rc, out) = tokio::task::spawn_blocking(move || {
         Unheld::RemoteHead {

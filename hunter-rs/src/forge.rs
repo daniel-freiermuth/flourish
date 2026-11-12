@@ -1353,8 +1353,6 @@ fn gitlab_feedback(
 }
 
 pub trait Forge: Send + Sync {
-    /// Git SSH URL for push operations.
-    fn ssh_url(&self, https_url: &str) -> String;
     /// owner/repo from a remote URL.
     fn owner_repo(&self, url: &str) -> Option<(String, String)>;
     /// Extract (`owner_repo_slug`, `pr_number`) from a PR/MR web URL.
@@ -1403,7 +1401,8 @@ pub trait Forge: Send + Sync {
     fn comment_pr(&self, url: &str, pr_number: i64, body: &str) -> anyhow::Result<()>;
     /// Close a PR/MR with a comment explaining why.
     fn close_pr(&self, url: &str, pr_number: i64, comment: &str) -> anyhow::Result<()>;
-    /// Push to the remote (--force to raw SSH URL).
+    /// Force-push `HEAD` to `branch` at `url`, the repo's URL as stored:
+    /// the transport it is cloned over is the one it is pushed over.
     fn push(&self, repo_path: &Path, url: &str, branch: &str) -> anyhow::Result<()>;
     /// What a review of PR `pr_number` needs: state, head, base, author,
     /// title and body, and whether the head is in a fork.
@@ -1692,16 +1691,6 @@ fn strip_any_scheme(url: &str) -> Option<&str> {
     ["https", "http", "ssh"]
         .iter()
         .find_map(|s| strip_scheme(url, s))
-}
-
-/// Whether `url` carries one of the web schemes `ssh_url` rewrites.
-///
-/// `http://` counts alongside `https://`: `valid_repo_url` accepts it,
-/// and a plain-HTTP remote carries none of the SSH key material the
-/// push path depends on, so leaving it unrewritten sent
-/// `git push --force` over an unauthenticated, unencrypted hop.
-fn is_web_scheme(url: &str) -> bool {
-    strip_scheme(url, "https").is_some() || strip_scheme(url, "http").is_some()
 }
 
 /// Split a remote URL into (host, path), for every form the write path
@@ -2742,22 +2731,6 @@ pub struct GitHubForge;
 pub struct GitLabForge;
 
 impl Forge for GitHubForge {
-    fn ssh_url(&self, https_url: &str) -> String {
-        // Enterprise hosts too: a self-hosted GitHub's clone URL is
-        // `git@<its host>:owner/repo.git`, and rewriting it to
-        // github.com would push an internal repo at the public forge.
-        if is_web_scheme(https_url)
-            && let Some((host, path)) = url_host_path(https_url)
-            && is_github_host(host)
-        {
-            let path = path.trim_end_matches('/').trim_end_matches(".git");
-            if !path.is_empty() {
-                return format!("git@{host}:{path}.git");
-            }
-        }
-        https_url.to_owned()
-    }
-
     fn owner_repo(&self, url: &str) -> Option<(String, String)> {
         github_owner_repo(url)
     }
@@ -2918,11 +2891,10 @@ impl Forge for GitHubForge {
     }
 
     fn push(&self, repo_path: &Path, url: &str, branch: &str) -> anyhow::Result<()> {
-        let ssh = self.ssh_url(url);
         let refspec = format!("HEAD:{branch}");
         let (rc, out) = Unheld::Push {
             force: Force::Always,
-            url: &ssh,
+            url,
             refspec: &refspec,
         }
         .run(repo_path, 120);
@@ -3216,15 +3188,6 @@ impl Forge for GitHubForge {
 // ---------------------------------------------------------------------------
 
 impl Forge for GitLabForge {
-    fn ssh_url(&self, https_url: &str) -> String {
-        if let Some((host, path)) = gitlab_host_path(https_url)
-            && is_web_scheme(https_url)
-        {
-            return format!("git@{host}:{path}.git");
-        }
-        https_url.to_owned()
-    }
-
     fn owner_repo(&self, url: &str) -> Option<(String, String)> {
         let (_, path) = gitlab_host_path(url)?;
         // Split at last '/' — GitLab paths may be multi-level (group/sub/repo).
@@ -3442,11 +3405,10 @@ impl Forge for GitLabForge {
     }
 
     fn push(&self, repo_path: &Path, url: &str, branch: &str) -> anyhow::Result<()> {
-        let ssh = self.ssh_url(url);
         let refspec = format!("HEAD:{branch}");
         let (rc, out) = Unheld::Push {
             force: Force::Always,
-            url: &ssh,
+            url,
             refspec: &refspec,
         }
         .run(repo_path, 120);

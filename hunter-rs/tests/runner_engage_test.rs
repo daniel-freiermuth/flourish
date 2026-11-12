@@ -291,6 +291,19 @@ async fn fixture(label: &str) -> Fixture {
         .unwrap();
     let repo_dir = hunter::store::Store::repo_dir(&repos_root, rid);
     std::fs::rename(&repo.work, &repo_dir).unwrap();
+    // No test reaches a forge. A push or `ls-remote` to the repo's URL that
+    // a test does not route ([`push_to`]) lands on a path that does not
+    // exist, failing at once and offline, as a forge that does not answer
+    // would. Keyed on the scheme alone, so a test's own route for the URL
+    // is the longer match and wins.
+    git(
+        &repo_dir,
+        &[
+            "config",
+            &format!("url.{}/.insteadOf", dir.path().join("no-forge").display()),
+            "https://",
+        ],
+    );
 
     let (fid, _) = store
         .upsert_finding(
@@ -2258,7 +2271,7 @@ async fn push_to(f: &Fixture, to: Option<&str>) -> std::path::PathBuf {
         &[
             "config",
             &format!("url.{}.insteadOf", to.unwrap_or(origin)),
-            "git@github.com:acme/widget.git",
+            REPO_URL,
         ],
     );
     std::path::PathBuf::from(origin)

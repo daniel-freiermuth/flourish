@@ -53,6 +53,19 @@ async fn fixture_on(label: &str, url: &str, forge: ForgeName) -> Fixture {
         .unwrap();
     let repo_dir = hunter::store::Store::repo_dir(&repos_root, rid);
     std::fs::rename(&repo.work, &repo_dir).unwrap();
+    // No test reaches a forge. A push or `ls-remote` to the repo's URL that
+    // a test does not route ([`route_push`]) lands on a path that does not
+    // exist, failing at once and offline, as a refusing forge would. Keyed
+    // on the scheme alone, so a test's own route for the URL is the longer
+    // match and wins.
+    git(
+        &repo_dir,
+        &[
+            "config",
+            &format!("url.{}/.insteadOf", dir.path().join("no-forge").display()),
+            "https://",
+        ],
+    );
 
     // Filed first and left `new`, so the finding under fix is not id 1: a
     // write aimed at the wrong finding id lands on this one, not on the
@@ -403,7 +416,7 @@ async fn a_finished_fix_ships_and_records_its_draft_pr() {
             &[
                 "config",
                 &format!("url.{}.insteadOf", origin.trim()),
-                "git@github.com:acme/widget.git",
+                REPO_URL,
             ],
         );
         if case == "created" {
@@ -1703,7 +1716,7 @@ async fn a_description_without_commits_ships_nothing() {
         &[
             "config",
             &format!("url.{}.insteadOf", origin.trim()),
-            "git@github.com:acme/widget.git",
+            REPO_URL,
         ],
     );
     let worker = ScriptedBackend::writing("PR-DESCRIPTION.md", "nothing changed");
@@ -1760,18 +1773,15 @@ async fn a_fix_ships_nothing_when_its_default_branch_was_rewritten_meanwhile() {
     assert!(!bins.called_with("gh", "create"), "{:?}", bins.calls());
 }
 
-/// Send `run_fix`'s push, which targets the forge's SSH URL, to `target`:
-/// the clone's `origin` when `None`, as the shipping tests above do.
+/// Send `run_fix`'s push, which targets the repo's URL as stored, to
+/// `target`: the clone's `origin` when `None`, as the shipping tests above
+/// do.
 fn route_push(f: &Fixture, target: Option<&str>) {
     let origin = git(&f.repo_dir, &["remote", "get-url", "origin"]);
     let target = target.unwrap_or(origin.trim());
     git(
         &f.repo_dir,
-        &[
-            "config",
-            &format!("url.{target}.insteadOf"),
-            "git@github.com:acme/widget.git",
-        ],
+        &["config", &format!("url.{target}.insteadOf"), REPO_URL],
     );
 }
 
@@ -1978,15 +1988,15 @@ const GLAB_MR_EXISTS: &str = "\nCreating draft merge request for fix/a-real-bug-
 async fn gitlab_retry_adopts_the_mr_that_already_exists() {
     let bins = support::FakeBins::acquire("fix-gl-exists");
     let f = fixture_on("fix-gl-exists", GL_REPO_URL, ForgeName::Gitlab).await;
-    // The push goes to git@gitlab.com:group/widget.git; land it on the
-    // local bare origin instead.
+    // The push goes to the repo's URL; land it on the local bare origin
+    // instead.
     let origin = git(&f.repo_dir, &["remote", "get-url", "origin"]);
     git(
         &f.repo_dir,
         &[
             "config",
             &format!("url.{}.insteadOf", origin.trim()),
-            "git@gitlab.com:group/widget.git",
+            GL_REPO_URL,
         ],
     );
     bins.script(
@@ -2020,14 +2030,13 @@ async fn a_failed_push_counts_only_while_the_forge_is_reachable() {
         let mut f = fixture_on("fix-push-offline", &url, ForgeName::Github).await;
         f.cfg.network_gate = true;
         // The push goes nowhere, and fails at once, without a network.
-        let push_url = hunter::forge::forge_for(ForgeName::Github).ssh_url(&url);
         let nowhere = f.cfg.work_root.join("no-such-remote.git");
         git(
             &f.repo_dir,
             &[
                 "config",
                 &format!("url.{}.insteadOf", nowhere.display()),
-                &push_url,
+                &url,
             ],
         );
         let down: &[&str] = if counted { &[] } else { &[host] };
