@@ -2268,8 +2268,7 @@ async fn a_denied_harvest_leaves_the_pr_pending() {
     assert_eq!(f.scalar("SELECT COUNT(*) FROM jobs").await, Some(0));
     assert!(bins.calls_to("gh").is_empty(), "{:?}", bins.calls());
     let trees: Vec<_> = std::fs::read_dir(&f.cfg.work_root)
-        .map(|d| d.map(|e| e.unwrap().path()).collect())
-        .unwrap_or_default();
+        .map_or_default(|d| d.map(|e| e.unwrap().path()).collect());
     assert!(trees.is_empty(), "no worktree may be left: {trees:?}");
     assert_eq!(harvest_streak(&f).await, 0);
     let pending: Vec<i64> = f

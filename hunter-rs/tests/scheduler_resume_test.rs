@@ -1400,11 +1400,7 @@ impl Backend for RecordingBackend {
             killed_reason: None,
             tokens_new: 30_000,
             calls: 4,
-            session_file: Some(
-                resume_from
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-            ),
+            session_file: Some(resume_from.map_or_default(|p| p.to_string_lossy().into_owned())),
             duration_s: 1.0,
             stdout_tail: String::new(),
             usage_delta: None,

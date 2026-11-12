@@ -1589,7 +1589,7 @@ fn gitlab_project_owner(url: &str, project_id: i64) -> anyhow::Result<String> {
     }
     let project: Project = serde_json::from_str(out.trim())
         .map_err(|e| anyhow::anyhow!("glab api {api}: unparseable project: {e}"))?;
-    Ok(project.namespace.map(|n| n.full_path).unwrap_or_default())
+    Ok(project.namespace.map_or_default(|n| n.full_path))
 }
 
 /// GitLab user id of the login `glab` is authenticated as on the
@@ -2535,7 +2535,7 @@ fn github_review_threads(
         .map(|t| {
             let mut comments = t.comments.nodes.into_iter();
             let first = comments.next().unwrap_or_default();
-            let poster = first.author.map(|a| a.login).unwrap_or_default();
+            let poster = first.author.map_or_default(|a| a.login);
             let (replies, hidden) = screen_replies(
                 comments.collect(),
                 ThreadVoices {
@@ -2683,8 +2683,7 @@ fn gitlab_review_threads(
                 .notes
                 .first()
                 .and_then(|n| n.author.as_ref())
-                .map(|a| a.username.clone())
-                .unwrap_or_default();
+                .map_or_default(|a| a.username.clone());
             let ids: HashMap<String, i64> = d
                 .notes
                 .iter()
@@ -2697,7 +2696,7 @@ fn gitlab_review_threads(
                 .skip(1)
                 .filter(|n| !n.system)
                 .map(|n| ThreadComment {
-                    id: n.id.map(|id| id.to_string()).unwrap_or_default(),
+                    id: n.id.map_or_default(|id| id.to_string()),
                     full_database_id: None,
                     author: n.author.as_ref().map(|a| GhAuthor {
                         login: a.username.clone(),
@@ -2986,15 +2985,14 @@ impl Forge for GitHubForge {
             head_sha: v.head_ref_oid,
             head_ref: v.head_ref_name,
             base_ref: v.base_ref_name,
-            author: v.author.map(|a| a.login).unwrap_or_default(),
+            author: v.author.map_or_default(|a| a.login),
             title: v.title,
             body: v.body,
             cross_repo: v.is_cross_repository,
             head_owner: v
                 .head_repository_owner
                 .filter(|_| v.is_cross_repository)
-                .map(|o| o.login)
-                .unwrap_or_default(),
+                .map_or_default(|o| o.login),
         })
     }
 
@@ -3041,7 +3039,7 @@ impl Forge for GitHubForge {
             .map(|p| OpenPr {
                 number: p.number,
                 title: p.title,
-                author: p.author.map(|a| a.login).unwrap_or_default(),
+                author: p.author.map_or_default(|a| a.login),
                 is_draft: p.is_draft,
                 cross_repo: p.is_cross_repository,
                 url: p.url,
@@ -3481,7 +3479,7 @@ impl Forge for GitLabForge {
             head_sha: mr.sha,
             head_ref: mr.source_branch,
             base_ref: mr.target_branch,
-            author: mr.author.map(|a| a.username).unwrap_or_default(),
+            author: mr.author.map_or_default(|a| a.username),
             title: mr.title,
             body: mr.description,
             cross_repo,
@@ -3507,7 +3505,7 @@ impl Forge for GitLabForge {
             .map(|mr| OpenPr {
                 number: mr.iid,
                 title: mr.title,
-                author: mr.author.map(|a| a.username).unwrap_or_default(),
+                author: mr.author.map_or_default(|a| a.username),
                 is_draft: mr.draft,
                 cross_repo: mr.source_project_id != mr.target_project_id,
                 url: mr.web_url,
