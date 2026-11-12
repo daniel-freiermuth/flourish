@@ -91,8 +91,8 @@ pub(super) enum LeftBy {
     /// its changes.
     #[default]
     Reviewer,
-    /// A curator, which ran in the fixer's session: the resumed fixer is
-    /// told its rewrite was undone ([`CURATION_UNDONE_PROMPT`]).
+    /// A curator, which ran in the fixer's session: its curation is owed
+    /// again once its changes are undone ([`owe_curation`]).
     Curator,
 }
 
@@ -965,49 +965,55 @@ async fn curated_head(
 }
 
 /// Put the tree back to the reviewed commit when the daemon died during a
-/// curation ([`CURATING_FILE`] left behind): abort a rebase, cherry-pick,
-/// merge or `am` the curator left in progress, then [`undo`] to the
-/// reviewed tree and description, under the clone's permit. Run first in a
-/// later attempt of the chain, before anything reads the tree; the verdict
-/// saved for the reviewed tree then ships it without another review. A
-/// tree that could not be put back is recorded for [`restore_reviewed`]
-/// ([`undo_or_record`]), which runs next: no worker runs on it until it is,
-/// and the one that then does is told its curation was undone as if it had
-/// been now. `true` when a curation's changes were undone now.
-pub(super) async fn recover_curation(lane: &mut Lane, store: &Store, start: &FixStart) -> bool {
+/// curation ([`CURATING_FILE`] left behind): [`undo`] to the reviewed tree
+/// and description. Run first in a later attempt of the chain, before
+/// anything reads the tree. The curation is owed again ([`owe_curation`]):
+/// the attempt runs no fixer, and curates on the verdict saved for the
+/// reviewed tree before it ships, as any part of the fix a stop cut short
+/// is had again. A tree that could not be put back is recorded for
+/// [`restore_reviewed`] ([`undo_or_record`]), which runs next: no worker
+/// runs on it until it is.
+pub(super) async fn recover_curation(lane: &mut Lane, store: &Store, start: &FixStart) {
     let marker = start.ws.root.join(CURATING_FILE);
     let Some(curating) = read_json::<ReviewedTree>(&marker) else {
-        return false;
+        return;
     };
-    if let Ok(permit) = lane.lock_clone(start.repo.id).await {
-        let at = start.ws.tree.clone();
-        let _ = permit
-            .blocking(move |hold| {
-                for op in ["rebase", "cherry-pick", "merge", "am"] {
-                    // Nothing in progress is fine.
-                    let _ = hold.git_in(&at, &[op, "--abort"], 60);
-                }
-            })
-            .await;
-    }
     let undone = undo_or_record(lane, start, curating).await;
     let outcome = match &undone {
         Ok(()) => "the reviewed commit restored".to_owned(),
         Err(e) => format!("restoring the reviewed commit failed: {e}"),
     };
+    owe_curation(start);
     let _ = std::fs::remove_file(&marker);
     let fid = start.finding.id;
-    let message = format!("#{fid} curation: interrupted by a restart; {outcome}");
+    let message =
+        format!("#{fid} curation: interrupted by a restart; {outcome}; to be curated again");
     let _ = fix_event(store, "review", fid, start.job, message).await;
-    undone.is_ok()
 }
 
-/// What a fixer resumed after its curation's changes were undone
-/// ([`LeftBy::Curator`]) is told: the curation was undone, and there is
-/// nothing left to do.
-pub(super) const CURATION_UNDONE_PROMPT: &str = "Your rewrite of this branch's history has been \
-     undone: the branch is back at the reviewed commit, which ships as it is. Do not change the \
-     history, the files or PR-DESCRIPTION.md. Stop now.";
+/// Record that `start`'s fix owes its curation again ([`Owed::Curation`]),
+/// its review through and its verdict saved for the reviewed tree: a
+/// curation cut short by a restart, or whose changes had to be put back.
+fn owe_curation(start: &FixStart) {
+    let progress = read_json::<Progress>(&start.ws.root.join(PROGRESS_FILE)).unwrap_or_default();
+    write_progress(
+        start,
+        &Progress {
+            title: progress.title,
+            follow_ups: progress.follow_ups,
+            owed: Some(Owed::Curation),
+            ..Progress::default()
+        },
+    );
+}
+
+/// Whether `start`'s fix owes only its curation ([`Owed::Curation`]): its
+/// review is through, so the attempt runs no fixer, whatever the hold an
+/// operator released, and goes straight to the curation.
+pub(super) fn owes_curation(start: &FixStart) -> bool {
+    read_json::<Progress>(&start.ws.root.join(PROGRESS_FILE))
+        .is_some_and(|progress| matches!(progress.owed, Some(Owed::Curation)))
+}
 
 /// How many commits `start`'s branch has on top of its pinned commit, if
 /// git can say.
@@ -1184,6 +1190,19 @@ pub(super) async fn has_kept_verdict(ws: &Workspace) -> bool {
     covering_verdict(ws).await.is_some()
 }
 
+/// Whether the next attempt in `ws` will curate: a curation is owed
+/// ([`Owed::Curation`]), or will be once a curation the daemon died in is
+/// recovered ([`CURATING_FILE`]) or a curator's tree is put back
+/// ([`RESTORE_FILE`], [`LeftBy::Curator`]). Such an attempt runs a model,
+/// so its continuation is never free.
+pub(super) fn curation_pending(ws: &Workspace) -> bool {
+    let owed = read_json::<Progress>(&ws.root.join(PROGRESS_FILE))
+        .is_some_and(|progress| matches!(progress.owed, Some(Owed::Curation)));
+    let restoring = read_json::<Restore>(&ws.root.join(RESTORE_FILE))
+        .is_some_and(|restore| restore.by == LeftBy::Curator);
+    owed || restoring || ws.root.join(CURATING_FILE).exists()
+}
+
 /// In the workspace root: the review stop a hold was made for ([`Held`]),
 /// so the operator's `continue` resumes the fixer on its issues.
 const HELD_FILE: &str = "review-held.json";
@@ -1341,8 +1360,8 @@ async fn undo_or_record(
 /// failed. Run first in every later attempt of the chain, before anything
 /// reads the tree, so no worker builds on a reviewer's commit or leftovers
 /// and none of them ships. Done once: the record then goes, so a later
-/// attempt keeps the fixer's own work. Whose changes were undone, if any:
-/// a resumed fixer is told its curation was. An error says what still
+/// attempt keeps the fixer's own work. A curator's changes put back leave
+/// its curation owed again ([`owe_curation`]). An error says what still
 /// differs; no worker may run in the tree then.
 ///
 /// A `BLOCKED.md` in the tree is a review hold's own report, which no hold
@@ -1355,10 +1374,10 @@ pub(super) async fn restore_reviewed(
     lane: &mut Lane,
     store: &Store,
     start: &FixStart,
-) -> Result<Option<LeftBy>, String> {
+) -> Result<(), String> {
     let path = start.ws.root.join(RESTORE_FILE);
     let Some(Restore { tree: reviewed, by }) = read_json::<Restore>(&path) else {
-        return Ok(None);
+        return Ok(());
     };
     let commit = reviewed.before.head.as_deref().unwrap_or_default();
     let unrecorded = start.ws.tree.join(BLOCKED_REPORT);
@@ -1374,12 +1393,15 @@ pub(super) async fn restore_reviewed(
     let fid = start.finding.id;
     let agent = match by {
         LeftBy::Reviewer => "a reviewer",
-        LeftBy::Curator => "a curator",
+        LeftBy::Curator => {
+            owe_curation(start);
+            "a curator"
+        }
     };
     let message =
         format!("#{fid} the tree {agent} left was put back to the reviewed commit {commit}");
     let _ = fix_event(store, "review", fid, start.job, message).await;
-    Ok(Some(by))
+    Ok(())
 }
 
 /// The prompt a fix resumed after an operator's `continue` of a hold whose
