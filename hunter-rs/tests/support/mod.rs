@@ -100,6 +100,49 @@ pub fn load_config(root: &Path) -> hunter::config::Config {
     cfg
 }
 
+/// A literal `Config` rooted at `root`, for tests that build one without
+/// a config file: data, database and UI under `root`, port 0, the network
+/// gate and the pre-PR review off (as in [`load_config`]). `Config` has
+/// no `Default` in production; a test that needs other values overrides
+/// them with struct-update syntax (`Config { x, ..test_config(root) }`).
+pub fn test_config(root: &Path) -> hunter::config::Config {
+    hunter::config::Config {
+        root: root.to_path_buf(),
+        work_root: root.join("data"),
+        db_path: root.join("hunter.db"),
+        serve_port: 0,
+        serve_host: std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST),
+        allowed_hosts: hunter::config::HostAllowList::default(),
+        ui_dir: root.join("ui"),
+        omp_bin: "omp".to_owned(),
+        stale_after_s: 300.0,
+        cache_ttl_s: 3600.0,
+        poll_s: 2.0,
+        session_grace_s: 120,
+        min_free_disk_bytes: 0,
+        model_default: None,
+        model_smol: None,
+        model_hunt: None,
+        model_fix: None,
+        backend_type: "omp-scavenge".to_owned(),
+        llm_provider: hunter::backends::omp_scavenge::LlmProvider::Anthropic,
+        provider_hosts: None,
+        network_gate: false,
+        hunt_max_wall_s: 1800,
+        hunt_max_findings: 8,
+        hunt_rehunt_days: 90,
+        fix_max_wall_s: 2700,
+        review_max_rounds: 0,
+        review_curate: false,
+        scan_interval_days: 1.0,
+        modernization_interval_days: 30,
+        standards_interval_days: 30,
+        simplification_interval_days: 30,
+        renovate_github_token: None,
+        review_bots: hunter::forge::ReviewBots::default(),
+    }
+}
+
 /// Path to the schema-only `dev.db` that `build.rs` regenerates from
 /// `migrations/`. Never opened directly — always copied first.
 fn dev_db() -> PathBuf {

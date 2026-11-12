@@ -8,7 +8,6 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode, header};
-use hunter::config::Config;
 use hunter::server::{AppState, router};
 use hunter::store::Store;
 use serde_json::{Value, json};
@@ -82,42 +81,7 @@ async fn test_state() -> TestState {
     let dir = support::TempDir::new("server");
     dir.subdir("ui");
     let store = seeded_store(&dir).await;
-    let config = Config {
-        root: dir.path().to_path_buf(),
-        work_root: dir.join("data"),
-        db_path: dir.join("hunter.db"),
-        serve_port: 0,
-        serve_host: std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST),
-        allowed_hosts: hunter::config::HostAllowList::default(),
-        ui_dir: dir.join("ui"),
-        // Backend inputs (round 2) — inert under NullBackend.
-        omp_bin: "omp".into(),
-        stale_after_s: 300.0,
-        cache_ttl_s: 3600.0,
-        poll_s: 2.0,
-        session_grace_s: 120,
-        min_free_disk_bytes: 0,
-        model_default: None,
-        model_smol: None,
-        model_hunt: None,
-        model_fix: None,
-        backend_type: "omp-scavenge".into(),
-        llm_provider: hunter::backends::omp_scavenge::LlmProvider::Anthropic,
-        provider_hosts: None,
-        network_gate: false,
-        hunt_max_wall_s: 1800,
-        hunt_max_findings: 8,
-        hunt_rehunt_days: 90,
-        fix_max_wall_s: 2700,
-        review_max_rounds: 0,
-        review_curate: false,
-        scan_interval_days: 1.0,
-        modernization_interval_days: 30,
-        standards_interval_days: 30,
-        simplification_interval_days: 30,
-        renovate_github_token: None,
-        review_bots: hunter::forge::ReviewBots::default(),
-    };
+    let config = support::test_config(dir.path());
     TestState {
         state: AppState {
             store: Arc::new(store),

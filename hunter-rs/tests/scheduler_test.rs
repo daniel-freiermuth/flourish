@@ -44,41 +44,9 @@ async fn open_store(pool: SqlitePool, path: &Path) -> Store {
 }
 
 fn test_config(cache_ttl_s: f64) -> Config {
-    let dir = std::env::temp_dir();
     Config {
-        root: dir.clone(),
-        work_root: dir.join("data"),
-        db_path: dir.join("hunter.db"),
-        serve_port: 0,
-        serve_host: std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST),
-        allowed_hosts: hunter::config::HostAllowList::default(),
-        ui_dir: dir.join("ui"),
-        omp_bin: "omp".to_owned(),
-        stale_after_s: 300.0,
         cache_ttl_s,
-        poll_s: 2.0,
-        session_grace_s: 120,
-        min_free_disk_bytes: 0,
-        model_default: None,
-        model_smol: None,
-        model_hunt: None,
-        model_fix: None,
-        backend_type: "omp-scavenge".to_owned(),
-        llm_provider: hunter::backends::omp_scavenge::LlmProvider::Anthropic,
-        provider_hosts: None,
-        network_gate: false,
-        hunt_max_wall_s: 1800,
-        hunt_max_findings: 8,
-        hunt_rehunt_days: 90,
-        fix_max_wall_s: 2700,
-        review_max_rounds: 0,
-        review_curate: false,
-        scan_interval_days: 1.0,
-        modernization_interval_days: 30,
-        standards_interval_days: 30,
-        simplification_interval_days: 30,
-        renovate_github_token: None,
-        review_bots: hunter::forge::ReviewBots::default(),
+        ..support::test_config(&std::env::temp_dir())
     }
 }
 
