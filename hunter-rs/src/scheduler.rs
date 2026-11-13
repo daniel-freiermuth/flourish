@@ -5952,6 +5952,33 @@ async fn record_fix_failure(
 /// failure a finding's work that hit it records in its streak.
 const TREE_NOT_MADE: &str = "workspace not created";
 
+/// End an engage whose tree's branch could not be read
+/// ([`engage_tree_branch`]): its job is failed unstarted, its tree
+/// released, and the failure counted as for a tree not made
+/// ([`count_unmade_engage_tree`]). Nothing is pushed or posted.
+async fn unreadable_branch(
+    store: &JobStore,
+    lane: &mut Lane,
+    (fid, ws, running): (i64, OpenWorkspace, RunningJob),
+    err: &str,
+) -> CycleSummary {
+    let job = running.id();
+    let detail = format!("tree branch unreadable: {err}");
+    log_write_failure(
+        running.fail_unstarted(&detail).await,
+        format_args!("job {job}: failing unstarted"),
+    );
+    close_workspace(lane, ws).await;
+    let failed = CycleSummary {
+        kind: Some(FindingJobKind::Engage.into()),
+        finding_id: Some(fid),
+        job_id: Some(job),
+        failure: Some(detail),
+        ..Default::default()
+    };
+    count_unmade_engage_tree(store, fid, job, failed).await
+}
+
 /// Count an engage whose tree could not be made ([`open_workspace`] has
 /// failed its job and logged why) as a failed engage under the fixed
 /// [`TREE_NOT_MADE`], as for every other kind. Uncounted, the flagged PR
@@ -7425,6 +7452,9 @@ struct EngageStart {
     job: i64,
     ws: OpenWorkspace,
     pinned: String,
+    /// The branch the tree works on ([`engage_tree_branch`]): the one the
+    /// worker is told to commit on, and the one pushed to `head_ref`.
+    branch: String,
     cap: Option<i64>,
     /// The newest feedback the chain's worker was shown: read from the PR
     /// by a cold attempt, inherited by a resume (which is only told to
@@ -7668,6 +7698,14 @@ async fn start_engage(
         }
     };
     let seen_activity = engage_seen_activity(store, job, pr.as_ref()).await;
+    let branch = match engage_tree_branch(&ws.tree, &head_ref).await {
+        Ok(branch) => branch,
+        Err(e) => {
+            return Ok(Err(
+                unreadable_branch(store, lane, (fid, ws, running), &e).await
+            ));
+        }
+    };
     let shown_ps = engage_shown_ps(store, job, &ps, resume.is_none()).await;
     Ok(Ok((
         EngageStart {
@@ -7679,6 +7717,7 @@ async fn start_engage(
             job,
             ws,
             pinned,
+            branch,
             cap,
             seen_activity,
             shown_ps,
@@ -7982,45 +8021,37 @@ async fn push_then_reply(
 ) -> Result<bool, String> {
     let (repo, worktree, head_ref) = (&start.repo, &start.ws.tree, &start.head_ref);
     let fg = forge::forge_for(repo.forge);
-    let wt = worktree.clone();
-    // The worker's own commits: those on top of the commit its tree was
-    // created at. Not `origin/<head_ref>..HEAD`: that ref moves under a
-    // running worker (fetch-ahead, a dependency scan's fetch), and after a
-    // rebase or force-push of the PR branch it would name the branch's old
-    // commits as the worker's, and push them into a lease that refuses.
-    let range = format!("{}..HEAD", start.pinned);
-    let (rc, commits) =
-        tokio::task::spawn_blocking(move || Unheld::Commits { range: &range }.run(&wt, 30))
-            .await
-            .unwrap_or((127, String::new()));
-    let has_commits = rc == 0 && !commits.trim().is_empty();
-    // Already pushed: this tree's `HEAD` is the PR's head, or, when the
+    // What goes out is the PR branch as the worker left it
+    // ([`branch_change`]), not where its `HEAD` is: a checkout elsewhere is
+    // an inspection. Not compared with `origin/<head_ref>`: that ref moves
+    // under a running worker (fetch-ahead, a dependency scan's fetch).
+    let local = branch_change(start).await?;
+    let changed = local.is_some();
+    // Already pushed: the commit to push is the PR's head, or, when the
     // forge would not say, is the commit this chain itself last pushed
     // ([`own_push`]), when an earlier attempt pushed it and was kept
     // because its reply was refused. Then its commits are on the PR, and
     // this attempt only has to reply: pushing them again would be a no-op
     // push recorded as a new one.
-    let remote = if has_commits {
+    let remote = if changed {
         remote_head(start).await
     } else {
         None
     };
-    let local = if has_commits {
-        local_head(start).await
-    } else {
-        None
-    };
-    let already = local.is_some()
+    let already = changed
         && match &remote {
             Some(r) => Some(r) == local.as_ref(),
             None => own_push(&start.ws.root) == local,
         };
     if already {
         *pushed_before = true;
-    } else if has_commits {
+    } else if changed {
         let push_url = repo.url.clone();
         let wt = worktree.clone();
-        let refspec = format!("HEAD:{head_ref}");
+        let refspec = format!(
+            "{}:refs/heads/{head_ref}",
+            local.as_deref().unwrap_or_default()
+        );
         // Leased to the PR head the chain's tree was created at, with the
         // expected commit spelled out: the worker may rewrite that history,
         // but a commit pushed to the branch since -- while this attempt ran,
@@ -8053,12 +8084,8 @@ async fn push_then_reply(
             return Err(format!("push failed: {tail}"));
         }
         *pushed = true;
-        let local = match local {
-            Some(sha) => Some(sha),
-            None => local_head(start).await,
-        };
-        if let Some(sha) = local {
-            record_own_push(&start.ws.root, &sha);
+        if let Some(sha) = &local {
+            record_own_push(&start.ws.root, sha);
         }
     }
     let reply = worktree.join("PR-REPLY.md");
@@ -8300,8 +8327,9 @@ async fn record_failed_engage(
     }
     // Nothing reached the PR and its branch is where the attempt started:
     // the work is done and only its publishing failed, so the retry
-    // continues this attempt instead of redoing it.
-    let kept = finished && branch_unmoved(start).await;
+    // continues this attempt instead of redoing it. Not an unfinished
+    // rewind ([`UNFINISHED_REWIND`]): its work is not done.
+    let kept = finished && !fail.starts_with(UNFINISHED_REWIND) && branch_unmoved(start).await;
     if kept {
         log_write_failure(
             store.keep_attempt_as_checkpoint(job).await,
@@ -8395,14 +8423,137 @@ async fn remote_head(start: &EngageStart) -> Option<String> {
     (rc == 0).then(|| out.split_whitespace().next().unwrap_or_default().to_owned())
 }
 
-/// The commit `start`'s tree is at.
-async fn local_head(start: &EngageStart) -> Option<String> {
-    let tree = start.ws.tree.clone();
+/// The commit `rev` names in `start`'s tree.
+async fn commit_of(start: &EngageStart, rev: &str) -> Option<String> {
+    let (tree, rev) = (start.ws.tree.clone(), rev.to_owned());
     let (rc, out) =
-        tokio::task::spawn_blocking(move || Unheld::Commit { rev: "HEAD" }.run(&tree, 30))
+        tokio::task::spawn_blocking(move || Unheld::Commit { rev: &rev }.run(&tree, 30))
             .await
             .unwrap_or((127, String::new()));
     (rc == 0).then(|| out.trim().to_owned())
+}
+
+/// `merge-base --is-ancestor <ancestor> <rev>` in `start`'s tree: 0 when
+/// `rev` descends from `ancestor`, 1 when not, anything else when git
+/// cannot say.
+async fn ancestor_rc(start: &EngageStart, ancestor: &str, rev: &str) -> i32 {
+    let (tree, ancestor, rev) = (start.ws.tree.clone(), ancestor.to_owned(), rev.to_owned());
+    tokio::task::spawn_blocking(move || {
+        Unheld::IsAncestor {
+            ancestor: &ancestor,
+            rev: &rev,
+        }
+        .run(&tree, 30)
+        .0
+    })
+    .await
+    .unwrap_or(127)
+}
+
+/// The commit the worker's change puts on the PR branch, if it changed it:
+/// the tree's own branch (`start.branch`) as the worker left it, where git
+/// records every deliberate change (a commit, an amend, a rebase or
+/// squash, a `reset --hard` that drops the PR's last commits), and that a
+/// checkout elsewhere (`HEAD~1` to show a test failing without the fix,
+/// `origin/<default>` to see whether the bug is still there) leaves alone.
+/// A branch the worker deleted changed nothing. Measured from where this
+/// chain left the PR branch: its own last push ([`own_push`]) once it has
+/// pushed, so a later attempt that drops that push is a rewind too, and
+/// the commit its tree was created at until then.
+///
+/// Commits made off the branch (on a detached `HEAD`) are not pushed:
+/// `engage.md` tells the worker that the branch is what goes out.
+///
+/// A branch moved back with what it dropped still uncommitted in the tree
+/// (a `reset HEAD~1` or `--soft` to rework a commit, left unfinished) is no
+/// decision to take: pushing would drop the commit's changes from the PR,
+/// and replying as if nothing were wrong would hide that. The attempt
+/// fails, saying so ([`UNFINISHED_REWIND`]), with nothing pushed or posted.
+/// Only changes to tracked files count: a file the dropped commits added
+/// and a build regenerates (a lockfile) is untracked after a `reset --hard`
+/// too, and cannot be told from one a mixed `reset` left.
+async fn branch_change(start: &EngageStart) -> Result<Option<String>, String> {
+    let pinned = start.pinned.as_str();
+    let base = own_push(&start.ws.root).unwrap_or_else(|| pinned.to_owned());
+    let Some(branch) = commit_of(start, &format!("refs/heads/{}", start.branch)).await else {
+        return Ok(None);
+    };
+    if branch == base {
+        return Ok((base != pinned).then_some(branch));
+    }
+    if ancestor_rc(start, &branch, &base).await == 0
+        && commit_of(start, "HEAD").await.as_deref() == Some(branch.as_str())
+        && let Some(left) = dropped_left(start, &branch, &base).await
+    {
+        return Err(format!(
+            "{UNFINISHED_REWIND}: the branch was moved back to {branch} with what it dropped \
+             left uncommitted ({left}); nothing pushed"
+        ));
+    }
+    Ok(Some(branch))
+}
+
+/// The failure of an engage that left its branch moved back with what it
+/// dropped uncommitted ([`branch_change`]). Its attempt is not kept: a
+/// resume is only told to carry on, and would end the same way, so the
+/// next engage starts afresh from the PR.
+const UNFINISHED_REWIND: &str = "uncommitted changes on a rewound branch";
+
+/// The branch `tree`, an engage tree, works on: its private
+/// [`crate::workspace::tree_branch`] when it has one (the PR branch was
+/// checked out elsewhere when it was made), the PR branch `head_ref` when
+/// it has none (`rev-parse --verify --quiet` exits 1 exactly then). Any
+/// other failure (a timeout, a failed spawn) is an error: in a tree with a
+/// private branch, `head_ref` is another worktree's branch, which must not
+/// be taken for this tree's.
+async fn engage_tree_branch(tree: &Path, head_ref: &str) -> Result<String, String> {
+    let own = crate::workspace::tree_branch(tree);
+    let (tree, rev) = (tree.to_owned(), format!("refs/heads/{own}"));
+    let (rc, out) =
+        tokio::task::spawn_blocking(move || Unheld::Commit { rev: &rev }.run(&tree, 30))
+            .await
+            .unwrap_or((127, "spawn error".to_owned()));
+    match rc {
+        0 => Ok(own),
+        1 => Ok(head_ref.to_owned()),
+        _ => Err(format!(
+            "looking up {own} exited {rc}: {}",
+            crate::util::tail(&out, 300)
+        )),
+    }
+}
+
+/// What of the commits dropped from the branch (`<branch>..<base>`) is
+/// still uncommitted in `start`'s tree: changes to tracked files at the
+/// paths they changed, as `git status --porcelain` lists them, or `None`
+/// when there are none. What git cannot list counts as left.
+async fn dropped_left(start: &EngageStart, branch: &str, base: &str) -> Option<String> {
+    let (tree, from, to) = (start.ws.tree.clone(), branch.to_owned(), base.to_owned());
+    let (rc, paths) = tokio::task::spawn_blocking(move || {
+        Unheld::ChangedPaths {
+            from: &from,
+            to: &to,
+            paths: &[],
+        }
+        .run(&tree, 60)
+    })
+    .await
+    .unwrap_or((127, String::new()));
+    if rc != 0 {
+        return Some("its paths could not be listed".to_owned());
+    }
+    let paths: Vec<String> = paths.lines().map(str::to_owned).collect();
+    if paths.is_empty() {
+        return None;
+    }
+    let tree = start.ws.tree.clone();
+    let (_, out) = tokio::task::spawn_blocking(move || {
+        Unheld::TrackedStatusOf { paths: &paths }.run(&tree, 60)
+    })
+    .await
+    .unwrap_or((127, "spawn error".to_owned()));
+    let left: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
+    (!left.is_empty()).then(|| left.join(", "))
 }
 
 /// Whether the PR branch on the forge is where this chain left it, or the
@@ -8621,7 +8772,7 @@ fn engage_prompt(
         &cfg.root,
         finding,
         &start.ws.tree,
-        &start.head_ref,
+        &start.branch,
         &start.repo,
         pr,
         &start.ps,
