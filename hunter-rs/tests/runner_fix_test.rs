@@ -2016,6 +2016,84 @@ async fn gitlab_retry_adopts_the_mr_that_already_exists() {
     assert_eq!(finding.pr_url.as_deref(), Some(GL_MR_URL));
 }
 
+/// A GitLab MR create that fails for any other reason records glab's
+/// error, not its preamble: glab prints a few hundred characters of
+/// "Creating ... / Failed to create merge request ..." before the box
+/// that names the API status, and a failure cut off before it gives the
+/// operator no reason.
+#[tokio::test]
+async fn a_failed_gitlab_mr_create_records_the_error_glab_printed() {
+    let bins = support::FakeBins::acquire("fix-gl-create-fails");
+    let f = fixture_on("fix-gl-create-fails", GL_REPO_URL, ForgeName::Gitlab).await;
+    let origin = git(&f.repo_dir, &["remote", "get-url", "origin"]);
+    git(
+        &f.repo_dir,
+        &[
+            "config",
+            &format!("url.{}.insteadOf", origin.trim()),
+            GL_REPO_URL,
+        ],
+    );
+    let forbidden = GLAB_MR_EXISTS.replace(
+        "409 {message: [Another open merge request already\n  exists for this source branch: !42]}.",
+        "403 {message: 403 Forbidden}.",
+    );
+    bins.script(
+        "glab",
+        &format!(
+            "case \"$1 $2\" in\n\"mr create\") cat >&2 <<'__FAKE_EOF__'\n{forbidden}\n__FAKE_EOF__\nexit 1;;\nesac\nexit 1"
+        ),
+    );
+
+    let summary = fix(&f, &committing(true)).await;
+
+    let failure = summary.failure.as_deref().unwrap_or_default();
+    assert!(
+        failure.starts_with("PR create failed: glab mr create failed (rc=1)"),
+        "{summary:?}"
+    );
+    assert!(failure.contains("403 Forbidden"), "{summary:?}");
+}
+
+/// A GitLab MR create whose glab output is long keeps the forge layer's
+/// own diagnosis at its head as well as the end of glab's output: an MR
+/// that glab did open but whose URL hunter could not read (here an
+/// `http://` one) is recorded as that, with the URL, and not as a refusal.
+#[tokio::test]
+async fn a_long_gitlab_create_failure_keeps_its_diagnosis_and_its_end() {
+    let bins = support::FakeBins::acquire("fix-gl-create-no-url");
+    let f = fixture_on("fix-gl-create-no-url", GL_REPO_URL, ForgeName::Gitlab).await;
+    let origin = git(&f.repo_dir, &["remote", "get-url", "origin"]);
+    git(
+        &f.repo_dir,
+        &[
+            "config",
+            &format!("url.{}.insteadOf", origin.trim()),
+            GL_REPO_URL,
+        ],
+    );
+    let title = "fix(scheduler): keep the end of a failed MR create, where glab names the answer of the API";
+    let opened = format!(
+        "\nCreating draft merge request for fix/a-real-bug-1 into main in platform/backend/services/widget-service\n\n!128 Draft: {title} (fix/a-real-bug-1)\n http://gitlab.example.com/platform/backend/services/widget-service/-/merge_requests/128\n"
+    );
+    assert!(opened.len() > 300);
+    bins.script(
+        "glab",
+        &format!(
+            "case \"$1 $2\" in\n\"mr create\") cat <<'__FAKE_EOF__'\n{opened}\n__FAKE_EOF__\nexit 0;;\nesac\nexit 1"
+        ),
+    );
+
+    let summary = fix(&f, &committing(true)).await;
+
+    let failure = summary.failure.as_deref().unwrap_or_default();
+    assert!(
+        failure.starts_with("PR create failed: glab mr create succeeded but printed no MR URL"),
+        "{summary:?}"
+    );
+    assert!(failure.contains("/-/merge_requests/128"), "{summary:?}");
+}
+
 /// A finished fix whose push fails while the forge cannot be reached is
 /// the network's failure, not the fix's: nothing is counted, the attempt
 /// becomes the checkpoint, so its commits and transcript are kept and the

@@ -6235,10 +6235,37 @@ async fn ship_pr(
             {
                 return Ok((pr_url, true));
             }
-            let head: String = err_msg.chars().take(300).collect();
-            Err(ShipFailure::forge(format!("PR create failed: {head}")))
+            Err(ShipFailure::forge(format!(
+                "PR create failed: {}",
+                create_failure_text(&err_msg)
+            )))
         }
     }
+}
+
+/// The longest text of a failed PR create that is recorded.
+const CREATE_FAILURE_MAX: usize = 300;
+
+/// What is recorded of a failed PR create's error: all of it when short,
+/// otherwise its first line, the forge layer's diagnosis (`… failed
+/// (rc=1)`, `… succeeded but printed no MR URL`, a timeout), and the end
+/// of the tool's output, where glab names the API's answer after a
+/// preamble of a few hundred characters.
+fn create_failure_text(err: &str) -> String {
+    if err.len() <= CREATE_FAILURE_MAX {
+        return err.to_owned();
+    }
+    let mut cut = err
+        .find('\n')
+        .unwrap_or(err.len())
+        .min(CREATE_FAILURE_MAX / 2);
+    while !err.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let head = err[..cut].trim_end();
+    let rest = err[cut..].trim_start();
+    let tail = crate::util::tail(rest, CREATE_FAILURE_MAX - head.len());
+    format!("{head} … {tail}")
 }
 
 /// Log a fix-job event against its job and finding.
@@ -10311,6 +10338,51 @@ mod extract_pr_url_tests {
             extract_pr_url("https://github.com/o/r/pull/1 https://github.com/o/r/pull/2"),
             Some("https://github.com/o/r/pull/1".to_owned())
         );
+    }
+}
+
+#[cfg(test)]
+mod create_failure_text_tests {
+    use super::{CREATE_FAILURE_MAX, create_failure_text};
+
+    /// A timed-out create keeps the timeout, which `run_cmd` puts on the
+    /// first line, and the end of what the tool printed before it.
+    #[test]
+    fn keeps_the_first_line_and_the_end() {
+        let err = format!(
+            "glab mr create failed (rc=124): timeout after 300s\n{}\nlast words",
+            "x".repeat(500)
+        );
+        let text = create_failure_text(&err);
+        assert!(
+            text.starts_with("glab mr create failed (rc=124): timeout after 300s … x"),
+            "{text}"
+        );
+        assert!(text.ends_with("\nlast words"), "{text}");
+        assert!(text.len() <= CREATE_FAILURE_MAX + " … ".len(), "{text}");
+    }
+
+    /// One long line of multi-byte text is cut on char boundaries at both
+    /// ends, its head capped so the end still fits.
+    #[test]
+    fn cuts_a_long_first_line_on_char_boundaries() {
+        // The leading byte puts every char boundary at an odd offset, so
+        // the head's cap (150) lands inside a char.
+        let err = format!("a{}END", "é".repeat(400));
+        let text = create_failure_text(&err);
+        // The head stops at the last char boundary below the cap, never
+        // past it: 'a' and 74 'é' are 149 bytes.
+        let head = format!("a{} … é", "é".repeat(74));
+        assert!(text.starts_with(&head), "{text}");
+        assert!(text.ends_with("END"), "{text}");
+        assert!(text.len() <= CREATE_FAILURE_MAX + " … ".len(), "{text}");
+    }
+
+    #[test]
+    fn keeps_a_short_error_whole() {
+        let err =
+            "gh pr create failed (rc=1): pull request create failed: GraphQL: Validation Failed";
+        assert_eq!(create_failure_text(err), err);
     }
 }
 
