@@ -1414,7 +1414,7 @@ async fn update_repo(
         if !s.is_empty() {
             if !valid_repo_url(s) {
                 return Err(ApiError::BadRequest(
-                    "url must be http(s) or an ssh clone URL".to_owned(),
+                    "url must be https or an ssh clone URL".to_owned(),
                 ));
             }
             action.push(format!("url={s}"));
@@ -1558,7 +1558,8 @@ async fn repoint_clone_origin(permit: &ClonePermit<'_>, old_url: &str, new_url: 
 
 // -- POST /api/repos (contract §7) -----------------------------------------------
 
-/// Reject a repo URL whose scheme could execute when rendered as a link.
+/// Reject a repo URL whose scheme could execute when rendered as a link,
+/// or that would carry hunter's pushes in plain text.
 ///
 /// `Repo.url` is displayed as an `<a href>` in the UI, so a stored
 /// `javascript:` (or `data:`/`vbscript:`) URL runs on click. Only the
@@ -1567,10 +1568,14 @@ async fn repoint_clone_origin(permit: &ClonePermit<'_>, old_url: &str, new_url: 
 /// serve, and validating a write is cheaper than remembering to escape
 /// every read.
 ///
-/// Allow-listing `http`/`https` alone would break SSH clone URLs, which
+/// It is also the URL every clone, fetch and force-push goes to, exactly
+/// as given, so plain `http://` is refused too: a push over it would send
+/// the forge credentials unencrypted.
+///
+/// Allow-listing `https` alone would break SSH clone URLs, which
 /// the forge layer accepts (`git@host:owner/repo.git`). Those carry no
 /// scheme at all — the colon belongs to the scp-like syntax — so the
-/// rule is: if there is a URL scheme, it must be http, https or ssh.
+/// rule is: if there is a URL scheme, it must be https or ssh.
 fn valid_repo_url(url: &str) -> bool {
     // A leading `-` makes git read the value as an option rather than a
     // URL: `git clone --upload-pack=<cmd> <dir>` runs <cmd>. The clone
@@ -1599,8 +1604,9 @@ fn valid_repo_url(url: &str) -> bool {
     // explicit `ssh://git@host/path` spelling is equally ordinary and was
     // being refused by a message that claimed to allow it. What stays out
     // is anything a browser would execute from an href -- javascript:,
-    // data:, vbscript: -- which is what this guard exists for.
-    ["http", "https", "ssh"]
+    // data:, vbscript: -- which is what this guard exists for, and plain
+    // http, which would carry a push's credentials unencrypted.
+    ["https", "ssh"]
         .iter()
         .any(|s| scheme.eq_ignore_ascii_case(s))
 }
@@ -1664,7 +1670,7 @@ async fn add_repo(
     }
     if !valid_repo_url(&url) {
         return Err(ApiError::BadRequest(
-            "url must be http(s) or an ssh clone URL".to_owned(),
+            "url must be https or an ssh clone URL".to_owned(),
         ));
     }
     let branch = match body.get("branch").and_then(Value::as_str).map(str::trim) {

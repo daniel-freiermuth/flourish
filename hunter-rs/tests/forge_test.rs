@@ -198,8 +198,9 @@ fn forge_is_detected_from_the_host() {
 
 /// Every URL form the add endpoint accepts must also be parseable here.
 ///
-/// `valid_repo_url` accepts http/https/ssh and the scp-like form, and
-/// `post_test` asserts `ssh://git@github.com/...` is created with a 201.
+/// `valid_repo_url` accepts https/ssh and the scp-like form (rows stored
+/// as http before it refused that remain), and `post_test` asserts
+/// `ssh://git@github.com/...` is created with a 201.
 /// If the parsers disagree, `create_pr` still works (it uses the worktree
 /// remote) but `sync_prs`, engage and withdraw all fail for that repo
 /// forever — a PR that is opened and then never tracked.

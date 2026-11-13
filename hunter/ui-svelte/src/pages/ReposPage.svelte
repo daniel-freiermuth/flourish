@@ -159,6 +159,13 @@
       toast("Name and URL are required", false);
       return false;
     }
+    // The daemon refuses plain http (`valid_repo_url`): hunter force-pushes
+    // over the URL as given, and that would send credentials unencrypted.
+    // Same test as the daemon's: the text before the first `:`, any case.
+    if (/^http:/i.test(newUrl.trim())) {
+      toast("Plain http:// URLs are refused: use https:// or an ssh clone URL", false);
+      return false;
+    }
     const body: Record<string, unknown> = {
       name: newName.trim(),
       url: newUrl.trim(),

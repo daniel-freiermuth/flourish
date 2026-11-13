@@ -1073,7 +1073,6 @@ async fn repo_urls_with_an_executable_scheme_are_rejected() {
     // And the schemes the daemon actually clones with still work.
     for good in [
         "https://github.com/acme/widget.git",
-        "http://git.internal/acme/widget.git",
         "git@github.com:acme/widget.git",
         // The rejection message promises ssh; the explicit spelling of an
         // ssh clone URL has to be accepted for that to be true.
@@ -1104,6 +1103,25 @@ async fn updating_a_repo_url_is_validated_as_well() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+}
+
+/// Plain http is refused on both write paths: hunter clones, fetches and
+/// force-pushes over the URL exactly as stored, so an `http://` repo would
+/// send its push credentials unencrypted. The scheme is matched in any
+/// case, as every scheme is.
+#[tokio::test]
+async fn a_plain_http_repo_url_is_refused() {
+    let state = test_state().await;
+    for bad in [
+        "http://git.internal/acme/widget.git",
+        "HTTP://git.internal/acme/widget.git",
+    ] {
+        let (status, body) =
+            post(&state, "/api/repos", json!({ "name": "plain", "url": bad })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad} was added: {body}");
+        let (status, body) = post(&state, "/api/repo", json!({ "id": 1, "url": bad })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad} was stored: {body}");
+    }
 }
 
 /// Deleting a repo removes everything keyed to its id.
