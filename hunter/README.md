@@ -56,7 +56,8 @@ happens in the UI; the binary itself takes only `--root`, `--port` and the
 Hunter clones, fetches and pushes fix branches over that URL exactly as
 given, so it must be one you can push over: an `https://` URL through a
 git credential helper (`gh auth setup-git` installs `gh`'s), or an ssh
-`git@host:owner/repo.git` URL through your SSH keys.
+`git@host:owner/repo.git` URL through your SSH keys. Plain `http://` is
+refused: a push over it would send your credentials unencrypted.
 
 ## How it works
 
@@ -1222,6 +1223,14 @@ existed before it have no anchor and stay unconditional until a new verdict
 replaces them. To anchor them, insert `verdict_anchors` rows only after the
 daemon has started once on the new binary, which runs the migrations; a
 table created by hand beforehand makes the migration fail at startup.
+
+Upgrading to pushes over the stored URL: fix and engage pushes used to
+rewrite an `http(s)://` repo URL to its ssh form, and now go to the URL as
+stored. A repo registered over https whose pushes relied on SSH keys fails
+to publish until its URL is switched to the ssh form, and one stored as
+`http://` (no longer accepted) wants `https://` or ssh. `POST /api/repo`
+with `{"id": <id>, "url": "git@<host>:<owner>/<repo>.git"}` changes it and
+repoints the clone.
 
 It idles at zero token cost between cycles and wakes on a smart-sleep
 policy: right after a job with more queued work → drain immediately;

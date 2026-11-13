@@ -1635,9 +1635,10 @@ fn is_github_host(host: &str) -> bool {
 /// the host for `gh -R`).
 fn github_repo_path(url: &str) -> Option<(&str, &str)> {
     // Every form `valid_repo_url` accepts, not just the two most common:
-    // an `ssh://` or `http://` remote that the add endpoint takes with a
-    // 201 must not then be unparseable here, or the repo gets a PR that
-    // `sync_prs` can never track.
+    // an `ssh://` remote that the add endpoint takes with a 201, or an
+    // `http://` one stored before it refused them, must not then be
+    // unparseable here, or the repo gets a PR that `sync_prs` can never
+    // track.
     let (host, path) = url_host_path(url)?;
     if !is_github_host(host) {
         return None;
