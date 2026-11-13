@@ -167,7 +167,8 @@ pub enum TreeSpec {
     /// finding, so an older chain's leftover branch may still exist.
     Branch { name: String, at: String },
     /// A pull request's head, already fetched into `origin/<head_ref>`,
-    /// checked out as the local `head_ref`: engage.
+    /// checked out as the local `head_ref`, or as the tree's private
+    /// [`tree_branch`] when another worktree holds `head_ref`: engage.
     PrHead { head_ref: String },
 }
 
@@ -412,14 +413,35 @@ fn add_tree(permit: &CloneHold, tree: &Path, spec: &TreeSpec) -> Result<String, 
             if rc != 0 {
                 return Err(failed("worktree add", &out));
             }
-            // Best effort, as it always was: a worker left on a detached
-            // HEAD at the same commit still works, and the push names its
-            // refspec (`HEAD:<head_ref>`) explicitly. `origin/<head_ref>`
-            // rather than the sha so the local branch tracks the remote.
-            permit.git_in(tree, &["checkout", "-B", head_ref, &remote], GIT_TIMEOUT_S);
+            // The tree gets a branch of its own, which the worker changes
+            // and the engage pushes: the local `head_ref`, tracking the
+            // remote, or, when another worktree of the clone has that
+            // checked out (a superseded chain, the operator's checkout),
+            // the tree's private [`tree_branch`] at the same commit. Never
+            // a detached `HEAD`, which a worker cannot rewrite the PR from.
+            let (rc, _) =
+                permit.git_in(tree, &["checkout", "-B", head_ref, &remote], GIT_TIMEOUT_S);
+            if rc != 0 {
+                let own = tree_branch(tree);
+                let (rc, out) = permit.git_in(tree, &["checkout", "-B", &own, &sha], GIT_TIMEOUT_S);
+                if rc != 0 {
+                    return Err(failed("checkout of the tree's branch", &out));
+                }
+            }
             Ok(sha)
         }
     }
+}
+
+/// The private branch an engage tree works on when the PR branch is
+/// checked out elsewhere: `hunter/tree-<origin_id>`, one per chain, so no
+/// other tree ever holds it. Deleted with the tree ([`release_tree`]).
+pub fn tree_branch(tree: &Path) -> String {
+    let chain = tree
+        .parent()
+        .and_then(Path::file_name)
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    format!("hunter/tree-{chain}")
 }
 
 /// Remove a chain's tree from its clone. Never touches `session/`.
@@ -446,6 +468,9 @@ fn release_tree(clone: Option<&CloneHold>, tree: &Path) {
     }
     if let Some(p) = clone {
         prune_worktrees(p);
+        // The tree's private branch, if it had one: no other tree holds
+        // it, and a missing branch is no error.
+        p.git(&["branch", "-D", &tree_branch(tree)], GIT_TIMEOUT_S);
     }
 }
 

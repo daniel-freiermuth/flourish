@@ -8,7 +8,7 @@ project-wide formatters.
 `commit --amend` it, whatever keeps the history clean before it lands on
 {{DEFAULT_BRANCH}}. If a reviewer asks for a rebase or a tidier commit
 log, just do it. The one hard line: never push to, merge into, or
-otherwise touch {{DEFAULT_BRANCH}} itself — only ever push {{BRANCH}}.
+otherwise touch {{DEFAULT_BRANCH}} itself — only ever change {{BRANCH}}.
 
 # Repository Context
 {{REPO_NOTES}}
@@ -94,7 +94,11 @@ Protocol step 2 applies to maintainers only.
    commit. If the failure is unrelated flake, say so in PR-REPLY.md instead.
 
 # Deliverables
-- Commits on {{BRANCH}} (nothing needed changing -> no commits).
+- Commits on {{BRANCH}} (nothing needed changing -> no commits). The branch
+  {{BRANCH}} as you leave it is what is pushed, whatever you have checked
+  out at the end: commit everything you want on the PR, on {{BRANCH}}
+  itself. Uncommitted changes and commits made anywhere but on
+  {{BRANCH}} (a detached HEAD, another branch) are not pushed.
 - PR-REPLY.md at the worktree root, NOT COMMITTED (it is posted verbatim as
   a PR comment): concise — what you changed and why, or the answers to the
   questions, or why a suggestion was declined. No filler, no restating the

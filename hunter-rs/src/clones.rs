@@ -593,6 +593,12 @@ pub enum Unheld<'a> {
     /// changes and untracked files, one per line; empty when it is clean.
     /// Without the flag `status` refreshes and rewrites the tree's index.
     Status,
+    /// `--literal-pathspecs --no-optional-locks status --porcelain
+    /// --untracked-files=no --ignore-submodules=all -- <paths>`: the
+    /// uncommitted changes to tracked files among `paths`, taken literally;
+    /// untracked files and submodules are left out (a `reset --hard` does
+    /// not move a submodule's checkout, which then reads as changed).
+    TrackedStatusOf { paths: &'a [String] },
     /// `push <force> <url> <refspec>`. It changes the remote only: a push
     /// to a URL updates no remote-tracking ref.
     Push {
@@ -650,6 +656,18 @@ impl Unheld<'_> {
                 args.extend(["merge-base", "--is-ancestor", ancestor, rev]);
             }
             Self::Status => args.extend(["--no-optional-locks", "status", "--porcelain"]),
+            Self::TrackedStatusOf { paths } => {
+                args.extend([
+                    "--literal-pathspecs",
+                    "--no-optional-locks",
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=no",
+                    "--ignore-submodules=all",
+                    "--",
+                ]);
+                args.extend(paths.iter().map(String::as_str));
+            }
             Self::Push {
                 force,
                 url,

@@ -2249,6 +2249,477 @@ fn committing_and_replying() -> ScriptedBackend {
     })
 }
 
+/// An engage that drops the PR's last commit by moving the branch back
+/// (`reset --hard HEAD~1`, as a maintainer asked) pushes that: the PR
+/// branch on the forge moves back too, and the reply saying so is posted.
+/// `<pinned>..HEAD` is empty for a rewind, which used to push nothing while
+/// the reply claimed the commit was gone.
+#[tokio::test]
+async fn an_engage_that_drops_the_last_commit_pushes_the_rewind() {
+    let f = fixture("engage-rewind").await;
+    let bins = FakeBins::acquire("engage-rewind");
+    bins.ok("gh", PR_VIEW_JSON);
+    let origin = push_to(&f, None).await;
+    let parent = git(&origin, &["rev-parse", &format!("{BRANCH}~1")])
+        .trim()
+        .to_owned();
+    let backend = ScriptedBackend::new(|tree| {
+        git(tree, &["reset", "--hard", "-q", "HEAD~1"]);
+        std::fs::write(tree.join("PR-REPLY.md"), "dropped the commit, as asked").unwrap();
+        support::done()
+    });
+
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Cold(&finding),
+        &backend,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
+    assert_eq!(git(&origin, &["rev-parse", BRANCH]).trim(), parent);
+    assert!(bins.called_with("gh", "comment"), "{:?}", bins.calls());
+    let events = f.store.recent_events(20).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.message == format!("#{} PR #7 engaged (pushed, replied)", f.fid)),
+        "{events:?}"
+    );
+}
+
+/// A worker that only looked at an older commit (`git checkout HEAD~1`,
+/// to show a test failing without the fix) and left `HEAD` detached there
+/// changed nothing: the PR branch is not moved back, and only its reply is
+/// posted.
+#[tokio::test]
+async fn an_engage_left_detached_on_an_older_commit_pushes_nothing() {
+    let f = fixture("engage-detached").await;
+    let bins = FakeBins::acquire("engage-detached");
+    bins.ok("gh", PR_VIEW_JSON);
+    let origin = push_to(&f, None).await;
+    let head = git(&origin, &["rev-parse", BRANCH]);
+    let backend = ScriptedBackend::new(|tree| {
+        git(tree, &["checkout", "-q", "HEAD~1"]);
+        std::fs::write(tree.join("PR-REPLY.md"), "without the fix the test fails").unwrap();
+        support::done()
+    });
+
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Cold(&finding),
+        &backend,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
+    assert_eq!(git(&origin, &["rev-parse", BRANCH]), head, "nothing pushed");
+    assert!(bins.called_with("gh", "comment"), "{:?}", bins.calls());
+    let events = f.store.recent_events(20).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.message == format!("#{} PR #7 engaged (replied)", f.fid)),
+        "{events:?}"
+    );
+}
+
+/// Run the fixture's engage cold with `backend`; the summary and the PR
+/// branch on origin afterwards.
+async fn engage_once(
+    f: &Fixture,
+    backend: &ScriptedBackend,
+) -> (hunter::scheduler::CycleSummary, String) {
+    let origin = push_to(f, None).await;
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Cold(&finding),
+        backend,
+    )
+    .await
+    .unwrap();
+    (summary, git(&origin, &["rev-parse", BRANCH]))
+}
+
+/// A deliberate rewind (`reset --hard HEAD~1`) is pushed even with a
+/// scratch file the worker left in the tree, which `reset --hard` does not
+/// remove: what goes out is the branch, not the state of the tree.
+#[tokio::test]
+async fn a_rewind_with_a_scratch_file_left_behind_is_pushed() {
+    let f = fixture("engage-rewind-scratch").await;
+    let bins = FakeBins::acquire("engage-rewind-scratch");
+    bins.ok("gh", PR_VIEW_JSON);
+    let origin = push_to(&f, None).await;
+    let parent = git(&origin, &["rev-parse", &format!("{BRANCH}~1")]);
+    let backend = ScriptedBackend::new(|tree| {
+        std::fs::write(tree.join("repro.sh"), "echo repro\n").unwrap();
+        git(tree, &["reset", "--hard", "-q", "HEAD~1"]);
+        std::fs::write(tree.join("PR-REPLY.md"), "dropped the commit, as asked").unwrap();
+        support::done()
+    });
+
+    let (summary, branch) = engage_once(&f, &backend).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
+    assert_eq!(branch, parent);
+}
+
+/// A worker that commits on the branch and then leaves more edits to the
+/// same file uncommitted moved the branch forward, not back: the commit
+/// is pushed, and only what it committed.
+#[tokio::test]
+async fn a_commit_with_more_edits_left_uncommitted_is_pushed() {
+    let f = fixture("engage-commit-dirty").await;
+    let bins = FakeBins::acquire("engage-commit-dirty");
+    bins.ok("gh", PR_VIEW_JSON);
+    let backend = ScriptedBackend::new(|tree| {
+        commit_in(tree);
+        std::fs::write(tree.join("FIX.md"), "addressed, and more\n").unwrap();
+        std::fs::write(tree.join("PR-REPLY.md"), "addressed").unwrap();
+        support::done()
+    });
+
+    let (summary, _) = engage_once(&f, &backend).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
+    let origin = push_to(&f, None).await;
+    assert_eq!(
+        git(&origin, &["show", &format!("{BRANCH}:FIX.md")]),
+        "addressed\n"
+    );
+}
+
+/// A rewrite made off the PR branch (an amend on a detached `HEAD`)
+/// cannot be told from an inspection: nothing is pushed, and the reply
+/// goes out alone.
+#[tokio::test]
+async fn a_rewrite_made_off_the_branch_is_not_pushed() {
+    let f = fixture("engage-off-branch").await;
+    let bins = FakeBins::acquire("engage-off-branch");
+    bins.ok("gh", PR_VIEW_JSON);
+    let head = git(&push_to(&f, None).await, &["rev-parse", BRANCH]);
+    let backend = ScriptedBackend::new(|tree| {
+        git(tree, &["checkout", "-q", "--detach"]);
+        git(
+            tree,
+            &["commit", "--amend", "-q", "-m", "amended off the branch"],
+        );
+        std::fs::write(tree.join("PR-REPLY.md"), "addressed").unwrap();
+        support::done()
+    });
+
+    assert_reply_only(&f, &bins, &backend, &head).await;
+}
+
+/// A deliberate rewind (`reset --hard HEAD~1`) of a commit that added
+/// files is pushed even when the worker's build then regenerates them (a
+/// lockfile): untracked, they are not taken for an unfinished uncommit.
+#[tokio::test]
+async fn a_rewind_whose_added_files_are_regenerated_is_pushed() {
+    let f = fixture("engage-rewind-regenerated").await;
+    let bins = FakeBins::acquire("engage-rewind-regenerated");
+    bins.ok("gh", PR_VIEW_JSON);
+    let origin = push_to(&f, None).await;
+    let parent = git(&origin, &["rev-parse", &format!("{BRANCH}~1")]);
+    let backend = ScriptedBackend::new(|tree| {
+        let added = git(
+            tree,
+            &[
+                "show",
+                "--name-only",
+                "--format=",
+                "--diff-filter=A",
+                "HEAD",
+            ],
+        );
+        assert!(!added.trim().is_empty(), "the PR's last commit adds files");
+        git(tree, &["reset", "--hard", "-q", "HEAD~1"]);
+        for path in added.lines().filter(|l| !l.is_empty()) {
+            std::fs::write(tree.join(path), "regenerated\n").unwrap();
+        }
+        std::fs::write(tree.join("PR-REPLY.md"), "dropped the commit, as asked").unwrap();
+        support::done()
+    });
+
+    let (summary, branch) = engage_once(&f, &backend).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
+    assert_eq!(branch, parent);
+}
+
+/// A deliberate rewind of a commit that bumped an initialized submodule is
+/// pushed: `reset --hard` leaves the submodule's own checkout at the
+/// dropped revision, which is no rework left uncommitted.
+#[tokio::test]
+async fn a_rewind_of_a_submodule_bump_is_pushed() {
+    let f = fixture("engage-rewind-submodule").await;
+    let bins = FakeBins::acquire("engage-rewind-submodule");
+    bins.ok("gh", PR_VIEW_JSON);
+    let origin = push_to(&f, None).await;
+    let dir = TempDir::new("engage-rewind-submodule-src");
+    let sub = dir.path().join("sub");
+    git(dir.path(), &["init", "-q", "sub"]);
+    git(&sub, &["commit", "-q", "--allow-empty", "-m", "s1"]);
+    let file = ["-c", "protocol.file.allow=always"];
+    git(
+        dir.path(),
+        &["clone", "-q", "-b", BRANCH, &origin.to_string_lossy(), "up"],
+    );
+    let up = dir.path().join("up");
+    let s = sub.to_string_lossy().into_owned();
+    git(
+        &up,
+        &[file[0], file[1], "submodule", "add", "-q", &s, "sub"],
+    );
+    git(&up, &["commit", "-q", "-m", "add sub"]);
+    git(&sub, &["commit", "-q", "--allow-empty", "-m", "s2"]);
+    git(&up.join("sub"), &["pull", "-q", "origin"]);
+    git(&up, &["commit", "-q", "-am", "bump sub"]);
+    git(&up, &["push", "-q", "origin", BRANCH]);
+    let parent = git(&up, &["rev-parse", "HEAD~1"]);
+    let backend = ScriptedBackend::new(move |tree| {
+        git(
+            tree,
+            &[file[0], file[1], "submodule", "update", "-q", "--init"],
+        );
+        git(tree, &["reset", "--hard", "-q", "HEAD~1"]);
+        std::fs::write(tree.join("PR-REPLY.md"), "dropped the bump, as asked").unwrap();
+        support::done()
+    });
+
+    let (summary, branch) = engage_once(&f, &backend).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
+    assert_eq!(branch, parent);
+}
+
+/// Run the fixture's engage cold with `backend`, then check that the PR
+/// branch on `origin` is still at `head` and the reply was posted: the
+/// worker's tree was not pushed.
+async fn assert_reply_only(f: &Fixture, bins: &FakeBins, backend: &ScriptedBackend, head: &str) {
+    let (summary, branch) = engage_once(f, backend).await;
+    assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
+    assert_eq!(branch, head, "nothing pushed");
+    assert!(bins.called_with("gh", "comment"), "{:?}", bins.calls());
+}
+
+/// A worker that uncommits the PR's last commit to rework it (`git reset
+/// --soft HEAD~1`, its changes left staged) and ends without committing
+/// again left the branch moved back with what it dropped uncommitted: no
+/// guess is made. The attempt fails saying so, with nothing pushed and no
+/// reply posted.
+#[tokio::test]
+async fn an_unfinished_uncommit_fails_with_nothing_published() {
+    let f = fixture("engage-uncommit").await;
+    let bins = FakeBins::acquire("engage-uncommit");
+    bins.ok("gh", PR_VIEW_JSON);
+    let head = git(&push_to(&f, None).await, &["rev-parse", BRANCH]);
+    let backend = ScriptedBackend::new(|tree| {
+        git(tree, &["reset", "-q", "--soft", "HEAD~1"]);
+        std::fs::write(tree.join("PR-REPLY.md"), "reworking it").unwrap();
+        support::done_with_transcript(tree)
+    });
+
+    let (summary, branch) = engage_once(&f, &backend).await;
+
+    let failure = summary.failure.clone().unwrap_or_default();
+    assert!(
+        failure.starts_with("uncommitted changes on a rewound branch"),
+        "{summary:?}"
+    );
+    assert_eq!(branch, head, "nothing pushed");
+    assert!(!bins.called_with("gh", "comment"), "{:?}", bins.calls());
+    assert!(
+        f.store
+            .checkpoint_job(f.fid, hunter::domain::FindingJobKind::Engage)
+            .await
+            .unwrap()
+            .is_none(),
+        "the attempt is not kept: the next engage starts afresh"
+    );
+}
+
+/// An engage tree on a private branch (another worktree holds the PR
+/// branch) whose branch cannot be read (git fails, rather than saying the
+/// ref is missing) is not taken for one on the PR branch, which is the
+/// other worktree's: the engage fails before its worker runs, with
+/// nothing pushed or posted.
+#[tokio::test]
+async fn an_unreadable_tree_branch_fails_the_engage() {
+    let f = fixture("engage-branch-unreadable").await;
+    let bins = FakeBins::acquire("engage-branch-unreadable");
+    bins.ok("gh", PR_VIEW_JSON);
+    let origin = push_to(&f, None).await;
+    let head = git(&origin, &["rev-parse", BRANCH]);
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let clone = PathBuf::from(
+        f.store
+            .get_repo_by_id(finding.repo_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .path,
+    );
+    let other = TempDir::new("engage-branch-unreadable-holder");
+    let holder = other.path().join("holder");
+    let h = holder.to_string_lossy().into_owned();
+    let remote = format!("origin/{BRANCH}");
+    git(
+        &clone,
+        &["worktree", "add", "-q", "-B", BRANCH, &h, &remote],
+    );
+    let real = String::from_utf8(
+        std::process::Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    bins.script(
+        "git",
+        &format!(
+            "case \"$*\" in *rev-parse*refs/heads/hunter/tree-*) exit 128;; esac\nexec '{}' \"$@\"",
+            real.trim()
+        ),
+    );
+    let backend = committing_and_replying();
+
+    let (summary, branch) = engage_once(&f, &backend).await;
+
+    let failure = summary.failure.clone().unwrap_or_default();
+    assert!(failure.starts_with("tree branch unreadable"), "{summary:?}");
+    let jobs = f.store.jobs_by_finding(f.fid).await.unwrap();
+    assert_eq!(
+        (summary.kind, summary.finding_id, summary.job_id),
+        (
+            Some(hunter::domain::FindingJobKind::Engage.into()),
+            Some(f.fid),
+            jobs.first().map(|j| j.id),
+        ),
+        "the cycle reports whose engage failed"
+    );
+    assert!(backend.runs().is_empty(), "no worker ran");
+    assert_eq!(branch, head, "nothing pushed");
+    assert!(!bins.called_with("gh", "comment"), "{:?}", bins.calls());
+}
+
+/// When another worktree of the clone has the PR branch checked out, the
+/// engage's tree works on a private branch of its own at the PR head: the
+/// worker's commits and rewinds on it are pushed, never the other
+/// worktree's branch, even when that worktree lets the branch go before
+/// the push.
+#[tokio::test]
+async fn a_branch_held_by_another_worktree_is_never_pushed() {
+    for case in ["commit", "rewind", "holder gone"] {
+        let name = format!("engage-held-{}", case.replace(' ', "-"));
+        let f = fixture(&name).await;
+        let bins = FakeBins::acquire(&name);
+        bins.ok("gh", PR_VIEW_JSON);
+        let origin = push_to(&f, None).await;
+        let parent = git(&origin, &["rev-parse", &format!("{BRANCH}~1")]);
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        let clone = PathBuf::from(
+            f.store
+                .get_repo_by_id(finding.repo_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .path,
+        );
+        let other = TempDir::new(&format!("{name}-holder"));
+        let holder = other.path().join("holder");
+        let h = holder.to_string_lossy().into_owned();
+        let remote = format!("origin/{BRANCH}");
+        git(
+            &clone,
+            &["worktree", "add", "-q", "-B", BRANCH, &h, &remote],
+        );
+        git(
+            &holder,
+            &[
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "the other worktree's",
+            ],
+        );
+        let (c, hp) = (clone.clone(), h.clone());
+        let backend = ScriptedBackend::new(move |tree| {
+            if case == "rewind" {
+                git(tree, &["reset", "--hard", "-q", "HEAD~1"]);
+            } else {
+                commit_in(tree);
+            }
+            if case == "holder gone" {
+                git(&c, &["worktree", "remove", "--force", &hp]);
+            }
+            std::fs::write(tree.join("PR-REPLY.md"), "addressed").unwrap();
+            support::done()
+        });
+
+        let (summary, branch) = engage_once(&f, &backend).await;
+
+        assert_eq!(
+            summary.outcome.as_deref(),
+            Some("engaged"),
+            "{case}: {summary:?}"
+        );
+        if case == "rewind" {
+            assert_eq!(branch, parent, "{case}");
+        } else {
+            assert_eq!(
+                git(&origin, &["log", "--format=%s", "-2", BRANCH]).trim(),
+                "address review\nchange",
+                "{case}"
+            );
+        }
+    }
+}
+
+/// A worker that checks out the default branch, moved past the PR's base
+/// since, to see whether the bug is still there and leaves `HEAD` detached
+/// there inspected it: the PR branch is not replaced by the default
+/// branch.
+#[tokio::test]
+async fn an_engage_left_on_the_default_branch_pushes_nothing() {
+    let f = fixture("engage-on-default").await;
+    let bins = FakeBins::acquire("engage-on-default");
+    bins.ok("gh", PR_VIEW_JSON);
+    let origin = push_to(&f, None).await;
+    let head = git(&origin, &["rev-parse", BRANCH]);
+    let dir = TempDir::new("engage-on-default-upstream");
+    git(
+        dir.path(),
+        &["clone", "-q", &origin.to_string_lossy(), "up"],
+    );
+    let up = dir.path().join("up");
+    std::fs::write(up.join("UPSTREAM.md"), "moved on\n").unwrap();
+    git(&up, &["add", "UPSTREAM.md"]);
+    git(&up, &["commit", "-q", "-m", "upstream"]);
+    git(&up, &["push", "-q", "origin", "HEAD"]);
+    let backend = ScriptedBackend::new(|tree| {
+        git(tree, &["fetch", "-q", "origin"]);
+        git(tree, &["checkout", "-q", "origin/main"]);
+        std::fs::write(tree.join("PR-REPLY.md"), "still broken on main").unwrap();
+        support::done()
+    });
+
+    assert_reply_only(&f, &bins, &backend, &head).await;
+}
+
 /// A finished engage publishes its commits to the PR branch and its reply
 /// on the PR, then records the engagement: the PR counts as answered up to
 /// the newest feedback the worker was shown (none here), the attention
@@ -3170,6 +3641,36 @@ async fn a_kept_engage_that_commits_again_pushes_over_its_own_push() {
         "one more"
     );
     assert!(bins.called_with("gh", "comment"), "{:?}", bins.calls());
+}
+
+/// A kept engage whose released retry drops the commit the chain itself
+/// pushed (`reset --hard` back to the PR head it started from) rewound
+/// the PR: the rewind is pushed, over the chain's own push.
+#[tokio::test]
+async fn a_kept_engage_that_drops_its_own_push_pushes_the_rewind() {
+    let f = fixture("engage-kept-rewinds").await;
+    let bins = FakeBins::acquire("engage-kept-rewinds");
+    let origin = kept_after_its_push(&f, &bins).await;
+    let start = git(&origin, &["rev-parse", &format!("{BRANCH}~1")]);
+    let plan = released_plan(&f).await;
+    let back = ScriptedBackend::new(|tree| {
+        git(tree, &["reset", "--hard", "-q", "HEAD~1"]);
+        std::fs::write(tree.join("PR-REPLY.md"), "dropped it again").unwrap();
+        support::done_with_transcript(tree)
+    });
+
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
+        &back,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
+    assert_eq!(git(&origin, &["rev-parse", BRANCH]), start);
 }
 
 /// A kept engage is not continued into its old reply once someone else

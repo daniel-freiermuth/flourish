@@ -135,6 +135,35 @@ async fn relative_project_root_creates_tree_at_worker_cwd() {
     );
 }
 
+/// Engage trees of several chains on one PR in one clone: the first takes
+/// the PR branch, every later one, finding it checked out there, a private
+/// branch of its own at the same commit. None fails for want of a branch.
+#[tokio::test]
+async fn engage_trees_sharing_a_pr_branch_each_get_a_branch() {
+    let _bins = FakeBins::acquire("ws-pr-head-shared");
+    let f = fixture("ws-pr-head-shared", "main").await;
+    let mut branches = Vec::new();
+    for id in 1..=3 {
+        let spec = TreeSpec::PrHead {
+            head_ref: "feature".to_owned(),
+        };
+        let pinned = create(&f, &f.cfg.work_root, id, spec).await.unwrap();
+        let tree = Workspace::for_chain(&f.cfg.work_root, &f.clone, id).tree;
+        assert_eq!(
+            git(&tree, &["rev-parse", "HEAD"]).trim(),
+            pinned,
+            "chain {id}"
+        );
+        branches.push(
+            git(&tree, &["symbolic-ref", "--short", "HEAD"])
+                .trim()
+                .to_owned(),
+        );
+    }
+    assert_eq!(branches[0], "feature");
+    assert_ne!(branches[1], branches[2], "{branches:?}");
+}
+
 async fn job_state(pool: &SqlitePool, id: i64) -> (String, Option<String>, Option<String>) {
     sqlx::query_as("SELECT state, killed_reason, notes FROM jobs WHERE id = ?1")
         .bind(id)
