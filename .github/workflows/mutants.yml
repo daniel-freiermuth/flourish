@@ -61,7 +61,7 @@ jobs:
         with:
           workspaces: hunter-rs
 
-      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
           tool: cargo-mutants@27.1.0
 
@@ -131,7 +131,7 @@ jobs:
 
       # No dev.db step: build.rs regenerates it from migrations/ on every
       # build, which is what sqlx::query! validates against.
-      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
           tool: cargo-nextest@0.9.115,cargo-mutants@27.1.0
 
