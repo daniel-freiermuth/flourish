@@ -48,6 +48,15 @@ currently broken.
 - CI exists but is thin: it doesn't invoke tooling the project has ALREADY configured for
   itself (an `.eslintrc`/`ruff`/`clippy.toml`/`rustfmt.toml`/`pyproject.toml [tool.*]` exists
   but no CI job runs it), doesn't run the actual test suite, or never builds/typechecks
+- A Rust crate with a real test suite whose PRs are not gated on mutation testing. The
+  proposed gate: its own workflow and concurrency group, running `cargo mutants --in-diff`
+  on the PR's diff against its base (`git diff --relative` when the crate is in a
+  subdirectory), with a failed `--list` failing the job; any exit code but 0 fails (2
+  survivors, 3 timeouts, 4 red baseline); a large diff sharded (`--shard k/n`) to finish
+  under the step's time cap, hitting the cap failing; the test tool, any excluded tests and
+  the timeout floor (`minimum_test_timeout`) in `.cargo/mutants.toml`, so a local run
+  matches CI; `mutants.out*` in `.gitignore`; the tool version pinned.
+  Whether an existing gate is sound is the standards scan's question
 - No release/delivery automation for a project whose own metadata signals it's meant to be
   published (a `Cargo.toml` with `publish` not set to `false` plus real `description`/
   `repository` fields, a non-private `package.json`, `fastlane`/App Store/Play Store config
@@ -84,7 +93,9 @@ Before filing:
   project "usually" does
 - Any command you plan to propose adding to CI -> actually run it in the repo right now and
   quote the result; proposing a pipeline step that would immediately fail is worse than no
-  finding at all
+  finding at all. One exception: for a mutation gate run only `cargo mutants --list` (no
+  build, no tests) and quote its count, never the mutants themselves; with no PR diff the
+  run is the whole tree, which takes hours
 
 # Known non-candidates (suppression corpus — each holds only while its reason does; see the rule at its top)
 {{SUPPRESSIONS}}

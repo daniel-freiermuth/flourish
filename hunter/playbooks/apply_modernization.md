@@ -74,7 +74,12 @@ findings often do." The exceptions:
   and quote the results. A new workflow file typically will not execute until this PR is
   merged (GitHub/GitLab do not run brand-new pipeline definitions against the PR that adds
   them the same way they run existing ones) — your local run is the only verification
-  evidence that will exist before merge, so it is not optional.
+  evidence that will exist before merge, so it is not optional. A mutation gate is the one
+  exception to running the exact command: never run the mutants of the whole tree (hours).
+  Add `mutants.out*` to the crate's `.gitignore` first (the run below leaves `mutants.out/`
+  behind). Run `cargo mutants --list` and quote its count; then change one small function,
+  save `git diff --relative` to a file, run `cargo mutants --in-diff` on it, revert the
+  change, check `git status` shows no `mutants.out`, and quote what was caught or missed
 
 Whichever you pick, COMMIT PER STEP: you may be killed at any moment, and committed work
 survives while anything only in your head does not. Every path — including (a) — ends with at
