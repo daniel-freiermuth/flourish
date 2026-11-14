@@ -138,7 +138,9 @@ anyway if review pushes the PR further before it merges.
 # Deliverables
 
 - **Commits on {{BRANCH}}** (upgrade/test/refactor commits)
-- **PR-DESCRIPTION.md** at the worktree root, NOT COMMITTED (becomes PR body):
+- **PR-DESCRIPTION.md** at the worktree root, NOT COMMITTED. Its first line is
+  `Title: <the PR title>`, naming the change; then a blank line; the rest
+  becomes the PR body:
   - What improved (dep upgrade, test coverage, refactoring)
   - Why valuable (security, correctness, maintainability)
   - What changed (version bump + patch rebase, new test cases, simplified code)

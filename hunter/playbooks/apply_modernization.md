@@ -39,8 +39,8 @@ a plan document under `docs/` named after the finding's fingerprint or topic (e.
   an effort estimate, and your recommendation
 - This MUST be a real commit (a shipped PR always needs at least one) — do not leave it
   uncommitted and only describe it in the PR body
-- Start the plan commit's subject with `[RFC]` so it is unambiguous this needs a decision,
-  not a merge. The PR title is taken from the commit subject, not from PR-DESCRIPTION.md
+- Start the PR title (the `Title:` line of PR-DESCRIPTION.md, see Deliverables) with `[RFC]`
+  so it is unambiguous this needs a decision, not a merge
 
 ### (b) Proof of concept / spike — when a meaningful chunk IS tractable
 If you can demonstrate the migration working end-to-end for a representative slice (even if
@@ -94,11 +94,10 @@ step 1, not the original hunt-time claim restated.
 # Deliverables
 
 - **Commits on {{BRANCH}}** — at least one in every path, even (a) (the plan document itself)
-- **PR-DESCRIPTION.md** at the worktree root, NOT COMMITTED (becomes the PR body): which of
-  (a) / (b) / (c) you chose and why, the plan or the verification results, and — critically —
-  exactly what a human still needs to decide
-- If you chose (a), the plan commit's subject starts with `[RFC]` (see there): that subject
-  becomes the PR title, so review expectations are set from the title alone
+- **PR-DESCRIPTION.md** at the worktree root, NOT COMMITTED. Its first line is
+  `Title: <the PR title>`, starting with `[RFC]` if you chose (a); then a blank line; the rest
+  becomes the PR body: which of (a) / (b) / (c) you chose and why, the plan or the
+  verification results, and — critically — exactly what a human still needs to decide
 
 OR if re-verification showed the premise no longer holds:
 

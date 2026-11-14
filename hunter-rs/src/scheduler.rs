@@ -5620,8 +5620,13 @@ enum FixOutcome {
     /// classification maps to ([`parse_decline`]).
     Declined(Decline),
     /// The branch is pushed and its draft PR exists (`recovered`: it
-    /// already did).
-    Shipped { pr_url: String, recovered: bool },
+    /// already did). `titled`: by the worker's own title line
+    /// ([`title_and_body`]), not by the fallback.
+    Shipped {
+        pr_url: String,
+        recovered: bool,
+        titled: bool,
+    },
     /// The worker stopped mid-work and its tree and transcript are kept.
     Suspended,
     /// No PR this time: counted in the finding's failure streak
@@ -5827,7 +5832,7 @@ async fn conclude_fix(
     )
     .await
     {
-        Ok((pr_url, recovered)) => return Ok(FixOutcome::Shipped { pr_url, recovered }),
+        Ok(shipped) => return Ok(shipped),
         Err(failure) => failure,
     };
     if state == JobState::Suspended {
@@ -6218,15 +6223,14 @@ impl ShipFailure {
     }
 }
 
-/// Push the fix branch and open its draft PR: `(url, recovered)`, or why
+/// Push the fix branch and open its draft PR ([`FixOutcome::Shipped`]), or why
 /// not. Nothing to ship (no commits, no `PR-DESCRIPTION.md`, a worker
 /// that did not finish) is a failure like a push that fails.
 ///
 /// What the pre-PR review ended with ([`review::Ending`]) says what
-/// ships: the commit (`HEAD` unless a reviewer moved it), the note that
-/// follows the description in the PR body, and the title (the subject of
-/// the commit the fixer finished on before any review round, so answers
-/// to the review do not retitle the fix; the shipped commit's otherwise).
+/// ships: the commit (`HEAD` unless a reviewer moved it) and the note that
+/// follows the description in the PR body. The title is the worker's own
+/// ([`title_and_body`]), or the shipped commit's subject without one.
 async fn ship_pr(
     repo: &Repo,
     branch: &str,
@@ -6234,7 +6238,7 @@ async fn ship_pr(
     worktree: &Path,
     state: JobState,
     ending: &review::Ending,
-) -> Result<(String, bool), ShipFailure> {
+) -> Result<FixOutcome, ShipFailure> {
     let _phase = crate::activity::job_phase(JobPhase::Publishing);
     let db = repo.default_branch.clone();
     let wt = worktree.to_owned();
@@ -6293,12 +6297,15 @@ async fn ship_pr(
             repo.url
         )));
     }
-    let mut body = std::fs::read_to_string(&pr_desc).unwrap_or_default();
+    let description = std::fs::read_to_string(&pr_desc).unwrap_or_default();
+    let (title, body) = title_and_body(&description);
+    let mut body = body.to_owned();
     if let Some(note) = &ending.note {
         body = format!("{}\n\n{note}\n", body.trim_end());
     }
-    let title = if let Some(title) = &ending.title {
-        title.clone()
+    let titled = title.is_some();
+    let title = if let Some(title) = title {
+        title.to_owned()
     } else {
         let wt = worktree.to_owned();
         tokio::task::spawn_blocking(move || Unheld::Subject { rev: &rev }.run(&wt, 30))
@@ -6307,20 +6314,46 @@ async fn ship_pr(
     };
     let title = title.trim();
     let title = if title.is_empty() { branch } else { title };
+    let shipped = |pr_url, recovered| FixOutcome::Shipped {
+        pr_url,
+        recovered,
+        titled,
+    };
     match f.create_pr(Path::new(&repo.path), branch, &db, title, &body) {
-        Ok(pr_url) => Ok((pr_url, false)),
+        Ok(pr_url) => Ok(shipped(pr_url, false)),
         Err(e) => {
             let err_msg = e.to_string();
             if err_msg.contains("already exists")
                 && let Some(pr_url) = extract_pr_url(&err_msg)
             {
-                return Ok((pr_url, true));
+                return Ok(shipped(pr_url, true));
             }
             Err(ShipFailure::forge(format!(
                 "PR create failed: {}",
                 create_failure_text(&err_msg)
             )))
         }
+    }
+}
+
+/// The PR's title and body, from the worker's `PR-DESCRIPTION.md`: a first
+/// line `Title: <text>` is the title, and the body is what follows it. The
+/// worker keeps the description current through every review round, so
+/// the title says what the change is when it ships, not what it was
+/// before the review.
+///
+/// The line is matched exactly, at the very start of the file: a looser
+/// match would take a heading or a sentence of an older description for
+/// one. `None`: no such line (a description written before one was asked
+/// for, or one that spells it another way) and the whole text is the
+/// body, or a line that names nothing, which is dropped. The PR then takes
+/// its commit's subject, and the ship event says so.
+fn title_and_body(description: &str) -> (Option<&str>, &str) {
+    let (first, rest) = description.split_once('\n').unwrap_or((description, ""));
+    match first.strip_prefix("Title:").map(str::trim) {
+        Some("") => (None, rest.trim_start()),
+        Some(title) => (Some(title), rest.trim_start()),
+        None => (None, description),
     }
 }
 
@@ -6450,6 +6483,22 @@ async fn record_declined_fix(
     summary.outcome = Some(FindingStatus::from(status).as_str().into());
 }
 
+/// The `ship` event of a fix whose PR is open ([`FixOutcome::Shipped`]).
+/// A PR that took its commit's subject for a title says so: the worker
+/// was asked for a title line, and a miss nobody is told of stays a miss.
+fn shipped_message(fid: i64, pr_url: &str, recovered: bool, titled: bool) -> String {
+    if recovered {
+        format!("#{fid} recovered existing PR: {pr_url}")
+    } else if titled {
+        format!("#{fid} draft PR: {pr_url}")
+    } else {
+        format!(
+            "#{fid} draft PR: {pr_url}, titled by its commit's subject: \
+             PR-DESCRIPTION.md does not start with a `Title: ...` line"
+        )
+    }
+}
+
 /// Write a fix outcome: the finding's status, the event, and the summary.
 /// A one-shot budget override is spent by every outcome but a `BLOCKED.md`
 /// hold, a decline, and an attempt that could not publish offline (none of
@@ -6477,7 +6526,11 @@ async fn record_fix_outcome(
             record_declined_fix(store, finding, start, claim, decline, summary).await;
             return Ok(());
         }
-        FixOutcome::Shipped { pr_url, recovered } => {
+        FixOutcome::Shipped {
+            pr_url,
+            recovered,
+            titled,
+        } => {
             // A claim whose `pr_open` could not be written goes back to
             // `queued`.
             let (lost, unopened) = match claim.open_pr(&pr_url).await {
@@ -6498,11 +6551,7 @@ async fn record_fix_outcome(
                     (false, Some(claim))
                 }
             };
-            let message = if recovered {
-                format!("#{fid} recovered existing PR: {pr_url}")
-            } else {
-                format!("#{fid} draft PR: {pr_url}")
-            };
+            let message = shipped_message(fid, &pr_url, recovered, titled);
             let _ = fix_event(store, "ship", fid, job, message).await;
             if !lost {
                 summary.outcome = Some("pr_open".into());

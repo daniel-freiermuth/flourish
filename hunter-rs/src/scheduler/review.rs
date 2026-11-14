@@ -49,7 +49,7 @@ pub(super) const GRANT: &str = "grant";
 /// ([`Progress`]). A resumed attempt reviews from the round after the
 /// last one sent back, so a fixer suspended while answering a review does
 /// not restart the count. Reset to round 0 once the loop ends, keeping the
-/// title and the follow-ups for any later review of the chain.
+/// follow-ups for any later review of the chain.
 const PROGRESS_FILE: &str = "review-progress.json";
 
 /// In the workspace root: the verdict a review loop reached ([`Saved`]),
@@ -135,10 +135,6 @@ pub(super) struct Ending {
     /// `HEAD`, so what ships is what was reviewed, not the reviewer's
     /// commits.
     pub head: Option<String>,
-    /// The PR title: the subject of the commit the fixer finished on
-    /// before the first review round, so commits answering the review do
-    /// not retitle the fix. `None`: the shipped commit's subject.
-    pub title: Option<String>,
 }
 
 /// A verdict the review reached, kept for the tree it covers. Only a
@@ -148,7 +144,6 @@ pub(super) struct Ending {
 #[derive(Debug, Serialize, Deserialize)]
 struct Saved {
     note: Option<String>,
-    title: Option<String>,
     tree: TreeState,
 }
 
@@ -158,8 +153,6 @@ struct Progress {
     /// The last round whose issues went back to the fixer, or are owed
     /// to it ([`Owed::Answer`]).
     rounds: u32,
-    /// [`Ending::title`], taken before round 1.
-    title: Option<String>,
     /// The follow-ups the rounds so far raised ([`merge_follow_ups`]).
     #[serde(default)]
     follow_ups: Vec<serde_json::Value>,
@@ -174,6 +167,20 @@ struct Progress {
     /// ([`suspended_between_runs`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     paused_by: Option<i64>,
+}
+
+impl Progress {
+    /// Round `rounds` sent back, the `follow_ups` raised so far, nothing
+    /// owed. The follow-ups are an argument, not a field a caller may
+    /// leave out: every progress written carries them on, or the ones
+    /// found before a hold, a suspension or an outage never ship.
+    fn at(rounds: u32, follow_ups: Vec<serde_json::Value>) -> Self {
+        Self {
+            rounds,
+            follow_ups,
+            ..Self::default()
+        }
+    }
 }
 
 /// What a job suspended between its runs still owes, besides reviewing
@@ -226,8 +233,6 @@ struct Rounds<'a> {
     cfg: &'a Config,
     backend: &'a dyn Backend,
     start: &'a FixStart,
-    /// [`Ending::title`], kept across attempts and holds.
-    title: Option<String>,
 }
 
 impl Rounds<'_> {
@@ -292,11 +297,8 @@ impl Rounds<'_> {
         (reason, stop): (&str, &str),
     ) -> bool {
         let progress = Progress {
-            rounds: reviewed,
-            title: self.title.clone(),
-            follow_ups: follow_ups.to_vec(),
             owed: (!issues.is_empty()).then(|| Owed::Answer(issues.to_vec())),
-            ..Progress::default()
+            ..Progress::at(reviewed, follow_ups.to_vec())
         };
         let round = if issues.is_empty() {
             reviewed + 1
@@ -356,10 +358,8 @@ impl Rounds<'_> {
         }
         save_ending(self.start, ending).await;
         let progress = Progress {
-            title: self.title.clone(),
-            follow_ups: follow_ups.to_vec(),
             owed: Some(Owed::Curation),
-            ..Progress::default()
+            ..Progress::at(0, follow_ups.to_vec())
         };
         let stop = format!("curation: {why}; suspended to curate under a fresh grant");
         self.pause(job, progress, (reason, &stop)).await
@@ -387,16 +387,11 @@ impl Rounds<'_> {
     /// host the work needs is unreachable ([`super::unreachable_now`]):
     /// the network's failure, handled as the fix's other offline failures
     /// are (`FixOutcome::Offline`). The progress is rewound so the retry
-    /// reviews that round again, keeping the title and `follow_ups`.
+    /// reviews that round again, keeping the `follow_ups`.
     async fn offline(&self, round: u32, follow_ups: &[serde_json::Value]) -> Option<String> {
         let start = self.start;
         let host = super::unreachable_now(self.cfg, &start.repo.url, self.backend).await?;
-        let again = Progress {
-            rounds: round.saturating_sub(1),
-            title: self.title.clone(),
-            follow_ups: follow_ups.to_vec(),
-            ..Progress::default()
-        };
+        let again = Progress::at(round.saturating_sub(1), follow_ups.to_vec());
         write_progress(start, &again, "recording the review's progress");
         let message = format!("{host} unreachable; kept to review round {round} again");
         log_round(self.store(), start, round, &message).await;
@@ -436,12 +431,7 @@ impl Rounds<'_> {
         if let Some(host) = self.offline(round, follow_ups).await {
             return Unanswered::Offline(host);
         }
-        let progress = Progress {
-            rounds: 0,
-            title: self.title.clone(),
-            follow_ups: follow_ups.to_vec(),
-            ..Progress::default()
-        };
+        let progress = Progress::at(0, follow_ups.to_vec());
         let restoring = head.as_deref();
         if self.holds(round, issues) && hold(start, round, issues, (&progress, why, restoring)) {
             let message = format!(
@@ -501,12 +491,7 @@ impl Rounds<'_> {
         if why.is_some() && self.spent(job, owed, follow_ups, &suspended).await {
             return Unanswered::Suspended;
         }
-        let progress = Progress {
-            rounds: 0,
-            title: self.title.clone(),
-            follow_ups: follow_ups.to_vec(),
-            ..Progress::default()
-        };
+        let progress = Progress::at(0, follow_ups.to_vec());
         if self.holds(round, issues) && hold(start, round, issues, (&progress, &stop, None)) {
             let message = format!("{raised}, {stop}; held for the operator");
             log_round(self.store(), start, round, &message).await;
@@ -569,16 +554,11 @@ pub(super) async fn review_fix(
     }
     let root = &start.ws.root;
     let progress = read_json::<Progress>(&root.join(PROGRESS_FILE)).unwrap_or_default();
-    let title = match progress.title {
-        Some(title) => Some(title),
-        None => head_subject(&start.ws.tree).await,
-    };
     let rounds = Rounds {
         scope,
         cfg,
         backend,
         start,
-        title: title.clone(),
     };
     // The round reviewed last, and its issues the fixer is owed an answer
     // to: a suspended attempt's, sent before anything is reviewed again.
@@ -621,12 +601,7 @@ pub(super) async fn review_fix(
         }
         let message = format!("{raised}; back to the fixer");
         log_round(rounds.store(), start, round, &message).await;
-        let progress = Progress {
-            rounds: round,
-            title: title.clone(),
-            follow_ups: follow_ups.clone(),
-            ..Progress::default()
-        };
+        let progress = Progress::at(round, follow_ups.clone());
         match send_back(&rounds, &mut job, &progress, &issues).await {
             Answered::ReviewAgain => {}
             Answered::Conclude | Answered::Held => return job,
@@ -637,7 +612,6 @@ pub(super) async fn review_fix(
             Answered::Ship(ending) => break (ending, false),
         }
     };
-    ending.title = title;
     if finish(&rounds, lane, &mut job, &mut ending, follow_ups, keep).await {
         job.ending = Some(ending);
     }
@@ -660,18 +634,13 @@ async fn ship_saved(
         return job;
     }
     let follow_ups = progress.follow_ups;
-    let taken = Progress {
-        title: progress.title.clone(),
-        follow_ups: follow_ups.clone(),
-        ..Progress::default()
-    };
+    let taken = Progress::at(0, follow_ups.clone());
     write_progress(start, &taken, "recording the review's progress");
     let rounds = Rounds {
         scope,
         cfg,
         backend,
         start,
-        title: progress.title,
     };
     match curate(&rounds, lane, &mut job, &mut ending, &follow_ups).await {
         Curated::Accepted => save_ending(start, &ending).await,
@@ -997,10 +966,8 @@ fn owe_curation(start: &FixStart) {
     write_progress(
         start,
         &Progress {
-            title: progress.title,
-            follow_ups: progress.follow_ups,
             owed: Some(Owed::Curation),
-            ..Progress::default()
+            ..Progress::at(0, progress.follow_ups)
         },
         "recording the review's progress",
     );
@@ -1094,7 +1061,6 @@ async fn saved_ending(start: &FixStart) -> Option<Ending> {
     Some(Ending {
         note: saved.note,
         head: None,
-        title: saved.title,
     })
 }
 
@@ -1120,10 +1086,10 @@ async fn covering_verdict(ws: &Workspace) -> Option<Saved> {
 }
 
 /// End the loop's files. Its progress is reset to round 0, keeping the
-/// title and the `follow_ups`: a later attempt that finds the tree changed
-/// (an offline push retried after the fixer went on) is reviewed from
-/// round 1 again, under the same title and with them. `ending` is saved
-/// for the tree as it is when `keep` (a reviewer's own verdict).
+/// `follow_ups`: a later attempt that finds the tree changed (an offline
+/// push retried after the fixer went on) is reviewed from round 1 again,
+/// with them. `ending` is saved for the tree as it is when `keep` (a
+/// reviewer's own verdict).
 async fn end_loop(
     start: &FixStart,
     ending: &Ending,
@@ -1131,12 +1097,7 @@ async fn end_loop(
     keep: bool,
 ) {
     let root = &start.ws.root;
-    let progress = Progress {
-        rounds: 0,
-        title: ending.title.clone(),
-        follow_ups,
-        ..Progress::default()
-    };
+    let progress = Progress::at(0, follow_ups);
     write_progress(start, &progress, "resetting the review's progress");
     let _ = std::fs::remove_file(root.join(ENDING_FILE));
     let _ = std::fs::remove_file(root.join(HELD_FILE));
@@ -1149,7 +1110,6 @@ async fn end_loop(
 async fn save_ending(start: &FixStart, ending: &Ending) {
     let saved = Saved {
         note: ending.note.clone(),
-        title: ending.title.clone(),
         tree: tree_state(&start.ws.tree).await,
     };
     let written = write_json(&start.ws.root.join(ENDING_FILE), &saved);
@@ -1236,9 +1196,9 @@ impl Held {
 /// `issues` (`stop` says why no answer comes): the report goes where a
 /// worker's would (`BLOCKED.md`, which `conclude_fix` turns into a
 /// `prerequisite` hold with this attempt as its checkpoint), and the
-/// issues to [`HELD_FILE`] for the resume. `progress` (round 0, the title
-/// and the follow-ups so far) replaces the loop's progress, so a continued
-/// fix is reviewed from round 1 under the same title and keeps them.
+/// issues to [`HELD_FILE`] for the resume. `progress` (round 0 and the
+/// follow-ups so far) replaces the loop's progress, so a continued fix is
+/// reviewed from round 1 and keeps them.
 /// `restoring`: the commit the round's reviewer was shown, when its changes
 /// could not be undone, which every later attempt puts the tree back to
 /// before the fixer resumes ([`RESTORE_FILE`]); the report says so.
@@ -1284,8 +1244,8 @@ fn hold(
         let _ = std::fs::remove_file(root.join(HELD_FILE));
         return false;
     }
-    // The continued fix is reviewed from round 1 again, under the same
-    // title and with the follow-ups found so far.
+    // The continued fix is reviewed from round 1 again, with the
+    // follow-ups found so far.
     write_progress(start, progress, "keeping the review's progress");
     let _ = std::fs::remove_file(root.join(ENDING_FILE));
     true
@@ -1512,12 +1472,7 @@ async fn no_answer(
         return Answered::Offline(host);
     }
     if issues.iter().any(is_blocking) {
-        let kept = Progress {
-            rounds: 0,
-            title: progress.title.clone(),
-            follow_ups: progress.follow_ups.clone(),
-            ..Progress::default()
-        };
+        let kept = Progress::at(0, progress.follow_ups.clone());
         let stop = format!("the fixer could not answer them: {why}");
         if hold(start, round, issues, (&kept, &stop, None)) {
             let message = format!("{}, {stop}; held for the operator", tally(issues));
@@ -1529,7 +1484,7 @@ async fn no_answer(
 }
 
 /// A fix that concludes on a report (`BLOCKED.md`, a decline) starts any
-/// later review from round 1, keeping the title and follow-ups and nothing
+/// later review from round 1, keeping the follow-ups and nothing
 /// else (no issues owed from before the report, no stop): the
 /// operator's `continue` of a hold is a fresh start, however the report
 /// came to be (an answer, a suspended one, the attempt that finished it,
@@ -1539,11 +1494,7 @@ pub(super) fn restart_rounds(start: &FixStart) {
     if let Some(progress) = read_json::<Progress>(&start.ws.root.join(PROGRESS_FILE)) {
         write_progress(
             start,
-            &Progress {
-                title: progress.title,
-                follow_ups: progress.follow_ups,
-                ..Progress::default()
-            },
+            &Progress::at(0, progress.follow_ups),
             "recording the review's progress",
         );
     }
@@ -1605,16 +1556,6 @@ async fn ready_to_ship(start: &FixStart, rr: &RunResult) -> bool {
             .await
             .unwrap_or((127, String::new()));
     rc == 0 && !commits.trim().is_empty()
-}
-
-/// The subject of `tree`'s `HEAD`, if it has one.
-async fn head_subject(tree: &Path) -> Option<String> {
-    let tree = tree.to_owned();
-    let (rc, out) =
-        tokio::task::spawn_blocking(move || Unheld::Subject { rev: "HEAD" }.run(&tree, 30))
-            .await
-            .ok()?;
-    (rc == 0).then(|| out.trim().to_owned())
 }
 
 /// Run review round `round` in `start`'s tree under `cap` tokens and
@@ -2327,7 +2268,6 @@ fn failed(round: u32, why: &str, head: Option<String>, issues: &[serde_json::Val
     Ending {
         note: Some(note),
         head,
-        title: None,
     }
 }
 
@@ -2341,7 +2281,6 @@ fn unresolved(round: u32, issues: &[serde_json::Value], unanswered: Option<&str>
     Ending {
         note: Some(note),
         head: None,
-        title: None,
     }
 }
 
