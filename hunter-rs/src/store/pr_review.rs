@@ -2010,7 +2010,7 @@ impl Store {
             job_id,
             (base, head, merge_base),
             (verdict, failure),
-            now,
+            (now, None),
         )
         .await?;
         sqlx::query!(
