@@ -16,6 +16,10 @@ Focus on safe, mechanical improvements with LOW RISK:
 - **Exact duplicates**: 5+ identical lines repeated 2+ times
 - **Near duplicates**: Same logic with minor variations (parameter differences)
 - **Refactor**: Extract to shared function/method
+- **Not this**: two separate solutions to the same problem (two retry helpers, two config
+  loaders, two caches for the same data) that look alike. Whether one should take over the
+  other, or both should stay, is a design question the simplification scan asks. Do not
+  file a shared extraction for them
 
 ### Dead Code (smell: dead-code)
 - **Unreachable code**: Branches that can never execute

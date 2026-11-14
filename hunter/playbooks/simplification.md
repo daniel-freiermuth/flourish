@@ -56,6 +56,8 @@ Accretion leaves traces. Start where they are thickest instead of reading top to
 - Traits, interfaces, generics, plugin points and config surfaces: count their users
 - Shared helpers, utility modules and "common"/"shared"/"lib" code extracted to remove
   duplication (`git log --grep` for extract/dedupe/share/common): count who still shares them
+- Two modules, helpers or types that do the same job under different names (search for the
+  concept, not the name: two retry loops, two config loaders, two caches for the same data)
 
 ## What Counts as a Simplification Opportunity
 
@@ -97,6 +99,32 @@ Accretion leaves traces. Start where they are thickest instead of reading top to
 - Two mechanisms for one job: the old path and the new path both alive
 - **Simplify**: derive instead of store; finish the migration to one path
 
+### Parallel solutions (smell: parallel-solutions)
+- Two solutions to the same problem living side by side, neither meant to replace the other:
+  built by separate efforts that did not know of each other, or deliberately at the time
+- This is not duplication to extract. The question is whether one of the two can go
+- Converge only by picking one: an existing solution takes over the other's users, and the
+  other is deleted. That holds in two cases:
+  - the survivor covers what the other's users need as it stands; or
+  - the survivor needs adapting, and the adaptation is one its OWN users would want anyway
+    (it closes a gap or lifts a limit for them too). Say what its own users gain
+- Not filed: a third, more general thing that replaces both; or a survivor that would grow
+  options, flags, modes or callbacks only the newcomers use. One thing bent to serve two
+  customers costs more than two plain things, and then keeping both IS the boring choice
+- Not filed either when the two are different problems that look alike. Check their
+  history: two things that changed at different times for different reasons will keep
+  doing so, and belong apart
+- Converging can change what someone observes: the survivor's own users in the second case,
+  or the moved users whenever the two behave differently (another backoff, another default,
+  another error). That is allowed for this class, but never silently: list every such
+  difference and who sees it. A finding with any is applied as a plan a human decides on,
+  not as a direct change
+- Evidence: what each solution's users actually need, enumerated; which one survives and
+  why; what it lacks for the other's users; for each lack, what its own users gain from
+  closing it; and every behavior difference a user of either would see
+- Confidence at most 0.7
+- **Simplify**: move the users over, delete the other
+
 ### Orphaned scaffolding (smell: orphaned-scaffolding)
 - Helpers, columns, fields, flags or plumbing that supported a feature history shows was
   removed, and that now serve nothing or only each other
@@ -131,7 +159,8 @@ Accretion leaves traces. Start where they are thickest instead of reading top to
 - Anything that loosens a type: an enum to a string or int, a struct to a map or tuple, a
   newtype to its bare primitive, typed data to untyped JSON. Fewer type definitions is not
   less complexity
-- A change that alters observable behavior, unless filed as a `requirement-question`
+- A change that alters observable behavior, unless filed as a `requirement-question`, or as
+  `parallel-solutions` with every difference listed
 - Performance work, style, naming
 
 # Verification is mandatory, not optional
@@ -172,7 +201,7 @@ away. Each entry:
   "file": "path/file.ext",
   "symbol": "type, function or module the complexity lives in",
   "line": 0,
-  "smell_type": "vestigial-generality|unreachable-variant|over-powered-structure|rule-accretion|duplicate-state|orphaned-scaffolding|needless-novelty|requirement-question",
+  "smell_type": "vestigial-generality|unreachable-variant|over-powered-structure|rule-accretion|duplicate-state|parallel-solutions|orphaned-scaffolding|needless-novelty|requirement-question",
   "current_approach": "what the code does today, and what that costs (concepts, states, cases)",
   "proposed_approach": "the boring replacement, concretely (boring = conventional and precisely typed, never a looser type)",
   "severity": "high|medium|low",
@@ -192,7 +221,7 @@ Confidence guide:
 - **0.9+**: countable and complete (zero constructions, one implementation, one value),
   with the reason it was built found and shown to be gone
 - **0.7-0.9**: enumeration complete, but the replacement needs design judgment
-  (`needless-novelty`: at most 0.7)
+  (`needless-novelty`, `parallel-solutions`: at most 0.7)
 - **0.5-0.7**: the payers are few rather than none; a human must weigh it
 - **<0.5**: prefer not filing (`requirement-question` is the exception: at most 0.5)
 
