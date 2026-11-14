@@ -376,6 +376,57 @@ pub struct SchedulerState {
 pub struct FindingDetail {
     pub jobs: Vec<Job>,
     pub pr_state: Option<PrState>,
+    /// The rounds of every review the finding's fixes had before their PR
+    /// opened, newest first. Always present, [] when none.
+    pub fix_review_rounds: Vec<FixReviewRoundOut>,
+}
+
+/// One round of a fix's review before its PR opened: a reviewer over the
+/// fix's commits, `base_sha..head_sha`.
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export)]
+pub struct FixReviewRoundOut {
+    pub id: i64,
+    /// The fix chain's first job: the rounds of one chain are one review.
+    pub origin_job_id: i64,
+    /// The fix attempt the round ran in.
+    pub job_id: Option<i64>,
+    /// The commit the fix's tree was made at.
+    pub base_sha: String,
+    /// The commit the reviewer was shown.
+    pub head_sha: String,
+    /// `ok` (the reviewer finished; no issues is a clean round), `partial`
+    /// (it was stopped after it wrote issues, which the fix went on with)
+    /// or `failed` (no review was had).
+    pub verdict: String,
+    /// Why the round failed, or stopped partway.
+    pub failure: Option<String>,
+    pub finished_at: i64,
+    /// What the round's reviewer spent; null where nobody counted it.
+    pub tokens_new: Option<i64>,
+    /// Blocking ones first.
+    pub issues: Vec<ReviewIssueOut>,
+}
+
+/// One issue a review round reported, as the reviewer wrote it.
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export)]
+pub struct ReviewIssueOut {
+    pub id: i64,
+    /// `introduced`, `incomplete`, `weak-proof` or `follow-up` (outside
+    /// the change's scope: never sent to the fixer), or the reviewer's
+    /// own word.
+    pub kind: String,
+    pub blocking: bool,
+    pub severity: Option<String>,
+    pub confidence: Option<f64>,
+    pub file: Option<String>,
+    pub line: Option<i64>,
+    /// `"RIGHT"` when `line` numbers the reviewed head, `"LEFT"` the base;
+    /// null when the reviewer did not say, read as RIGHT.
+    pub side: Option<String>,
+    pub summary: String,
+    pub detail: String,
 }
 
 /// /`api/summary.next_candidate` -- the job the scheduler would pick next,

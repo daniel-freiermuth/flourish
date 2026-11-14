@@ -5,9 +5,20 @@
 //! every subject: both reviewers write the issue schema of their playbook
 //! (`review.md`). A subject's own state extends these rows in tables of
 //! its own ([`super::pr_review`] for a PR review's).
+//!
+//! A fix's review is the `fix` subject: one review per fix chain, owned by
+//! the finding and the chain's first job, created by the first round the
+//! job lane records of it ([`JobStore::record_fix_review_round`]). The
+//! rounds are a record: the fix's review loop does not read them back.
+//!
+//! [`JobStore::record_fix_review_round`]: super::JobStore::record_fix_review_round
 
 use serde::{Deserialize, Serialize};
 use sqlx::SqliteConnection;
+
+use super::{ImmediateTx, Store};
+use crate::types::{FixReviewRoundOut, ReviewIssueOut};
+use crate::util::now_ms;
 
 /// An issue as the reviewer reported it: a pre-PR round's, which goes back
 /// to the fixer and is kept in the fix's review files, or a PR review
@@ -80,20 +91,21 @@ impl From<serde_json::Value> for ReportedIssue {
 /// job `job_id` when one ran, with the merge-base it resolved
 /// (`merge_base`; `None` for a round that failed before resolving it),
 /// how it ended (`verdict`: `ok`, `partial` or `failed`, with why for the
-/// latter two) and when. Returns the round's id.
+/// latter two), when, and what its reviewer spent (`tokens_new`, when
+/// counted). Returns the round's id.
 pub(super) async fn insert_round(
     tx: &mut SqliteConnection,
     review_id: i64,
     job_id: Option<i64>,
     (base, head, merge_base): (&str, &str, Option<&str>),
     (verdict, failure): (&str, Option<&str>),
-    finished_at: i64,
+    (finished_at, tokens_new): (i64, Option<i64>),
 ) -> sqlx::Result<i64> {
     sqlx::query_scalar!(
         r#"INSERT INTO review_rounds
                (review_id, job_id, base_sha, head_sha, merge_base_sha, verdict, failure,
-                finished_at)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                finished_at, tokens_new)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
            RETURNING id AS "id!: i64""#,
         review_id,
         job_id,
@@ -102,7 +114,8 @@ pub(super) async fn insert_round(
         merge_base,
         verdict,
         failure,
-        finished_at
+        finished_at,
+        tokens_new
     )
     .fetch_one(&mut *tx)
     .await
@@ -140,4 +153,147 @@ pub(super) async fn insert_issue(
     )
     .fetch_one(&mut *tx)
     .await
+}
+
+/// How a round of a fix's review ended, as
+/// [`JobStore::record_fix_review_round`](super::JobStore::record_fix_review_round)
+/// records it: the round's verdict, and the issues of a kept one.
+#[derive(Debug, Clone, Copy)]
+pub enum FixReviewRound<'a> {
+    /// The reviewer finished `base..head`, reporting these issues (none:
+    /// a clean round).
+    Ok(&'a [ReportedIssue]),
+    /// The reviewer was stopped (killed, crashed, its tree not put back)
+    /// after it wrote these issues, which the fix goes on with; `why` it
+    /// did not finish.
+    Partial {
+        why: &'a str,
+        issues: &'a [ReportedIssue],
+    },
+    /// No review was had this round, for this reason.
+    Failed(&'a str),
+}
+
+impl Store {
+    /// Record one round of the review of `finding_id`'s fix chain, the
+    /// chain that job `origin_job_id` began, in one transaction: the
+    /// chain's review, the first time a round of it is recorded; the
+    /// round, run by job `job_id` over `base..head` with its reviewer's
+    /// spend (`tokens_new`); and the issues a kept round reported,
+    /// follow-ups among them. A fix's range always starts at the commit
+    /// its tree was made at, the change's merge-base, so every round
+    /// reviews the whole change. Returns the round's id. The job lane's
+    /// write
+    /// ([`JobStore::record_fix_review_round`](super::JobStore::record_fix_review_round)).
+    pub(super) async fn record_fix_review_round(
+        &self,
+        (finding_id, origin_job_id): (i64, i64),
+        job_id: i64,
+        (base, head): (&str, &str),
+        tokens_new: Option<i64>,
+        round: FixReviewRound<'_>,
+    ) -> sqlx::Result<i64> {
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
+        sqlx::query!(
+            "INSERT INTO reviews (subject, finding_id, origin_job_id) VALUES ('fix', ?1, ?2) \
+             ON CONFLICT (origin_job_id) DO NOTHING",
+            finding_id,
+            origin_job_id
+        )
+        .execute(&mut *tx)
+        .await?;
+        let review_id = sqlx::query_scalar!(
+            r#"SELECT id AS "id!: i64" FROM reviews
+               WHERE subject = 'fix' AND finding_id = ?1 AND origin_job_id = ?2"#,
+            finding_id,
+            origin_job_id
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let (verdict, failure, issues) = match round {
+            FixReviewRound::Ok(issues) => ("ok", None, issues),
+            FixReviewRound::Partial { why, issues } => ("partial", Some(why), issues),
+            FixReviewRound::Failed(why) => ("failed", Some(why), &[][..]),
+        };
+        let round_id = insert_round(
+            &mut tx,
+            review_id,
+            Some(job_id),
+            (base, head, Some(base)),
+            (verdict, failure),
+            (now_ms(), tokens_new),
+        )
+        .await?;
+        for issue in issues {
+            insert_issue(&mut tx, round_id, issue).await?;
+        }
+        tx.commit().await?;
+        Ok(round_id)
+    }
+
+    /// Every round of the reviews of `finding_id`'s fixes, newest first,
+    /// each with its issues, blocking ones first.
+    pub async fn fix_review_rounds(&self, finding_id: i64) -> sqlx::Result<Vec<FixReviewRoundOut>> {
+        let rounds = sqlx::query!(
+            r#"
+            SELECT r.id AS "id!: i64", rv.origin_job_id AS "origin_job_id!: i64", r.job_id,
+                   r.base_sha, r.head_sha, r.verdict, r.failure,
+                   r.finished_at AS "finished_at!: i64", r.tokens_new
+            FROM review_rounds r JOIN reviews rv ON rv.id = r.review_id
+            WHERE rv.subject = 'fix' AND rv.finding_id = ?1
+            ORDER BY r.finished_at DESC, r.id DESC
+            "#,
+            finding_id
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let issues = sqlx::query!(
+            r#"
+            SELECT i.id AS "id!: i64", i.round_id AS "round_id!: i64", i.kind,
+                   i.blocking AS "blocking!: bool", i.severity, i.confidence, i.file, i.line,
+                   i.side, i.summary, i.detail
+            FROM review_issues i JOIN review_rounds r ON r.id = i.round_id
+            JOIN reviews rv ON rv.id = r.review_id
+            WHERE rv.subject = 'fix' AND rv.finding_id = ?1
+            ORDER BY i.round_id, i.blocking DESC, i.id
+            "#,
+            finding_id
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut by_round: std::collections::HashMap<i64, Vec<ReviewIssueOut>> =
+            std::collections::HashMap::new();
+        for i in issues {
+            by_round
+                .entry(i.round_id)
+                .or_default()
+                .push(ReviewIssueOut {
+                    id: i.id,
+                    kind: i.kind,
+                    blocking: i.blocking,
+                    severity: i.severity,
+                    confidence: i.confidence,
+                    file: i.file,
+                    line: i.line,
+                    side: i.side,
+                    summary: i.summary,
+                    detail: i.detail,
+                });
+        }
+        Ok(rounds
+            .into_iter()
+            .map(|r| FixReviewRoundOut {
+                id: r.id,
+                origin_job_id: r.origin_job_id,
+                job_id: r.job_id,
+                base_sha: r.base_sha,
+                head_sha: r.head_sha,
+                verdict: r.verdict,
+                failure: r.failure,
+                finished_at: r.finished_at,
+                tokens_new: r.tokens_new,
+                issues: by_round.remove(&r.id).unwrap_or_default(),
+            })
+            .collect())
+    }
 }

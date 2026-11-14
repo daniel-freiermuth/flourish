@@ -168,10 +168,11 @@ Handler: server.py:222-228 -> `_finding_detail(qs)` (server.py:384-403).
 - Query param `id`: required, must be all digits. Missing, non-digit, or nonexistent finding -> **`404 {"error": "no such finding"}`** in all three cases (server.py:224-226, 393-399). (Never 400, despite the docstring.)
 - Success `200`:
 ```json
-{ "jobs": [ <job row>, ... ], "pr_state": { ... } | null }
+{ "jobs": [ <job row>, ... ], "pr_state": { ... } | null, "fix_review_rounds": [ ... ] }
 ```
 - `jobs`: `jobs_by_finding(fid)` (store.py:1228-1241): `SELECT j.*, r.name AS repo_name FROM jobs j JOIN repos r ON r.id = j.repo_id WHERE j.finding_id = ? ORDER BY j.id DESC` — complete history, **no limit**. Columns: the 17 jobs columns (section 6) + `repo_name`.
 - `pr_state`: `get_pr_state(fid)` (store.py:1085-1087): `SELECT * FROM pr_state WHERE finding_id = ?`; the whole row as an object, or `null` if none. Columns (schema.sql:164-207): `finding_id:int, pr_number:int|null, state:str|null (OPEN|MERGED|CLOSED), mergeable:str|null, checks:str|null, head_ref:str|null, last_activity_at:int|null, last_engaged_activity_at:int|null, needs_attention:str|null, attention_since:int|null, attention_fingerprint:str|null, addressed_fingerprint:str|null, head_sha:str|null, addressed_head_sha:str|null, synced_at:int|null, harvested_at:int|null`. The failure streaks are not on the wire: migration 023 moved them from `findings` and `pr_state` to `finding_work`.
+- `fix_review_rounds` (**Rust only**): **always added**, `[]` when none. Every round of the reviews the finding's fixes had before their PR opened (migration 040, `reviews.subject = 'fix'`; `Store::fix_review_rounds`), newest first: `{id:int, origin_job_id:int (the fix chain's first job: one review per chain), job_id:int|null (the attempt the round ran in), base_sha:str (the commit the fix's tree was made at), head_sha:str (the commit reviewed), verdict:"ok"|"partial"|"failed", failure:str|null, finished_at:int (ms), tokens_new:int|null, issues:[{id:int, kind:str, blocking:bool, severity:str|null, confidence:float|null, file:str|null, line:int|null, side:"RIGHT"|"LEFT"|null, summary:str, detail:str}]}`, issues blocking first, follow-ups among them (`kind: "follow-up"`). A round is `ok` when its reviewer finished, `partial` when it was stopped (or its round failed) after it wrote issues the fix went on with, `failed` otherwise.
 
 ---
 
@@ -384,7 +385,7 @@ Cite the symbol names below, not the line numbers: the numbers are a hint for fi
 - `/api/findings` — `isFindingList` (`:144-146`): rows with distinct numeric `id`, and each row's `timeline`, when present and non-null, rows with distinct numeric `id`.
 - `/api/jobs` — `isJobList` (`:149-151`): rows with distinct numeric `id`, and `produced_finding_ids`, when present and non-null, an array with no repeated entry.
 - `/api/events` — `isEventList` (`:154-156`): rows with distinct numeric `id`.
-- `/api/finding` — `isFindingDetail` (`:130-136`): `jobs` rows with distinct numeric `id`; `pr_state` either absent/null or an object.
+- `/api/finding` — `isFindingDetail` (`:130-136`): `jobs` rows with distinct numeric `id`; `pr_state` either absent/null or an object; `fix_review_rounds`, when present and non-null, rows with distinct numeric `id`, each with `issues` rows with distinct numeric `id`.
 
 Nothing else is checked. `api<T>()` casts the parsed JSON to `T` without inspecting it (`api.svelte.ts:32-45`), so the generated types in `lib/generated/` state what the server is believed to send, never what the client verified.
 
@@ -400,7 +401,7 @@ Absent here is a dash, an empty cell or a missing badge, with `error` still null
 
 **`/api/events`.** `LogPage` renders all six keys: `id, at, kind, message, finding_id, job_id` (`LogPage.svelte:89-108`).
 
-**`/api/finding`.** `FindingDetail` renders `jobs[].{id,kind,state,tokens_new,started_at,finished_at,model}` (`:71-89`) and, when `pr_state` is non-null, `pr_state.{state,mergeable,checks,head_ref,pr_number,needs_attention,synced_at}` (`:104-127`).
+**`/api/finding`.** `FindingDetail` renders `jobs[].{id,kind,state,tokens_new,started_at,finished_at,model}` (`:71-89`), when `pr_state` is non-null, `pr_state.{state,mergeable,checks,head_ref,pr_number,needs_attention,synced_at}` (`:104-127`), and `fix_review_rounds[].{id,verdict,job_id,finished_at,failure,issues[].{id,blocking,kind,summary}}` (absent read as `[]`).
 
 **`/api/stats`.** `StatsPage` renders `totals.{jobs,total_tokens,total_calls,done,denied,total_usage_delta}` (`:23-49`), `by_kind[].{kind,jobs,done,failed,killed,denied,total_tokens,avg_tokens,total_usage_delta,models}` (`:75-87`) and `by_finding[].{finding_id,fingerprint,status,severity,jobs,total_tokens,total_calls,total_usage_delta}` (`:114-134`).
 

@@ -166,6 +166,23 @@ describe("isFindingDetail", () => {
     expect(isFindingDetail({ jobs: 3 })).toBe(false);
   });
 
+  // FindingDetail.svelte keys the fix review's rounds and their issues by id,
+  // and reads round.issues.length with no guard.
+  it("rejects fix review rounds or issues it cannot key", () => {
+    const round = (id: unknown, issues: unknown) => ({ id, issues });
+    expect(isFindingDetail({ jobs: [], fix_review_rounds: [] })).toBe(true);
+    expect(isFindingDetail({ jobs: [], fix_review_rounds: null })).toBe(true);
+    expect(isFindingDetail({
+      jobs: [], fix_review_rounds: [round(2, [{ id: 5 }, { id: 6 }]), round(1, [])],
+    })).toBe(true);
+    expect(isFindingDetail({ jobs: [], fix_review_rounds: [round(1, []), round(1, [])] }))
+      .toBe(false);
+    expect(isFindingDetail({ jobs: [], fix_review_rounds: [round(1, null)] })).toBe(false);
+    expect(isFindingDetail({ jobs: [], fix_review_rounds: [round(1, [{ id: 5 }, { id: 5 }])] }))
+      .toBe(false);
+    expect(isFindingDetail({ jobs: [], fix_review_rounds: 3 })).toBe(false);
+  });
+
   it("rejects a non-object body", () => {
     expect(isFindingDetail("ok")).toBe(false);
     expect(isFindingDetail(null)).toBe(false);
