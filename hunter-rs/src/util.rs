@@ -1,13 +1,11 @@
 //! Small shared utilities (port of hunter/util.py where still needed).
 
-use std::io::Read;
+use std::fs::File;
+use std::io::{Read, Seek as _};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
-
-use nix::sys::signal::{self, Signal};
-use nix::unistd::Pid;
+use std::time::Duration;
 
 /// Epoch milliseconds (types.py `now_ms`).
 pub fn now_ms() -> i64 {
@@ -45,53 +43,6 @@ pub fn join_pipes(so: JoinHandle<Vec<u8>>, se: JoinHandle<Vec<u8>>) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-fn killpg<T: Into<Option<Signal>>>(pgid: u32, sig: T) -> bool {
-    signal::killpg(Pid::from_raw(pgid as i32), sig).is_ok()
-}
-
-/// Is any process still in the group? The null signal performs the
-/// permission and existence checks without delivering anything.
-fn group_alive(pgid: u32) -> bool {
-    killpg(pgid, None)
-}
-
-/// SIGTERM the child's process group, wait up to 10 s, then SIGKILL.
-///
-/// Signalling the group rather than the pid is what makes a timeout
-/// enforceable. Killing only the direct child leaves any descendant it
-/// spawned (`npx` → `node` → the tool itself) holding the inherited stdout
-/// and stderr, so the pipes never reach EOF and `join_pipes` blocks
-/// forever — the process we gave up waiting for outlives the deadline that
-/// was supposed to bound it. Callers must spawn with `process_group(0)`.
-pub fn kill_tree(child: &mut Child) {
-    let pgid = child.id();
-    if !killpg(pgid, Signal::SIGTERM) {
-        let _ = child.wait();
-        return; // already gone
-    }
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        // Reap first: a zombie direct child still counts as a group
-        // member, so an unreaped one would make the probe below claim
-        // the group is alive forever.
-        let _ = child.try_wait();
-        // Signal 0 tests the whole group, which is the condition that
-        // matters. Waiting on the direct child instead declares success
-        // while a descendant that ignored SIGTERM is still holding the
-        // inherited pipes — the caller then blocks in `join_pipes` and
-        // the deadline this exists to enforce is lost.
-        if !group_alive(pgid) {
-            break; // no members left
-        }
-        if Instant::now() >= deadline {
-            killpg(pgid, Signal::SIGKILL);
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let _ = child.wait();
-}
-
 /// Last `max_bytes` of `s`, snapped forward to a char boundary.
 ///
 /// Command output and worker logs are arbitrary UTF-8, so indexing a tail
@@ -107,6 +58,11 @@ pub fn tail(s: &str, max_bytes: usize) -> &str {
 
 /// Run a command, merged stdout+stderr, never fails (`util.run_cmd`):
 /// timeout -> (124, msg + whatever was captured); spawn error -> (127, msg).
+/// For the daemon's own tools (git, `gh`, `glab`): the command runs in a
+/// cgroup of its own in the current unit of work ([`crate::child`]). What
+/// it leaves running when it exits (an ssh master, a helper daemon) is not
+/// ended here but with the unit; one that runs out its timeout is ended
+/// with everything it started.
 /// Blocking — call via `spawn_blocking` from async contexts.
 pub fn run_cmd(argv: &[&str], timeout_s: u64) -> (i32, String) {
     run_cmd_in(argv, None, timeout_s)
@@ -114,10 +70,10 @@ pub fn run_cmd(argv: &[&str], timeout_s: u64) -> (i32, String) {
 
 /// [`run_cmd`], optionally in a working directory.
 ///
-/// The single spawn-and-reap implementation. Every copy of this loop has
-/// to reap the whole process group on all three exit paths, and the
-/// copies did not: the fix landed four times, one of them two rounds
-/// late. There is one body now, so there is one place to get it right.
+/// The single spawn-and-reap implementation. Every copy of this loop had
+/// to get the reaping right on all three exit paths, and the copies did
+/// not: the fix landed four times, one of them two rounds late. There is
+/// one body now, so there is one place to get it right.
 pub fn run_cmd_in(argv: &[&str], cwd: Option<&Path>, timeout_s: u64) -> (i32, String) {
     run_cmd_fed(argv, cwd, None, timeout_s)
 }
@@ -126,6 +82,27 @@ pub fn run_cmd_in(argv: &[&str], cwd: Option<&Path>, timeout_s: u64) -> (i32, St
 /// body too structured for flags (`gh api --input -`).
 pub fn run_cmd_input(argv: &[&str], input: &str, timeout_s: u64) -> (i32, String) {
     run_cmd_fed(argv, None, Some(input), timeout_s)
+}
+
+/// A file in memory for a command's stdout or stderr.
+///
+/// A file, not a pipe: a descendant the command leaves running keeps
+/// what it inherited, and a pipe would then never reach EOF, so reading
+/// it to the end would wait for the leftover. A file is read when the
+/// command exits, whatever still holds it, and never fills up.
+fn output_file() -> std::io::Result<File> {
+    let fd =
+        nix::sys::memfd::memfd_create(c"hunter-output", nix::sys::memfd::MFdFlags::MFD_CLOEXEC)?;
+    Ok(File::from(fd))
+}
+
+/// Everything written to `file` so far, from its start.
+fn written(file: &mut File) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    if file.rewind().is_ok() {
+        let _ = file.read_to_end(&mut bytes);
+    }
+    bytes
 }
 
 /// The one body behind every `run_cmd*` (see [`run_cmd_in`]).
@@ -138,33 +115,36 @@ fn run_cmd_fed(
     let Some((prog, rest)) = argv.split_first() else {
         return (127, "empty argv".to_owned());
     };
-    let mut cmd = Command::new(prog);
+    let outputs = output_file().and_then(|out| Ok((out.try_clone()?, out, output_file()?)));
+    let (out_end, mut out, mut err) = match outputs {
+        Ok((out_end, out, err)) => (out_end, out, err),
+        Err(e) => return (127, format!("no file for the output of {prog}: {e}")),
+    };
+    let err_end = match err.try_clone() {
+        Ok(end) => end,
+        Err(e) => return (127, format!("no file for the output of {prog}: {e}")),
+    };
+    let mut cmd = crate::child::command(prog);
     cmd.args(rest)
         .stdin(if input.is_some() {
             Stdio::piped()
         } else {
             Stdio::null()
         })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdout(out_end)
+        .stderr(err_end);
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-    let child = cmd.spawn();
-    let mut child = match child {
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => return (127, e.to_string()),
     };
-    // Fed from a thread, like the pipes are drained: a child that answers
-    // before reading all of its input would otherwise block us on a full
-    // stdin pipe while we never get to read its output. Dropping the
-    // handle at the end is the EOF the child waits for.
-    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+    // Fed from a thread: a child that answers before reading all of its
+    // input would otherwise block us on a full stdin pipe while we never
+    // get to wait for it. Dropping the handle at the end is the EOF the
+    // child waits for.
+    if let (Some(input), Some(mut stdin)) = (input, child.take_stdin()) {
         let input = input.to_owned();
         std::thread::spawn(move || {
             use std::io::Write as _;
@@ -172,35 +152,29 @@ fn run_cmd_fed(
             let _ = stdin.write_all(input.as_bytes());
         });
     }
-    // Readers start now, not after the wait: see `drain_pipe`. Every exit
-    // path below reaps the child first, so the joins see a closed pipe.
-    let so = drain_pipe(child.stdout.take());
-    let se = drain_pipe(child.stderr.take());
+    // stdout first, then stderr: the merged output util.py produced with
+    // `stderr=STDOUT`, decoded lossily once.
+    let merged = |out: &mut File, err: &mut File| {
+        let mut bytes = written(out);
+        bytes.extend(written(err));
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
     let deadline = std::time::Instant::now() + Duration::from_secs(timeout_s);
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                // The direct child exiting says nothing about the pipes: a
-                // descendant it left behind still holds them, and
-                // `join_pipes` reads to EOF. On this path no deadline is
-                // in force, so that wait would be unbounded. Killing the
-                // group first is what guarantees EOF; it costs nothing
-                // when there is no descendant, since the group is then
-                // already empty.
-                kill_tree(&mut child);
-                return (status.code().unwrap_or(-1), join_pipes(so, se));
-            }
+            // What the command left is its unit's to end (module docs).
+            Ok(Some(status)) => return (status.code().unwrap_or(-1), merged(&mut out, &mut err)),
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
-                    kill_tree(&mut child);
-                    let out = join_pipes(so, se);
+                    child.kill_tree();
+                    let out = merged(&mut out, &mut err);
                     return (124, format!("timeout after {timeout_s}s\n{out}"));
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
-                kill_tree(&mut child);
-                let out = join_pipes(so, se);
+                child.kill_tree();
+                let out = merged(&mut out, &mut err);
                 return (127, format!("{e}\n{out}"));
             }
         }
@@ -226,6 +200,15 @@ mod tests {
         );
         assert_eq!(rc, 0);
         assert_eq!(out.len(), 600_000);
+    }
+
+    /// A command killed by a signal has no exit code of its own: -1, never
+    /// a code a caller reads as the command's answer (git's 1 for "not
+    /// tracked" or "no such ref").
+    #[test]
+    fn test_run_cmd_reports_a_command_killed_by_a_signal_as_minus_one() {
+        let (rc, _) = run_cmd(&["sh", "-c", "kill -KILL $$"], 30);
+        assert_eq!(rc, -1);
     }
 
     /// `read_to_string` would abort on the first invalid byte and leave the

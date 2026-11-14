@@ -1072,7 +1072,7 @@ async fn commit_count(start: &FixStart) -> Option<usize> {
     let range = format!("{}..HEAD", start.pinned);
     let tree = start.ws.tree.clone();
     let (rc, commits) =
-        tokio::task::spawn_blocking(move || Unheld::Commits { range: &range }.run(&tree, 30))
+        crate::child::spawn_blocking(move || Unheld::Commits { range: &range }.run(&tree, 30))
             .await
             .ok()?;
     (rc == 0).then(|| commits.lines().filter(|l| !l.trim().is_empty()).count())
@@ -1100,7 +1100,7 @@ async fn curated(
         reviewed.to_owned(),
         start.pinned.clone(),
     );
-    let (same, descends) = tokio::task::spawn_blocking(move || {
+    let (same, descends) = crate::child::spawn_blocking(move || {
         let same = Unheld::SameTree {
             from: &reviewed,
             to: "HEAD",
@@ -1643,7 +1643,7 @@ pub(super) async fn unshippable(start: &FixStart) -> String {
     let range = format!("{}..HEAD", start.pinned);
     let tree = start.ws.tree.clone();
     let (rc, commits) =
-        tokio::task::spawn_blocking(move || Unheld::Commits { range: &range }.run(&tree, 30))
+        crate::child::spawn_blocking(move || Unheld::Commits { range: &range }.run(&tree, 30))
             .await
             .unwrap_or((127, String::new()));
     match rc {
@@ -1668,7 +1668,7 @@ async fn ready_to_ship(start: &FixStart, rr: &RunResult) -> bool {
     let range = format!("{}..HEAD", start.pinned);
     let tree = tree.clone();
     let (rc, commits) =
-        tokio::task::spawn_blocking(move || Unheld::Commits { range: &range }.run(&tree, 30))
+        crate::child::spawn_blocking(move || Unheld::Commits { range: &range }.run(&tree, 30))
             .await
             .unwrap_or((127, String::new()));
     rc == 0 && !commits.trim().is_empty()
@@ -1953,7 +1953,7 @@ async fn clean_tree(lane: &mut Lane, start: &FixStart) -> Result<Vec<String>, St
 /// ignored. [`UNREADABLE`] when git cannot say.
 async fn uncommitted(tree: &Path) -> Result<Vec<String>, String> {
     let tree = tree.to_owned();
-    let (rc, out) = tokio::task::spawn_blocking(move || Unheld::Status.run(&tree, 60))
+    let (rc, out) = crate::child::spawn_blocking(move || Unheld::Status.run(&tree, 60))
         .await
         .unwrap_or((127, String::new()));
     if rc != 0 {
@@ -2210,7 +2210,7 @@ impl TreeState {
 
 pub(super) async fn tree_state(tree: &Path) -> TreeState {
     let tree: PathBuf = tree.to_owned();
-    tokio::task::spawn_blocking(move || {
+    crate::child::spawn_blocking(move || {
         let ok = |(rc, out): (i32, String)| (rc == 0).then(|| out.trim().to_owned());
         TreeState {
             head: ok(Unheld::Commit { rev: "HEAD" }.run(&tree, 30)),

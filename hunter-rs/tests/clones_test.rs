@@ -116,7 +116,7 @@ async fn a_permit_runs_one_command_at_a_time() {
             tokio::pin!(first);
             tokio::select! {
                 _ = &mut first => panic!("the first command ended before it was let"),
-                r = tokio::task::spawn_blocking(move || started_rx.recv()) => r.unwrap().unwrap(),
+                r = hunter::child::spawn_blocking(move || started_rx.recv()) => r.unwrap().unwrap(),
             }
             let second = permit.blocking(move |_| log.send("second").unwrap());
             let let_go = async {

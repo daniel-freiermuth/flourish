@@ -62,8 +62,14 @@ jobs:
         with:
           tool: cargo-nextest@0.9.115
 
+      # Every process the daemon starts runs in a cgroup of its own
+      # (src/child.rs), the tests' children included, so the tests need a
+      # cgroup they may manage, as the daemon does. The script `just test`
+      # runs: the runner's step cgroup is not writable, so it starts the
+      # command in a delegated scope of the runner's user systemd, in
+      # place, with this step's environment and exit status.
       - name: Test
-        run: cargo nextest run --profile ci
+        run: ./scripts/in-delegated-cgroup.sh cargo nextest run --profile ci
 
       # Same two commands as `just bindings`. The UI's API types are
       # generated from src/types.rs and committed, so the frontend job
@@ -120,7 +126,8 @@ jobs:
           tool: cargo-nextest@0.9.115,cargo-llvm-cov@0.6.23
 
       - name: Coverage
-        run: cargo llvm-cov nextest --profile ci --summary-only --fail-under-lines 50
+        # In a delegated cgroup, as the test job's (src/child.rs).
+        run: ./scripts/in-delegated-cgroup.sh cargo llvm-cov nextest --profile ci --summary-only --fail-under-lines 50
 
 
   # ── Svelte frontend (hunter/ui-svelte/) ────────────────────────

@@ -20,13 +20,19 @@ RestartSec=30
 TimeoutStopSec=3000
 
 # systemd's default KillMode=control-group SIGTERMs every process in the
-# cgroup, which includes the omp worker -- it runs in its own process
-# group but the same cgroup, so the default undoes the timeout above by
-# killing the very run we are waiting to finish, wasting the tokens it has
+# cgroup, which includes the omp worker -- it runs in a cgroup of its own
+# below the unit's -- so the default undoes the timeout above by killing
+# the very run we are waiting to finish, wasting the tokens it has
 # already spent. `mixed` sends the SIGTERM to the daemon alone and lets it
 # wind the worker down; the final SIGKILL after TimeoutStopSec still goes
-# to the whole cgroup, so nothing can outlive the stop.
+# to the whole cgroup, so nothing can outlive the stop. The same goes for
+# a daemon that dies on its own: systemd ends what is left in the unit.
 KillMode=mixed
+
+# The daemon runs every process it starts in a cgroup of its own below
+# the unit's (hunter-rs/src/child.rs). Delegate=yes is systemd's promise
+# to leave that subtree to the daemon.
+Delegate=yes
 
 [Install]
 WantedBy=default.target

@@ -373,7 +373,7 @@ async fn keep_partly_posted(
 async fn blocking<T: Send + 'static>(
     call: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
 ) -> anyhow::Result<T> {
-    tokio::task::spawn_blocking(call)
+    crate::child::spawn_blocking(call)
         .await
         .unwrap_or_else(|e| Err(anyhow::anyhow!("forge task: {e}")))
 }

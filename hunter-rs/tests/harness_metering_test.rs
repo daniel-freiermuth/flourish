@@ -1,9 +1,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! `run_worker` end to end — metering, the unmetered verdict, output drain.
 //!
-//! `harness_test.rs` covers the pieces (`ledger_usage`, `kill_tree`) in
-//! isolation. Nothing covered the function that
-//! wires them together, which is where the accounting invariant lives:
+//! `harness_test.rs` covers the pieces (`ledger_usage`) and
+//! `child_test.rs` the kill (`kill_tree`) in isolation. Nothing covered
+//! the function that wires them together, which is where the accounting
+//! invariant lives:
 //!
 //! > a run whose token spend could not be measured must never be recorded
 //! > as costing zero.
@@ -29,6 +30,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use hunter::backends::omp_scavenge::harness;
+use hunter::child::Leash;
 use hunter::config::Config;
 use hunter::types::RunResult;
 use hunter::workspace::Workspace;
@@ -96,7 +98,15 @@ impl Fixture {
 
     fn run(&self, cap_tokens: Option<i64>, max_wall_s: i64) -> RunResult {
         harness::run_worker(
-            &self.cfg, &self.ws, PROMPT, cap_tokens, max_wall_s, None, None, None,
+            &self.cfg,
+            &self.ws,
+            PROMPT,
+            cap_tokens,
+            max_wall_s,
+            None,
+            None,
+            None,
+            &Leash::default(),
         )
     }
 
@@ -121,6 +131,7 @@ impl Fixture {
             None,
             Some(session_file),
             None,
+            &Leash::default(),
         )
     }
 }
@@ -228,6 +239,7 @@ fn metered_worker_sums_the_ledger_and_is_not_flagged() {
         Some("test-model"),
         None,
         None,
+        &Leash::default(),
     );
 
     assert_eq!(res.killed_reason, None, "a metered run carries no flag");
@@ -288,6 +300,31 @@ fn worker_without_a_ledger_is_flagged_unmetered_despite_exit_zero() {
     assert_eq!(res.tokens_new, 0);
     assert_eq!(res.calls, 0);
     assert_eq!(res.session_file, None);
+}
+
+/// A daemon killed outright stops its worker's spending at least: omp is
+/// started with SIGTERM as its parent-death signal, from the thread that
+/// waits for the whole run (`Command::die_with_spawner`).
+#[test]
+fn the_worker_is_started_to_die_with_the_daemon() {
+    let fx = Fixture::new("pdeathsig");
+    let reports = TempDir::new("pdeathsig-reports");
+    fx.bins.script(
+        "omp",
+        &support::parent_death_signal_reporter(reports.path(), false),
+    );
+
+    let res = fx.run(Some(1_000_000), 30);
+
+    let signals: Vec<String> = support::parent_death_signals(reports.path())
+        .into_values()
+        .collect();
+    assert_eq!(
+        signals,
+        ["15"],
+        "SIGTERM; the worker said {:?}",
+        res.stdout_tail
+    );
 }
 
 /// omp changes its usage schema mid-run. A meter that read the renamed
@@ -612,16 +649,7 @@ fn worker_leaving_a_descendant_behind_does_not_hang_the_harness() {
     );
 
     let t0 = std::time::Instant::now();
-    let res = harness::run_worker(
-        &fx.cfg,
-        &fx.ws,
-        PROMPT,
-        Some(1_000_000),
-        30,
-        None,
-        None,
-        None,
-    );
+    let res = fx.run(Some(1_000_000), 30);
     let elapsed = t0.elapsed();
 
     assert!(
@@ -633,6 +661,146 @@ fn worker_leaving_a_descendant_behind_does_not_hang_the_harness() {
         res.stdout_tail.contains("worker-done"),
         "output captured before the group was reaped: {:?}",
         res.stdout_tail
+    );
+}
+
+/// A worker's git, too, runs ssh without connection sharing, though the
+/// worker's environment is an allowlist: the ssh wrapper comes first on
+/// the `PATH` it is given (`hunter::child::install_ssh_wrapper`), so none
+/// of what a worker starts uses or becomes the operator's ssh master.
+#[test]
+fn a_workers_git_runs_ssh_without_connection_sharing() {
+    let fx = Fixture::new("worker-ssh");
+    let _own = fx.bins.unset_env("GIT_SSH_COMMAND");
+    let _own_ssh = fx.bins.unset_env("GIT_SSH");
+    fx.bins.script("ssh", "exit 1");
+    let work = TempDir::new("worker-ssh-work");
+    hunter::child::install_ssh_wrapper(work.path());
+    fx.bins.script(
+        "omp",
+        &format!(
+            "{ledger}printf 'PATH=%s\\n' \"$PATH\"\n\
+             git ls-remote git@example.org:o/r.git >/dev/null 2>&1\nexit 0",
+            ledger = ledger_sh(&[(1000, 200, 50)])
+        ),
+    );
+
+    let res = fx.run(Some(1_000_000), 30);
+
+    assert_eq!(res.exit_code, Some(0), "{:?}", res.stdout_tail);
+    let wrapper = work.join("bin");
+    assert!(
+        res.stdout_tail
+            .contains(&format!("PATH={}:", wrapper.display())),
+        "{:?}",
+        res.stdout_tail
+    );
+    let calls = fx.bins.calls_to("ssh");
+    assert_eq!(calls.len(), 1, "git ran ssh once: {calls:?}");
+    assert!(
+        calls[0].windows(2).any(|w| w == ["-o", "ControlPath=none"]),
+        "{calls:?}"
+    );
+}
+
+/// What a worker left, a TERM-trapping loop whose cleanup takes 1.5 s:
+/// it runs on well after `omp` exited, and its cleanup takes up the start
+/// of the harness's kill. The worker goes on once the trap is set.
+const LEFTOVER_SH: &str = "sh -c 'trap \"sleep 1.5; exit 0\" TERM; touch trapping; \
+                           while :; do sleep 0.1; done' &\n\
+                           while [ ! -e trapping ]; do sleep 0.01; done\n";
+
+/// A worker that finished in time is not killed at the wall clock while
+/// what it left is still finishing its cleanup: the run ended when `omp`
+/// did, not when what it left does.
+#[test]
+fn a_worker_that_ended_in_time_is_not_killed_at_the_wall_clock_by_its_leftovers() {
+    let fx = Fixture::new("leftover-wallclock");
+    fx.bins.script(
+        "omp",
+        &format!(
+            "{LEFTOVER_SH}{ledger}sleep 1.2\nexit 0",
+            ledger = ledger_sh(&[(1000, 200, 50)])
+        ),
+    );
+
+    let res = fx.run(Some(1_000_000), 2);
+
+    assert_eq!(res.killed_reason, None, "{:?}", res.stdout_tail);
+    assert_eq!(res.exit_code, Some(0));
+}
+
+/// Likewise the cap: a worker whose last call took it over the cap but
+/// that then exited 0 finished; what it left still running does not make
+/// that a cap kill.
+#[test]
+fn a_worker_that_ended_is_not_capped_by_its_leftovers() {
+    let fx = Fixture::new("leftover-cap");
+    fx.bins.script(
+        "omp",
+        &format!(
+            "{LEFTOVER_SH}{ledger}exit 0",
+            ledger = ledger_sh(&[(1000, 200, 50)])
+        ),
+    );
+
+    let res = fx.run(Some(1000), 30);
+
+    assert_eq!(res.killed_reason, None, "{:?}", res.stdout_tail);
+    assert_eq!(res.exit_code, Some(0));
+    assert_eq!(res.tokens_new, 1250);
+}
+
+/// A cut leash kills the worker there and then: its caller stopped
+/// waiting (`OmpScavengeBackend::run` dropped), and nothing would record
+/// it. `run_worker` then returns at once, the worker and its escaped
+/// descendant gone, rather than running on until a cap.
+#[test]
+fn a_cut_leash_kills_the_worker() {
+    let fx = Fixture::new("leash");
+    fx.bins.script(
+        "omp",
+        &format!(
+            "{ledger}setsid sh -c 'touch escaped; exec sleep 300' &\nexec sleep 300",
+            ledger = ledger_sh(&[(1000, 200, 50)])
+        ),
+    );
+    let leash = Leash::default();
+    let worker = {
+        let (cfg, ws, leash) = (fx.cfg.clone(), fx.ws.clone(), leash.clone());
+        std::thread::spawn(move || {
+            harness::run_worker(
+                &cfg,
+                &ws,
+                PROMPT,
+                Some(1_000_000),
+                300,
+                None,
+                None,
+                None,
+                &leash,
+            )
+        })
+    };
+    let tree = &fx.ws.tree;
+    assert!(support::eventually(
+        std::time::Duration::from_secs(10),
+        || tree.join("escaped").exists()
+    ));
+
+    leash.cut();
+
+    let res = worker.join().unwrap();
+    assert_eq!(
+        res.killed_reason, None,
+        "no cap, wall clock or meter stopped it"
+    );
+    assert!(
+        support::eventually(std::time::Duration::from_secs(5), || {
+            support::processes_in(tree) == 0
+        }),
+        "{} process(es) outlived the cut",
+        support::processes_in(tree)
     );
 }
 

@@ -1,0 +1,6 @@
+disallowed-methods = [
+    # A blocking task runs on a thread of its own, outside the task-local
+    # unit of work its caller is in: what it starts would land outside the
+    # unit's cgroup. The wrapper carries the unit along (src/child.rs).
+    { path = "tokio::task::spawn_blocking", reason = "use crate::child::spawn_blocking, which carries the caller's unit of work" },
+]

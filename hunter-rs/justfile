@@ -44,16 +44,25 @@ check:
 # test after 60s, ci reports every failure and allows 120s. Running the
 # default locally therefore both hides failures past the first and can
 # fail a slow test that CI passes.
+#
+# In a cgroup the tests may manage, as CI runs it: every process the
+# daemon starts, the tests' children included, runs in a cgroup of its own
+# (src/child.rs), and outside a cgroup they may manage those tests fail.
+# scripts/in-delegated-cgroup.sh runs the suite in place where the current
+# cgroup is writable -- so a hunter worker running this gate keeps it
+# inside its own cgroup, which ends it -- and in a new delegated
+# `systemd-run --user --scope` only elsewhere.
 test:
-    cargo nextest run --profile ci
+    ./scripts/in-delegated-cgroup.sh cargo nextest run --profile ci
 
 # Mutation-test one module: does the suite notice when it breaks?
 mutants FILE:
-    cargo mutants --test-tool nextest -j 4 --file {{FILE}}
+    ./scripts/in-delegated-cgroup.sh cargo mutants --test-tool nextest -j 4 --file {{FILE}}
 
-# Run the daemon against the local hunter/ root.
+# Run the daemon against the local hunter/ root, in a cgroup it may manage
+# (README § Running as a service).
 run:
-    cargo run -- --root ../hunter
+    systemd-run --user --scope --quiet --unit=hunter-dev -p Delegate=yes cargo run -- --root ../hunter
 
 # Build both halves of what the daemon serves.
 #

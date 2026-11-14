@@ -2189,6 +2189,46 @@ async fn run_reports_how_far_the_long_window_moved_during_the_job() {
     );
 }
 
+/// A run whose future is dropped kills its worker on the spot. The worker
+/// runs on a blocking thread the dropped future does not stop, so without
+/// that it would work on in the job's tree with no runner to record it,
+/// beside the settle that ends its job and the resume that may follow.
+#[tokio::test]
+async fn dropping_a_run_kills_its_worker() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new("facade-run-dropped");
+    let omp = dir.join("omp");
+    std::fs::write(&omp, "#!/bin/sh\ntouch started\nexec sleep 300\n").unwrap();
+    std::fs::set_permissions(&omp, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut config = cfg_with(1800.0, omp.to_str().unwrap());
+    config.work_root = dir.subdir("work-root");
+    config.poll_s = 0.02;
+    let ws = hunter::workspace::Workspace::for_chain(&config.work_root, &dir.subdir("clone"), 1);
+    std::fs::create_dir_all(&ws.tree).unwrap();
+    let b = make_backend_with(FakeLedger::new(0, 0), config, FakeProber::new(0));
+    let started = async {
+        while !ws.tree.join("started").exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    };
+
+    tokio::select! {
+        rr = b.run(&ws, "prompt", Some(1_000_000), 300, hunter::backend::JobClass::Hunt, None) => {
+            panic!("the worker was meant to run on: {rr:?}");
+        }
+        () = started => {}
+    }
+
+    assert!(
+        support::eventually(std::time::Duration::from_secs(5), || {
+            support::processes_in(&ws.tree) == 0
+        }),
+        "{} process(es) outlived the dropped run",
+        support::processes_in(&ws.tree)
+    );
+}
+
 // ============================================================
 // status_html
 // ============================================================

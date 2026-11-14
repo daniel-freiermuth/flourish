@@ -7,11 +7,11 @@
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 use crate::domain::{ForgeName, Severity};
-use crate::util::{drain_pipe, join_pipes, kill_tree, run_cmd};
+use crate::util::{drain_pipe, join_pipes, run_cmd};
 
 /// One update candidate, matching the `dep_update` finding schema.
 ///
@@ -181,7 +181,9 @@ pub fn scan_repo(
         tracing::debug!("dep_scan: no installed renovate usable for {repo_name}");
         return None;
     };
-    let mut cmd = Command::new(&renovate);
+    // renovate is a node script: the timeout below is enforced against
+    // the whole tree (`Child::kill_tree`).
+    let mut cmd = crate::child::command(&renovate);
     cmd.args(["--platform=local", "--dry-run=lookup"])
         .current_dir(repo_path)
         .env_clear()
@@ -200,16 +202,7 @@ pub fn scan_repo(
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    #[cfg(unix)]
-    {
-        // renovate is a node script: the timeout below can only be
-        // enforced against the whole tree.
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-    let child = cmd.spawn();
-
-    let mut child = match child {
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             tracing::debug!("dep_scan: renovate not available for {repo_name}: {e}");
@@ -219,8 +212,8 @@ pub fn scan_repo(
 
     // Renovate is extremely chatty at debug level; drain both pipes from a
     // reader thread each or it wedges on a full pipe buffer mid-lookup.
-    let so = drain_pipe(child.stdout.take());
-    let se = drain_pipe(child.stderr.take());
+    let so = drain_pipe(child.take_stdout());
+    let se = drain_pipe(child.take_stderr());
 
     let deadline = std::time::Instant::now() + Duration::from_secs(timeout_s);
     loop {
@@ -229,7 +222,7 @@ pub fn scan_repo(
                 // renovate is a node script that spawns helpers: the direct
                 // child can exit while a descendant still holds the pipes, which
                 // would make this read unbounded (see util::run_cmd).
-                kill_tree(&mut child);
+                child.kill_tree();
                 let output = join_pipes(so, se);
                 // A non-zero exit means the lookup is untrustworthy even when
                 // it logged plenty: fall back to the AI job.
@@ -255,7 +248,7 @@ pub fn scan_repo(
             }
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
-                    kill_tree(&mut child);
+                    child.kill_tree();
                     let _ = join_pipes(so, se);
                     tracing::warn!("dep_scan: renovate timeout for {repo_name}");
                     return None;
@@ -263,7 +256,7 @@ pub fn scan_repo(
                 std::thread::sleep(Duration::from_millis(200));
             }
             Err(_) => {
-                kill_tree(&mut child);
+                child.kill_tree();
                 let _ = join_pipes(so, se);
                 return None;
             }

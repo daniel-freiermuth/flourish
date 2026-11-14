@@ -21,6 +21,9 @@
 //! Two tests stop their daemon by sending SIGTERM to `Pid::this()`. That
 //! reaches only the test that sent it: `FakeBins::acquire` refuses to run
 //! outside nextest's process-per-test mode.
+//!
+//! Each test runs in a cgroup of its own ([`daemon_bins`]): the daemon
+//! claims the cgroup it runs in (`hunter::child::start`).
 
 mod support;
 
@@ -34,12 +37,55 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// one (`Config::load`).
 const MODELS: &str = r#""models": {"default": "test-model"}"#;
 
+/// A port for a daemon under test to listen on, free now on 127.0.0.1
+/// and 127.0.0.2, and below the kernel's ephemeral range
+/// (`ip_local_port_range`, 32768-60999 unless changed).
+///
+/// The daemon binds it only seconds later, once its auth children have
+/// settled. A port the kernel handed out to a `bind(0)` and took back is
+/// meanwhile anyone's next ephemeral port: another test's `bind(0)`, any
+/// outgoing connection's. Mutation-testing baselines failed that way, the
+/// daemon gone before it served or "127.0.0.1:<port> answered" in
+/// `the_daemon_binds_the_configured_address`. Below that range only an
+/// explicit bind takes a port.
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+        .subsec_nanos();
+    let seed = u64::from(std::process::id()) * 2_654_435_761 + u64::from(nanos);
+    (0..10_000u64)
+        .map(|i| 10_000 + u16::try_from((seed + i * 7_919) % 22_000).unwrap())
+        .find(|&port| {
+            ["127.0.0.1", "127.0.0.2"]
+                .iter()
+                .all(|ip| std::net::TcpListener::bind((*ip, port)).is_ok())
+        })
+        .expect("a free port below the ephemeral range")
+}
+
+/// [`FakeBins::acquire`], with this test's process first in a cgroup of
+/// its own, which a daemon it runs then claims: the cgroup nextest's
+/// processes share holds every other test's children, which the daemon
+/// would refuse to start beside.
+fn daemon_bins(label: &str) -> FakeBins {
+    support::private_cgroup(label);
+    FakeBins::acquire(label)
+}
+
+/// `run_daemon(cfg)` on a thread and runtime of its own, as `main` gives
+/// it: the daemon future is not `Send`, so it cannot be a task on the
+/// test's runtime. An error it returns is printed as well, so a test that
+/// finds the daemon gone early (`wait_for_summary`) shows why.
+fn spawn_daemon(cfg: hunter::config::Config) -> std::thread::JoinHandle<anyhow::Result<()>> {
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("daemon runtime")
+            .block_on(hunter::daemon::run_daemon(cfg))
+            .inspect_err(|e| eprintln!("run_daemon returned an error: {e:#}"))
+    })
 }
 
 /// One HTTP/1.1 request with `Connection: close`; `None` if nothing is
@@ -132,7 +178,21 @@ async fn wait_until<F, Fut>(
 
 #[tokio::test]
 async fn a_paused_daemon_reports_it_and_stops_on_sigterm() {
-    let bins = FakeBins::acquire("daemon");
+    a_paused_daemon_stops_on(nix::sys::signal::Signal::SIGTERM).await;
+}
+
+/// SIGHUP, what closing the terminal of a hand-run daemon sends, stops it
+/// like SIGTERM: left at its default it would kill the daemon outright,
+/// leaving every process it started running.
+#[tokio::test]
+async fn a_paused_daemon_stops_on_sighup() {
+    a_paused_daemon_stops_on(nix::sys::signal::Signal::SIGHUP).await;
+}
+
+/// Start a daemon, pause it, then send this process `signal`: the daemon
+/// must report the pause and stop promptly and cleanly.
+async fn a_paused_daemon_stops_on(signal: nix::sys::signal::Signal) {
+    let bins = daemon_bins("daemon");
     bins.omp("exit 0");
     let root = TempDir::new("daemon-root");
     let _home = bins.env("HOME", root.path());
@@ -152,15 +212,7 @@ async fn a_paused_daemon_reports_it_and_stops_on_sigterm() {
         support::auth_cookie(&store).await
     };
 
-    // Its own thread and runtime, as `main` gives it: the daemon future is
-    // not `Send`, so it cannot be a task on this test's runtime.
-    let daemon = std::thread::spawn(move || {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("daemon runtime")
-            .block_on(hunter::daemon::run_daemon(cfg))
-    });
+    let daemon = spawn_daemon(cfg);
 
     wait_for_summary(
         port,
@@ -193,14 +245,13 @@ async fn a_paused_daemon_reports_it_and_stops_on_sigterm() {
     )
     .await;
 
-    nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGTERM)
-        .expect("send SIGTERM to this test process");
+    nix::sys::signal::kill(nix::unistd::Pid::this(), signal).expect("signal this test process");
 
     let deadline = Instant::now() + Duration::from_secs(10);
     while !daemon.is_finished() {
         assert!(
             Instant::now() < deadline,
-            "a paused daemon must stop promptly on SIGTERM, as systemctl stop sends it"
+            "a paused daemon must stop promptly on {signal}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -253,7 +304,7 @@ async fn seed_open_pr(store: &hunter::store::Store, repos: &std::path::Path) -> 
 /// only jobs: paused, a trigger still syncs, and the PR's merge lands.
 #[tokio::test]
 async fn a_running_daemon_syncs_open_prs_on_its_admin_lane_even_paused() {
-    let bins = FakeBins::acquire("daemon-admin");
+    let bins = daemon_bins("daemon-admin");
     bins.omp("exit 0");
     bins.ok(
         "gh",
@@ -274,13 +325,7 @@ async fn a_running_daemon_syncs_open_prs_on_its_admin_lane_even_paused() {
     let cookie = support::auth_cookie(&store).await;
     let fid = seed_open_pr(&store, &root.join("repos")).await;
 
-    let daemon = std::thread::spawn(move || {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("daemon runtime")
-            .block_on(hunter::daemon::run_daemon(cfg))
-    });
+    let daemon = spawn_daemon(cfg);
 
     let summary = wait_for_summary(
         port,
@@ -348,7 +393,7 @@ async fn a_running_daemon_syncs_open_prs_on_its_admin_lane_even_paused() {
 /// cycle finds nothing and reports idle.
 #[tokio::test]
 async fn the_job_lane_runs_cycles_while_the_first_pr_sync_runs() {
-    let bins = FakeBins::acquire("daemon-wait-sync");
+    let bins = daemon_bins("daemon-wait-sync");
     bins.omp("exit 0");
     let root = TempDir::new("daemon-wait-sync-root");
     let release = root.join("release-gh");
@@ -386,13 +431,7 @@ async fn the_job_lane_runs_cycles_while_the_first_pr_sync_runs() {
         .await
         .unwrap();
 
-    let daemon = std::thread::spawn(move || {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("daemon runtime")
-            .block_on(hunter::daemon::run_daemon(cfg))
-    });
+    let daemon = spawn_daemon(cfg);
 
     let summary = wait_for_summary(port, &daemon, &cookie, "the job lane to run a cycle", |s| {
         !s["scheduler_state"].is_null()
@@ -580,14 +619,7 @@ impl EngageFixture {
     }
 
     fn start(&self) -> std::thread::JoinHandle<anyhow::Result<()>> {
-        let cfg = self.cfg.clone();
-        std::thread::spawn(move || {
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .expect("daemon runtime")
-                .block_on(hunter::daemon::run_daemon(cfg))
-        })
+        spawn_daemon(self.cfg.clone())
     }
 }
 
@@ -661,7 +693,7 @@ fn until_released(release: &std::path::Path) -> String {
 /// rather than after its own sleep (a minute, after that job).
 #[tokio::test]
 async fn the_job_lane_holds_engages_back_until_the_first_pr_sync_ends() {
-    let bins = FakeBins::acquire("daemon-first-sync-engage");
+    let bins = daemon_bins("daemon-first-sync-engage");
     bins.omp("exit 0");
     gh_disagreeing(&bins, "");
     let f = EngageFixture::new(&bins, "daemon-first-sync-engage-root").await;
@@ -704,7 +736,7 @@ async fn the_job_lane_holds_engages_back_until_the_first_pr_sync_ends() {
 /// per pass, never in a loop.
 #[tokio::test]
 async fn an_engage_whose_pr_end_the_sync_never_records_is_held_without_a_hot_loop() {
-    let bins = FakeBins::acquire("daemon-engage-unrecorded");
+    let bins = daemon_bins("daemon-engage-unrecorded");
     bins.omp("exit 0");
     gh_disagreeing(&bins, "");
     let f = EngageFixture::new(&bins, "daemon-engage-unrecorded-root").await;
@@ -773,7 +805,7 @@ async fn an_engage_whose_pr_end_the_sync_never_records_is_held_without_a_hot_loo
 /// there and refuse 127.0.0.1 -- which a hard-coded bind would accept.
 #[tokio::test]
 async fn the_daemon_binds_the_configured_address() {
-    let bins = FakeBins::acquire("daemon-bind");
+    let bins = daemon_bins("daemon-bind");
     bins.omp("exit 0");
     let root = TempDir::new("daemon-bind-root");
     let _home = bins.env("HOME", root.path());
@@ -787,13 +819,7 @@ async fn the_daemon_binds_the_configured_address() {
     .unwrap();
     let mut cfg = support::load_config(root.path());
     support::healthy_auth(&mut cfg);
-    let daemon = std::thread::spawn(move || {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("daemon runtime")
-            .block_on(hunter::daemon::run_daemon(cfg))
-    });
+    let daemon = spawn_daemon(cfg);
 
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
@@ -839,7 +865,7 @@ async fn the_daemon_binds_the_configured_address() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_starting_daemon_reclaims_leftover_trees() {
     let dir = TempDir::new("daemon-sweep");
-    let bins = FakeBins::acquire("daemon-sweep");
+    let bins = daemon_bins("daemon-sweep");
     bins.omp("echo 'fake omp: no usage data here' >&2\nexit 1");
     let _home = bins.env("HOME", dir.path());
     let mut cfg = support::load_config(dir.path());
@@ -877,7 +903,7 @@ async fn a_starting_daemon_reclaims_leftover_trees() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_starting_daemon_turns_automatic_maintenance_off_in_its_clones() {
     let dir = TempDir::new("daemon-quiet");
-    let bins = FakeBins::acquire("daemon-quiet");
+    let bins = daemon_bins("daemon-quiet");
     bins.omp("echo 'fake omp: no usage data here' >&2\nexit 1");
     let _home = bins.env("HOME", dir.path());
     let mut cfg = support::load_config(dir.path());
@@ -1145,4 +1171,224 @@ fn the_next_wake_is_the_sleep_after_now_in_ms() {
     assert_eq!(hunter::daemon::next_wake_ms(1_000, 0.0), 1_000);
     assert_eq!(hunter::daemon::next_wake_ms(1_000, 2.5), 3_500);
     assert_eq!(hunter::daemon::next_wake_ms(1_000, 900.0), 901_000);
+}
+
+/// A second daemon started on the work root of a running one stops at the
+/// work root's lock, before it touches the running daemon's cgroups: a
+/// unit of the running one that is empty at that moment (between its
+/// commands) stays, where removing it would fail the running daemon's
+/// next spawn in it.
+#[tokio::test]
+async fn a_second_daemon_on_the_work_root_leaves_the_running_ones_cgroups_alone() {
+    let bins = daemon_bins("daemon-second");
+    bins.omp("exit 0");
+    let root = TempDir::new("daemon-second-root");
+    let _home = bins.env("HOME", root.path());
+    let port = free_port();
+    std::fs::write(
+        root.join("config.json"),
+        format!(r#"{{"ompBin": "omp", {MODELS}, "serve": {{"port": {port}}}}}"#),
+    )
+    .unwrap();
+    let mut cfg = support::load_config(root.path());
+    support::healthy_auth(&mut cfg);
+    let cookie = {
+        std::fs::create_dir_all(cfg.db_path.parent().unwrap()).unwrap();
+        let store = hunter::store::Store::connect(&cfg.db_path).await.unwrap();
+        support::auth_cookie(&store).await
+    };
+    let daemon = spawn_daemon(cfg);
+    wait_for_summary(port, &daemon, &cookie, "the daemon to serve", |_| true).await;
+    // The running daemon's, made in its cgroup, empty for now.
+    let unit = hunter::child::Unit::new("cycle").unwrap();
+    let cgroup = hunter::child::own_cgroup()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(unit.name());
+
+    let second = std::process::Command::new(env!("CARGO_BIN_EXE_hunter"))
+        .arg("--root")
+        .arg(root.path())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+
+    // The daemon logs to stdout (`tracing_subscriber::fmt`).
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(
+        !second.status.success(),
+        "the second daemon started: {said}"
+    );
+    assert!(said.contains("already running"), "{said}");
+    assert!(
+        cgroup.is_dir(),
+        "the second daemon removed {}",
+        cgroup.display()
+    );
+    stop_daemon(daemon).await;
+}
+
+/// A daemon started with SIGHUP ignored (`nohup`) keeps it ignored: it
+/// runs on through a hangup, as whoever started it so wants, and still
+/// stops on SIGTERM. The daemon binary, so that the ignore is inherited
+/// the way `nohup` passes it on.
+#[tokio::test]
+async fn a_daemon_started_with_sighup_ignored_runs_on_through_a_hangup() {
+    let bins = daemon_bins("daemon-nohup");
+    bins.omp("exit 0");
+    let root = TempDir::new("daemon-nohup-root");
+    let _home = bins.env("HOME", root.path());
+    let port = free_port();
+    // No auth gateway to stand up: a provider that runs none.
+    std::fs::write(
+        root.join("config.json"),
+        format!(
+            r#"{{"ompBin": "omp", {MODELS}, "backend": {{"llmProvider": "openai-codex"}}, "serve": {{"port": {port}}}}}"#
+        ),
+    )
+    .unwrap();
+    let mut daemon = std::process::Command::new("sh")
+        .args(["-c", "trap '' HUP; exec \"$0\" --root \"$1\""])
+        .arg(env!("CARGO_BIN_EXE_hunter"))
+        .arg(root.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = nix::unistd::Pid::from_raw(i32::try_from(daemon.id()).unwrap());
+    let serving = async || http(port, "GET", "/api/summary", "", "").await.is_some();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !serving().await {
+        assert!(
+            daemon.try_wait().unwrap().is_none(),
+            "the daemon ended early"
+        );
+        assert!(Instant::now() < deadline, "the daemon never served");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGHUP).unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    assert_eq!(
+        daemon.try_wait().unwrap(),
+        None,
+        "the hangup stopped the daemon"
+    );
+    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while daemon.try_wait().unwrap().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "the daemon did not stop on SIGTERM"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(daemon.wait().unwrap().success());
+}
+
+/// The pids of the processes running `sleep 600` in the cgroup `dir` and
+/// below it: the fake omp's auth broker and gateway ([`FakeBins::omp`]).
+fn auth_sleeps_in(dir: &std::path::Path) -> Vec<u32> {
+    let mut pids: Vec<u32> = std::fs::read_to_string(dir.join("cgroup.procs"))
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter_map(|pid| pid.parse().ok())
+        .filter(|pid| {
+            std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| c == b"sleep\x00600\x00")
+        })
+        .collect();
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            pids.extend(auth_sleeps_in(&entry.path()));
+        }
+    }
+    pids
+}
+
+/// Kills everything in the cgroups below `.0` when dropped: what a
+/// failing test left there (the test itself runs in `.0`).
+struct KillBelow(std::path::PathBuf);
+
+impl Drop for KillBelow {
+    fn drop(&mut self) {
+        for entry in std::fs::read_dir(&self.0).unwrap().flatten() {
+            let _ = std::fs::write(entry.path().join("cgroup.kill"), "1");
+        }
+    }
+}
+
+/// A daemon stopped while it waits at startup for its auth broker and
+/// gateway to answer stops the way it always does: the wait is cut short,
+/// it ends both (they are its children) and exits 0. Before its handlers
+/// were installed first, the SIGTERM killed it there by its default
+/// action, and both ran on. The daemon binary, so that the signal is its
+/// own.
+#[tokio::test]
+async fn a_daemon_stopped_while_its_auth_gateway_starts_ends_it_and_exits_cleanly() {
+    let cgroup = support::private_cgroup("daemon-stop-starting");
+    let _kill = KillBelow(cgroup.clone());
+    let bins = FakeBins::acquire("daemon-stop-starting");
+    // Its auth broker and gateway sleep, never answering.
+    bins.omp("exit 0");
+    let root = TempDir::new("daemon-stop-starting-root");
+    let _home = bins.env("HOME", root.path());
+    let (port, broker, gateway) = (free_port(), free_port(), free_port());
+    assert!(port != broker && port != gateway && broker != gateway);
+    std::fs::write(
+        root.join("config.json"),
+        format!(
+            r#"{{"ompBin": "omp", {MODELS}, "serve": {{"port": {port}}},
+                "authGateway": {{"brokerPort": {broker}, "gatewayPort": {gateway}}}}}"#
+        ),
+    )
+    .unwrap();
+    let mut daemon = std::process::Command::new(env!("CARGO_BIN_EXE_hunter"))
+        .arg("--root")
+        .arg(root.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while auth_sleeps_in(&cgroup).len() < 2 {
+        assert!(
+            daemon.try_wait().unwrap().is_none(),
+            "the daemon ended early"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "the auth broker and gateway never started"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let pid = nix::unistd::Pid::from_raw(i32::try_from(daemon.id()).unwrap());
+    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM).unwrap();
+
+    // Well inside the 15 s the startup waits for the gateway at most.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = daemon.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the daemon went on waiting for its gateway"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(
+        status.success(),
+        "the daemon did not stop cleanly: {status}"
+    );
+    assert_eq!(auth_sleeps_in(&cgroup), Vec::<u32>::new(), "left running");
 }

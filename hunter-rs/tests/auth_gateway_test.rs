@@ -310,6 +310,42 @@ fn until(mut done: impl FnMut() -> bool) {
     }
 }
 
+/// A daemon killed outright takes its broker and gateway along: both are
+/// started with SIGTERM as their parent-death signal, from the supervisor
+/// thread that lives as long as each (`Command::die_with_spawner`). An
+/// orphaned gateway would admit a dead run's token.
+#[test]
+fn the_broker_and_gateway_are_started_to_die_with_the_daemon() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new("gw-pdeathsig");
+    let reports = dir.subdir("reports");
+    let omp = dir.join("omp-reporting");
+    std::fs::write(
+        &omp,
+        format!(
+            "#!/bin/sh\n{}\n",
+            support::parent_death_signal_reporter(&reports, true)
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&omp, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut cfg = support::test_config(dir.path());
+    cfg.work_root = dir.subdir("work_root");
+    cfg.omp_bin = omp.to_string_lossy().into_owned();
+    cfg.auth_gateway.broker_port = dead_port();
+    cfg.auth_gateway.gateway_port = dead_port();
+    let gw = AuthGateway::new(&cfg);
+
+    let services = AuthServices::start(&cfg, &gw).unwrap();
+    until(|| support::parent_death_signals(&reports).len() == 2);
+    drop(services);
+
+    let signals: Vec<String> = support::parent_death_signals(&reports)
+        .into_values()
+        .collect();
+    assert_eq!(signals, ["15", "15"], "SIGTERM for both");
+}
+
 /// Daemon start empties a clients file a crashed daemon left behind,
 /// starts the broker and the gateway on their ports, and stopping them
 /// leaves neither running.
