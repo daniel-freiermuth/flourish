@@ -9,5 +9,6 @@
   "serve": { "port": 8377 },
   "feedback": { "bots": [] },
   "models": { "default": "opus", "smol": "sonnet", "hunt": null, "fix": null },
-  "backend": { "type": "omp-scavenge", "llmProvider": "anthropic" }
+  "backend": { "type": "omp-scavenge", "llmProvider": "anthropic" },
+  "authGateway": { "brokerPort": 8765, "gatewayPort": 4000 }
 }

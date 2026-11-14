@@ -3064,11 +3064,13 @@ impl Store {
     /// counted as an attempt: a stop the daemon chose costs the work no
     /// try, as a stop during a single run never did. Nor is one the review
     /// suspended between its runs because its grant was spent
-    /// (`killed_reason = 'grant'`): the work is done up to that point, and
-    /// the resume only carries on with it. Either one's spend is real and
-    /// counts like any other, in `total` and `max_single`, and a grant
-    /// suspension counts in `runs`, which gates the cost arm of the
-    /// ceiling, so that arm still bounds a chain of them.
+    /// (`killed_reason = 'grant'`), or because its curator was refused its
+    /// credentials (`'auth-unavailable'`, a gateway outage): the work is
+    /// done up to that point, and the resume only carries on with it.
+    /// Each one's spend is real and counts like any other, in `total` and
+    /// `max_single`, and a grant or credentials suspension counts in
+    /// `runs`, which gates the cost arm of the ceiling, so that arm still
+    /// bounds a chain of them.
     pub async fn resume_chain_stats(
         &self,
         job_id: i64,
@@ -3088,10 +3090,12 @@ impl Store {
             )
             SELECT COALESCE(SUM(tokens_new), 0) AS "total!: i64",
                    COALESCE(SUM(killed_reason IS NOT 'shutdown' AND killed_reason IS NOT 'grant'
+                                AND killed_reason IS NOT 'auth-unavailable'
                                 AND (resumed_from IS NULL OR killed_reason = 'cap'
                                      OR COALESCE(tokens_new, 0) > 0)), 0) AS "attempts!: i64",
                    COALESCE(SUM(killed_reason IS NOT 'shutdown'
-                                AND (resumed_from IS NULL OR killed_reason IN ('cap', 'grant')
+                                AND (resumed_from IS NULL
+                                     OR killed_reason IN ('cap', 'grant', 'auth-unavailable')
                                      OR COALESCE(tokens_new, 0) > 0)), 0) AS "runs!: i64",
                    COALESCE(MAX(tokens_new), 0) AS "max_single!: i64"
             FROM jobs WHERE id IN (SELECT id FROM chain)

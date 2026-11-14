@@ -114,7 +114,7 @@ async fn relative_project_root_creates_tree_at_worker_cwd() {
     let project = f.dir.subdir("hunter");
     // nextest gives this test its own process, so the cwd cannot race others.
     std::env::set_current_dir(f.dir.path()).unwrap();
-    let cfg = Config::load(Path::new("hunter")).unwrap();
+    let cfg = support::load_config(Path::new("hunter"));
     let ws = Workspace::for_chain(&cfg.work_root, &f.clone, 1);
     let pinned = create(
         &f,

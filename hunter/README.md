@@ -381,6 +381,43 @@ Known limits of the gate:
 - A network that reaches the forge and provider only through a proxy
   never accepts a direct connection: set `network.gate: false` there.
 
+**Worker credentials.** With `backend.llmProvider: anthropic` no worker
+uses your stored login. The daemon runs `omp auth-broker serve` (the only
+process that holds the OAuth refresh tokens) and `omp auth-gateway serve`
+in front of it as its own children, on the loopback ports
+`authGateway.brokerPort` and `authGateway.gatewayPort`; it restarts them
+when they exit and stops them only after the job lane has finished its
+last worker. Every worker run gets a token of its own: 32 random bytes,
+whose SHA-256 the daemon lists in `<workRoot>/gateway/clients.json` (0600,
+emptied at every daemon start) for as long as the run lasts and removes
+when it ends, however it ends. The worker gets `ANTHROPIC_BASE_URL`
+pointing at the gateway and the token as `--api-key`; it keeps your omp
+profile otherwise. Before a picked job is dispatched (after the network
+gate), the cycle asks the broker and the gateway for their health; while
+either does not answer, the job is held like a budget denial: a `deny`
+event with the reason (`auth: broker on 127.0.0.1:8765 unreachable ...`),
+the Status page's **denied** with that reason, a retry in a minute, and
+nothing counted. A run then waits up to 20 seconds for the gateway to
+admit its new token (the gateway re-reads the clients file every 10
+seconds); if it does not, no worker is spawned, the job is closed as never
+started and the cycle is held the same way. A continuation that only
+publishes runs no worker and is not held. Workers never fall back to the
+local login. Inside a fix job, its reviewers, answers and curation are
+runs of their own: a token refused there ends that run as failed, as any
+other run that cannot start does. `openai-codex` and `github-copilot` have
+no verified route through the gateway yet: for them the daemon runs
+neither child and their workers use the local login as before.
+
+The broker and gateway count as up only while the daemon's own children
+run on their ports: a port another process holds (a second daemon with
+the same ports, an orphan) answers health checks but would refuse every
+token, so its child, which exits with `EADDRINUSE`, holds the work with
+`auth: gateway port 4000 is taken by another process`. The children get
+`PR_SET_PDEATHSIG`, so a daemon that is killed outright takes them along.
+A curation refused its token costs the fix no resume attempt, and a resume
+that only owed its curation and is refused again is closed as never
+started, so an outage grows no resume chain.
+
 The cost ceiling applies only when the historical typical estimate is
 positive. An absent or zero estimate is not a zero-token allowance;
 the attempt ceiling and provider budget still bound the run.
@@ -1151,7 +1188,11 @@ quota source for one installation.
 - `models` — fuzzy names, anything omp's `--model` flag accepts. `default`
   applies to all workers; `smol` is for lightweight helper tasks; `hunt`/
   `fix` override per job family; `null` inherits `default`. The pre-PR
-  reviewer runs with the `fix` model.
+  reviewer runs with the `fix` model. With `backend.llmProvider:
+  anthropic` a model is required: `default`, or both `hunt` and `fix`.
+  Workers reach Anthropic through the auth gateway with `--api-key`,
+  which omp accepts only together with `--model`, so the daemon refuses
+  to load a config that leaves either family without one.
 - `review.maxRounds` (default 7) — how many times a finished fix is
   reviewed before it ships; issues still open after the last round hold
   the fix for you (§ Finding lifecycle). `0` ships unreviewed.
@@ -1181,6 +1222,11 @@ quota source for one installation.
   network gate (§ Scheduling loop) in place of the provider's own, each
   `host` or `host:port` (443 when omitted), e.g. `["llm-gw.corp:8443"]`
   for a gateway. Default: the provider's API host.
+- `authGateway.brokerPort` (default 8765) and `authGateway.gatewayPort`
+  (default 4000) — the loopback ports of the auth broker and gateway the
+  daemon runs for an `anthropic` daemon's workers (§ Scheduling loop,
+  *Worker credentials*). Two different non-zero ports, checked whatever
+  the provider; only an `anthropic` daemon uses them.
 - `network.gate` — `false` turns the network gate off, for a machine that
   reaches its forge and provider only through a proxy, where a direct
   connection never succeeds. Default `true`.

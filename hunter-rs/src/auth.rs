@@ -135,7 +135,8 @@ pub fn cleared_session_cookie() -> HeaderValue {
     HeaderValue::from_static("hunter_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
 }
 
-fn hex(bytes: &[u8]) -> String {
+/// `bytes` as lowercase hex.
+pub(crate) fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     bytes
         .iter()

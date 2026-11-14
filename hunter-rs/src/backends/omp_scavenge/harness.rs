@@ -347,6 +347,19 @@ fn resume_unavailable(session_file: &Path, why: &str) -> RunResult {
     }
 }
 
+/// Where a worker sends its provider calls instead of the provider, and
+/// the key it presents there: the daemon's auth gateway and one run's
+/// token ([`super::gateway::ClientToken::worker_auth`]).
+pub struct WorkerAuth<'a> {
+    /// The variable naming the provider's endpoint (`ANTHROPIC_BASE_URL`).
+    pub base_url_env: &'static str,
+    pub base_url: String,
+    /// Passed as `--api-key`, never through the environment: omp prefers
+    /// a stored login over an environment key, and a runtime flag over
+    /// both.
+    pub api_key: &'a str,
+}
+
 // ---------------------------------------------------------------------------
 // Worker execution (`harness.run_worker`)
 // ---------------------------------------------------------------------------
@@ -367,6 +380,11 @@ fn resume_unavailable(session_file: &Path, why: &str) -> RunResult {
 /// outright (`killed_reason = "resume-unavailable"`) rather than quietly
 /// downgraded to a cold run.
 ///
+/// `auth` routes the worker through the daemon's auth gateway: the
+/// endpoint variable is set and the token passed as `--api-key`. `None`
+/// leaves the worker on omp's own credentials (a provider with no gateway
+/// route).
+///
 /// Blocking — call via `spawn_blocking` from async contexts.
 #[allow(
     clippy::too_many_lines,
@@ -383,6 +401,7 @@ pub fn run_worker(
     max_wall_s: i64,
     model: Option<&str>,
     resume_from: Option<&Path>,
+    auth: Option<&WorkerAuth<'_>>,
 ) -> RunResult {
     let t0 = Instant::now();
     let cwd = ws.tree.as_path();
@@ -516,6 +535,9 @@ pub fn run_worker(
     if let Some(smol) = &cfg.model_smol {
         cmd.arg(format!("--smol={smol}"));
     }
+    if let Some(auth) = auth {
+        cmd.arg("--api-key").arg(auth.api_key);
+    }
 
     // Spawn in its own process group (for group-kill).
     #[cfg(unix)]
@@ -524,7 +546,8 @@ pub fn run_worker(
         cmd.process_group(0);
     }
     // Build a minimal env so the worker doesn't inherit the full daemon env
-    // (especially ANTHROPIC_ API keys/tokens).
+    // (especially ANTHROPIC_ API keys/tokens). The gateway's endpoint is
+    // the one provider variable a worker gets, and only through `auth`.
     let allowlist: &[&str] = &[
         "PATH",
         "HOME",
@@ -544,6 +567,9 @@ pub fn run_worker(
         if allowlist.contains(&k.as_str()) || allowed_prefixes.iter().any(|p| k.starts_with(p)) {
             cmd.env(&k, &v);
         }
+    }
+    if let Some(auth) = auth {
+        cmd.env(auth.base_url_env, &auth.base_url);
     }
     // Every chain builds in a fresh tree, so a tree-local `target/` would
     // start every chain with a full cold compile inside its wall-clock

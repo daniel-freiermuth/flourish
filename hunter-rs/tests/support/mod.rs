@@ -94,11 +94,21 @@ impl Drop for TempDir {
 /// a fix test's worker would be asked to review its own fix too. A test of
 /// the review turns it back on.
 pub fn load_config(root: &Path) -> hunter::config::Config {
+    // A root without a config file gets one naming a worker model, which
+    // an anthropic config needs (`Config::load`), and nothing else: every
+    // other setting is the default.
+    let file = root.join("config.json");
+    if !file.exists() {
+        std::fs::write(&file, TEST_MODELS_CONFIG).expect("write config.json");
+    }
     let mut cfg = hunter::config::Config::load(root).expect("load config");
     cfg.network_gate = false;
     cfg.review_max_rounds = 0;
     cfg
 }
+
+/// A config file naming only the worker model.
+pub const TEST_MODELS_CONFIG: &str = r#"{"models": {"default": "test-model"}}"#;
 
 /// A literal `Config` rooted at `root`, for tests that build one without
 /// a config file: data, database and UI under `root`, port 0, the network
@@ -128,6 +138,7 @@ pub fn test_config(root: &Path) -> hunter::config::Config {
         llm_provider: hunter::backends::omp_scavenge::LlmProvider::Anthropic,
         provider_hosts: None,
         network_gate: false,
+        auth_gateway: hunter::config::AuthGatewayConfig::default(),
         hunt_max_wall_s: 1800,
         hunt_max_findings: 8,
         hunt_rehunt_days: 90,
@@ -451,6 +462,17 @@ impl FakeBins {
             .iter()
             .any(|c| c.iter().any(|a| a == arg))
     }
+
+    /// Install `omp` running `body`, except as the daemon's auth broker
+    /// and gateway (`omp auth-broker serve`, `omp auth-gateway serve`),
+    /// which stay up as children do until the daemon stops them. Pair with
+    /// [`healthy_auth`], which answers their ports.
+    pub fn omp(&self, body: &str) {
+        self.script(
+            "omp",
+            &format!("case \"$1\" in auth-broker|auth-gateway) exec sleep 600 ;; esac\n{body}"),
+        );
+    }
 }
 
 /// Undo the fake binaries' argument escaping (see [`FakeBins::script`]).
@@ -491,6 +513,101 @@ fn set_executable(path: &Path) {
 
 #[cfg(not(unix))]
 fn set_executable(_path: &Path) {}
+
+// ---------------------------------------------------------------------------
+// A healthy auth broker and gateway
+// ---------------------------------------------------------------------------
+
+/// Serve loopback HTTP on a free port, answering each request with the
+/// status `answer(path, bearer)` gives. Runs until the test process ends.
+pub fn serve(answer: impl Fn(&str, Option<&str>) -> u16 + Send + 'static) -> u16 {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            let _ = reader.read_line(&mut request);
+            let path = request.split_whitespace().nth(1).unwrap_or("").to_owned();
+            let mut bearer = None;
+            loop {
+                let mut header = String::new();
+                if reader.read_line(&mut header).unwrap_or(0) == 0 || header.trim().is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = header.split_once(':')
+                    && name.eq_ignore_ascii_case("authorization")
+                {
+                    bearer = value.trim().strip_prefix("Bearer ").map(str::to_owned);
+                }
+            }
+            let status = answer(&path, bearer.as_deref());
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+        }
+    });
+    port
+}
+
+/// `token`'s SHA-256 as the gateway's clients file lists it.
+pub fn sha_hex(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    Sha256::digest(token.as_bytes())
+        .iter()
+        .fold(String::new(), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+}
+
+/// Every `tokenSha256` the clients file at `path` lists; none while it
+/// does not exist.
+pub fn listed(path: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let clients: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text).unwrap();
+    clients
+        .values()
+        .map(|c| c["tokenSha256"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// An auth broker that is up: its health check answers.
+pub fn fake_broker() -> u16 {
+    serve(|path, _| if path == "/v1/healthz" { 200 } else { 404 })
+}
+
+/// An auth gateway that is up and admits the tokens the clients file at
+/// `clients` lists, as the real one does once it has read the file.
+pub fn fake_gateway(clients: PathBuf) -> u16 {
+    serve(move |path, bearer| match path {
+        "/healthz" => 200,
+        "/v1/models" => match bearer {
+            Some(token) if listed(&clients).contains(&sha_hex(token)) => 200,
+            _ => 401,
+        },
+        _ => 404,
+    })
+}
+
+/// A healthy auth broker and gateway for a daemon under test
+/// (`run_daemon`): the daemon's own children run (the fake `omp` from
+/// [`FakeBins::omp`] stays up as `auth-broker serve` and `auth-gateway
+/// serve`), and their ports are answered by [`fake_broker`] and
+/// [`fake_gateway`] on free ports, which `cfg` is pointed at. Without it
+/// the daemon holds every job, as it should for a gateway that is down.
+pub fn healthy_auth(cfg: &mut hunter::config::Config) {
+    let clients =
+        hunter::backends::omp_scavenge::gateway::AuthGateway::clients_file(&cfg.work_root);
+    cfg.auth_gateway.broker_port = fake_broker();
+    cfg.auth_gateway.gateway_port = fake_gateway(clients);
+}
 
 // ---------------------------------------------------------------------------
 // A backend that simulates a worker
@@ -549,6 +666,9 @@ pub struct ScriptedBackend {
     on_decide: Option<DecideHook>,
     /// The `usage_delta` every run reports ([`ScriptedBackend::using`]).
     usage_delta: Option<f64>,
+    /// Why workers get no credentials (`Backend::auth_unavailable`),
+    /// [`ScriptedBackend::auth_down`].
+    auth_down: Option<String>,
 }
 
 impl ScriptedBackend {
@@ -579,6 +699,7 @@ impl ScriptedBackend {
             runs: Mutex::new(Vec::new()),
             on_decide: None,
             usage_delta: None,
+            auth_down: None,
         }
     }
 
@@ -587,6 +708,14 @@ impl ScriptedBackend {
     #[must_use]
     pub fn denying_above(mut self, tokens: i64) -> Self {
         self.deny_above = Some(tokens);
+        self
+    }
+
+    /// Answer the credentials check with `why`
+    /// (`Backend::auth_unavailable`): the auth gateway is down.
+    #[must_use]
+    pub fn auth_down(mut self, why: &str) -> Self {
+        self.auth_down = Some(why.to_owned());
         self
     }
 
@@ -755,6 +884,10 @@ impl Backend for ScriptedBackend {
             .iter()
             .find(|h| self.offline.contains(h) || dispatched && self.offline_dispatched.contains(h))
             .cloned()
+    }
+
+    async fn auth_unavailable(&self) -> Option<String> {
+        self.auth_down.clone()
     }
 
     async fn run(

@@ -190,6 +190,7 @@ fn make_backend_with(ledger: FakeLedger, cfg: Config, prober: FakeProber) -> Omp
         ledger: Arc::new(ledger),
         agent_db: PathBuf::from("/nonexistent/agent.db"),
         prober: Arc::new(prober),
+        gateway: None,
     }
 }
 
@@ -945,6 +946,7 @@ async fn test_no_windows_forces_probe_shared() {
         ledger: Arc::new(FakeLedger::new(0, 0)),
         agent_db: db.clone(),
         prober: Arc::new(prober),
+        gateway: None,
     };
     let result = b.keep_fresh().await.unwrap();
     assert!(result);
@@ -972,6 +974,7 @@ async fn test_fresh_window_no_probe() {
         ledger: Arc::new(FakeLedger::new(0, 0)),
         agent_db: db.clone(),
         prober: Arc::new(prober),
+        gateway: None,
     };
     let result = b.keep_fresh().await.unwrap();
     assert!(!result);
@@ -996,6 +999,7 @@ async fn test_stale_window_forces_probe() {
         ledger: Arc::new(FakeLedger::new(0, 0)),
         agent_db: db.clone(),
         prober: Arc::new(prober),
+        gateway: None,
     };
     let result = b.keep_fresh().await.unwrap();
     assert!(result);
@@ -1021,6 +1025,7 @@ async fn test_age_just_inside_threshold_no_probe() {
         ledger: Arc::new(FakeLedger::new(0, 0)),
         agent_db: db.clone(),
         prober: Arc::new(prober),
+        gateway: None,
     };
     let result = b.keep_fresh().await.unwrap();
     assert!(!result);
@@ -1042,6 +1047,7 @@ fn test_age_exactly_at_threshold_is_fresh() {
         // Never read: is_fresh inspects the passed-in windows only.
         agent_db: PathBuf::from("/nonexistent/agent.db"),
         prober: Arc::new(prober),
+        gateway: None,
     };
 
     let at = |age_s| {
@@ -1081,6 +1087,7 @@ async fn test_respects_configured_stale_after_s() {
         ledger: Arc::new(FakeLedger::new(0, 0)),
         agent_db: db.clone(),
         prober: Arc::new(prober),
+        gateway: None,
     };
     let result = b.keep_fresh().await.unwrap();
     assert!(!result);
@@ -1093,6 +1100,7 @@ async fn test_respects_configured_stale_after_s() {
         ledger: Arc::new(FakeLedger::new(0, 0)),
         agent_db: db.clone(),
         prober: Arc::new(prober2),
+        gateway: None,
     };
     let result2 = b2.keep_fresh().await.unwrap();
     assert!(result2);
@@ -1109,6 +1117,7 @@ async fn test_invalidates_before_reading() {
         ledger: Arc::new(FakeLedger::new(0, 0)),
         agent_db: db.clone(),
         prober: Arc::new(prober),
+        gateway: None,
     };
     b.keep_fresh().await.unwrap();
     let c = calls.lock().unwrap();
@@ -1133,6 +1142,7 @@ async fn test_uses_configured_omp_bin() {
         ledger: Arc::new(FakeLedger::new(0, 0)),
         agent_db: db.clone(),
         prober: Arc::new(prober),
+        gateway: None,
     };
     b.keep_fresh().await.unwrap();
     let c = calls.lock().unwrap();
@@ -1150,6 +1160,7 @@ async fn test_failed_probe_returns_false() {
         ledger: Arc::new(FakeLedger::new(0, 0)),
         agent_db: db.clone(),
         prober: Arc::new(prober),
+        gateway: None,
     };
     let result = b.keep_fresh().await.unwrap();
     assert!(!result);
@@ -1165,6 +1176,7 @@ async fn test_failed_invalidate_does_not_block_read() {
         ledger: Arc::new(FakeLedger::new(0, 0)),
         agent_db: db.clone(),
         prober: Arc::new(prober),
+        gateway: None,
     };
     let result = b.keep_fresh().await.unwrap();
     assert!(result);
@@ -2009,6 +2021,7 @@ async fn keep_fresh_against_ledger(
         ledger: Arc::new(store),
         agent_db,
         prober: Arc::new(FakeProber::new(0)),
+        gateway: None,
     };
     let started = now_ms();
     b.keep_fresh().await.unwrap();
@@ -2154,6 +2167,7 @@ async fn run_reports_how_far_the_long_window_moved_during_the_job() {
         ledger: Arc::new(FakeLedger::new(0, 0)),
         agent_db,
         prober: Arc::new(FakeProber::new(0)),
+        gateway: None,
     };
 
     let rr = b
@@ -2216,6 +2230,7 @@ async fn codex_status_html_shows_only_codex_windows() {
         ledger: Arc::new(FakeLedger::new(0, 0)),
         agent_db,
         prober: Arc::new(FakeProber::new(0)),
+        gateway: None,
     };
 
     let html = b.status_html().await.unwrap();

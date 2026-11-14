@@ -6,8 +6,11 @@
 //! window reading and ramp math. `facade`: `decide`, `keep_fresh` and
 //! `status_html`, one loop over the provider's windows. `harness`:
 //! `run_worker`, the usage-delta sandwich around it, and `Backend::run`.
+//! `gateway`: the auth broker and gateway the daemon runs, and the
+//! per-run gateway token a worker reaches its provider with.
 pub mod capacity;
 mod facade;
+pub mod gateway;
 pub mod harness;
 pub mod provider;
 

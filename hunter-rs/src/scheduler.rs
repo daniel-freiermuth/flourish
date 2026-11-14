@@ -1877,7 +1877,7 @@ pub async fn anticipated_tokens(
 
 use std::path::PathBuf;
 
-use crate::backend::{Backend, JobClass, Verdict};
+use crate::backend::{AUTH_UNAVAILABLE, Backend, JobClass, Verdict};
 use crate::forge::{self, PrView};
 use crate::ingest::{EntryTypes, IngestResult, ingest_findings, ingest_scan_findings};
 use crate::playbooks;
@@ -2056,22 +2056,28 @@ const MAX_CONSECUTIVE_SAME_FAILURE: i64 = 3;
 /// `Failed` instead of being resumed into the same wall. A failure that
 /// repeats after doing work is bounded by the resume give-up ceiling.
 ///
-/// `resume-unavailable` is `Failed` rather than `Killed` because nothing
-/// was spawned — there was no run to kill, the attempt could not start.
+/// `resume-unavailable` and [`AUTH_UNAVAILABLE`] are `Failed` rather than
+/// `Killed` because nothing was spawned — there was no run to kill, the
+/// attempt could not start.
 ///
 /// `shutdown` and `grant` are no run's end: a fix job the daemon's
 /// shutdown, or a spent grant, stopped between its worker runs (the
 /// pre-PR review, [`review::review_fix`]), with the fixer's transcript to
-/// continue. Each is a pause, as a cap is.
+/// continue. Each is a pause, as a cap is. So is [`AUTH_UNAVAILABLE`] on
+/// a job with a transcript: the review suspended it before a curation
+/// whose run was refused its credentials (the run itself, which spawned
+/// nothing, has none).
 fn job_state(rr: &RunResult) -> FinishedState {
     match rr.killed_reason.as_deref() {
-        Some("cap" | review::STOPPED | review::GRANT) if rr.session_file.is_some() => {
+        Some("cap" | review::STOPPED | review::GRANT | AUTH_UNAVAILABLE)
+            if rr.session_file.is_some() =>
+        {
             FinishedState::Suspended
         }
         Some("wallclock") if rr.session_file.is_some() && rr.tokens_new > 0 => {
             FinishedState::Suspended
         }
-        Some("resume-unavailable") => FinishedState::Failed,
+        Some("resume-unavailable" | AUTH_UNAVAILABLE) => FinishedState::Failed,
         Some(_) => FinishedState::Killed,
         None if rr.exit_code == Some(0) => FinishedState::Done,
         None if rr.session_file.is_some() && rr.tokens_new > 0 => FinishedState::Suspended,
@@ -3694,7 +3700,7 @@ pub async fn run_hunt(
         }
     };
     let ran = (WorkOf::Repo(RepoJobKind::Hunt, repo), running);
-    let running = match unmetered_offline(store, cfg, backend, &repo.url, ran, &rr).await {
+    let running = match held_unstarted(store, cfg, backend, &repo.url, ran, &rr).await {
         ControlFlow::Continue(running) => running,
         ControlFlow::Break(denied) => {
             close_workspace(lane, ws).await;
@@ -4125,7 +4131,7 @@ pub async fn run_recheck(
         }
     };
     let ran = (WorkOf::Finding(FindingJobKind::Recheck, fid), running);
-    let running = match unmetered_offline(store, cfg, backend, &repo.url, ran, &rr).await {
+    let running = match held_unstarted(store, cfg, backend, &repo.url, ran, &rr).await {
         ControlFlow::Continue(running) => running,
         ControlFlow::Break(denied) => {
             close_workspace(lane, ws).await;
@@ -4626,7 +4632,7 @@ async fn run_analysis_job<K: AnalysisKind>(
         }
     };
     let ran = (WorkOf::Repo(kind, repo), running);
-    let running = match unmetered_offline(store, cfg, backend, &repo.url, ran, &rr).await {
+    let running = match held_unstarted(store, cfg, backend, &repo.url, ran, &rr).await {
         ControlFlow::Continue(running) => running,
         ControlFlow::Break(denied) => {
             close_workspace(lane, ws).await;
@@ -5633,12 +5639,14 @@ enum FixOutcome {
     /// ([`record_fix_failure`]).
     Failed { failure: String },
     /// The finished worker's branch could not be pushed or its PR opened
-    /// (`publishing`), or a review round could not run, while a host the
-    /// fix needs is unreachable (#95): the network's failure, not the
-    /// fix's. Nothing is counted and the attempt is kept as the
+    /// (`publishing`), or a review round or its curation could not run,
+    /// while a host the fix needs is unreachable (#95) or a worker could
+    /// not get provider credentials ([`Outage`]): the machine's failure,
+    /// not the fix's. Nothing is counted and the attempt is kept as the
     /// checkpoint, so the next cycle continues it: one that was publishing
-    /// only has to publish, one cut off in review reviews that round again.
-    Offline { host: String, publishing: bool },
+    /// only has to publish, one cut off in review reviews that round
+    /// again, and one cut off before its curation curates.
+    Offline { outage: Outage, publishing: bool },
     /// The finished worker's branch could not be pushed or its PR opened
     /// while the forge answered: counted under the step's name
     /// ([`failure_key`]), and the attempt is kept as the checkpoint, so
@@ -5796,9 +5804,9 @@ async fn conclude_fix(
         return Ok(FixOutcome::Held { report });
     }
 
-    if let Some(host) = &reviewed.offline {
+    if let Some(outage) = &reviewed.offline {
         return Ok(FixOutcome::Offline {
-            host: host.clone(),
+            outage: outage.clone(),
             publishing: false,
         });
     }
@@ -5857,7 +5865,7 @@ async fn conclude_fix(
     }
     if let Some(host) = forge_unreachable_now(cfg, &start.repo.url, backend).await {
         return Ok(FixOutcome::Offline {
-            host,
+            outage: Outage::Unreachable(host),
             publishing: finished,
         });
     }
@@ -6591,21 +6599,16 @@ async fn record_fix_outcome(
             }
             Some(claim)
         }
-        FixOutcome::Offline { host, .. } => {
+        FixOutcome::Offline { outage, .. } => {
             // Nothing concluded, so a one-shot override is kept for the
             // attempt that publishes.
             log_write_failure(
                 store.keep_attempt_as_checkpoint(job).await,
                 format_args!("job {job}: keeping the unpublished attempt as the checkpoint"),
             );
-            *summary = offline_denial(
-                store,
-                FindingJobKind::Fix.into(),
-                Some(fid),
-                Some(job),
-                host,
-            )
-            .await;
+            *summary = outage
+                .denial(store, FindingJobKind::Fix.into(), Some(fid), Some(job))
+                .await;
             release_claim(claim).await;
             return Ok(());
         }
@@ -6749,6 +6752,8 @@ pub async fn run_fix(
             || (r.after_hold().is_none()
                 && review::suspended_between_runs(&start, r.predecessor_id()))
     });
+    // What a paused resume found, to put back if it runs nothing (below).
+    let found = paused.then(|| review::ProgressSnapshot::take(&start));
     let (prompt, answers_held) = match fix_prompt(cfg, resume, &start) {
         Ok(prompted) => prompted,
         Err(e) => {
@@ -6777,7 +6782,7 @@ pub async fn run_fix(
         }
     };
     let ran = (WorkOf::Finding(FindingJobKind::Fix, fid), running);
-    let running = match unmetered_offline(store, cfg, backend, &start.repo.url, ran, &rr).await {
+    let running = match held_unstarted(store, cfg, backend, &start.repo.url, ran, &rr).await {
         ControlFlow::Continue(running) => running,
         ControlFlow::Break(denied) => {
             release_claim(claim).await;
@@ -6794,6 +6799,28 @@ pub async fn run_fix(
     // reviewer and the fixer's answers run under the same grant, and the
     // row records what all of them spent.
     let reviewed = review::review_fix(scope, lane, cfg, backend, &start, rr).await;
+    // A paused resume ran no fixer; when an outage stopped every run it
+    // started before any did work (a reviewer, an answer or a curator
+    // refused its credentials, or failed offline), it ran nothing at all:
+    // its progress is put back as it found it and it is closed as never
+    // started, as a refused fixer is (`held_unstarted`), so the attempt it
+    // continues stays the checkpoint, its resume still answers what it
+    // owes, and an outage that keeps refusing grows no chain.
+    if let Some(found) = found
+        && reviewed.rr.tokens_new == 0
+        && let Some(outage) = reviewed.offline.clone()
+    {
+        found.restore(&start);
+        let job = running.id();
+        log_write_failure(
+            running.fail_unstarted(&outage.to_string()).await,
+            format_args!("job {job}: failing unstarted"),
+        );
+        release_claim(claim).await;
+        close_workspace(lane, start.ws).await;
+        let kind = FindingJobKind::Fix.into();
+        return Ok(outage.denial(store, kind, Some(fid), Some(job)).await);
+    }
     let rr = &reviewed.rr;
     let recorded = log_write_failure(
         record_job(store, running, rr, model, resume).await,
@@ -6833,7 +6860,7 @@ pub async fn run_fix(
         // Marked as kept only to publish, so the resume ceiling spares it;
         // not one cut off in review, whose work is not done.
         FixOutcome::Offline {
-            host,
+            outage: Outage::Unreachable(host),
             publishing: true,
         } => recorded.map(|r| (r, format!("{UNPUBLISHED_OFFLINE}: {host}"))),
         _ => None,
@@ -8639,7 +8666,7 @@ pub async fn run_engage(
         }
     };
     let ran = (WorkOf::Finding(FindingJobKind::Engage, fid), running);
-    let running = match unmetered_offline(store, cfg, backend, &start.repo.url, ran, &rr).await {
+    let running = match held_unstarted(store, cfg, backend, &start.repo.url, ran, &rr).await {
         ControlFlow::Continue(running) => running,
         ControlFlow::Break(denied) => {
             close_workspace(lane, start.ws).await;
@@ -9467,7 +9494,7 @@ pub async fn run_harvest(
         }
     };
     let ran = (WorkOf::Finding(FindingJobKind::Harvest, fid), running);
-    let running = match unmetered_offline(store, cfg, backend, &repo.url, ran, &rr).await {
+    let running = match held_unstarted(store, cfg, backend, &repo.url, ran, &rr).await {
         ControlFlow::Continue(running) => running,
         ControlFlow::Break(denied) => {
             close_workspace(lane, ws).await;
@@ -9918,14 +9945,102 @@ async fn offline_denial(
     }
 }
 
-/// A worker that failed without doing any metered work, while a host its
-/// work needs is unreachable: it never got to the work, so its failure is
+/// How soon a cycle held because workers cannot get credentials is
+/// retried. The check is two loopback requests, so this only bounds how
+/// long work waits once the auth broker and gateway are back.
+const AUTH_RETRY_MS: i64 = 60_000;
+
+/// The cycle's end when a worker cannot get provider credentials
+/// (`Backend::auth_unavailable`, or a run that ended
+/// [`AUTH_UNAVAILABLE`]): denied with `why`, to be retried in
+/// [`AUTH_RETRY_MS`], with a `deny` event, as a budget denial is. Nothing
+/// is counted and no checkpoint moves.
+async fn auth_denial(
+    store: &Store,
+    kind: JobKind,
+    finding_id: Option<i64>,
+    job_id: Option<i64>,
+    why: String,
+) -> CycleSummary {
+    let _ = store.log_event("deny", &why, job_id, finding_id).await;
+    CycleSummary {
+        kind: Some(kind),
+        finding_id,
+        job_id,
+        denied: Some(why),
+        retry_at: Some(now_ms() + AUTH_RETRY_MS),
+        ..Default::default()
+    }
+}
+
+/// What kept a worker from its work without being the work's failure: a
+/// host the work needs is unreachable, or the worker could not get
+/// provider credentials (a run ended [`AUTH_UNAVAILABLE`]). Nothing is
+/// counted, the attempt is kept, and the cycle ends with
+/// [`Self::denial`].
+#[derive(Debug, Clone)]
+enum Outage {
+    /// This host is unreachable.
+    Unreachable(String),
+    /// Why the worker got no credentials (the run's `stdout_tail`).
+    Auth(String),
+}
+
+impl Outage {
+    /// `rr`'s own outage: a run refused its credentials, which spawned
+    /// nothing.
+    fn of_run(rr: &RunResult) -> Option<Self> {
+        (rr.killed_reason.as_deref() == Some(AUTH_UNAVAILABLE))
+            .then(|| Self::Auth(rr.stdout_tail.clone()))
+    }
+
+    /// The outage a run that did no work met, asked after it failed: a
+    /// host its work needs that is unreachable now
+    /// ([`unreachable_now`]), or else workers getting no credentials now
+    /// (`Backend::auth_unavailable`: the gateway or broker went down after
+    /// its token was admitted). `None` = the failure is the work's.
+    async fn now(cfg: &Config, repo_url: &str, backend: &dyn Backend) -> Option<Self> {
+        if let Some(host) = unreachable_now(cfg, repo_url, backend).await {
+            return Some(Self::Unreachable(host));
+        }
+        backend.auth_unavailable().await.map(Self::Auth)
+    }
+
+    /// The cycle's end for it: [`offline_denial`] or [`auth_denial`].
+    async fn denial(
+        self,
+        store: &Store,
+        kind: JobKind,
+        finding_id: Option<i64>,
+        job_id: Option<i64>,
+    ) -> CycleSummary {
+        match self {
+            Self::Unreachable(host) => offline_denial(store, kind, finding_id, job_id, host).await,
+            Self::Auth(why) => auth_denial(store, kind, finding_id, job_id, why).await,
+        }
+    }
+}
+
+impl std::fmt::Display for Outage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreachable(host) => write!(f, "{host} unreachable"),
+            Self::Auth(why) => f.write_str(why),
+        }
+    }
+}
+
+/// A worker that never got to the work: its run spawned nothing because
+/// it could not get credentials ([`AUTH_UNAVAILABLE`]), or it failed
+/// without doing any metered work while a host its work needs is
+/// unreachable or workers cannot get credentials ([`Outage::now`]: the
+/// gateway its token was admitted by went down under it). Its failure is
 /// not counted. Its job is closed `failed` as unstarted, which leaves the
 /// checkpoint it was continuing in place, and the cycle ends as
-/// [`offline_denial`] (`Break`). Any other run is handed back
+/// [`Outage::denial`] (`Break`). Any other run is handed back
 /// (`Continue`) for its outcome to be recorded: one that did metered work
 /// failed at the work, and is counted as before.
-async fn unmetered_offline(
+async fn held_unstarted(
     store: &Store,
     cfg: &Config,
     backend: &dyn Backend,
@@ -9933,24 +10048,34 @@ async fn unmetered_offline(
     (work, running): (WorkOf<'_>, RunningJob),
     rr: &RunResult,
 ) -> ControlFlow<CycleSummary, RunningJob> {
-    if !matches!(job_state(rr), FinishedState::Failed | FinishedState::Killed) || rr.tokens_new > 0
-    {
-        return ControlFlow::Continue(running);
-    }
-    let Some(host) = unreachable_now(cfg, repo_url, backend).await else {
-        return ControlFlow::Continue(running);
+    let outage = if let Some(outage) = Outage::of_run(rr) {
+        outage
+    } else {
+        if !matches!(job_state(rr), FinishedState::Failed | FinishedState::Killed)
+            || rr.tokens_new > 0
+        {
+            return ControlFlow::Continue(running);
+        }
+        let Some(outage) = Outage::now(cfg, repo_url, backend).await else {
+            return ControlFlow::Continue(running);
+        };
+        outage
     };
     let job = running.id();
+    let notes = match &outage {
+        Outage::Unreachable(host) => {
+            format!("offline: {host} unreachable; the worker did no metered work")
+        }
+        Outage::Auth(why) => why.clone(),
+    };
     log_write_failure(
-        running
-            .fail_unstarted(&format!(
-                "offline: {host} unreachable; the worker did no metered work"
-            ))
-            .await,
+        running.fail_unstarted(&notes).await,
         format_args!("job {job}: failing unstarted"),
     );
     ControlFlow::Break(
-        offline_denial(store, work.job_kind(), work.finding_id(), Some(job), host).await,
+        outage
+            .denial(store, work.job_kind(), work.finding_id(), Some(job))
+            .await,
     )
 }
 
@@ -10426,8 +10551,23 @@ async fn run_cycle_inner(
         }
     };
 
+    // A worker that cannot get provider credentials (the auth gateway or
+    // its broker is down) would fail at its first call, so the candidate
+    // is held as a budget denial holds it: after the network gate, which
+    // names the more basic cause, and before dispatch, so nothing starts
+    // or is counted. A continuation that costs no tokens runs no worker:
+    // the free fallback below still runs it.
+    let denied = match denied {
+        None => match backend.auth_unavailable().await {
+            Some(why) => Some(auth_denial(store, candidate.job_kind(), None, None, why).await),
+            None => None,
+        },
+        denied => denied,
+    };
+
     // An error its runner did not count is counted as `cycle error`
-    // ([`dispatch_counted`]), here and in the free fallback below.
+    // ([`dispatch_counted`]), here and in the free fallback below. A
+    // denial runs the free fallback, a credentials hold included.
     let mut result = match denied {
         Some(denied) => denied,
         None => dispatch_counted(scope, lane, cfg, backend, &candidate).await?,

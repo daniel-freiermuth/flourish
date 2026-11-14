@@ -9,6 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use super::capacity::{self, HEADROOM_MS, WindowState};
+use super::gateway::{self, AuthGateway, ClientToken};
 use super::provider::{LlmProvider, Pacing};
 
 use crate::backend::SpendLedger;
@@ -26,6 +27,12 @@ pub struct OmpScavengeBackend {
     pub agent_db: PathBuf,
     /// `keep_fresh`'s `omp usage` subprocess seam.
     pub prober: Arc<dyn Prober>,
+    /// The daemon's auth gateway, which every worker run reaches its
+    /// provider through with a token of its own; `None` leaves workers on
+    /// omp's local login (a provider with no gateway route, and tests that
+    /// are not about it). Daemon-side omp calls (`keep_fresh`'s probes)
+    /// never use it: they are the daemon's, not a worker's.
+    pub gateway: Option<Arc<AuthGateway>>,
 }
 
 // ---- private helpers (facade.py functions) --------------------------------
@@ -675,6 +682,15 @@ impl Backend for OmpScavengeBackend {
         })
     }
 
+    /// Why the broker or the gateway cannot serve a worker right now
+    /// ([`AuthGateway::health`]); always `None` without a gateway.
+    async fn auth_unavailable(&self) -> Option<String> {
+        let gateway = self.gateway.clone()?;
+        tokio::task::spawn_blocking(move || gateway.health())
+            .await
+            .unwrap_or_else(|e| Some(format!("auth: health check failed: {e}")))
+    }
+
     async fn status_html(&self) -> anyhow::Result<String> {
         let now_ms = crate::util::now_ms();
         let db = self.agent_db.clone();
@@ -735,7 +751,18 @@ impl Backend for OmpScavengeBackend {
         let ws_owned = ws.clone();
         let prompt_owned = prompt.to_owned();
         let resume_owned = resume_from.map(std::path::Path::to_owned);
+        let auth_gateway = self.gateway.clone();
         let mut rr = tokio::task::spawn_blocking(move || {
+            // The token lives in this closure and nowhere else: it is
+            // withdrawn when the closure returns or unwinds, so it ends
+            // with the run whatever ends the run.
+            let token = match auth_gateway
+                .map(|g| g.admit(ws_owned.origin_id))
+                .transpose()
+            {
+                Ok(token) => token,
+                Err(why) => return gateway::refused(&why),
+            };
             super::harness::run_worker(
                 &cfg,
                 &ws_owned,
@@ -744,6 +771,7 @@ impl Backend for OmpScavengeBackend {
                 max_wall_s,
                 model.as_deref(),
                 resume_owned.as_deref(),
+                token.as_ref().map(ClientToken::worker_auth).as_ref(),
             )
         })
         .await?;

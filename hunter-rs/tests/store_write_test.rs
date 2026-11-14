@@ -3988,11 +3988,12 @@ async fn a_failure_counts_only_while_the_finding_is_in_the_kinds_tier() {
 }
 
 /// An attempt the daemon's shutdown stopped between a fix's review runs,
-/// or the review suspended for a spent grant, costs the work no try, but
-/// what it spent is spent: it counts in the chain's total and largest
-/// attempt, which the resume reservation and the give-up ceiling's spend
-/// arm read. A grant suspension still counts as a run, which gates that
-/// arm, so a chain of them is bounded.
+/// or the review suspended for a spent grant or a curator refused its
+/// credentials, costs the work no try, but what it spent is spent: it
+/// counts in the chain's total and largest attempt, which the resume
+/// reservation and the give-up ceiling's spend arm read. A grant or
+/// credentials suspension still counts as a run, which gates that arm, so
+/// a chain of them is bounded.
 #[tokio::test]
 async fn chain_stats_count_review_stops_as_spend_not_as_attempts() {
     let (_dir, path, pool) = fresh_db().await;
@@ -4003,19 +4004,20 @@ async fn chain_stats_count_review_stops_as_spend_not_as_attempts() {
          (10, 'fix', 1, 2, 'suspended', 100, NULL, 'cap', 1000), \
          (11, 'fix', 1, 2, 'suspended', 400, 10, 'shutdown', 2000), \
          (12, 'fix', 1, 2, 'suspended', 300, 11, 'cap', 3000), \
-         (13, 'fix', 1, 2, 'suspended', 200, 12, 'grant', 4000);",
+         (13, 'fix', 1, 2, 'suspended', 200, 12, 'grant', 4000), \
+         (14, 'fix', 1, 2, 'suspended', 500, 13, 'auth-unavailable', 5000);",
     )
     .execute(&pool)
     .await
     .unwrap();
     let store = rw_store(&path).await;
     assert_eq!(
-        store.resume_chain_stats(13, None).await.unwrap(),
+        store.resume_chain_stats(14, None).await.unwrap(),
         ResumeChainStats {
-            total: 1000,
+            total: 1500,
             attempts: 2,
-            runs: 3,
-            max_single: 400
+            runs: 4,
+            max_single: 500
         }
     );
 }

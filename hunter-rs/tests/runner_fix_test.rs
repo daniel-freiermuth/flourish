@@ -2593,6 +2593,10 @@ enum Act {
     FixDetached,
     /// A reviewer that exits non-zero before its first call: no provider.
     ReviewUnreached,
+    /// Any run the backend refused its credentials (the auth gateway did
+    /// not admit its token): nothing spawned, ending `auth-unavailable`
+    /// with [`REFUSED`] as the reason.
+    Refused,
     /// A reviewer that commits in the tree, leaves a test artifact behind
     /// and keeps the index locked, so undoing its changes cannot check the
     /// fix branch out again, having written `.0`.
@@ -3000,8 +3004,13 @@ fn run_act(run: &support::Run, i: usize, act: Act) -> hunter::types::RunResult {
             commit("HALF.md", "fix: half of the answer");
             ended(continued(), Ending::Capped)
         }
+        Act::Refused => hunter::backends::omp_scavenge::gateway::refused(REFUSED),
     }
 }
+
+/// Why a scripted run was refused its credentials ([`Act::Refused`]).
+const REFUSED: &str =
+    "auth: gateway on 127.0.0.1:4000 did not admit job-1-0 within 20.0s (answered 401)";
 
 /// What a build rewrites the tracked `FIX.md` to, as `cargo test` without
 /// `--locked` rewrites a stale `Cargo.lock` ([`Act::FixRelocked`]).
@@ -4538,6 +4547,38 @@ async fn a_kept_fix_publishes_past_a_spent_budget_and_an_unreachable_provider() 
 
     assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
     assert!(spent.runs().is_empty(), "no worker");
+    assert_eq!(shipped_subject(&f), "fix: the real bug");
+}
+
+/// A kept fix that only has to publish runs no worker, so an auth gateway
+/// that is down does not keep it waiting: the cycle that holds its pick
+/// for credentials publishes it all the same.
+#[tokio::test]
+async fn a_kept_fix_publishes_while_workers_get_no_credentials() {
+    let bins = support::FakeBins::acquire("fix-kept-auth-down");
+    bins.ok("gh", "https://github.com/acme/widget/pull/42");
+    let mut f = fixture("fix-kept-auth-down").await;
+    review_on(&mut f, 3);
+    let nowhere = f.cfg.work_root.join("refusing.git");
+    route_push(&f, Some(&nowhere.to_string_lossy()));
+    let refused = fix(&f, &reviewed_worker(vec![Act::Fix, Act::Review(CLEAN)])).await;
+    assert_eq!(refused.outcome.as_deref(), Some("requeued"), "{refused:?}");
+    let key = format!("url.{}.insteadOf", nowhere.display());
+    git(&f.repo_dir, &["config", "--unset-all", &key]);
+    route_push(&f, None);
+    let pool = support::open_pool(&f.db).await;
+    sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
+        .bind(24 * 60 * 60_000_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let down = reviewed_worker(vec![]).auth_down("auth: gateway is not running");
+
+    let summary =
+        hunter::scheduler::run_cycle(&mut support::jobs(&f.store), &f.cfg, &down, None).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    assert!(down.runs().is_empty(), "no worker");
     assert_eq!(shipped_subject(&f), "fix: the real bug");
 }
 
@@ -6276,6 +6317,314 @@ async fn a_reviewer_fails_offline(reviewer: Act) {
         "the body",
         "reviewed this time, with no failure note"
     );
+}
+
+/// The cycle was held for [`REFUSED`], as the gate holds it: denied with
+/// the gateway's reason, not offline, and nothing shipped or counted.
+async fn assert_held_for_credentials(
+    f: &Fixture,
+    summary: &hunter::scheduler::CycleSummary,
+    bins: &support::FakeBins,
+) {
+    assert_eq!(summary.denied.as_deref(), Some(REFUSED), "{summary:?}");
+    assert_eq!(summary.unreachable, None, "{summary:?}");
+    assert_eq!(
+        (summary.kind, summary.finding_id),
+        (Some(FindingJobKind::Fix.into()), Some(f.fid)),
+        "the denial names the work it held"
+    );
+    assert_eq!(bins.calls_to("gh").len(), 0, "nothing ships");
+    assert!(held(f).await.is_none(), "nothing is held");
+    assert_eq!(fix_streak(f).await.streak, 0, "nothing is counted");
+}
+
+/// A reviewer refused its credentials (the auth gateway did not admit its
+/// token) is an outage, as an unreachable host is: the fix does not ship
+/// unreviewed, and the retry reviews that round again.
+#[tokio::test]
+async fn a_reviewer_refused_its_credentials_is_kept_and_its_round_reviewed_again() {
+    let bins = support::FakeBins::acquire("fix-review-reviewer-auth");
+    bins.ok("gh", "https://github.com/acme/widget/pull/42");
+    let f = reviewed_fixture("fix-review-reviewer-auth", 7).await;
+    let worker = reviewed_worker(vec![Act::Fix, Act::Refused]);
+
+    let summary = fix(&f, &worker).await;
+
+    assert_held_for_credentials(&f, &summary, &bins).await;
+    let plan = pending_resume(&f).await;
+    let retry = reviewed_worker(vec![Act::Continue, Act::Review(CLEAN)]);
+
+    let summary = resume(&f, &plan, &retry).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    let runs = retry.runs();
+    assert_eq!(
+        runs[1].session,
+        review_dir(&runs[0].session, summary.job_id, 1),
+        "round 1 again"
+    );
+    assert_eq!(pr_body(&bins), "the body", "reviewed this time");
+}
+
+/// The fixer's answer refused its credentials: held as an offline answer
+/// is, and the retry reviews that round (here round 2) again before
+/// anything ships.
+#[tokio::test]
+async fn an_answer_refused_its_credentials_is_kept_and_its_round_reviewed_again() {
+    let bins = support::FakeBins::acquire("fix-review-answer-auth");
+    bins.ok("gh", "https://github.com/acme/widget/pull/42");
+    let f = reviewed_fixture("fix-review-answer-auth", 7).await;
+    let worker = reviewed_worker(vec![
+        Act::Fix,
+        Act::Review(BLOCKING),
+        Act::Answer,
+        Act::Review(BLOCKING),
+        Act::Refused,
+    ]);
+
+    let summary = fix(&f, &worker).await;
+
+    assert_held_for_credentials(&f, &summary, &bins).await;
+    let plan = pending_resume(&f).await;
+    let retry = reviewed_worker(vec![
+        Act::Continue,
+        Act::Review(BLOCKING),
+        Act::FixMore,
+        Act::Review(CLEAN),
+    ]);
+
+    let summary = resume(&f, &plan, &retry).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    let runs = retry.runs();
+    assert_eq!(
+        runs[1].session,
+        review_dir(&runs[0].session, summary.job_id, 2),
+        "round 2 again"
+    );
+}
+
+/// A curator refused its credentials: the fix is not shipped uncurated.
+/// The job is suspended with its curation owed and the cycle held for the
+/// gateway; the resume, without a fixer run or another review, curates
+/// and ships.
+#[tokio::test]
+async fn a_curation_refused_its_credentials_is_had_by_the_resume() {
+    let bins = support::FakeBins::acquire("fix-curate-auth");
+    bins.ok("gh", "https://github.com/acme/widget/pull/42");
+    let mut f = reviewed_fixture("fix-curate-auth", 7).await;
+    f.cfg.review_curate = true;
+    let worker = reviewed_worker(vec![
+        Act::Fix,
+        Act::Review(BLOCKING),
+        Act::Answer,
+        Act::Review(CLEAN),
+        Act::Refused,
+    ]);
+
+    let summary = fix(&f, &worker).await;
+
+    assert_held_for_credentials(&f, &summary, &bins).await;
+    let plan = pending_resume(&f).await;
+    let resumed = reviewed_worker(vec![Act::Curate(Curation::Squash)]);
+
+    let summary = resume(&f, &plan, &resumed).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    let runs = resumed.runs();
+    assert_eq!(runs.len(), 1, "only the curation");
+    assert!(runs[0].prompt.starts_with("curate"), "{}", runs[0].prompt);
+    assert_eq!(shipped_commits(&f), ["fix: the real bug, curated"]);
+}
+
+/// A fix's chain as the store has it: the fix checkpoint's id, and its
+/// chain's counted attempts.
+async fn fix_chain(f: &Fixture) -> (i64, i64) {
+    let checkpoint = f
+        .store
+        .checkpoint_job(f.fid, FindingJobKind::Fix)
+        .await
+        .unwrap()
+        .expect("a checkpoint");
+    let stats = f
+        .store
+        .resume_chain_stats(checkpoint.id, None)
+        .await
+        .unwrap();
+    (checkpoint.id, stats.attempts)
+}
+
+/// A reviewer whose calls failed because the gateway went down under it,
+/// after its token was admitted, did no work for an outage, as one cut
+/// off offline did: nothing ships unreviewed or is counted, and the retry
+/// reviews the round again.
+#[tokio::test]
+async fn a_reviewer_the_gateway_failed_under_is_kept_and_its_round_reviewed_again() {
+    let bins = support::FakeBins::acquire("fix-review-auth-lost");
+    bins.ok("gh", "https://github.com/acme/widget/pull/42");
+    let f = reviewed_fixture("fix-review-auth-lost", 7).await;
+    let worker = reviewed_worker(vec![Act::Fix, Act::ReviewUnreached]).auth_down(REFUSED);
+
+    let summary = fix(&f, &worker).await;
+
+    assert_held_for_credentials(&f, &summary, &bins).await;
+    let plan = pending_resume(&f).await;
+    let retry = reviewed_worker(vec![Act::Continue, Act::Review(CLEAN)]);
+
+    let summary = resume(&f, &plan, &retry).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    let runs = retry.runs();
+    assert_eq!(
+        runs[1].session,
+        review_dir(&runs[0].session, summary.job_id, 1),
+        "round 1 again"
+    );
+}
+
+/// A resume of a fix the review paused between its runs (here a spent
+/// grant, with a round's issues owed) runs no fixer. When its only run, the
+/// owed answer, is refused its credentials or fails offline, it ran
+/// nothing: it is closed as never started, the paused job stays the
+/// checkpoint, and the next resume answers the owed issues instead of
+/// continuing the fixer.
+#[tokio::test]
+async fn a_paused_resume_that_ran_nothing_keeps_what_it_owed() {
+    let host = "api.provider.example";
+    for offline in [false, true] {
+        let bins = support::FakeBins::acquire("fix-paused-refused");
+        bins.ok("gh", "https://github.com/acme/widget/pull/42");
+        let mut f = reviewed_fixture("fix-paused-refused", 3).await;
+        let worker =
+            reviewed_worker(vec![Act::Fix, Act::ReviewKilled(BLOCKING)]).granting(Some(10_000));
+        let summary = fix(&f, &worker).await;
+        assert_eq!(summary.outcome.as_deref(), Some("suspended"), "{summary:?}");
+        let chain = fix_chain(&f).await;
+        let plan = pending_resume(&f).await;
+        f.cfg.network_gate = offline;
+        let cut_off = if offline {
+            reviewed_worker(vec![Act::AnswerFails])
+                .needing(&[host])
+                .offline(&[host])
+        } else {
+            reviewed_worker(vec![Act::Refused])
+        };
+
+        let summary = resume(&f, &plan, &cut_off).await;
+
+        if offline {
+            assert_eq!(summary.unreachable.as_deref(), Some(host), "{summary:?}");
+        } else {
+            assert_held_for_credentials(&f, &summary, &bins).await;
+        }
+        assert_eq!(cut_off.runs().len(), 1, "{offline}: only the answer");
+        assert_eq!(fix_chain(&f).await, chain, "{offline}: the same checkpoint");
+        let closed = f.store.list_jobs(1).await.unwrap();
+        assert_eq!(
+            (closed[0].job.id, closed[0].job.state),
+            (summary.job_id.unwrap(), hunter::domain::JobState::Failed),
+            "{offline}: closed as never started"
+        );
+        f.cfg.network_gate = false;
+        let plan = pending_resume(&f).await;
+        let resumed = reviewed_worker(vec![Act::Answer, Act::Review(CLEAN)]);
+
+        let summary = resume(&f, &plan, &resumed).await;
+
+        assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+        let runs = resumed.runs();
+        assert!(
+            runs[0].prompt.starts_with("answer"),
+            "{offline}: the owed answer first: {}",
+            runs[0].prompt
+        );
+        drop(bins);
+    }
+}
+
+/// A resume that only owes its curation and whose curator is refused its
+/// credentials ran nothing: it is closed as never started, its
+/// predecessor stays the checkpoint, and the chain does not grow however
+/// often the gateway refuses. A later admitted resume curates and ships.
+#[tokio::test]
+async fn refused_curation_only_resumes_grow_no_chain() {
+    let bins = support::FakeBins::acquire("fix-curate-auth-again");
+    bins.ok("gh", "https://github.com/acme/widget/pull/42");
+    let mut f = reviewed_fixture("fix-curate-auth-again", 7).await;
+    f.cfg.review_curate = true;
+    let worker = reviewed_worker(vec![
+        Act::Fix,
+        Act::Review(BLOCKING),
+        Act::Answer,
+        Act::Review(CLEAN),
+        Act::Refused,
+    ]);
+    assert_held_for_credentials(&f, &fix(&f, &worker).await, &bins).await;
+    let chain = fix_chain(&f).await;
+
+    for again in 1..=2 {
+        let plan = pending_resume(&f).await;
+        let refused = reviewed_worker(vec![Act::Refused]);
+
+        let summary = resume(&f, &plan, &refused).await;
+
+        assert_held_for_credentials(&f, &summary, &bins).await;
+        assert_eq!(refused.runs().len(), 1, "{again}: only the curator");
+        assert_eq!(fix_chain(&f).await, chain, "{again}: the same checkpoint");
+        let closed = f.store.list_jobs(1).await.unwrap();
+        assert_eq!(
+            (closed[0].job.id, closed[0].job.state),
+            (summary.job_id.unwrap(), hunter::domain::JobState::Failed),
+            "{again}: closed as never started"
+        );
+    }
+    let plan = pending_resume(&f).await;
+    let resumed = reviewed_worker(vec![Act::Curate(Curation::Squash)]);
+
+    let summary = resume(&f, &plan, &resumed).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    assert_eq!(resumed.runs().len(), 1, "only the curation");
+    assert_eq!(shipped_commits(&f), ["fix: the real bug, curated"]);
+}
+
+/// A curation refused its credentials costs the chain no resume attempt,
+/// as a spent grant does not: a chain one counted attempt short of
+/// `MAX_RESUME_ATTEMPTS` (4), whose next attempt passes its review and has
+/// its curation refused, is not given up; its resume curates and ships.
+#[tokio::test]
+async fn a_refused_curation_costs_the_chain_no_resume_attempt() {
+    let bins = support::FakeBins::acquire("fix-curate-auth-ceiling");
+    bins.ok("gh", "https://github.com/acme/widget/pull/42");
+    let mut f = reviewed_fixture("fix-curate-auth-ceiling", 7).await;
+    f.cfg.review_curate = true;
+    let summary = fix(&f, &reviewed_worker(vec![Act::FixThen(Ending::Capped)])).await;
+    assert_eq!(summary.outcome.as_deref(), Some("suspended"), "{summary:?}");
+    for _ in 0..2 {
+        let plan = pending_resume(&f).await;
+        let capped = reviewed_worker(vec![Act::ContinueThen(Ending::Capped)]);
+        let summary = resume(&f, &plan, &capped).await;
+        assert_eq!(summary.outcome.as_deref(), Some("suspended"), "{summary:?}");
+    }
+    assert_eq!(fix_chain(&f).await.1, 3, "one attempt short of the ceiling");
+    let plan = pending_resume(&f).await;
+    let reviewed = reviewed_worker(vec![Act::FixMore, Act::Review(CLEAN), Act::Refused]);
+
+    let summary = resume(&f, &plan, &reviewed).await;
+
+    assert_held_for_credentials(&f, &summary, &bins).await;
+    assert_eq!(
+        fix_chain(&f).await.1,
+        3,
+        "the refused curation is no attempt"
+    );
+    let plan = pending_resume(&f).await;
+    let resumed = reviewed_worker(vec![Act::Curate(Curation::Squash)]);
+
+    let summary = resume(&f, &plan, &resumed).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    assert_eq!(resumed.runs().len(), 1, "only the curation");
 }
 
 /// A round cut off while a host is unreachable, whose reviewer committed
