@@ -4073,7 +4073,7 @@ async fn an_auto_posted_round_wakes_the_pr_sync() {
     f.store.set_pr_review_auto_post(id, false).await.unwrap();
     // The posted round is out of the way, and the new head is stable.
     let pool = f.pool().await;
-    sqlx::query("UPDATE pr_review_rounds SET post_state = 'posted'")
+    sqlx::query("UPDATE pr_review_posts SET post_state = 'posted'")
         .execute(&pool)
         .await
         .unwrap();
@@ -4306,7 +4306,7 @@ async fn a_post_whose_recording_failed_is_not_posted_again() {
     .await;
     let pool = f.pool().await;
     sqlx::query(
-        "CREATE TRIGGER no_review_ref BEFORE UPDATE OF forge_review_ref ON pr_review_rounds \
+        "CREATE TRIGGER no_review_ref BEFORE UPDATE OF forge_review_ref ON pr_review_posts \
          BEGIN SELECT RAISE(ABORT, 'disk is full'); END",
     )
     .execute(&pool)
@@ -4355,7 +4355,7 @@ async fn a_rebound_review_posts_nothing_of_its_earlier_url() {
     let waiting = record_round(&f, id, ("aaa", "bbb"), &[issue("waiting", None, None)]).await;
     let pool = f.pool().await;
     // Part of the first went up on the earlier PR before its post failed.
-    sqlx::query("UPDATE pr_review_rounds SET landed_at = 1 WHERE id = ?1")
+    sqlx::query("UPDATE pr_review_posts SET landed_at = 1 WHERE round_id = ?1")
         .bind(landed)
         .execute(&pool)
         .await
@@ -4398,7 +4398,7 @@ async fn a_rebound_review_posts_nothing_of_its_earlier_url() {
         ]
     );
 
-    sqlx::query("UPDATE pr_review_rounds SET post_state = 'pending' WHERE id = ?1")
+    sqlx::query("UPDATE pr_review_posts SET post_state = 'pending' WHERE round_id = ?1")
         .bind(landed)
         .execute(&pool)
         .await
@@ -6813,7 +6813,7 @@ async fn an_answer_whose_recording_failed_is_not_posted_again() {
     let (_, inline, _) = judged_round(&f, true).await;
     let pool = f.pool().await;
     sqlx::query(
-        "CREATE TRIGGER no_answer BEFORE UPDATE OF answer ON pr_review_issues \
+        "CREATE TRIGGER no_answer BEFORE UPDATE OF answer ON pr_review_threads \
          BEGIN SELECT RAISE(ABORT, 'disk is full'); END",
     )
     .execute(&pool)
