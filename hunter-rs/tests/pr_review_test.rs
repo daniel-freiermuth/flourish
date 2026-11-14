@@ -54,7 +54,7 @@ impl Fixture {
 
 /// Repo "widget" (GitHub, `REPO_URL`) with a real clone whose origin
 /// carries `main` and branch `feature` one commit ahead, and a hermetic
-/// `pr_review.md` naming the slots these tests assert on.
+/// `review.md` naming the slots these tests assert on.
 async fn fixture(label: &str) -> Fixture {
     let dir = TempDir::new(label);
     let repo = GitRepo::with_branch(&dir, "feature");
@@ -89,7 +89,7 @@ async fn fixture(label: &str) -> Fixture {
     );
     let playbooks = dir.subdir("playbooks");
     std::fs::write(
-        playbooks.join("pr_review.md"),
+        playbooks.join("review.md"),
         "base={{BASE}}\nearlier={{EARLIER_ISSUES}}\nout={{OUT_PATH}}\n{{REPLIES_ONLY}}\n",
     )
     .unwrap();
@@ -733,7 +733,11 @@ async fn rounds_review_from_the_merge_base_then_incrementally() {
         Some(main.as_str())
     );
     assert!(backend.runs()[0].prompt.contains(&format!("base={main}")));
-    assert!(backend.runs()[0].prompt.contains("earlier=[]"));
+    assert!(
+        backend.runs()[0]
+            .prompt
+            .contains("earlier=# Earlier issues\n```json\n[]\n```")
+    );
     let review = f.store.get_pr_review(id).await.unwrap().unwrap();
     assert_eq!(
         review.last_reviewed_sha.as_deref(),
