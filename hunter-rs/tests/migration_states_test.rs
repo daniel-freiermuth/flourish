@@ -1317,3 +1317,171 @@ async fn upgrading_kills_all_but_the_newest_running_job_of_each_place() {
     );
     pool.close().await;
 }
+
+/// Every PR review row, one JSON array per row in the columns of migration
+/// 039's tables: read from those tables before migration 040 (`[0]`), and
+/// from the review model after it (`[1]`). The move kept every row and
+/// column, and every issue's derived state, when both read the same.
+const REVIEW_ROWS: [[&str; 2]; 4] = [
+    [
+        "SELECT json_array(id, review_id, binding, job_id, base_sha, head_sha, merge_base_sha, \
+                verdict, failure, finished_at, post_state, post_error, post_attempts, \
+                posted_at, forge_review_ref, landed_at, review_sent_at) \
+         FROM pr_review_rounds ORDER BY id",
+        "SELECT json_array(r.id, r.review_id, o.binding, r.job_id, r.base_sha, r.head_sha, \
+                r.merge_base_sha, r.verdict, r.failure, r.finished_at, o.post_state, \
+                o.post_error, o.post_attempts, o.posted_at, o.forge_review_ref, o.landed_at, \
+                o.review_sent_at) \
+         FROM review_rounds r JOIN pr_review_posts o ON o.round_id = r.id ORDER BY r.id",
+    ],
+    [
+        "SELECT json_array(id, round_id, kind, blocking, severity, confidence, file, line, \
+                side, summary, detail, inline, thread_ref, thread_gone_at, answer, \
+                resolved_at, resolving, reopened_at, newest_reply_at, answered_through, \
+                replies_json, hidden_replies) \
+         FROM pr_review_issues ORDER BY id",
+        "SELECT json_array(i.id, i.round_id, i.kind, i.blocking, i.severity, i.confidence, \
+                i.file, i.line, i.side, i.summary, i.detail, t.inline, t.thread_ref, \
+                t.thread_gone_at, t.answer, t.resolved_at, t.resolving, t.reopened_at, \
+                t.newest_reply_at, t.answered_through, t.replies_json, t.hidden_replies) \
+         FROM review_issues i JOIN pr_review_threads t ON t.issue_id = i.id ORDER BY i.id",
+    ],
+    [
+        "SELECT json_array(round_id, issue_id, verdict, note, seen_reopened_at, seen_reply_at, \
+                answers_reply_at) \
+         FROM pr_review_verdicts ORDER BY round_id, issue_id",
+        "SELECT json_array(round_id, issue_id, verdict, note, seen_reopened_at, seen_reply_at, \
+                answers_reply_at) \
+         FROM review_verdicts ORDER BY round_id, issue_id",
+    ],
+    [ISSUE_STATES, ISSUE_STATES],
+];
+
+/// Each issue's derived state: (issue, status, judged round, target round,
+/// awaits since).
+const ISSUE_STATES: &str = "SELECT json_array(issue_id, status, judged_round_id, \
+                                   target_round_id, awaits_since) \
+                            FROM pr_review_issue_state ORDER BY issue_id";
+
+async fn review_rows(pool: &SqlitePool, after: bool) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    for pair in REVIEW_ROWS {
+        rows.push(
+            sqlx::query_scalar(pair[usize::from(after)])
+                .fetch_all(pool)
+                .await
+                .unwrap(),
+        );
+    }
+    rows
+}
+
+/// Migration 040 moves every PR review onto the review model: rounds,
+/// issues and verdicts into the shared tables, a round's binding and post
+/// and an issue's thread into the PR tables, each with the id it had, and
+/// every issue's derived state stays as it was for each case the view
+/// tells apart (rebutted over a released round, addressed by a pending
+/// one, reopened with a reply awaiting judgment, never judged). The review
+/// reads back as it did: its rounds with their issues, and the earlier
+/// issues its next round is told, of its current binding only.
+#[tokio::test]
+async fn upgrading_moves_pr_reviews_onto_the_review_model() {
+    let (_dir, path) = scratch("mig-review-model");
+
+    let before_040 = sqlx::migrate!("./migrations")
+        .iter()
+        .position(|m| m.version == 40)
+        .expect("migration 040 exists");
+    let pool = seed_state(&path, before_040).await;
+    sqlx::raw_sql(
+        "INSERT INTO repos (id, name, url, path, forge, default_branch, added_at) VALUES \
+         (1, 'widget', 'https://e/w.git', '/wr/repos/repo-1', 'github', 'main', 1); \
+         INSERT INTO pr_reviews (id, repo_id, pr_number, repo_url, binding, author, base_ref, \
+                                 watch, head_sha, last_reviewed_sha, requested_by, \
+                                 requested_at) VALUES \
+         (5, 1, 7, 'https://e/w.git', 2, 'alice', 'main', 1, 'h2', 'h2', 'op', 1); \
+         INSERT INTO pr_review_rounds (id, review_id, binding, job_id, base_sha, head_sha, \
+                                       merge_base_sha, verdict, failure, finished_at, \
+                                       post_state, post_error, post_attempts, posted_at, \
+                                       forge_review_ref, landed_at, review_sent_at) VALUES \
+         (10, 5, 1, NULL, 'b0', 'h0', 'b0', 'ok', NULL, 100, 'discarded', NULL, 0, NULL, \
+          NULL, NULL, NULL), \
+         (11, 5, 2, NULL, 'm', 'h1', 'm', 'ok', NULL, 200, 'posted', 'flaky', 1, 210, 'R1', \
+          205, 204), \
+         (12, 5, 2, NULL, 'h1', 'h2', 'm', 'ok', NULL, 300, 'pending', NULL, 0, NULL, NULL, \
+          NULL, NULL), \
+         (13, 5, 2, NULL, 'h2', 'h2', NULL, 'failed', 'boom', 400, NULL, NULL, 0, NULL, \
+          NULL, NULL, NULL); \
+         INSERT INTO pr_review_issues (id, round_id, kind, blocking, severity, confidence, \
+                                       file, line, side, summary, detail, inline, \
+                                       thread_ref, thread_gone_at, answer, resolved_at, \
+                                       resolving, reopened_at, replies_json, hidden_replies, \
+                                       newest_reply_at, answered_through) VALUES \
+         (20, 10, 'introduced', 1, 'high', 0.9, 'a.rs', 1, NULL, 'old', '', 0, NULL, NULL, \
+          NULL, NULL, NULL, NULL, '[]', 0, NULL, NULL), \
+         (21, 11, 'introduced', 0, 'low', 0.8, 'a.rs', 3, 'RIGHT', 'fixed one', 'd', 1, \
+          'T21', NULL, 'addressed', 250, NULL, NULL, '[]', 0, NULL, NULL), \
+         (22, 11, 'incomplete', 0, NULL, NULL, 'b.rs', 9, 'LEFT', 'disputed', '', 1, 'T22', \
+          NULL, NULL, NULL, 1, 260, \
+          '[{\"author\":\"alice\",\"body\":\"no\",\"own\":false}]', 1, 270, 265), \
+         (23, 12, 'follow-up', 0, NULL, NULL, NULL, NULL, NULL, 'new', '', 0, NULL, NULL, \
+          NULL, NULL, NULL, NULL, '[]', 0, NULL, NULL); \
+         INSERT INTO pr_review_verdicts (round_id, issue_id, verdict, note, seen_reopened_at, \
+                                         seen_reply_at, answers_reply_at) VALUES \
+         (11, 20, 'rebuttal-accepted', 'argued', NULL, 90, 90), \
+         (12, 21, 'addressed', 'fixed', NULL, NULL, NULL), \
+         (12, 22, 'open', 'still', NULL, 265, 265);",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let before = review_rows(&pool, false).await;
+    assert_eq!(
+        before[3],
+        [
+            "[20,\"rebutted\",11,11,null]",
+            "[21,\"addressed\",12,null,null]",
+            "[22,\"reopened\",12,null,270]",
+            "[23,\"open\",null,null,null]",
+        ],
+        "the seed covers each state"
+    );
+    pool.close().await;
+
+    let store = Store::connect(&path).await.expect("roll forward");
+    let rounds: Vec<(i64, i64, Vec<i64>)> = store
+        .list_pr_review_rounds()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(review, r)| (review, r.id, r.issues.iter().map(|i| i.id).collect()))
+        .collect();
+    assert_eq!(
+        rounds,
+        [
+            (5, 13, vec![]),
+            (5, 12, vec![23]),
+            (5, 11, vec![21, 22]),
+            (5, 10, vec![20])
+        ]
+    );
+    let earlier: Vec<i64> = store
+        .earlier_pr_review_issues(5)
+        .await
+        .unwrap()
+        .iter()
+        .map(|i| i.id)
+        .collect();
+    assert_eq!(earlier, [21, 22, 23], "the current binding's chain only");
+    drop(store);
+
+    let pool = open(&path).await;
+    assert_eq!(review_rows(&pool, true).await, before);
+    let reviews: Vec<String> =
+        sqlx::query_scalar("SELECT json_array(id, subject, pr_review_id) FROM reviews")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(reviews, ["[5,\"pr\",5]"]);
+    pool.close().await;
+}

@@ -20,29 +20,38 @@
 //! both lanes' reads replace with what the forge returned, and whether its
 //! thread is gone from the PR, which any complete read of the PR finds.
 //!
-//! An issue's state is derived, never kept (migration 037's
-//! `pr_review_issue_state`): its status is the newest verdict of a round
-//! not discarded, and what its thread on the PR is to show is the newest
-//! verdict of a round released to the PR (approved, posted, with nothing to
-//! post, or landed in part), a verdict over the thread as it stood before a
-//! human reopened it counting as none. What is recorded besides the
-//! verdicts is only what hunter has said in each thread ([`Said`]). A post
-//! makes every thread it touches show the released judgement
-//! ([`Said::steps`]), so it is idempotent and order-free: two rounds
-//! posting the same judgement say it once, an older round posted after a
-//! newer one says the newer one's, and discarding a round takes its
-//! verdicts back without a write to undo. A round of which any part may
-//! have reached the PR (`landed_at`, marked before each call that may put
-//! it there, and unmarked only when the forge refused its review outright
-//! with nothing of it on the PR) is released for good: it can no longer
-//! be discarded.
+//! A PR review is the `pr` subject of the review model (migration 040,
+//! [`super::review`]): its rounds, issues and verdicts are the shared
+//! `review_*` rows, its row in `reviews` names the request
+//! (`reviews.pr_review_id`), and what only a PR review has extends the
+//! shared rows one to one: a round's binding and post
+//! (`pr_review_posts`), an issue's thread on the PR (`pr_review_threads`).
+//! A review is named by its `pr_reviews` id here, a round and an issue by
+//! their shared rows' ids.
+//!
+//! An issue's state is derived, never kept (the `pr_review_issue_state`
+//! view of migrations 037 and 040): its status is the newest verdict of a
+//! round not discarded, and what its thread on the PR is to show is the
+//! newest verdict of a round released to the PR (approved, posted, with
+//! nothing to post, or landed in part), a verdict over the thread as it
+//! stood before a human reopened it counting as none. What is recorded
+//! besides the verdicts is only what hunter has said in each thread
+//! ([`Said`]). A post makes every thread it touches show the released
+//! judgement ([`Said::steps`]), so it is idempotent and order-free: two
+//! rounds posting the same judgement say it once, an older round posted
+//! after a newer one says the newer one's, and discarding a round takes
+//! its verdicts back without a write to undo. A round of which any part
+//! may have reached the PR (`landed_at`, marked before each call that may
+//! put it there, and unmarked only when the forge refused its review
+//! outright with nothing of it on the PR) is released for good: it can no
+//! longer be discarded.
 
 use std::collections::HashSet;
 use std::time::Duration;
 
 use serde::Serialize;
 
-use super::{ImmediateTx, ReportedIssue, Store};
+use super::{ImmediateTx, ReportedIssue, Store, review};
 use crate::domain::{ForgeName, PrReviewState};
 use crate::forge;
 use crate::types::{PrReviewIssueOut, PrReviewReplyOut, PrReviewRoundOut};
@@ -508,7 +517,7 @@ impl PrReviewRow {
     }
 }
 
-/// What a round said about one earlier issue (`pr_review_verdicts`).
+/// What a round said about one earlier issue (`review_verdicts`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IssueVerdict {
     /// The new commits fix it.
@@ -752,11 +761,13 @@ macro_rules! select_reviews {
                    p.held AS "held!: bool", p.drafts_left_at,
                    (SELECT j.id FROM jobs j
                     WHERE j.pr_review_id = p.id AND j.state = 'running') AS "running_job_id?: i64",
-                   (SELECT MAX(s.awaits_since) FROM pr_review_issues i
-                    JOIN pr_review_rounds rr ON rr.id = i.round_id
+                   (SELECT MAX(s.awaits_since) FROM reviews rv
+                    JOIN review_rounds rr ON rr.review_id = rv.id
+                    JOIN pr_review_posts o ON o.round_id = rr.id
+                    JOIN review_issues i ON i.round_id = rr.id
                     JOIN pr_review_issue_state s ON s.issue_id = i.id
-                    WHERE rr.review_id = p.id
-                      AND rr.binding = p.binding) AS "awaiting_since?: i64"
+                    WHERE rv.pr_review_id = p.id
+                      AND o.binding = p.binding) AS "awaiting_since?: i64"
             FROM pr_reviews p
             JOIN repos r ON r.id = p.repo_id
             WHERE r.deleted_at IS NULL
@@ -937,13 +948,17 @@ impl Store {
         )
         .fetch_one(&mut *tx)
         .await?;
+        add_review(&mut tx, id).await?;
         // An earlier binding's rounds still to post are about another PR:
         // never posted, here or anywhere. One part of which landed stays as
         // it is, what is on that PR being said; posting skips it all the
         // same ([`Self::approved_pr_review_rounds`]).
         sqlx::query!(
-            "UPDATE pr_review_rounds SET post_state = 'discarded' \
-             WHERE review_id = ?1 AND post_state IN ('pending', 'approved') \
+            "UPDATE pr_review_posts SET post_state = 'discarded' \
+             WHERE round_id IN (SELECT r.id FROM review_rounds r \
+                                JOIN reviews rv ON rv.id = r.review_id \
+                                WHERE rv.pr_review_id = ?1) \
+               AND post_state IN ('pending', 'approved') \
                AND landed_at IS NULL \
                AND binding != (SELECT binding FROM pr_reviews WHERE id = ?1)",
             id
@@ -1023,13 +1038,15 @@ impl Store {
     ) -> sqlx::Result<PostDecided> {
         let mut tx = ImmediateTx::begin(&self.pool).await?;
         let row = sqlx::query!(
-            r#"SELECT r.post_state, r.landed_at IS NOT NULL AS "landed!: bool",
-                      r.binding = p.binding AS "current!: bool",
+            r#"SELECT o.post_state, o.landed_at IS NOT NULL AS "landed!: bool",
+                      o.binding = p.binding AS "current!: bool",
                       p.state AS "state!: PrReviewState", p.id AS "review_id!: i64"
-               FROM pr_review_rounds r
-               JOIN pr_reviews p ON p.id = r.review_id
+               FROM pr_review_posts o
+               JOIN review_rounds r ON r.id = o.round_id
+               JOIN reviews rv ON rv.id = r.review_id
+               JOIN pr_reviews p ON p.id = rv.pr_review_id
                JOIN repos rp ON rp.id = p.repo_id
-               WHERE r.id = ?1 AND rp.deleted_at IS NULL"#,
+               WHERE o.round_id = ?1 AND rp.deleted_at IS NULL"#,
             round_id
         )
         .fetch_optional(&mut *tx)
@@ -1056,8 +1073,8 @@ impl Store {
             }
             PostDecision::Approve => {
                 sqlx::query!(
-                    "UPDATE pr_review_rounds SET post_state = 'approved', post_error = NULL, \
-                         post_attempts = 0 WHERE id = ?1",
+                    "UPDATE pr_review_posts SET post_state = 'approved', post_error = NULL, \
+                         post_attempts = 0 WHERE round_id = ?1",
                     round_id
                 )
                 .execute(&mut *tx)
@@ -1070,7 +1087,7 @@ impl Store {
             }
             PostDecision::Discard => {
                 sqlx::query!(
-                    "UPDATE pr_review_rounds SET post_state = 'discarded' WHERE id = ?1",
+                    "UPDATE pr_review_posts SET post_state = 'discarded' WHERE round_id = ?1",
                     round_id
                 )
                 .execute(&mut *tx)
@@ -1088,17 +1105,19 @@ impl Store {
     /// one's are about another PR ([`Self::request_pr_review`]).
     pub async fn approved_pr_review_rounds(&self) -> sqlx::Result<Vec<ApprovedRound>> {
         let rows = sqlx::query!(
-            r#"SELECT r.id AS "id!: i64", r.review_id AS "review_id!: i64",
-                      r.binding AS "binding!: i64", r.base_sha,
-                      r.head_sha, r.forge_review_ref,
-                      r.review_sent_at IS NOT NULL AS "review_sent!: bool",
+            r#"SELECT r.id AS "id!: i64", p.id AS "review_id!: i64",
+                      o.binding AS "binding!: i64", r.base_sha,
+                      r.head_sha, o.forge_review_ref,
+                      o.review_sent_at IS NOT NULL AS "review_sent!: bool",
                       r.base_sha IS NOT COALESCE(r.merge_base_sha, r.base_sha)
                         AS "incremental!: bool"
-               FROM pr_review_rounds r
-               JOIN pr_reviews p ON p.id = r.review_id
+               FROM pr_review_posts o
+               JOIN review_rounds r ON r.id = o.round_id
+               JOIN reviews rv ON rv.id = r.review_id
+               JOIN pr_reviews p ON p.id = rv.pr_review_id
                JOIN repos rp ON rp.id = p.repo_id
-               WHERE r.post_state = 'approved' AND p.state = 'open'
-                 AND r.binding = p.binding AND rp.deleted_at IS NULL
+               WHERE o.post_state = 'approved' AND p.state = 'open'
+                 AND o.binding = p.binding AND rp.deleted_at IS NULL
                ORDER BY r.finished_at, r.id"#
         )
         .fetch_all(&self.pool)
@@ -1121,12 +1140,14 @@ impl Store {
     /// Round `round_id`'s issues as a post needs them, blocking first.
     pub async fn pr_review_round_issues(&self, round_id: i64) -> sqlx::Result<Vec<PostableIssue>> {
         let rows = sqlx::query!(
-            r#"SELECT id AS "id!: i64", kind, blocking AS "blocking!: bool", severity, file,
-                      line, side, summary, detail, inline AS "posted_inline!: bool",
-                      inline AND thread_ref IS NULL AND thread_gone_at IS NULL
+            r#"SELECT i.id AS "id!: i64", i.kind, i.blocking AS "blocking!: bool", i.severity,
+                      i.file, i.line, i.side, i.summary, i.detail,
+                      t.inline AS "posted_inline!: bool",
+                      t.inline AND t.thread_ref IS NULL AND t.thread_gone_at IS NULL
                         AS "unread_ref!: bool"
-               FROM pr_review_issues WHERE round_id = ?1
-               ORDER BY blocking DESC, id"#,
+               FROM review_issues i JOIN pr_review_threads t ON t.issue_id = i.id
+               WHERE i.round_id = ?1
+               ORDER BY i.blocking DESC, i.id"#,
             round_id
         )
         .fetch_all(&self.pool)
@@ -1166,20 +1187,21 @@ impl Store {
         round_id: i64,
     ) -> sqlx::Result<Vec<ThreadToSettle>> {
         let rows = sqlx::query!(
-            r#"SELECT i.id AS "issue_id!: i64", i.thread_ref AS "thread_ref!",
-                      i.answer, i.answered_through,
-                      i.resolved_at IS NOT NULL AS "resolved!: bool",
-                      i.answer IS NULL AND i.reopened_at IS NOT NULL AS "reopened!: bool",
+            r#"SELECT i.id AS "issue_id!: i64", t.thread_ref AS "thread_ref!",
+                      t.answer, t.answered_through,
+                      t.resolved_at IS NOT NULL AS "resolved!: bool",
+                      t.answer IS NULL AND t.reopened_at IS NOT NULL AS "reopened!: bool",
                       v.round_id AS "round_id!: i64", v.verdict, v.note, v.answers_reply_at,
                       v.seen_reply_at, r.head_sha
-               FROM pr_review_issues i
+               FROM review_issues i
+               JOIN pr_review_threads t ON t.issue_id = i.id
                JOIN pr_review_issue_state s ON s.issue_id = i.id
-               JOIN pr_review_verdicts v ON v.round_id = s.target_round_id
-                                        AND v.issue_id = i.id
-               JOIN pr_review_rounds r ON r.id = v.round_id
-               WHERE i.thread_ref IS NOT NULL AND i.thread_gone_at IS NULL
+               JOIN review_verdicts v ON v.round_id = s.target_round_id
+                                     AND v.issue_id = i.id
+               JOIN review_rounds r ON r.id = v.round_id
+               WHERE t.thread_ref IS NOT NULL AND t.thread_gone_at IS NULL
                  AND (i.round_id = ?1
-                      OR EXISTS (SELECT 1 FROM pr_review_verdicts w
+                      OR EXISTS (SELECT 1 FROM review_verdicts w
                                  WHERE w.round_id = ?1 AND w.issue_id = i.id))
                ORDER BY i.id"#,
             round_id
@@ -1228,10 +1250,10 @@ impl Store {
         let mut tx = ImmediateTx::begin(&self.pool).await?;
         let word = verdict.as_str();
         sqlx::query!(
-            "UPDATE pr_review_issues SET answer = ?2, resolving = NULL, \
+            "UPDATE pr_review_threads SET answer = ?2, resolving = NULL, \
                  answered_through = CASE WHEN ?3 IS NULL THEN answered_through \
                                          ELSE MAX(COALESCE(answered_through, ?3), ?3) END \
-             WHERE id = ?1",
+             WHERE issue_id = ?1",
             issue_id,
             word,
             answers_reply_at
@@ -1256,8 +1278,8 @@ impl Store {
     ) -> sqlx::Result<()> {
         let mut tx = ImmediateTx::begin(&self.pool).await?;
         sqlx::query!(
-            "UPDATE pr_review_rounds SET forge_review_ref = ?2 \
-             WHERE id = ?1 AND post_state = 'approved'",
+            "UPDATE pr_review_posts SET forge_review_ref = ?2 \
+             WHERE round_id = ?1 AND post_state = 'approved'",
             round_id,
             review_ref
         )
@@ -1299,7 +1321,9 @@ impl Store {
         let mut tx = ImmediateTx::begin(&self.pool).await?;
         for (issue, thread) in found {
             sqlx::query!(
-                "UPDATE pr_review_issues SET thread_ref = ?3 WHERE id = ?1 AND round_id = ?2",
+                "UPDATE pr_review_threads SET thread_ref = ?3 \
+                 WHERE issue_id = ?1 \
+                   AND issue_id IN (SELECT id FROM review_issues WHERE round_id = ?2)",
                 issue,
                 round_id,
                 thread
@@ -1335,7 +1359,7 @@ impl Store {
         resolved: bool,
     ) -> sqlx::Result<()> {
         sqlx::query!(
-            "UPDATE pr_review_issues SET resolving = ?2 WHERE id = ?1",
+            "UPDATE pr_review_threads SET resolving = ?2 WHERE issue_id = ?1",
             issue_id,
             resolved
         )
@@ -1355,9 +1379,9 @@ impl Store {
     ) -> sqlx::Result<()> {
         let now = now_ms();
         sqlx::query!(
-            "UPDATE pr_review_issues SET resolved_at = CASE WHEN ?2 THEN ?3 END, \
+            "UPDATE pr_review_threads SET resolved_at = CASE WHEN ?2 THEN ?3 END, \
                  resolving = NULL \
-             WHERE id = ?1",
+             WHERE issue_id = ?1",
             issue_id,
             resolved,
             now
@@ -1373,9 +1397,9 @@ impl Store {
     pub(super) async fn record_pr_review_round_posted(&self, round_id: i64) -> sqlx::Result<()> {
         let now = now_ms();
         sqlx::query!(
-            "UPDATE pr_review_rounds SET post_state = 'posted', posted_at = ?2, \
+            "UPDATE pr_review_posts SET post_state = 'posted', posted_at = ?2, \
                  post_error = NULL \
-             WHERE id = ?1 AND post_state = 'approved'",
+             WHERE round_id = ?1 AND post_state = 'approved'",
             round_id,
             now
         )
@@ -1395,10 +1419,10 @@ impl Store {
         why: &str,
     ) -> sqlx::Result<i64> {
         let attempts = sqlx::query_scalar!(
-            r#"UPDATE pr_review_rounds SET post_attempts = post_attempts + 1, post_error = ?2,
+            r#"UPDATE pr_review_posts SET post_attempts = post_attempts + 1, post_error = ?2,
                    post_state = CASE WHEN post_attempts + 1 >= ?3 THEN 'pending'
                                      ELSE post_state END
-               WHERE id = ?1 AND post_state = 'approved'
+               WHERE round_id = ?1 AND post_state = 'approved'
                RETURNING post_attempts AS "attempts!: i64""#,
             round_id,
             why,
@@ -1439,7 +1463,7 @@ impl Store {
         let mut tx = ImmediateTx::begin(&self.pool).await?;
         let now = now_ms();
         sqlx::query!(
-            "UPDATE pr_review_rounds SET review_sent_at = ?2 WHERE id = ?1",
+            "UPDATE pr_review_posts SET review_sent_at = ?2 WHERE round_id = ?1",
             round_id,
             now
         )
@@ -1463,11 +1487,12 @@ impl Store {
     /// ([`AdminStore::unmark_pr_review_sent`](super::AdminStore::unmark_pr_review_sent)).
     pub(super) async fn unmark_pr_review_sent(&self, round_id: i64) -> sqlx::Result<()> {
         sqlx::query!(
-            "UPDATE pr_review_rounds SET review_sent_at = NULL, \
-                 landed_at = CASE WHEN EXISTS (SELECT 1 FROM pr_review_issues \
-                                               WHERE round_id = ?1 AND inline) \
+            "UPDATE pr_review_posts SET review_sent_at = NULL, \
+                 landed_at = CASE WHEN EXISTS (SELECT 1 FROM review_issues i \
+                                               JOIN pr_review_threads t ON t.issue_id = i.id \
+                                               WHERE i.round_id = ?1 AND t.inline) \
                                   THEN landed_at END \
-             WHERE id = ?1",
+             WHERE round_id = ?1",
             round_id
         )
         .execute(&self.pool)
@@ -1617,21 +1642,22 @@ impl Store {
     pub async fn list_pr_review_rounds(&self) -> sqlx::Result<Vec<(i64, PrReviewRoundOut)>> {
         let rounds = sqlx::query!(
             r#"
-            SELECT r.id AS "id!: i64", r.review_id AS "review_id!: i64", r.job_id, r.base_sha,
+            SELECT r.id AS "id!: i64", rv.pr_review_id AS "review_id!: i64", r.job_id, r.base_sha,
                    r.head_sha, r.verdict, r.failure, r.finished_at AS "finished_at!: i64",
-                   r.post_state, r.post_error, r.posted_at,
-                   r.landed_at IS NOT NULL AS "landed!: bool",
-                   (SELECT COUNT(*) FROM pr_review_verdicts v
-                    JOIN pr_review_issues i ON i.id = v.issue_id
+                   o.post_state, o.post_error, o.posted_at,
+                   o.landed_at IS NOT NULL AS "landed!: bool",
+                   (SELECT COUNT(*) FROM review_verdicts v
+                    JOIN pr_review_threads t ON t.issue_id = v.issue_id
                     WHERE v.round_id = r.id AND v.verdict != 'open'
-                      AND i.inline AND i.thread_gone_at IS NULL) AS "resolutions!: i64",
-                   (SELECT COUNT(*) FROM pr_review_verdicts v
-                    JOIN pr_review_issues i ON i.id = v.issue_id
+                      AND t.inline AND t.thread_gone_at IS NULL) AS "resolutions!: i64",
+                   (SELECT COUNT(*) FROM review_verdicts v
+                    JOIN pr_review_threads t ON t.issue_id = v.issue_id
                     WHERE v.round_id = r.id AND v.verdict = 'open'
-                      AND i.inline AND i.thread_gone_at IS NULL
+                      AND t.inline AND t.thread_gone_at IS NULL
                       AND (v.answers_reply_at IS NOT NULL
-                           OR i.answer IN ('addressed', 'rebuttal-accepted'))) AS "answers!: i64"
-            FROM pr_review_rounds r
+                           OR t.answer IN ('addressed', 'rebuttal-accepted'))) AS "answers!: i64"
+            FROM review_rounds r JOIN pr_review_posts o ON o.round_id = r.id
+            JOIN reviews rv ON rv.id = r.review_id
             ORDER BY r.finished_at DESC, r.id DESC
             "#
         )
@@ -1642,18 +1668,19 @@ impl Store {
             SELECT i.id AS "id!: i64", i.round_id AS "round_id!: i64", i.kind,
                    i.blocking AS "blocking!: bool", i.severity, i.confidence, i.file, i.line,
                    i.side, i.summary, i.detail,
-                   i.inline AS "posted_inline!: bool",
+                   t.inline AS "posted_inline!: bool",
                    s.status AS "status!: String",
-                   i.resolved_at IS NOT NULL AS "resolved_on_forge!: bool",
-                   (SELECT NULLIF(v.note, '') FROM pr_review_verdicts v
+                   t.resolved_at IS NOT NULL AS "resolved_on_forge!: bool",
+                   (SELECT NULLIF(v.note, '') FROM review_verdicts v
                     WHERE v.round_id = s.judged_round_id AND v.issue_id = i.id)
                      AS "verdict_note: String",
-                   i.replies_json, i.hidden_replies AS "hidden_replies!: i64",
-                   s.awaits_since IS NOT NULL AND r.binding = p.binding
+                   t.replies_json, t.hidden_replies AS "hidden_replies!: i64",
+                   s.awaits_since IS NOT NULL AND o.binding = p.binding
                      AS "awaits_judgment!: bool"
-            FROM pr_review_issues i JOIN pr_review_issue_state s ON s.issue_id = i.id
-            JOIN pr_review_rounds r ON r.id = i.round_id
-            JOIN pr_reviews p ON p.id = r.review_id
+            FROM review_issues i JOIN pr_review_threads t ON t.issue_id = i.id
+            JOIN pr_review_issue_state s ON s.issue_id = i.id
+            JOIN review_rounds r ON r.id = i.round_id JOIN pr_review_posts o ON o.round_id = r.id
+            JOIN reviews rv ON rv.id = r.review_id JOIN pr_reviews p ON p.id = rv.pr_review_id
             ORDER BY i.round_id, i.blocking DESC, i.id
             "#
         )
@@ -1740,11 +1767,14 @@ impl Store {
     pub async fn earlier_pr_review_issues(&self, id: i64) -> sqlx::Result<Vec<EarlierIssue>> {
         let rounds = sqlx::query!(
             r#"
-            SELECT id AS "id!: i64", base_sha, head_sha, verdict = 'ok' AS "finished!: bool"
-            FROM pr_review_rounds
-            WHERE review_id = ?1 AND verdict != 'failed'
-              AND binding = (SELECT binding FROM pr_reviews WHERE id = ?1)
-            ORDER BY finished_at, id
+            SELECT r.id AS "id!: i64", r.base_sha, r.head_sha,
+                   r.verdict = 'ok' AS "finished!: bool"
+            FROM review_rounds r
+            JOIN pr_review_posts o ON o.round_id = r.id
+            JOIN reviews rv ON rv.id = r.review_id
+            WHERE rv.pr_review_id = ?1 AND r.verdict != 'failed'
+              AND o.binding = (SELECT binding FROM pr_reviews WHERE id = ?1)
+            ORDER BY r.finished_at, r.id
             "#,
             id
         )
@@ -1763,16 +1793,20 @@ impl Store {
             r#"
             SELECT i.id AS "id!: i64", i.round_id AS "round_id!: i64", i.kind,
                    i.blocking AS "blocking!: bool", i.severity, i.file, i.line, i.side,
-                   i.summary, i.detail, i.thread_ref, i.reopened_at,
+                   i.summary, i.detail, t.thread_ref, t.reopened_at,
                    s.status AS "status!: String", s.awaits_since AS "awaits_since: i64",
-                   i.replies_json,
-                   i.resolved_at IS NULL AS "unresolved!: bool",
-                   i.thread_gone_at IS NOT NULL AS "gone!: bool",
-                   r.post_state IS NOT NULL AND r.post_state = 'discarded' AS "discarded!: bool"
-            FROM pr_review_issues i JOIN pr_review_rounds r ON r.id = i.round_id
+                   t.replies_json,
+                   t.resolved_at IS NULL AS "unresolved!: bool",
+                   t.thread_gone_at IS NOT NULL AS "gone!: bool",
+                   o.post_state IS NOT NULL AND o.post_state = 'discarded' AS "discarded!: bool"
+            FROM review_issues i
+            JOIN pr_review_threads t ON t.issue_id = i.id
+            JOIN review_rounds r ON r.id = i.round_id
+            JOIN pr_review_posts o ON o.round_id = r.id
+            JOIN reviews rv ON rv.id = r.review_id
             JOIN pr_review_issue_state s ON s.issue_id = i.id
-            WHERE r.review_id = ?1
-              AND r.binding = (SELECT binding FROM pr_reviews WHERE id = ?1)
+            WHERE rv.pr_review_id = ?1
+              AND o.binding = (SELECT binding FROM pr_reviews WHERE id = ?1)
             ORDER BY r.finished_at, r.id, i.id
             "#,
             id
@@ -1814,12 +1848,16 @@ impl Store {
     /// binding's: an earlier one's threads are on another PR.
     pub async fn posted_pr_review_issues(&self, id: i64) -> sqlx::Result<Vec<(i64, String)>> {
         let rows = sqlx::query!(
-            r#"SELECT i.id AS "id!: i64", i.thread_ref AS "thread_ref!"
-               FROM pr_review_issues i JOIN pr_review_rounds r ON r.id = i.round_id
-               WHERE r.review_id = ?1 AND i.thread_ref IS NOT NULL
-                 AND r.binding = (SELECT binding FROM pr_reviews WHERE id = ?1)
-                 AND i.thread_gone_at IS NULL
-               ORDER BY i.id"#,
+            r#"SELECT t.issue_id AS "id!: i64", t.thread_ref AS "thread_ref!"
+               FROM pr_review_threads t
+               JOIN review_issues i ON i.id = t.issue_id
+               JOIN pr_review_posts o ON o.round_id = i.round_id
+               JOIN review_rounds r ON r.id = i.round_id
+               JOIN reviews rv ON rv.id = r.review_id
+               WHERE rv.pr_review_id = ?1 AND t.thread_ref IS NOT NULL
+                 AND o.binding = (SELECT binding FROM pr_reviews WHERE id = ?1)
+                 AND t.thread_gone_at IS NULL
+               ORDER BY t.issue_id"#,
             id
         )
         .fetch_all(&self.pool)
@@ -1960,23 +1998,27 @@ impl Store {
             PrReviewRound::Partial { why, .. } => ("partial", Some(why)),
             PrReviewRound::Failed(why) => ("failed", Some(why)),
         };
-        let round_id = sqlx::query_scalar!(
-            r#"INSERT INTO pr_review_rounds
-                   (review_id, job_id, base_sha, head_sha, verdict, failure, finished_at,
-                    merge_base_sha, binding)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-               RETURNING id AS "id!: i64""#,
-            id,
-            job_id,
-            base,
-            head,
-            verdict,
-            failure,
-            now,
-            merge_base,
-            binding
+        let review_id = sqlx::query_scalar!(
+            r#"SELECT id AS "id!: i64" FROM reviews WHERE pr_review_id = ?1"#,
+            id
         )
         .fetch_one(&mut *tx)
+        .await?;
+        let round_id = review::insert_round(
+            &mut tx,
+            review_id,
+            job_id,
+            (base, head, merge_base),
+            (verdict, failure),
+            now,
+        )
+        .await?;
+        sqlx::query!(
+            "INSERT INTO pr_review_posts (round_id, binding) VALUES (?1, ?2)",
+            round_id,
+            binding
+        )
+        .execute(&mut *tx)
         .await?;
         if let PrReviewRound::Ok {
             issues, verdicts, ..
@@ -2102,6 +2144,19 @@ impl Store {
     }
 }
 
+/// Give review `id` its row in the review model (migration 040), which its
+/// rounds belong to, unless an earlier request did.
+async fn add_review(tx: &mut sqlx::SqliteConnection, id: i64) -> sqlx::Result<()> {
+    sqlx::query!(
+        "INSERT INTO reviews (subject, pr_review_id) VALUES ('pr', ?1) \
+         ON CONFLICT (pr_review_id) DO NOTHING",
+        id
+    )
+    .execute(&mut *tx)
+    .await?;
+    Ok(())
+}
+
 /// Record what the request made at `now` of open review `id`, as it now
 /// stands, waits for ([`Store::request_pr_review`]): a round, unless one
 /// reviewed its head and no news in a thread of its binding awaits
@@ -2113,10 +2168,12 @@ impl Store {
 async fn record_request(tx: &mut sqlx::SqliteConnection, id: i64, now: i64) -> sqlx::Result<bool> {
     let asks = sqlx::query_scalar!(
         r#"SELECT (p.head_sha IS NULL OR p.head_sha IS NOT p.last_reviewed_sha
-                   OR EXISTS (SELECT 1 FROM pr_review_issues i
-                              JOIN pr_review_rounds rr ON rr.id = i.round_id
+                   OR EXISTS (SELECT 1 FROM reviews rv
+                              JOIN review_rounds rr ON rr.review_id = rv.id
+                              JOIN pr_review_posts o ON o.round_id = rr.id
+                              JOIN review_issues i ON i.round_id = rr.id
                               JOIN pr_review_issue_state s ON s.issue_id = i.id
-                              WHERE rr.review_id = p.id AND rr.binding = p.binding
+                              WHERE rv.pr_review_id = p.id AND o.binding = p.binding
                                 AND s.awaits_since IS NOT NULL)) AS "asks!: bool"
            FROM pr_reviews p WHERE p.id = ?1 AND p.state = 'open'"#,
         id
@@ -2172,9 +2229,9 @@ async fn observe_threads(
         let replies = serde_json::to_string(&t.replies).unwrap_or_else(|_| "[]".to_owned());
         let newest_reply_at = t.newest_reply_at();
         sqlx::query!(
-            "UPDATE pr_review_issues SET replies_json = ?2, hidden_replies = ?3, \
+            "UPDATE pr_review_threads SET replies_json = ?2, hidden_replies = ?3, \
                  newest_reply_at = ?4 \
-             WHERE id = ?1",
+             WHERE issue_id = ?1",
             t.issue_id,
             replies,
             t.hidden,
@@ -2188,9 +2245,9 @@ async fn observe_threads(
             // reopen gets a `reopened_at` past the last one's, so no
             // verdict's `seen_reopened_at` names it.
             reopened += sqlx::query!(
-                "UPDATE pr_review_issues SET answer = NULL, resolved_at = NULL, \
+                "UPDATE pr_review_threads SET answer = NULL, resolved_at = NULL, \
                      reopened_at = MAX(?2, COALESCE(reopened_at + 1, ?2)) \
-                 WHERE id = ?1 AND resolved_at IS NOT NULL AND resolved_at <= ?3 \
+                 WHERE issue_id = ?1 AND resolved_at IS NOT NULL AND resolved_at <= ?3 \
                    AND resolving IS NOT 0",
                 t.issue_id,
                 now,
@@ -2203,10 +2260,10 @@ async fn observe_threads(
         // Hunter's own step, found taken: recorded as
         // `record_pr_review_thread_resolution` records it.
         sqlx::query!(
-            "UPDATE pr_review_issues \
+            "UPDATE pr_review_threads \
              SET resolved_at = CASE WHEN ?2 THEN COALESCE(resolved_at, ?3) END, \
                  resolving = NULL \
-             WHERE id = ?1 AND resolving = ?2",
+             WHERE issue_id = ?1 AND resolving = ?2",
             t.issue_id,
             t.resolved,
             now
@@ -2217,11 +2274,12 @@ async fn observe_threads(
     Ok(reopened)
 }
 
-/// Record what kept round `round_id` of review `review_id` wrote: its
-/// `issues` and its `verdicts` on earlier issues, and its post state:
-/// `approved` when the review posts automatically, `pending` otherwise,
-/// when it has something to post, none when it has not, and `discarded`
-/// when the round is of an earlier binding than the review's now (see
+/// Record what kept round `round_id` of review `review_id` (its
+/// `pr_reviews` id) wrote: its `issues`, each with its thread's row, and
+/// its `verdicts` on earlier issues, and its post state: `approved` when
+/// the review posts automatically, `pending` otherwise, when it has
+/// something to post, none when it has not, and `discarded` when the
+/// round is of an earlier binding than the review's now (see
 /// [`Store::record_pr_review_round`]).
 async fn record_kept(
     tx: &mut sqlx::SqliteConnection,
@@ -2230,41 +2288,23 @@ async fn record_kept(
     verdicts: &[Verdict],
 ) -> sqlx::Result<()> {
     for i in issues {
-        // The column takes only the two words a forge knows; anything
-        // else is the reviewer not saying.
-        let side = i
-            .side
-            .as_deref()
-            .map(str::to_ascii_uppercase)
-            .filter(|s| s == "RIGHT" || s == "LEFT");
+        let issue_id = review::insert_issue(&mut *tx, round_id, i).await?;
         sqlx::query!(
-            "INSERT INTO pr_review_issues \
-                 (round_id, kind, blocking, severity, confidence, file, line, \
-                  side, summary, detail) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            round_id,
-            i.kind,
-            i.blocking,
-            i.severity,
-            i.confidence,
-            i.file,
-            i.line,
-            side,
-            i.summary,
-            i.detail
+            "INSERT INTO pr_review_threads (issue_id) VALUES (?1)",
+            issue_id
         )
         .execute(&mut *tx)
         .await?;
     }
-    record_verdicts(&mut *tx, (review_id, round_id), verdicts).await?;
+    record_verdicts(&mut *tx, round_id, verdicts).await?;
     let says = !issues.is_empty() || verdicts_say_something(&mut *tx, round_id).await?;
     sqlx::query!(
-        "UPDATE pr_review_rounds SET post_state = \
+        "UPDATE pr_review_posts SET post_state = \
              CASE WHEN binding != (SELECT binding FROM pr_reviews WHERE id = ?2) \
                   THEN 'discarded' \
                   WHEN (SELECT auto_post FROM pr_reviews WHERE id = ?2) \
                   THEN 'approved' ELSE 'pending' END \
-         WHERE id = ?1 AND ?3",
+         WHERE round_id = ?1 AND ?3",
         round_id,
         review_id,
         says
@@ -2282,7 +2322,9 @@ async fn record_inline(
 ) -> sqlx::Result<()> {
     for issue in inline {
         sqlx::query!(
-            "UPDATE pr_review_issues SET inline = 1 WHERE id = ?1 AND round_id = ?2",
+            "UPDATE pr_review_threads SET inline = 1 \
+             WHERE issue_id = ?1 \
+               AND issue_id IN (SELECT id FROM review_issues WHERE round_id = ?2)",
             issue,
             round_id
         )
@@ -2297,8 +2339,8 @@ async fn mark_gone(tx: &mut sqlx::SqliteConnection, gone: &[i64]) -> sqlx::Resul
     let now = now_ms();
     for issue in gone {
         sqlx::query!(
-            "UPDATE pr_review_issues SET thread_gone_at = COALESCE(thread_gone_at, ?2) \
-             WHERE id = ?1",
+            "UPDATE pr_review_threads SET thread_gone_at = COALESCE(thread_gone_at, ?2) \
+             WHERE issue_id = ?1",
             issue,
             now
         )
@@ -2308,31 +2350,31 @@ async fn mark_gone(tx: &mut sqlx::SqliteConnection, gone: &[i64]) -> sqlx::Resul
     Ok(())
 }
 
-/// Record round `round_id`'s `verdicts` on earlier issues of review
-/// `review_id`. A verdict on an issue of another review or another
-/// binding, or of this very round, is dropped: the reviewer was never
-/// shown it.
+/// Record round `round_id`'s `verdicts` on earlier issues of its review.
+/// A verdict on an issue of another review or another binding, or of this
+/// very round, is dropped: the reviewer was never shown it.
 async fn record_verdicts(
     tx: &mut sqlx::SqliteConnection,
-    (review_id, round_id): (i64, i64),
+    round_id: i64,
     verdicts: &[Verdict],
 ) -> sqlx::Result<()> {
     for v in verdicts {
         let word = v.verdict.as_str();
         sqlx::query!(
-            "INSERT INTO pr_review_verdicts \
+            "INSERT INTO review_verdicts \
                  (round_id, issue_id, verdict, note, answers_reply_at, seen_reopened_at, \
                   seen_reply_at) \
-             SELECT ?1, i.id, ?3, ?4, ?6, ?7, ?8 FROM pr_review_issues i \
-             JOIN pr_review_rounds r ON r.id = i.round_id \
-             WHERE i.id = ?2 AND r.review_id = ?5 AND r.id != ?1 \
-               AND r.binding = (SELECT binding FROM pr_review_rounds WHERE id = ?1) \
+             SELECT ?1, i.id, ?3, ?4, ?5, ?6, ?7 FROM review_issues i \
+             JOIN review_rounds r ON r.id = i.round_id \
+             JOIN pr_review_posts o ON o.round_id = r.id \
+             WHERE i.id = ?2 AND r.id != ?1 \
+               AND r.review_id = (SELECT review_id FROM review_rounds WHERE id = ?1) \
+               AND o.binding = (SELECT binding FROM pr_review_posts WHERE round_id = ?1) \
              ON CONFLICT DO NOTHING",
             round_id,
             v.issue_id,
             word,
             v.note,
-            review_id,
             v.answers_reply_at,
             v.seen_reopened_at,
             v.seen_reply_at
@@ -2353,15 +2395,16 @@ async fn verdicts_say_something(
     round_id: i64,
 ) -> sqlx::Result<bool> {
     let rows = sqlx::query!(
-        r#"SELECT v.verdict, v.answers_reply_at, i.answer, i.answered_through,
-                  i.resolved_at IS NOT NULL AS "resolved!: bool",
-                  i.answer IS NULL AND i.reopened_at IS NOT NULL AS "reopened!: bool"
-           FROM pr_review_verdicts v
-           JOIN pr_review_issues i ON i.id = v.issue_id
-           JOIN pr_review_rounds ir ON ir.id = i.round_id
-           WHERE v.round_id = ?1 AND i.reopened_at IS v.seen_reopened_at
-             AND ((i.inline AND i.thread_gone_at IS NULL)
-                  OR ir.post_state IN ('pending', 'approved'))"#,
+        r#"SELECT v.verdict, v.answers_reply_at, t.answer, t.answered_through,
+                  t.resolved_at IS NOT NULL AS "resolved!: bool",
+                  t.answer IS NULL AND t.reopened_at IS NOT NULL AS "reopened!: bool"
+           FROM review_verdicts v
+           JOIN pr_review_threads t ON t.issue_id = v.issue_id
+           JOIN review_issues i ON i.id = v.issue_id
+           JOIN pr_review_posts io ON io.round_id = i.round_id
+           WHERE v.round_id = ?1 AND t.reopened_at IS v.seen_reopened_at
+             AND ((t.inline AND t.thread_gone_at IS NULL)
+                  OR io.post_state IN ('pending', 'approved'))"#,
         round_id
     )
     .fetch_all(&mut *tx)
@@ -2384,7 +2427,7 @@ async fn verdicts_say_something(
 async fn mark_landed(tx: &mut sqlx::SqliteConnection, round_id: i64) -> sqlx::Result<()> {
     let now = now_ms();
     sqlx::query!(
-        "UPDATE pr_review_rounds SET landed_at = COALESCE(landed_at, ?2) WHERE id = ?1",
+        "UPDATE pr_review_posts SET landed_at = COALESCE(landed_at, ?2) WHERE round_id = ?1",
         round_id,
         now
     )

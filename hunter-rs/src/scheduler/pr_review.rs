@@ -10,7 +10,7 @@
 //! stopped partway keeps what it wrote, but its head is reviewed again),
 //! so a watched PR is reviewed incrementally as its author pushes. The
 //! results are the reviewer's issues, recorded per round
-//! (`pr_review_rounds`); a round with issues is posted to the PR once a
+//! (`review_rounds`); a round with issues is posted to the PR once a
 //! user approved it, or at once when the review posts automatically.
 //!
 //! A later round also judges the issues earlier rounds of its chain

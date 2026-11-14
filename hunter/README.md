@@ -770,7 +770,7 @@ itself. If a thread hunter
 resolved is found unresolved, a human reopened it and the issue is open
 again — unless hunter itself set out to unresolve it: a post marks the
 resolution it sets out to make before the forge call
-(`pr_review_issues.resolving`), so a read that overlaps the call, or
+(`pr_review_threads.resolving`), so a read that overlaps the call, or
 comes after one that failed once the forge acted, takes the thread as
 hunter left it, records hunter's step, and reopens nothing. A failed
 read is logged and the round goes on without replies. The
@@ -786,7 +786,7 @@ only where somebody other than hunter replied) or `open`, each with a
 one-sentence note. An issue it does not name stays as it was — silence
 never resolves anything — and a failed round records no verdict.
 
-Nothing records an issue's status: `pr_review_verdicts` keeps every
+Nothing records an issue's status: `review_verdicts` keeps every
 round's verdicts and notes, and the status is derived from them (the
 `pr_review_issue_state` view): the newest verdict of a round not
 discarded — `addressed`, `rebutted` or `open` — or *reopened* once a human
@@ -1083,8 +1083,15 @@ for the schema — most columns carry comments explaining *why*, not just *what*
 - **`pr_state`** — one row per finding with an open/merged PR: forge state,
   attention fingerprint + suppression marker (state-based, see § PR
   follow-up loop), harvest tracking.
-- **`pr_reviews`**, **`pr_review_rounds`**, **`pr_review_issues`**,
-  **`pr_review_verdicts`** — requested reviews of PRs hunter did not open
+- **`reviews`**, **`review_rounds`**, **`review_issues`**,
+  **`review_verdicts`**, **`review_answers`** — the review model every
+  review shares: a review of one subject (`pr`: its `pr_reviews` row;
+  `fix`/`engage`: a finding and the job that began the chain), its rounds
+  (`base..head`, merge-base, verdict, spend), the issues each reported,
+  each later round's verdict per earlier issue, and the other side's
+  answers. A PR review's own state extends them one to one:
+  **`pr_reviews`**, **`pr_review_posts`** (per round),
+  **`pr_review_threads`** (per issue) — requested reviews of PRs hunter did not open
   (PR, the repo URL it was requested under and its binding to it, author,
   Watch, auto-post, the trust decision (vouches, the fork owner decided
   about) and the fork owner read last, newest and last reviewed head,
