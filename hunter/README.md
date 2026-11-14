@@ -572,7 +572,7 @@ trust check here rests on that, and resolving its threads needs it too
 first); a request where hunter's login cannot push fails saying so.
 
 Each round fetches the PR's head (`refs/pull/N/head` or
-`refs/merge-requests/N/head`) and runs a reviewer (`playbooks/pr_review.md`;
+`refs/merge-requests/N/head`) and runs a reviewer (`playbooks/review.md`;
 it may build and run targeted tests, but must leave the tree as it found
 it) in a tree detached at that head. The first round reviews from the
 merge-base with the PR's base branch. Later rounds review only from the

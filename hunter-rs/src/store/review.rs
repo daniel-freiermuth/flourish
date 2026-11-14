@@ -1,6 +1,6 @@
 //! What a reviewer reports, the same for the pre-PR review of a fix and the
 //! review of a PR hunter did not open: both reviewers write the issue
-//! schema of their playbooks (`review.md`, `pr_review.md`).
+//! schema of their playbook (`review.md`).
 
 use serde::{Deserialize, Serialize};
 
