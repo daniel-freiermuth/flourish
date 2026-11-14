@@ -48,6 +48,9 @@ currently broken.
 - CI exists but is thin: it doesn't invoke tooling the project has ALREADY configured for
   itself (an `.eslintrc`/`ruff`/`clippy.toml`/`rustfmt.toml`/`pyproject.toml [tool.*]` exists
   but no CI job runs it), doesn't run the actual test suite, or never builds/typechecks
+- A Rust crate with a real test suite whose PRs are not gated on mutation testing
+  (`cargo mutants --in-diff` against the base; `CODING_STANDARDS.md`, "Testing / Mutation
+  testing" says how). Whether an existing gate is sound is the standards scan's question
 - No release/delivery automation for a project whose own metadata signals it's meant to be
   published (a `Cargo.toml` with `publish` not set to `false` plus real `description`/
   `repository` fields, a non-private `package.json`, `fastlane`/App Store/Play Store config
