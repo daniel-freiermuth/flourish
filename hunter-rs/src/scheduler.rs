@@ -587,8 +587,8 @@ async fn select(
     queued.retain(not_held(FindingJobKind::Fix));
     // A place a job is running on takes no second attempt: the insert
     // would be refused (migration 031). It is skipped like held work, so a
-    // job left `running` by a stray worker keeps only its own place, not
-    // the whole selection, from being picked.
+    // job still `running` keeps only its own place, not the whole
+    // selection, from being picked.
     let running = store.running_places().await?;
     let busy = |place: JobPlace| running.contains(&place);
     for tier in [

@@ -752,6 +752,12 @@ impl Backend for OmpScavengeBackend {
         let prompt_owned = prompt.to_owned();
         let resume_owned = resume_from.map(std::path::Path::to_owned);
         let auth_gateway = self.gateway.clone();
+        // The worker runs on a blocking thread, which dropping this
+        // future would not stop. The guard kills it instead, from the
+        // drop: a worker never runs on once nothing waits to record it.
+        // After the run has ended, cutting is a no-op.
+        let leash = crate::child::Leash::default();
+        let _cut = leash.cut_on_drop();
         let mut rr = tokio::task::spawn_blocking(move || {
             // The token lives in this closure and nowhere else: it is
             // withdrawn when the closure returns or unwinds, so it ends
@@ -772,6 +778,7 @@ impl Backend for OmpScavengeBackend {
                 model.as_deref(),
                 resume_owned.as_deref(),
                 token.as_ref().map(ClientToken::worker_auth).as_ref(),
+                &leash,
             )
         })
         .await?;

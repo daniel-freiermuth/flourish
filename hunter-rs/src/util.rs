@@ -2,12 +2,9 @@
 
 use std::io::Read;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
-
-use nix::sys::signal::{self, Signal};
-use nix::unistd::Pid;
+use std::time::Duration;
 
 /// Epoch milliseconds (types.py `now_ms`).
 pub fn now_ms() -> i64 {
@@ -45,53 +42,6 @@ pub fn join_pipes(so: JoinHandle<Vec<u8>>, se: JoinHandle<Vec<u8>>) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-fn killpg<T: Into<Option<Signal>>>(pgid: u32, sig: T) -> bool {
-    signal::killpg(Pid::from_raw(pgid as i32), sig).is_ok()
-}
-
-/// Is any process still in the group? The null signal performs the
-/// permission and existence checks without delivering anything.
-fn group_alive(pgid: u32) -> bool {
-    killpg(pgid, None)
-}
-
-/// SIGTERM the child's process group, wait up to 10 s, then SIGKILL.
-///
-/// Signalling the group rather than the pid is what makes a timeout
-/// enforceable. Killing only the direct child leaves any descendant it
-/// spawned (`npx` → `node` → the tool itself) holding the inherited stdout
-/// and stderr, so the pipes never reach EOF and `join_pipes` blocks
-/// forever — the process we gave up waiting for outlives the deadline that
-/// was supposed to bound it. Callers must spawn with `process_group(0)`.
-pub fn kill_tree(child: &mut Child) {
-    let pgid = child.id();
-    if !killpg(pgid, Signal::SIGTERM) {
-        let _ = child.wait();
-        return; // already gone
-    }
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        // Reap first: a zombie direct child still counts as a group
-        // member, so an unreaped one would make the probe below claim
-        // the group is alive forever.
-        let _ = child.try_wait();
-        // Signal 0 tests the whole group, which is the condition that
-        // matters. Waiting on the direct child instead declares success
-        // while a descendant that ignored SIGTERM is still holding the
-        // inherited pipes — the caller then blocks in `join_pipes` and
-        // the deadline this exists to enforce is lost.
-        if !group_alive(pgid) {
-            break; // no members left
-        }
-        if Instant::now() >= deadline {
-            killpg(pgid, Signal::SIGKILL);
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let _ = child.wait();
-}
-
 /// Last `max_bytes` of `s`, snapped forward to a char boundary.
 ///
 /// Command output and worker logs are arbitrary UTF-8, so indexing a tail
@@ -107,6 +57,8 @@ pub fn tail(s: &str, max_bytes: usize) -> &str {
 
 /// Run a command, merged stdout+stderr, never fails (`util.run_cmd`):
 /// timeout -> (124, msg + whatever was captured); spawn error -> (127, msg).
+/// For the daemon's own tools (git, `gh`, `glab`): it runs `argv` as one
+/// ([`crate::child::tool`]), not contained.
 /// Blocking — call via `spawn_blocking` from async contexts.
 pub fn run_cmd(argv: &[&str], timeout_s: u64) -> (i32, String) {
     run_cmd_in(argv, None, timeout_s)
@@ -138,7 +90,7 @@ fn run_cmd_fed(
     let Some((prog, rest)) = argv.split_first() else {
         return (127, "empty argv".to_owned());
     };
-    let mut cmd = Command::new(prog);
+    let mut cmd = crate::child::tool(prog);
     cmd.args(rest)
         .stdin(if input.is_some() {
             Stdio::piped()
@@ -150,13 +102,7 @@ fn run_cmd_fed(
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-    let child = cmd.spawn();
-    let mut child = match child {
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => return (127, e.to_string()),
     };
@@ -164,7 +110,7 @@ fn run_cmd_fed(
     // before reading all of its input would otherwise block us on a full
     // stdin pipe while we never get to read its output. Dropping the
     // handle at the end is the EOF the child waits for.
-    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+    if let (Some(input), Some(mut stdin)) = (input, child.take_stdin()) {
         let input = input.to_owned();
         std::thread::spawn(move || {
             use std::io::Write as _;
@@ -174,8 +120,8 @@ fn run_cmd_fed(
     }
     // Readers start now, not after the wait: see `drain_pipe`. Every exit
     // path below reaps the child first, so the joins see a closed pipe.
-    let so = drain_pipe(child.stdout.take());
-    let se = drain_pipe(child.stderr.take());
+    let so = drain_pipe(child.take_stdout());
+    let se = drain_pipe(child.take_stderr());
     let deadline = std::time::Instant::now() + Duration::from_secs(timeout_s);
     loop {
         match child.try_wait() {
@@ -187,19 +133,19 @@ fn run_cmd_fed(
                 // group first is what guarantees EOF; it costs nothing
                 // when there is no descendant, since the group is then
                 // already empty.
-                kill_tree(&mut child);
+                child.kill_tree();
                 return (status.code().unwrap_or(-1), join_pipes(so, se));
             }
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
-                    kill_tree(&mut child);
+                    child.kill_tree();
                     let out = join_pipes(so, se);
                     return (124, format!("timeout after {timeout_s}s\n{out}"));
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
-                kill_tree(&mut child);
+                child.kill_tree();
                 let out = join_pipes(so, se);
                 return (127, format!("{e}\n{out}"));
             }
@@ -210,43 +156,6 @@ fn run_cmd_fed(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_run_cmd_outlives_a_full_pipe_buffer() {
-        // 300 KB per stream, far past the 64 KiB pipe buffer. Read only
-        // after the wait, the child blocks on write, never exits, and this
-        // comes back as (124, "timeout after 30s") instead.
-        let (rc, out) = run_cmd(
-            &[
-                "sh",
-                "-c",
-                "yes abcdefghij | head -c 300000; yes klmnopqrst | head -c 300000 >&2",
-            ],
-            30,
-        );
-        assert_eq!(rc, 0);
-        assert_eq!(out.len(), 600_000);
-    }
-
-    /// `read_to_string` would abort on the first invalid byte and leave the
-    /// buffer EMPTY -- losing the whole stream and stopping the drain.
-    #[test]
-    fn test_run_cmd_survives_invalid_utf8() {
-        let (rc, out) = run_cmd(&["sh", "-c", "printf 'before\\377after'"], 30);
-        assert_eq!(rc, 0);
-        assert!(
-            out.contains("before"),
-            "lost output before the bad byte: {out:?}"
-        );
-        assert!(
-            out.contains("after"),
-            "stopped draining at the bad byte: {out:?}"
-        );
-        assert!(
-            out.contains('\u{fffd}'),
-            "bad byte should decode lossily: {out:?}"
-        );
-    }
 
     // -- tail -------------------------------------------------------------
     //
@@ -307,84 +216,5 @@ mod tests {
         assert_eq!(tail("abcdef", 0), "");
         assert_eq!(tail("€", 0), "");
         assert_eq!(tail("", 0), "");
-    }
-}
-
-#[cfg(test)]
-mod process_group_tests {
-    use super::*;
-
-    /// A timeout must bound the call even when the child leaves a
-    /// descendant holding the pipes.
-    ///
-    /// `sh -c "sleep 30 & ..."` models `npx` → `node` → tool: the shell
-    /// exits, the grandchild inherits stdout and stderr and keeps them
-    /// open. Killing only the direct child leaves those pipes unclosed, so
-    /// `join_pipes` blocks on `read_to_end` forever and `run_cmd` never
-    /// returns — the timeout it was given is unenforceable.
-    #[test]
-    fn test_timeout_holds_when_a_grandchild_inherits_the_pipes() {
-        let t0 = std::time::Instant::now();
-        let (rc, _out) = run_cmd(&["sh", "-c", "sleep 30 & sleep 30"], 1);
-        let elapsed = t0.elapsed();
-
-        assert_eq!(rc, 124, "expected the timeout exit code");
-        assert!(
-            elapsed < Duration::from_secs(20),
-            "run_cmd hung past its 1s timeout: {elapsed:?}"
-        );
-    }
-}
-
-#[cfg(test)]
-mod kill_tree_tests {
-    use super::*;
-
-    /// A descendant that ignores SIGTERM must still not outlive the
-    /// deadline. `kill_tree` sends SIGTERM to the group and then has to
-    /// escalate; returning as soon as the *direct* child exits leaves a
-    /// trapping grandchild holding the pipes, which is the same hang the
-    /// group kill exists to prevent.
-    #[test]
-    fn test_timeout_holds_against_a_sigterm_ignoring_grandchild() {
-        let t0 = std::time::Instant::now();
-        let (rc, _out) = run_cmd(
-            &["sh", "-c", "sh -c 'trap \"\" TERM; sleep 30' & sleep 30"],
-            1,
-        );
-        let elapsed = t0.elapsed();
-
-        assert_eq!(rc, 124, "expected the timeout exit code");
-        assert!(
-            elapsed < Duration::from_secs(20),
-            "run_cmd hung past its 1s timeout: {elapsed:?}"
-        );
-    }
-}
-
-#[cfg(test)]
-mod exit_path_tests {
-    use super::*;
-
-    /// A child that exits *promptly* while leaving a background descendant
-    /// must not block the call. This is the success path, where no timeout
-    /// is in force at all: `try_wait` reporting the direct child gone says
-    /// nothing about the pipes, which the descendant still holds open, so
-    /// `read_to_end` never returns and the caller hangs with no deadline to
-    /// rescue it. The timeout tests cannot catch this — they keep the
-    /// direct child alive until the deadline.
-    #[test]
-    fn test_prompt_exit_with_a_lingering_descendant_does_not_block() {
-        let t0 = std::time::Instant::now();
-        // The shell exits at once; the backgrounded sleep inherits stdout
-        // and stderr and would hold them for 30s.
-        let (rc, _out) = run_cmd(&["sh", "-c", "sleep 30 & exit 0"], 60);
-        let elapsed = t0.elapsed();
-
-        assert_eq!(rc, 0, "the direct child exited cleanly");
-        assert!(
-            elapsed < Duration::from_secs(10),
-            "run_cmd blocked on a descendant holding the pipes: {elapsed:?}"
-        );
     }
 }

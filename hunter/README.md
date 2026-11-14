@@ -35,8 +35,11 @@ zero token cost and only spends against a budget it never overshoots.
 
 Requires a Rust toolchain and Node/npm (the daemon binary and the UI
 bundle), `omp` on `PATH` (the headless worker CLI this project is built
-around), `git`, and the `gh` CLI (or `glab` for GitLab repos)
-authenticated for whatever repos you register.
+around), `git`, the `gh` CLI (or `glab` for GitLab repos) authenticated
+for whatever repos you register, and `bwrap` (bubblewrap) on `PATH` with
+unprivileged user namespaces allowed: the daemon starts every process in
+a PID namespace of its own (§ Running as a service), and refuses to start
+unless a probe process started through bwrap exits cleanly.
 
 ```sh
 cp hunter/config.anthropic.example.json hunter/config.json  # or config.openai-codex.example.json / config.github-copilot.example.json
@@ -412,8 +415,9 @@ The broker and gateway count as up only while the daemon's own children
 run on their ports: a port another process holds (a second daemon with
 the same ports, an orphan) answers health checks but would refuse every
 token, so its child, which exits with `EADDRINUSE`, holds the work with
-`auth: gateway port 4000 is taken by another process`. The children get
-`PR_SET_PDEATHSIG`, so a daemon that is killed outright takes them along.
+`auth: gateway port 4000 is taken by another process`. The children run
+in PID namespaces bound to the daemon like every worker (§ Running as a
+service), so a daemon that is killed outright takes them along.
 A curation refused its token costs the fix no resume attempt, and a resume
 that only owed its curation and is refused again is closed as never
 started, so an outage grows no resume chain.
@@ -547,7 +551,7 @@ are gated against two linear ramps:
 - A granted job's token cap is the ramp's remaining headroom, verbatim —
   there is no separate configured per-kind cap. Workers are metered
   **externally**: the harness tails the worker's live session JSONL and
-  SIGTERMs the process group at that cap, never depending on the worker
+  SIGTERMs the worker's processes at that cap, never depending on the worker
   cooperating with its own limit. A grant with no headroom figure carries
   no token bound, and `maxWallS` alone stops it.
 - Stale or missing usage data → conservative denial, never an optimistic
@@ -1087,6 +1091,7 @@ hunter-rs/src/
 ├── scheduler.rs    one cycle = one job; run_hunt/run_fix/run_engage/
 │                   run_harvest/run_recheck/pick_next/run_cycle
 ├── server.rs       axum JSON API + serves ui/
+├── child.rs        every spawn: bwrap PID namespace, reaper, spawner thread, kill_tree
 └── util.rs         shared subprocess helpers
 
 hunter/
@@ -1297,6 +1302,23 @@ loginctl enable-linger $USER   # keep it running after you log out
 
 After a rebuild, `systemctl --user restart hunter.service`; `just build`
 deliberately does not reach into the service manager itself.
+
+No worker outlives the daemon, however it stops: every omp worker, and
+Renovate and the auth broker and gateway, runs under `bwrap --unshare-pid
+--die-with-parent`, so when the daemon dies, SIGKILL and a crash
+included, the kernel kills each with everything it started, those that
+`setsid` or double-fork included (`hunter-rs/src/child.rs`). A restarted
+daemon therefore finds none of its predecessor's workers running, and
+resumes their work from the transcripts they left. The daemon's own git,
+`gh` and `glab` calls run as plain children, as the operator, each
+within its timeout; a graceful stop lets the one in flight finish.
+In bwrap's user namespace ssh rejects the system's ssh config, which it
+sees as owned by nobody, so a worker's git runs ssh with your own
+`~/.ssh/config` only (`GIT_SSH_COMMAND=ssh -F ~/.ssh/config`, or `-F
+/dev/null` without one), and with your SSH agent: settings that live only
+in `/etc/ssh` (crypto-policy includes, systemd's ssh proxy) do not apply
+there, and an `ssh` a worker runs outside git fails. Export your own
+`GIT_SSH_COMMAND` for the daemon to choose differently.
 
 Upgrading across migration 022 (`verdict_anchors`): suppressions that
 existed before it have no anchor and stay unconditional until a new verdict

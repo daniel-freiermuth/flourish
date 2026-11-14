@@ -135,6 +135,15 @@ jobs:
         with:
           tool: cargo-nextest@0.9.115,cargo-mutants@27.1.0
 
+      # The tests spawn through bwrap (src/child.rs), which needs an
+      # unprivileged user namespace; Ubuntu's AppArmor policy forbids
+      # those by default.
+      - name: Install bubblewrap
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - name: Mutants introduced by this PR
         # The script classifies cargo-mutants' exit code (mutants.rs/
         # exit-codes) instead of letting any failure pass:

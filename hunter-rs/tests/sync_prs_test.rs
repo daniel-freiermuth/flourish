@@ -285,17 +285,21 @@ async fn a_pass_reads_its_open_prs_side_by_side_within_the_bound() {
     for dir in [&live, &started, &seen] {
         std::fs::create_dir_all(dir).unwrap();
     }
+    // Each read names its files by mktemp: `$$` names nothing here, since
+    // every read runs in a PID namespace of its own (`hunter::child`),
+    // where each shell has the same small pid.
     bins.script(
         "gh",
         &format!(
-            "touch '{live}/'$$ '{started}/'$$\n\
+            "me=$(basename \"$(mktemp '{started}/XXXXXX')\")\n\
+             touch '{live}/'$me\n\
              i=0\n\
              while [ \"$(ls '{live}' | wc -l)\" -lt {bound} ] \
                    && [ \"$(ls '{started}' | wc -l)\" -lt {PRS} ] && [ $i -lt 250 ]; do\n\
                sleep 0.02; i=$((i+1))\n\
              done\n\
-             ls '{live}' | wc -l > '{seen}/'$$\n\
-             rm -f '{live}/'$$\n\
+             ls '{live}' | wc -l > '{seen}/'$me\n\
+             rm -f '{live}/'$me\n\
              cat <<'__PR_EOF__'\n{view}\n__PR_EOF__\nexit 0",
             live = live.display(),
             started = started.display(),

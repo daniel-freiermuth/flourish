@@ -613,10 +613,13 @@ async fn a_sync_pass_cut_short_by_shutdown_releases_no_engage() {
     std::fs::create_dir_all(&started).unwrap();
     std::fs::write(&release, "").unwrap();
     let open = r#"{"state":"OPEN","mergeable":"MERGEABLE","reviewDecision":"","comments":[],"reviews":[],"statusCheckRollup":[],"updatedAt":"2026-01-02T03:04:05Z","headRefName":"fix/some-bug","headRefOid":"deadbeef"}"#;
+    // One file per read, named by mktemp: `$$` names nothing here, since
+    // every read runs in a PID namespace of its own (`hunter::child`),
+    // where each shell has the same small pid.
     bins.script(
         "gh",
         &format!(
-            "touch '{started}/'$$\n\
+            "touch \"$(mktemp '{started}/XXXXXX')\"\n\
              i=0\n\
              while [ ! -e '{release}' ] && [ $i -lt 500 ]; do sleep 0.02; i=$((i+1)); done\n\
              cat <<'__PR_EOF__'\n{open}\n__PR_EOF__\nexit 0",

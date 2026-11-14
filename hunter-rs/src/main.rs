@@ -82,8 +82,27 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Cli, String> {
     Ok(Cli { root, port, user })
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    // Before anything else, the runtime included: every child the daemon
+    // starts runs under this binary in reaper mode (`hunter::child::reap`).
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if args.get(1).is_some_and(|a| a == hunter::child::REAPER_MODE) {
+        hunter::child::reap(&args[0], &args[2..]);
+    }
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("error: cannot start the async runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    runtime.block_on(daemon_main())
+}
+
+async fn daemon_main() -> ExitCode {
     let cli = match parse_args(std::env::args().skip(1)) {
         Ok(cli) => cli,
         Err(msg) => {

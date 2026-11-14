@@ -776,69 +776,6 @@ async fn a_settled_claim_spares_a_finding_a_running_job_works_on() {
     assert_eq!(status, Queued);
 }
 
-/// A dropped job is not a stopped worker: a worker runs on a blocking
-/// thread that cancelling its runner's future does not stop. While a
-/// process still works in the job's tree, the settle leaves the job
-/// `running` and owed, holding its reservation; once the tree is free,
-/// the next settle ends it.
-#[tokio::test]
-async fn a_job_dropped_while_its_tree_is_in_use_stays_owed() {
-    use hunter::domain::JobState::{Killed, Running};
-    use hunter::recovery::Settled;
-    let (dir, path, pool) = fresh_db().await;
-    seed_repo(&pool).await;
-    seed_findings(&pool).await;
-    let store = rw_store(&path).await;
-    let work_root = dir.subdir("work_root");
-    let job = support::scope(&store)
-        .create_job(
-            JobStart::fresh_repo(RepoJobKind::Hunt, 1),
-            Some(100_000),
-            None,
-        )
-        .await
-        .unwrap()
-        .job;
-    let id = job.id();
-    let tree = hunter::workspace::Workspace::for_chain(&work_root, Path::new(""), id).tree;
-    std::fs::create_dir_all(&tree).unwrap();
-    // The worker its runner's dropped future left behind.
-    let mut worker = std::process::Command::new("sleep")
-        .arg("60")
-        .current_dir(&tree)
-        .spawn()
-        .unwrap();
-    drop(job);
-    let jobs = support::jobs(&store);
-    let state = |store: Store| async move {
-        let jobs = store.list_jobs(10).await.unwrap();
-        jobs.into_iter().find(|j| j.job.id == id).unwrap().job.state
-    };
-
-    let while_working = jobs.settle_unsettled(&work_root).await;
-    let state_while_working = state(store.clone()).await;
-    worker.kill().unwrap();
-    worker.wait().unwrap();
-    let after = jobs.settle_unsettled(&work_root).await.unwrap();
-
-    assert_eq!(
-        while_working.unwrap(),
-        Settled {
-            deferred: 1,
-            ..Settled::default()
-        }
-    );
-    assert_eq!(state_while_working, Running);
-    assert_eq!(
-        after,
-        Settled {
-            jobs: 1,
-            ..Settled::default()
-        }
-    );
-    assert_eq!(state(store).await, Killed);
-}
-
 /// A job dropped unended -- its runner returned early, its future was
 /// cancelled, a panic unwound through it -- is owed: the next settle of
 /// the store's ledger kills it.
@@ -1329,45 +1266,6 @@ async fn reconcile_meters_a_reviewed_fix_chain_across_its_review_sessions() {
             "{reviewing}: the fixer's transcript is the checkpoint"
         );
     }
-}
-
-/// A worker that outlived its daemon (one run by hand and killed) is
-/// still in its tree. Resuming that chain would put a second worker in
-/// the same tree and transcript, so the orphan is killed, not suspended.
-#[tokio::test]
-async fn reconcile_does_not_suspend_an_orphan_whose_worker_is_still_running() {
-    let (dir, path, pool) = fresh_db().await;
-    seed_repo(&pool).await;
-    sqlx::raw_sql(
-        "INSERT INTO jobs (id, kind, repo_id, state, started_at) VALUES (5, 'test_gap', 1, 'running', 1000);",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    let store = rw_store(&path).await;
-    let work_root = dir.subdir("work_root");
-    let chain = work_root.join("jobs").join("5");
-    std::fs::create_dir_all(chain.join("session")).unwrap();
-    std::fs::create_dir_all(chain.join("tree")).unwrap();
-    std::fs::write(
-        chain.join("session").join("s.jsonl"),
-        format!("{CALL_1600}\n"),
-    )
-    .unwrap();
-    let mut worker = std::process::Command::new("sleep")
-        .arg("30")
-        .current_dir(chain.join("tree"))
-        .spawn()
-        .unwrap();
-
-    let result =
-        hunter::recovery::reconcile_and_log(store.take_unreconciled().unwrap(), &work_root).await;
-    worker.kill().unwrap();
-    worker.wait().unwrap();
-    result.unwrap();
-
-    let jobs = store.list_jobs(10).await.unwrap();
-    assert_eq!(jobs[0].job.state, hunter::domain::JobState::Killed);
 }
 
 /// A suspension ends a job like a kill or a failure does: the cycle did

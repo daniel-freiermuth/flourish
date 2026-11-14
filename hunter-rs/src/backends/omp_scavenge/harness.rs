@@ -2,8 +2,10 @@
 //!
 //! Port of `hunter/backends/omp_scavenge/harness.py`. The cap design (exp1b):
 //! never trust harness cooperation. The worker's session JSONL is written
-//! live under its chain's session directory; we watch it and SIGTERM the
-//! process group at the token threshold.
+//! live under its chain's session directory; we watch it and stop the
+//! worker's whole process tree at the token threshold (`Child::kill_tree`:
+//! SIGTERM, then SIGKILL). The worker runs under bwrap in a PID namespace
+//! of its own (`crate::child`), so nothing it starts outlives the kill.
 //!
 //! Every run is handed an explicit `--session-dir`: its chain's
 //! `session/` (see `crate::workspace`), which the caller owns and which is
@@ -26,16 +28,16 @@
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use serde::Deserialize;
 
+use crate::child::Leash;
 use crate::config::Config;
 use crate::types::RunResult;
-use crate::util::kill_tree;
 use crate::workspace::Workspace;
 
 // ---------------------------------------------------------------------------
@@ -364,6 +366,26 @@ pub struct WorkerAuth<'a> {
 // Worker execution (`harness.run_worker`)
 // ---------------------------------------------------------------------------
 
+/// The `GIT_SSH_COMMAND` a worker's git runs ssh with: ssh with the
+/// operator's own `<home>/.ssh/config` only, `/dev/null` when there is
+/// none.
+///
+/// A worker runs in bwrap's user namespace, where root's files read as
+/// owned by nobody, and ssh refuses a system config it cannot trust
+/// (`/etc/ssh/ssh_config`, its `ssh_config.d` includes): every git fetch
+/// or push over ssh would fail. With `-F` ssh reads the given file and no
+/// system one; the operator's own files keep their owner.
+fn git_ssh_command(home: Option<&Path>) -> String {
+    let config = home
+        .map(|home| home.join(".ssh").join("config"))
+        .filter(|config| config.is_file());
+    match config.as_deref().and_then(Path::to_str) {
+        // Run by git through the shell: quoted whole.
+        Some(config) => format!("ssh -F '{}'", config.replace('\'', r"'\''")),
+        None => "ssh -F /dev/null".to_owned(),
+    }
+}
+
 /// Spawn `omp -p`, meter its JSONL session ledger, kill at the cap.
 ///
 /// `cap_tokens` is the ramp's headroom for this run. `None` is a run with
@@ -385,6 +407,9 @@ pub struct WorkerAuth<'a> {
 /// leaves the worker on omp's own credentials (a provider with no gateway
 /// route).
 ///
+/// `leash` is cut by the caller that stops waiting for this run: the
+/// worker is killed then, not left running for no one.
+///
 /// Blocking — call via `spawn_blocking` from async contexts.
 #[allow(
     clippy::too_many_lines,
@@ -402,6 +427,7 @@ pub fn run_worker(
     model: Option<&str>,
     resume_from: Option<&Path>,
     auth: Option<&WorkerAuth<'_>>,
+    leash: &Leash,
 ) -> RunResult {
     let t0 = Instant::now();
     let cwd = ws.tree.as_path();
@@ -498,7 +524,7 @@ pub fn run_worker(
     }
 
     // Build command: [omp_bin, "-p", prompt] + optional flags
-    let mut cmd = Command::new(&cfg.omp_bin);
+    let mut cmd = crate::child::command(&cfg.omp_bin);
     cmd.arg("-p").arg(prompt);
     cmd.arg(format!("--session-dir={}", run_dir.display()));
     if let Some(sf) = resume_from {
@@ -539,12 +565,6 @@ pub fn run_worker(
         cmd.arg("--api-key").arg(auth.api_key);
     }
 
-    // Spawn in its own process group (for group-kill).
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
     // Build a minimal env so the worker doesn't inherit the full daemon env
     // (especially ANTHROPIC_ API keys/tokens). The gateway's endpoint is
     // the one provider variable a worker gets, and only through `auth`.
@@ -560,6 +580,8 @@ pub fn run_worker(
         "TEMP",
         "TMP",
         "SSH_AUTH_SOCK",
+        "GIT_SSH_COMMAND",
+        "GIT_SSH",
     ];
     let allowed_prefixes: &[&str] = &["OMP_", "XDG_"];
     cmd.env_clear();
@@ -567,6 +589,12 @@ pub fn run_worker(
         if allowlist.contains(&k.as_str()) || allowed_prefixes.iter().any(|p| k.starts_with(p)) {
             cmd.env(&k, &v);
         }
+    }
+    // An operator who chose how the daemon's git runs ssh chose it for
+    // the workers too.
+    if std::env::var_os("GIT_SSH_COMMAND").is_none() && std::env::var_os("GIT_SSH").is_none() {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        cmd.env("GIT_SSH_COMMAND", git_ssh_command(home.as_deref()));
     }
     if let Some(auth) = auth {
         cmd.env(auth.base_url_env, &auth.base_url);
@@ -600,7 +628,7 @@ pub fn run_worker(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut proc = match cmd.spawn() {
+    let mut proc = match cmd.spawn_leashed(leash) {
         Ok(p) => p,
         Err(e) => {
             return RunResult {
@@ -617,8 +645,8 @@ pub fn run_worker(
     };
 
     // Readers start here and run until the pipes close: see `drain_tail`.
-    let so = drain_tail(proc.stdout.take());
-    let se = drain_tail(proc.stderr.take());
+    let so = drain_tail(proc.take_stdout());
+    let se = drain_tail(proc.take_stderr());
 
     let mut session: Option<PathBuf> = None;
     let mut tokens: i64 = 0;
@@ -655,23 +683,23 @@ pub fn run_worker(
                     run_dir.display()
                 );
                 killed = Some("unmetered".to_owned());
-                kill_tree(&mut proc);
+                proc.kill_tree();
                 break;
             }
         }
         if exited {
             // Reap the group even though the worker left of its own
-            // accord. `exited` is about the direct child; a descendant it
-            // spawned still holds the inherited stdout and stderr, and the
-            // joins below read to EOF. This path has already left
-            // `max_wall_s` behind, so nothing would interrupt that wait.
-            // No-op when the group is already empty, which is the norm.
-            kill_tree(&mut proc);
+            // accord. `exited` is about omp itself (`Child::try_wait`):
+            // what it left may still run in its namespace, finishing its
+            // SIGTERM cleanup, and holds the inherited stdout and stderr
+            // the joins below read to EOF. No-op when the group is
+            // already empty, which is the norm.
+            proc.kill_tree();
             break;
         }
         if cap_tokens.is_some_and(|cap| tokens >= cap) {
             killed = Some("cap".to_owned());
-            kill_tree(&mut proc);
+            proc.kill_tree();
             break;
         }
         // On a resume the directory already holds the predecessor's
@@ -705,12 +733,12 @@ pub fn run_worker(
                 cfg.session_grace_s
             );
             killed = Some("unmetered".to_owned());
-            kill_tree(&mut proc);
+            proc.kill_tree();
             break;
         }
         if t0.elapsed().as_secs() as i64 >= max_wall_s {
             killed = Some("wallclock".to_owned());
-            kill_tree(&mut proc);
+            proc.kill_tree();
             break;
         }
         std::thread::sleep(Duration::from_secs_f64(cfg.poll_s));

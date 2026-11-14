@@ -1,9 +1,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! `run_worker` end to end — metering, the unmetered verdict, output drain.
 //!
-//! `harness_test.rs` covers the pieces (`ledger_usage`, `kill_tree`) in
-//! isolation. Nothing covered the function that
-//! wires them together, which is where the accounting invariant lives:
+//! `harness_test.rs` covers the pieces (`ledger_usage`) and
+//! `child_test.rs` the kill (`kill_tree`) in isolation. Nothing covered
+//! the function that wires them together, which is where the accounting
+//! invariant lives:
 //!
 //! > a run whose token spend could not be measured must never be recorded
 //! > as costing zero.
@@ -29,6 +30,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use hunter::backends::omp_scavenge::harness;
+use hunter::child::Leash;
 use hunter::config::Config;
 use hunter::types::RunResult;
 use hunter::workspace::Workspace;
@@ -96,7 +98,15 @@ impl Fixture {
 
     fn run(&self, cap_tokens: Option<i64>, max_wall_s: i64) -> RunResult {
         harness::run_worker(
-            &self.cfg, &self.ws, PROMPT, cap_tokens, max_wall_s, None, None, None,
+            &self.cfg,
+            &self.ws,
+            PROMPT,
+            cap_tokens,
+            max_wall_s,
+            None,
+            None,
+            None,
+            &Leash::default(),
         )
     }
 
@@ -121,6 +131,7 @@ impl Fixture {
             None,
             Some(session_file),
             None,
+            &Leash::default(),
         )
     }
 }
@@ -228,6 +239,7 @@ fn metered_worker_sums_the_ledger_and_is_not_flagged() {
         Some("test-model"),
         None,
         None,
+        &Leash::default(),
     );
 
     assert_eq!(res.killed_reason, None, "a metered run carries no flag");
@@ -612,16 +624,7 @@ fn worker_leaving_a_descendant_behind_does_not_hang_the_harness() {
     );
 
     let t0 = std::time::Instant::now();
-    let res = harness::run_worker(
-        &fx.cfg,
-        &fx.ws,
-        PROMPT,
-        Some(1_000_000),
-        30,
-        None,
-        None,
-        None,
-    );
+    let res = fx.run(Some(1_000_000), 30);
     let elapsed = t0.elapsed();
 
     assert!(
@@ -633,6 +636,187 @@ fn worker_leaving_a_descendant_behind_does_not_hang_the_harness() {
         res.stdout_tail.contains("worker-done"),
         "output captured before the group was reaped: {:?}",
         res.stdout_tail
+    );
+}
+
+/// What a worker left, a TERM-trapping loop whose cleanup takes 1.5 s:
+/// it keeps the namespace, and bwrap, alive well after `omp` exited. The
+/// worker goes on once the trap is set.
+const LEFTOVER_SH: &str = "sh -c 'trap \"sleep 1.5; exit 0\" TERM; touch trapping; \
+                           while :; do sleep 0.1; done' &\n\
+                           while [ ! -e trapping ]; do sleep 0.01; done\n";
+
+/// A worker that finished in time is not killed at the wall clock while
+/// what it left is still finishing its cleanup: the run ended when `omp`
+/// did, not when its namespace does.
+#[test]
+fn a_worker_that_ended_in_time_is_not_killed_at_the_wall_clock_by_its_leftovers() {
+    let fx = Fixture::new("leftover-wallclock");
+    fx.bins.script(
+        "omp",
+        &format!(
+            "{LEFTOVER_SH}{ledger}sleep 1.2\nexit 0",
+            ledger = ledger_sh(&[(1000, 200, 50)])
+        ),
+    );
+
+    let res = fx.run(Some(1_000_000), 2);
+
+    assert_eq!(res.killed_reason, None, "{:?}", res.stdout_tail);
+    assert_eq!(res.exit_code, Some(0));
+}
+
+/// Likewise the cap: a worker whose last call took it over the cap but
+/// that then exited 0 finished; what it left still running does not make
+/// that a cap kill.
+#[test]
+fn a_worker_that_ended_is_not_capped_by_its_leftovers() {
+    let fx = Fixture::new("leftover-cap");
+    fx.bins.script(
+        "omp",
+        &format!(
+            "{LEFTOVER_SH}{ledger}exit 0",
+            ledger = ledger_sh(&[(1000, 200, 50)])
+        ),
+    );
+
+    let res = fx.run(Some(1000), 30);
+
+    assert_eq!(res.killed_reason, None, "{:?}", res.stdout_tail);
+    assert_eq!(res.exit_code, Some(0));
+    assert_eq!(res.tokens_new, 1250);
+}
+
+/// Run a worker whose git reaches `git@example.org:o/r.git` with `HOME`
+/// at `home` and `SSH_AUTH_SOCK` set for the daemon, through a fake `ssh`
+/// on `PATH` that records its argv and fails; the argv git ran ssh with,
+/// and what the worker printed.
+fn worker_ssh(fx: &Fixture, home: &std::path::Path) -> (Vec<String>, String) {
+    let _home = fx.bins.env("HOME", home);
+    let _agent = fx
+        .bins
+        .env("SSH_AUTH_SOCK", std::path::Path::new("/run/agent.sock"));
+    fx.bins.script("ssh", "exit 1");
+    fx.bins.script(
+        "omp",
+        &format!(
+            "{ledger}git ls-remote git@example.org:o/r.git >/dev/null 2>&1\n\
+             printf 'agent=%s\\n' \"${{SSH_AUTH_SOCK-none}}\"\nexit 0",
+            ledger = ledger_sh(&[(1000, 200, 50)])
+        ),
+    );
+
+    let res = fx.run(Some(1_000_000), 30);
+
+    let calls = fx.bins.calls_to("ssh");
+    assert_eq!(calls.len(), 1, "git ran ssh once: {calls:?}");
+    (calls[0].clone(), res.stdout_tail)
+}
+
+/// A worker's git runs ssh with the operator's own `~/.ssh/config` and no
+/// system config, which ssh refuses as untrusted in the worker's user
+/// namespace; and the worker keeps the SSH agent (commit signing, cargo's
+/// git fetches).
+#[test]
+fn a_workers_git_runs_ssh_with_the_operators_config_and_agent() {
+    let fx = Fixture::new("ssh-own-config");
+    let _own = fx.bins.unset_env("GIT_SSH_COMMAND");
+    let _own_ssh = fx.bins.unset_env("GIT_SSH");
+    let home = TempDir::new("ssh-own-config-home");
+    std::fs::create_dir_all(home.join(".ssh")).unwrap();
+    std::fs::write(home.join(".ssh/config"), "Host *\n").unwrap();
+
+    let (argv, out) = worker_ssh(&fx, home.path());
+
+    let config = home.join(".ssh/config");
+    assert_eq!(
+        argv[..3],
+        ["ssh", "-F", config.to_str().unwrap()],
+        "{argv:?}"
+    );
+    assert!(out.contains("agent=/run/agent.sock\n"), "{out:?}");
+}
+
+/// Without a `~/.ssh/config` of the operator's, a worker's git runs ssh
+/// with none at all: still not the system's.
+#[test]
+fn a_workers_git_runs_ssh_without_a_config_when_the_operator_has_none() {
+    let fx = Fixture::new("ssh-no-config");
+    let _own = fx.bins.unset_env("GIT_SSH_COMMAND");
+    let _own_ssh = fx.bins.unset_env("GIT_SSH");
+    let home = TempDir::new("ssh-no-config-home");
+
+    let (argv, _) = worker_ssh(&fx, home.path());
+
+    assert_eq!(argv[..3], ["ssh", "-F", "/dev/null"], "{argv:?}");
+}
+
+/// An operator who exported their own `GIT_SSH_COMMAND` for the daemon
+/// keeps it for the workers.
+#[test]
+fn an_operators_git_ssh_command_is_the_workers() {
+    let fx = Fixture::new("ssh-operator-command");
+    let _own = fx.bins.env(
+        "GIT_SSH_COMMAND",
+        std::path::Path::new("ssh -o BatchMode=yes"),
+    );
+    let home = TempDir::new("ssh-operator-command-home");
+
+    let (argv, _) = worker_ssh(&fx, home.path());
+
+    assert_eq!(argv[..3], ["ssh", "-o", "BatchMode=yes"], "{argv:?}");
+}
+
+/// A cut leash kills the worker there and then: its caller stopped
+/// waiting (`OmpScavengeBackend::run` dropped), and nothing would record
+/// it. `run_worker` then returns at once, the worker and its escaped
+/// descendant gone, rather than running on until a cap.
+#[test]
+fn a_cut_leash_kills_the_worker() {
+    let fx = Fixture::new("leash");
+    fx.bins.script(
+        "omp",
+        &format!(
+            "{ledger}setsid sh -c 'touch escaped; exec sleep 300' &\nexec sleep 300",
+            ledger = ledger_sh(&[(1000, 200, 50)])
+        ),
+    );
+    let leash = Leash::default();
+    let worker = {
+        let (cfg, ws, leash) = (fx.cfg.clone(), fx.ws.clone(), leash.clone());
+        std::thread::spawn(move || {
+            harness::run_worker(
+                &cfg,
+                &ws,
+                PROMPT,
+                Some(1_000_000),
+                300,
+                None,
+                None,
+                None,
+                &leash,
+            )
+        })
+    };
+    let tree = &fx.ws.tree;
+    assert!(support::eventually(
+        std::time::Duration::from_secs(10),
+        || tree.join("escaped").exists()
+    ));
+
+    leash.cut();
+
+    let res = worker.join().unwrap();
+    assert_eq!(
+        res.killed_reason, None,
+        "no cap, wall clock or meter stopped it"
+    );
+    assert!(
+        support::eventually(std::time::Duration::from_secs(5), || {
+            support::processes_in(tree) == 0
+        }),
+        "{} process(es) outlived the cut",
+        support::processes_in(tree)
     );
 }
 

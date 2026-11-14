@@ -35,15 +35,15 @@
 //! an orphaned gateway, answers health checks but reads another clients
 //! file and would refuse every token. A child whose port is taken exits
 //! at once (`EADDRINUSE`), and the hold then says the port is taken by
-//! another process. Each child gets `PR_SET_PDEATHSIG`, so a daemon that
-//! dies without stopping it leaves no orphan behind.
+//! another process. Each child is started through [`crate::child`], so a
+//! daemon that dies without stopping it leaves no orphan behind.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread::JoinHandle;
@@ -55,7 +55,6 @@ use super::harness::WorkerAuth;
 use crate::backend::AUTH_UNAVAILABLE;
 use crate::config::Config;
 use crate::types::RunResult;
-use crate::util::kill_tree;
 
 /// The variable that points an Anthropic worker at the gateway.
 const BASE_URL_ENV: &str = "ANTHROPIC_BASE_URL";
@@ -535,42 +534,25 @@ impl Stop {
 
 /// Run `service` until `stop`, restarting it whenever it exits with a
 /// doubling backoff ([`RESTART_MIN`]..[`RESTART_MAX`]). On `stop` the
-/// child's process group is terminated ([`kill_tree`]).
+/// child's whole tree is terminated ([`crate::child::Child::kill_tree`]).
 fn supervise(service: &Service, stop: &Stop) {
     let name = service.name;
     let mut backoff = RESTART_MIN;
     loop {
         let started = Instant::now();
-        let mut cmd = Command::new(&service.omp_bin);
+        // Through `crate::child` like every child of the daemon: it dies
+        // with the daemon however the daemon dies, so an orphaned gateway
+        // never holds the port the next daemon's child needs. Its own
+        // process group, too, so a Ctrl-C to the daemon's terminal does
+        // not take the gateway down under a worker the daemon is still
+        // letting finish.
+        let mut cmd = crate::child::command(&service.omp_bin);
         cmd.args(&service.args)
-            .envs(service.env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        // Its own group: `kill_tree` stops all of it, and a Ctrl-C to the
-        // daemon's terminal does not take the gateway down under a
-        // worker the daemon is still letting finish.
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-            // A daemon that dies without stopping it (SIGKILL, a crash)
-            // takes it along: the kernel sends SIGTERM when the thread that
-            // spawned it ends, and this supervisor thread outlives its child
-            // on every other path. Without it, an orphaned gateway would
-            // hold the port the next daemon's child needs.
-            #[allow(
-                unsafe_code,
-                reason = "pre_exec is the only way to set PR_SET_PDEATHSIG in the child"
-            )]
-            // SAFETY: the closure runs between fork and exec and only calls
-            // prctl(2), which is async-signal-safe and touches no memory of
-            // the parent.
-            unsafe {
-                cmd.pre_exec(|| {
-                    nix::sys::prctl::set_pdeathsig(nix::sys::signal::Signal::SIGTERM)
-                        .map_err(io::Error::from)
-                });
-            }
+        for (key, value) in &service.env {
+            cmd.env(key, value);
         }
         match cmd.spawn() {
             Ok(mut child) => {
@@ -581,8 +563,8 @@ fn supervise(service: &Service, stop: &Stop) {
                     state.tail.clear();
                 }
                 let logs = [
-                    log_lines(name, child.stdout.take(), Arc::clone(&service.state)),
-                    log_lines(name, child.stderr.take(), Arc::clone(&service.state)),
+                    log_lines(name, child.take_stdout(), Arc::clone(&service.state)),
+                    log_lines(name, child.take_stderr(), Arc::clone(&service.state)),
                 ];
                 let exited = loop {
                     match child.try_wait() {
@@ -594,7 +576,7 @@ fn supervise(service: &Service, stop: &Stop) {
                 };
                 // Also after an exit of its own: a descendant left behind
                 // would hold the pipes the log threads read to the end.
-                kill_tree(&mut child);
+                child.kill_tree();
                 for log in logs {
                     let _ = log.join();
                 }

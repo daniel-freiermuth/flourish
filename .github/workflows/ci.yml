@@ -62,6 +62,15 @@ jobs:
         with:
           tool: cargo-nextest@0.9.115
 
+      # Every process the daemon starts runs under bwrap, the tests'
+      # included (src/child.rs). bwrap needs an unprivileged user
+      # namespace, which Ubuntu's AppArmor policy forbids by default.
+      - name: Install bubblewrap
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - name: Test
         run: cargo nextest run --profile ci
 
@@ -118,6 +127,13 @@ jobs:
       - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: cargo-nextest@0.9.115,cargo-llvm-cov@0.6.23
+
+      # As in the test job: the tests spawn through bwrap.
+      - name: Install bubblewrap
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - name: Coverage
         run: cargo llvm-cov nextest --profile ci --summary-only --fail-under-lines 50

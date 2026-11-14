@@ -97,6 +97,28 @@ fn success_with_no_updates_is_empty_not_none() {
     );
 }
 
+/// A Renovate that answered within the timeout is not a timeout because a
+/// helper it left is still finishing its SIGTERM cleanup: the scan ended
+/// when Renovate did, not when its namespace does.
+#[test]
+fn a_renovate_that_ended_in_time_is_not_timed_out_by_what_it_left() {
+    let bins = FakeBins::acquire("depscan-leftover");
+    let work = TempDir::new("depscan-leftover-repo");
+    bins.script(
+        "renovate",
+        &format!(
+            "sh -c 'trap \"sleep 2; exit 0\" TERM; touch trapping; while :; do sleep 0.1; done' &\n\
+             while [ ! -e trapping ]; do sleep 0.01; done\n\
+             printf '%s\\n' '{CHATTER}' '{UPDATE_LINE}'\nexit 0"
+        ),
+    );
+
+    let got = scan_repo(work.path(), REPO, None, 1);
+
+    assert_renovate_invoked(&bins);
+    assert_eq!(got.map(|scan| scan.candidates.len()), Some(1));
+}
+
 /// Scan a repo whose Renovate run printed `line` and exited 0.
 fn scan_printing(label: &str, line: &str) -> Option<hunter::dep_scan::DepScan> {
     let bins = FakeBins::acquire(label);

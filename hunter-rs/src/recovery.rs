@@ -40,10 +40,15 @@
 //!   `Drop` owes the row to the store's ledger. [`CycleScope::settle`]
 //!   and [`JobAuthority::settle_unsettled`] settle what is owed: what was
 //!   dropped, and nothing that is still held, however many scopes are
-//!   live at once. Dropped is not stopped -- a worker on a blocking
-//!   thread outlives its cancelled future -- so an owed job whose tree a
-//!   process still works in, and an owed claim whose finding a `running`
-//!   job works on, stay owed until that work is gone.
+//!   live at once. An owed claim whose finding a `running` job works on
+//!   stays owed until that job has ended.
+//!
+//! Neither owner leaves a worker running. Every worker the daemon starts
+//! is in a PID namespace that dies with the daemon ([`crate::child`]), so
+//! a dead process's workers died with it; and the backend kills a worker
+//! whose run is dropped or unwinds before it returns (`child::Leash`,
+//! `child::Child`'s drop), so a dropped job's worker is gone with it.
+//! Settling a job therefore never ends one a worker still works on.
 //!
 //! The store's settling writes take proof of one of the two: the
 //! [`Unreconciled`] token for "every `fixing` claim", a [`StrandedJob`] or
@@ -70,7 +75,7 @@ use crate::store::{
 };
 use crate::transition::Moved;
 use crate::types::{Finding, Job};
-use crate::workspace::{Workspace, tree_in_use};
+use crate::workspace::Workspace;
 
 const UNRECONCILED: u8 = 0;
 const RECONCILING: u8 = 1;
@@ -400,23 +405,22 @@ pub struct Settled {
     pub jobs: usize,
     /// Findings put back from `fixing` to `queued`.
     pub requeued: usize,
-    /// Owed jobs and claims this pass left owed, for a later one: a job
-    /// whose tree a live process still works in (its worker outlived the
-    /// dropped value), a claim whose finding a `running` job works on.
+    /// Owed claims this pass left owed, for a later one: a claim whose
+    /// finding a `running` job works on.
     pub deferred: usize,
 }
 
 /// Recover what a crashed prior process left: every `running` job, and
 /// every `fixing` finding no job is working on.
 ///
-/// A job still `running` here outlived the process that ran it. When its
-/// chain's session directory holds a transcript with metered work from
-/// this attempt, the job is recorded `suspended`, so the resume tier
-/// continues it instead of the work being lost; the same rule
-/// `scheduler::job_state` applies to a worker that died on its own. The
-/// rest are marked killed -- among them every job that died before its
-/// worker made a call, such as the fix jobs killed inside
-/// `git worktree add` on 2026-09-29.
+/// A job still `running` here was the dead process's, and its worker died
+/// with that process ([`crate::child`]). When its chain's session
+/// directory holds a transcript with metered work from this attempt, the
+/// job is recorded `suspended`, so the resume tier continues it instead of
+/// the work being lost; the same rule `scheduler::job_state` applies to a
+/// worker that died on its own. The rest are marked killed -- among them
+/// every job that died before its worker made a call, such as the fix
+/// jobs killed inside `git worktree add` on 2026-09-29.
 ///
 /// Consuming `token` is what keeps this to startup: no job can exist in
 /// the store before it ([`Recovered`]), and it cannot run again after.
@@ -612,8 +616,8 @@ pub struct CreatedJob {
 /// end the row ([`Self::complete`], [`Self::fail_unstarted`]), each
 /// consuming it; made only by [`CycleScope::create_job`]. Dropped unended
 /// -- its runner returned early, or the write that would have ended it
-/// failed -- it owes the job to the store's ledger, and the first settle
-/// after no process works in its tree any more suspends or kills it.
+/// failed -- it owes the job to the store's ledger, and the next settle
+/// suspends or kills it. Its worker is gone by then (`crate::child`).
 #[must_use = "a running job is ended by complete or fail_unstarted; dropped, it is settled as abandoned"]
 pub struct RunningJob {
     store: Store,
@@ -809,13 +813,11 @@ impl JobAuthority {
 /// beside live owners: a settle acts only on rows still `running` or
 /// `fixing`, and an owed claim's finding stays `fixing` until it is
 /// released, so no other holder can have claimed it meanwhile. What is
-/// still held is in no ledger and untouched. A dropped value is not proof
-/// that its work stopped: a worker runs on a blocking thread that
-/// dropping its future does not stop. So a job whose tree a process
-/// still works in, and a claim whose finding a `running` job still works
-/// on, stay owed for a later settle rather than being ended under that
-/// work. On an error, or if this future is dropped mid-settle, what it
-/// was settling stays owed.
+/// still held is in no ledger and untouched. A claim whose finding a
+/// `running` job still works on stays owed for a later settle rather than
+/// being released under that work. A dropped job needs no such wait: its
+/// worker was killed with its run (module docs). On an error, or if this
+/// future is dropped mid-settle, what it was settling stays owed.
 async fn settle_owed(store: &Store, work_root: &Path) -> anyhow::Result<Settled> {
     let owed = owed_now(store);
     let (settled, deferred) = settle_owned(store, &owed, work_root).await?;
@@ -843,25 +845,20 @@ fn lock(owned: &Mutex<Owned>) -> std::sync::MutexGuard<'_, Owned> {
     owned.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Settle `owned`; returns the counts and what is still worked on, which
-/// stays owed.
+/// Settle `owned`; returns the counts and the claims a `running` job
+/// still works on, which stay owed.
 async fn settle_owned(
     store: &Store,
     owned: &Owned,
     work_root: &Path,
 ) -> anyhow::Result<(Settled, Owned)> {
     let mut deferred = Owned::default();
-    let mut stranded = Vec::new();
-    for j in store.list_running_jobs().await? {
-        if !owned.jobs.contains(&j.id) {
-            continue;
-        }
-        if tree_in_use(&chain_workspace(store, work_root, &j).await?.tree) {
-            deferred.jobs.insert(j.id);
-        } else {
-            stranded.push(j);
-        }
-    }
+    let stranded: Vec<Job> = store
+        .list_running_jobs()
+        .await?
+        .into_iter()
+        .filter(|j| owned.jobs.contains(&j.id))
+        .collect();
     let jobs = settle_jobs(store, work_root, &stranded, Orphaned::Abandoned).await?;
     let mut requeued = Vec::new();
     for &owed_claim in &owned.claims {
@@ -882,7 +879,7 @@ async fn settle_owned(
     let settled = Settled {
         jobs,
         requeued: requeued.len(),
-        deferred: deferred.jobs.len() + deferred.claims.len(),
+        deferred: deferred.claims.len(),
     };
     Ok((settled, deferred))
 }
@@ -965,7 +962,7 @@ async fn chain_workspace(store: &Store, work_root: &Path, j: &Job) -> anyhow::Re
 }
 
 /// `(session_file, tokens)` of the work orphaned job `j` did itself,
-/// when it did any and nothing is still running in its tree.
+/// when it did any.
 ///
 /// The chain's session directory is shared by every attempt, so the
 /// ledger there also holds what earlier attempts already recorded --
@@ -1008,7 +1005,7 @@ async fn orphan_work(
         }
     };
     let own = tokens - store.ancestor_tokens(j.id).await?;
-    if own <= 0 || tree_in_use(&ws.tree) {
+    if own <= 0 {
         return Ok(None);
     }
     Ok(Some((file.to_string_lossy().into_owned(), own)))

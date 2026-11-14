@@ -134,28 +134,6 @@ pub fn jobs_root(work_root: &Path) -> PathBuf {
     work_root.join("jobs")
 }
 
-/// Whether a live process has its working directory inside `tree`.
-///
-/// A worker runs with its chain's tree as cwd, and so does everything it
-/// spawns. Under the systemd unit nothing survives the daemon
-/// (`KillMode=mixed` SIGKILLs the rest of the cgroup once the main
-/// process is gone), but a daemon run by hand and killed leaves its
-/// worker running in its own process group. Continuing that chain would
-/// put a second worker in the same tree and transcript, so the caller
-/// treats a tree in use as not resumable. Processes whose cwd cannot be
-/// read (another user's) are not ours and are skipped.
-pub fn tree_in_use(tree: &Path) -> bool {
-    let Ok(tree) = tree.canonicalize() else {
-        return false;
-    };
-    let Ok(procs) = std::fs::read_dir("/proc") else {
-        return false;
-    };
-    procs
-        .flatten()
-        .any(|p| std::fs::read_link(p.path().join("cwd")).is_ok_and(|cwd| cwd.starts_with(&tree)))
-}
-
 /// What a cold chain's tree starts as. Revisions are resolved to a commit
 /// in the clone when the tree is made; that commit is the chain's
 /// `pinned_sha`.

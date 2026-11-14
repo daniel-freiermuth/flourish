@@ -797,13 +797,21 @@ pub fn next_wake_ms(now_ms: i64, sleep_s: f64) -> i64 {
               startup contract"
 )]
 pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
+    // Every worker the daemon starts runs under bwrap (`crate::child`),
+    // which is what keeps any of them from outliving it. A bwrap that is
+    // missing, or cannot set up its namespaces here, would turn every
+    // contained spawn into an exit 1 read as the program's own
+    // (`child::check`), so the daemon does not start at all: nothing
+    // below has run yet.
+    tokio::task::spawn_blocking(crate::child::check).await??;
     // The lock first, then the store under it: the daemon's startup
     // token comes only with the lock, and the store holds the lock until
     // its last clone is gone. Before anything else reads the job table:
     // every `running` row and every `fixing` claim is the dead prior
-    // process's. The lanes need the `Recovered` the token becomes, so
-    // this runs exactly once and before any job exists. The sweep below
-    // then releases the trees of the chains this ended.
+    // process's, and so was every worker, which died with it. The lanes
+    // need the `Recovered` the token becomes, so this runs exactly once
+    // and before any job exists. The sweep below then releases the trees
+    // of the chains this ended.
     let lock = crate::recovery::DaemonLock::acquire(&cfg.work_root, &cfg.db_path)?;
     let (store, unreconciled) = Store::connect_exclusive(lock).await?;
     let store = Arc::new(store);

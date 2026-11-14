@@ -274,17 +274,23 @@ fn health_needs_our_running_children_and_their_ports_answering() {
     }
 }
 
-/// A fake `omp` for the daemon's children: logs each start's argv and
-/// pid, then stays up (`sleep`) or exits at once.
+/// A fake `omp` for the daemon's children: logs each start's argv, then
+/// stays up (`sleep`, working in `dir`, where `support::processes_in`
+/// finds it: a pid of its own names nothing outside its PID namespace)
+/// or exits at once.
 fn child_script(dir: &TempDir, stays_up: bool) -> (String, PathBuf) {
     use std::os::unix::fs::PermissionsExt;
     let log = dir.join("starts.log");
     let omp = dir.join("omp-children");
-    let tail = if stays_up { "exec sleep 60" } else { "exit 1" };
+    let tail = if stays_up {
+        format!("cd '{}' && exec sleep 60", dir.path().display())
+    } else {
+        "exit 1".to_owned()
+    };
     std::fs::write(
         &omp,
         format!(
-            "#!/bin/sh\necho \"$$ $* broker=$OMP_AUTH_BROKER_URL\" >> '{}'\n{tail}\n",
+            "#!/bin/sh\necho \"$* broker=$OMP_AUTH_BROKER_URL\" >> '{}'\n{tail}\n",
             log.display()
         ),
     )
@@ -362,15 +368,14 @@ fn start_empties_a_stale_clients_file_and_stop_ends_both_children() {
         "{gateway}"
     );
 
+    until(|| support::processes_in(dir.path()) == 2);
     drop(services);
 
-    for line in started {
-        let pid: i32 = line.split_whitespace().next().unwrap().parse().unwrap();
-        assert!(
-            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err(),
-            "child {pid} still running"
-        );
-    }
+    assert_eq!(
+        support::processes_in(dir.path()),
+        0,
+        "a child still runs after the stop"
+    );
 }
 
 /// A child that exits is started again, after a backoff that doubles with

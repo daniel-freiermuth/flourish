@@ -319,6 +319,10 @@ impl FakeBins {
         let dir = TempDir::new(&format!("bin-{label}"));
         let log = dir.join("invocations.log");
         std::fs::write(&log, "").expect("create invocation log");
+        // Every spawn runs under bwrap, which is looked up on `PATH` once
+        // per process (`hunter::child::bwrap`): here, while `PATH` is
+        // still the real one that `isolate` and `env` may narrow.
+        hunter::child::bwrap().expect("bwrap on PATH: every spawn runs under it");
         let original_path = std::env::var("PATH").unwrap_or_default();
         let combined = format!("{}:{original_path}", dir.path().display());
         // SAFETY: this process runs exactly one test (asserted above), so
@@ -1252,3 +1256,35 @@ pub const FORGE_HOST: &str = "forge.example";
 
 /// The provider a test backend's worker talks to (`ScriptedBackend::needing`).
 pub const PROVIDER_HOST: &str = "provider.example";
+
+// ---------------------------------------------------------------------------
+// Processes
+// ---------------------------------------------------------------------------
+
+/// How many live processes work in `dir` (their working directory is in
+/// it). Counted by directory rather than by pid: a process in a PID
+/// namespace knows itself by a pid that means nothing out here. A zombie
+/// has no working directory left and does not count.
+pub fn processes_in(dir: &Path) -> usize {
+    let dir = dir.canonicalize().expect("canonicalize the directory");
+    std::fs::read_dir("/proc")
+        .expect("list /proc")
+        .flatten()
+        .filter(|p| std::fs::read_link(p.path().join("cwd")).is_ok_and(|cwd| cwd.starts_with(&dir)))
+        .count()
+}
+
+/// Poll `done` every 20 ms until it holds or `within` has passed; whether
+/// it held.
+pub fn eventually(within: std::time::Duration, mut done: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        if done() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}

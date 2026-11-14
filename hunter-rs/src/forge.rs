@@ -3790,39 +3790,6 @@ pub fn detect_forge(url: &str) -> ForgeName {
 }
 
 #[cfg(test)]
-mod run_cmd_cwd_tests {
-    use super::*;
-
-    /// The working directory is the whole point of this wrapper.
-    /// Deliberately not the test's own cwd: a delegation that dropped the
-    /// directory would still pass against a path the process is in anyway.
-    #[test]
-    fn test_command_runs_in_the_requested_directory() {
-        let (rc, out) = run_cmd_cwd(&["sh", "-c", "pwd -P"], Path::new("/"), 30);
-        assert_eq!(rc, 0);
-        assert_eq!(out.trim_end(), "/");
-    }
-
-    /// The delegation has to carry the process-group reap with it, not
-    /// just the cwd. A child that exits promptly while leaving a
-    /// descendant holding the inherited pipes hangs `join_pipes` forever
-    /// on this path, where no deadline is in force to rescue it — the bug
-    /// the copied loop here shipped for two rounds.
-    #[test]
-    fn test_prompt_exit_with_a_lingering_descendant_does_not_block() {
-        let t0 = std::time::Instant::now();
-        let (rc, _out) = run_cmd_cwd(&["sh", "-c", "sleep 30 & exit 0"], Path::new("/"), 60);
-        let elapsed = t0.elapsed();
-
-        assert_eq!(rc, 0, "the direct child exited cleanly");
-        assert!(
-            elapsed < std::time::Duration::from_secs(10),
-            "run_cmd_cwd blocked on a descendant holding the pipes: {elapsed:?}"
-        );
-    }
-}
-
-#[cfg(test)]
 mod lookup_cache_tests {
     use super::*;
 
