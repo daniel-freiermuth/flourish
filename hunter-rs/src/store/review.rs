@@ -308,6 +308,9 @@ pub struct ChainIssue {
     pub issue: ReportedIssue,
     /// The fixer's answers, oldest first.
     pub answers: Vec<IssueAnswer>,
+    /// The round the newest of them answers: the newest round when the
+    /// fixer was sent the issue.
+    pub answered_round: Option<i64>,
     /// Later rounds' verdicts on it, oldest first.
     pub verdicts: Vec<IssueJudged>,
 }
@@ -340,6 +343,16 @@ impl ChainIssue {
         self.answers.last()
     }
 
+    /// The fixer's newest answer, when no round after the one it answers
+    /// judged the issue: no reviewer read it. Rounds are compared, not
+    /// counted: a round can stay silent on an issue, and the fixer can
+    /// leave one unanswered.
+    pub fn unjudged_answer(&self) -> Option<&IssueAnswer> {
+        let answered = self.answered_round?;
+        self.answer()
+            .filter(|_| !self.verdicts.iter().any(|v| v.round_id > answered))
+    }
+
     /// Why the newest round that judged it still found it open, when the
     /// newest verdict on it is `open`.
     pub fn still_open(&self) -> Option<&str> {
@@ -356,6 +369,8 @@ impl ChainIssue {
 pub struct FixReview {
     /// The ids of its kept rounds (`ok` or `partial`), oldest first.
     pub rounds: Vec<i64>,
+    /// The commit the newest kept round was shown; `None` before one.
+    pub head: Option<String>,
     /// Every issue its rounds reported, follow-ups among them: by round,
     /// oldest first, blocking ones first within a round.
     pub issues: Vec<ChainIssue>,
@@ -543,12 +558,17 @@ impl Store {
     /// began, as its loop goes by it: its kept rounds, and every issue they
     /// reported with the fixer's answers and later rounds' verdicts. Empty
     /// before its first round is recorded.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "four queries put together into one review: each `query!` row type is local \
+                  to the function, so the assembly cannot move out of it"
+    )]
     pub async fn fix_review(
         &self,
         (finding_id, origin_job_id): (i64, i64),
     ) -> sqlx::Result<FixReview> {
-        let rounds = sqlx::query_scalar!(
-            r#"SELECT r.id AS "id!: i64"
+        let kept = sqlx::query!(
+            r#"SELECT r.id AS "id!: i64", r.head_sha
                FROM review_rounds r JOIN reviews rv ON rv.id = r.review_id
                WHERE rv.subject = 'fix' AND rv.finding_id = ?1 AND rv.origin_job_id = ?2
                  AND r.verdict != 'failed'
@@ -558,6 +578,8 @@ impl Store {
         )
         .fetch_all(&self.pool)
         .await?;
+        let head = kept.last().map(|r| r.head_sha.clone());
+        let rounds = kept.into_iter().map(|r| r.id).collect();
         let issues = sqlx::query!(
             r#"SELECT i.id AS "id!: i64", i.round_id AS "round_id!: i64", i.kind,
                       i.blocking AS "blocking!: bool", i.severity, i.confidence, i.file,
@@ -572,7 +594,8 @@ impl Store {
         .fetch_all(&self.pool)
         .await?;
         let answers = sqlx::query!(
-            r#"SELECT a.issue_id AS "issue_id!: i64", a.answer, a.text, a.commit_sha
+            r#"SELECT a.issue_id AS "issue_id!: i64", a.round_id AS "round_id!: i64", a.answer,
+                      a.text, a.commit_sha
                FROM review_answers a JOIN review_issues i ON i.id = a.issue_id
                JOIN review_rounds r ON r.id = i.round_id
                JOIN reviews rv ON rv.id = r.review_id
@@ -617,6 +640,7 @@ impl Store {
                     detail: i.detail,
                 },
                 answers: Vec::new(),
+                answered_round: None,
                 verdicts: Vec::new(),
             })
             .collect();
@@ -630,6 +654,7 @@ impl Store {
                     text: a.text,
                     commit: a.commit_sha,
                 });
+                issue.answered_round = Some(a.round_id);
             }
         }
         for v in verdicts {
@@ -642,7 +667,11 @@ impl Store {
                 });
             }
         }
-        Ok(FixReview { rounds, issues })
+        Ok(FixReview {
+            rounds,
+            head,
+            issues,
+        })
     }
 
     /// Every round of the reviews of `finding_id`'s fixes, newest first,

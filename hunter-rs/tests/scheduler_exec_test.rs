@@ -330,6 +330,8 @@ async fn create_and_update_job_round_trip() {
         model: Some("claude-4"),
         usage_delta: Some(0.03),
         finished_at: 2000,
+        step: None,
+        kept: false,
     })
     .await
     .unwrap();
@@ -615,6 +617,8 @@ async fn a_downgrade_fails_the_recorded_job_and_no_other() {
             model: None,
             usage_delta: None,
             finished_at: 2000,
+            step: None,
+            kept: false,
         };
         recorded.push(job.complete(&outcome).await.unwrap());
     }
@@ -760,6 +764,8 @@ async fn a_settled_claim_spares_a_finding_a_running_job_works_on() {
             model: None,
             usage_delta: None,
             finished_at: 2000,
+            step: None,
+            kept: false,
         })
         .await
         .unwrap();
@@ -1198,6 +1204,50 @@ async fn reconcile_counts_only_the_orphans_own_work_in_a_handed_off_transcript()
                 assert_eq!(harvest.tokens_new, Some(tokens));
             }
         }
+    }
+}
+
+/// A fix orphan whose work item holds a step record that is not JSON
+/// still settles at startup, suspended (it did work) or killed (it did
+/// none), with no step to record as where it ended: recovery never refuses
+/// the daemon its start over one bad record.
+#[tokio::test]
+async fn reconcile_settles_a_fix_orphan_whose_step_record_is_not_json() {
+    for (calls, expected) in [
+        (0, hunter::domain::JobState::Killed),
+        (1, hunter::domain::JobState::Suspended),
+    ] {
+        let (dir, path, pool) = fresh_db().await;
+        seed_repo(&pool).await;
+        seed_findings(&pool).await;
+        sqlx::raw_sql(
+            "INSERT INTO jobs (id, kind, repo_id, finding_id, state, started_at) \
+             VALUES (10, 'fix', 1, 2, 'running', 1000); \
+             INSERT INTO finding_work (finding_id, kind, step) VALUES (2, 'fix', 'review 2');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let store = rw_store(&path).await;
+        let work_root = dir.subdir("work_root");
+        let session = work_root.join("jobs").join("10").join("session");
+        std::fs::create_dir_all(&session).unwrap();
+        if calls > 0 {
+            std::fs::write(session.join("s.jsonl"), format!("{CALL_1600}\n")).unwrap();
+        }
+
+        hunter::recovery::reconcile_and_log(store.take_unreconciled().unwrap(), &work_root)
+            .await
+            .unwrap();
+
+        let jobs = store.list_jobs(10).await.unwrap();
+        let fix = &jobs.iter().find(|j| j.job.id == 10).unwrap().job;
+        assert_eq!(fix.state, expected);
+        let ended: Option<String> = sqlx::query_scalar("SELECT ended_step FROM jobs WHERE id = 10")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(ended, None);
     }
 }
 

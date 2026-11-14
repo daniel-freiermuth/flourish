@@ -869,10 +869,9 @@ pub struct OpenPrOut {
 #[derive(Debug, Clone)]
 pub struct RunResult {
     pub exit_code: Option<i32>,
-    /// None | "cap" | "wallclock" | "unmetered" | "resume-unavailable" |
-    /// "auth-unavailable" (the auth gateway did not admit the run's token,
-    /// so no worker was spawned), or the review's "shutdown" | "grant" for
-    /// a stop between two runs; what each maps to is `scheduler::job_state`.
+    /// None | "cap" | "wallclock" | "unmetered" | "resume-unavailable", or
+    /// a fix job's "shutdown" for a stop between two of its runs ("cap"
+    /// for a grant spent there); what each maps to is `scheduler::job_state`.
     pub killed_reason: Option<String>,
     pub tokens_new: i64,
     pub calls: i64,

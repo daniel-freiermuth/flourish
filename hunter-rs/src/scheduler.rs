@@ -635,7 +635,9 @@ async fn select(
         for (kind, items) in tiers {
             for f in items.iter().filter(|f| !tried.contains(&f.id)) {
                 let kept = store.checkpoint_job(f.id, kind).await?;
-                if !kept.is_some_and(|j| kept_to_publish(&j)) {
+                let Some(kept) = kept else { continue };
+                let fix = fix_record(store, &kept).await?;
+                if !kept_to_publish(&kept, fix.as_ref().map(|(_, r)| r)) {
                     continue;
                 }
                 match finding_pick(store, cfg, kind, f, false, mode).await? {
@@ -1015,21 +1017,24 @@ fn resume_prompt(kind: JobKind, plan: &ResumePlan) -> String {
 ///   hands straight on into the closed PR's harvest, which is gated and
 ///   reserved for as a resume, so the withdrawal is too, and runs only
 ///   when that warm handoff can, instead of losing it to a cold harvest;
-/// - it is a fix whose `ws` holds no verdict covering its tree. One whose
-///   verdict pinned a commit (a reviewer's change or a curation that
-///   could not be undone) has none, so its retry is reviewed afresh,
-///   which may send it back to the fixer or curate it, and is reserved
-///   for as any resume is. With the review off, a kept fix's (empty)
-///   verdict is saved all the same;
-/// - it is a fix whose next attempt will curate ([`review::curation_pending`]):
-///   a curation owed, or one the daemon died in or whose changes are to be
-///   put back, which owes it once recovered. The curator is a model run,
-///   capped and reserved for as any resume is.
-async fn publishes_for_free(job: &Job, ws: &Workspace, as_kept: bool) -> bool {
-    let fix = job.kind == JobKind::Finding(FindingJobKind::Fix);
-    as_kept
-        && !ws.tree.join("WITHDRAW.md").exists()
-        && (!fix || (review::has_kept_verdict(ws).await && !review::curation_pending(ws)))
+/// - it is a fix (`fix`, its step record) whose next attempt runs a model
+///   ([`review::publishes_as_reviewed`]): one not at its publish (a
+///   curation still to run, or a review again, for a commit a reviewer or
+///   a curator left in place of `HEAD`), one with a tree to put back, or
+///   one whose verdict does not cover its tree as it is. With the review
+///   off, a kept fix's (empty) verdict covers its tree all the same.
+async fn publishes_for_free(
+    ws: &Workspace,
+    fix: Option<&review::StepRecord>,
+    as_kept: bool,
+) -> bool {
+    if !as_kept || ws.tree.join("WITHDRAW.md").exists() {
+        return false;
+    }
+    match fix {
+        Some(record) => review::publishes_as_reviewed(record, ws).await,
+        None => true,
+    }
 }
 
 /// What to reserve for a resumed attempt.
@@ -1124,7 +1129,7 @@ async fn pick_resume(
                     plan,
                 }));
             }
-            Resumable::GaveUp { why, scope } => {
+            Resumable::GaveUp { why, scope, .. } => {
                 if let JobKind::Repo(kind) = kind {
                     count_given_up_repo_chain(scope, (repo.0, &repo.1), kind, job_id, &why).await;
                     return Ok(Picked::Ended);
@@ -1185,8 +1190,8 @@ async fn finding_pick(
                 plan,
             })
         }
-        Resumable::GaveUp { why, scope } => {
-            if count_given_up_chain(scope, kind, f.id, job_id, &why).await {
+        Resumable::GaveUp { why, scope, step } => {
+            if count_given_up_chain(scope, kind, (f.id, job_id, step.as_deref()), &why).await {
                 Picked::Ended
             } else {
                 fresh()
@@ -1282,16 +1287,21 @@ fn publish_refused(job: &Job) -> bool {
 }
 
 /// Whether `job` is a finished attempt kept only to publish: refused by
-/// the forge ([`publish_refused`]) or unpublished while it was unreachable
-/// ([`UNPUBLISHED_OFFLINE`]). Its work is done, so the resume ceiling
-/// spares it for a while, and a retry whose own run does nothing still
-/// publishes.
-fn kept_to_publish(job: &Job) -> bool {
+/// the forge ([`publish_refused`]), unpublished while it was unreachable
+/// ([`UNPUBLISHED_OFFLINE`]), or a fix attempt recorded about to publish
+/// (`JobOutcome::publishing`) whose shipping the daemon's death cut off:
+/// still `done`, its step record (`fix`) at [`review::Step::Publish`].
+/// Its work is done, so the resume ceiling spares it for a while, and a
+/// retry whose own run does nothing still publishes.
+fn kept_to_publish(job: &Job, fix: Option<&review::StepRecord>) -> bool {
+    let publishing =
+        || job.state == JobState::Done && fix.is_some_and(|r| r.step() == review::Step::Publish);
     publish_refused(job)
         || job.notes.as_deref().is_some_and(|n| {
             n.strip_prefix(UNPUBLISHED_OFFLINE)
                 .is_some_and(|rest| rest.starts_with(':'))
         })
+        || publishing()
 }
 
 /// [`kept_to_publish`]'s notes as SQL `LIKE` patterns, for counting such
@@ -1412,12 +1422,12 @@ async fn count_given_up_repo_chain(
 /// also ends chains, for findings a human may since have moved on.
 ///
 /// True when this count ended the work, so the finding has left its
-/// tier.
+/// tier. `step` is the step record a fix's dropped checkpoint had, which a
+/// hold puts back with it ([`record_fix_failure`]).
 async fn count_given_up_chain(
     scope: &CycleScope<'_>,
     kind: FindingJobKind,
-    fid: i64,
-    job: i64,
+    (fid, job, step): (i64, i64, Option<&str>),
     why: &str,
 ) -> bool {
     let store = scope.store();
@@ -1443,8 +1453,7 @@ async fn count_given_up_chain(
         FindingJobKind::Fix => {
             record_fix_failure(
                 store,
-                fid,
-                job,
+                (fid, job, step),
                 failure,
                 why,
                 HoldReason::GaveUp,
@@ -1506,7 +1515,7 @@ async fn engage_pr_moved(
     let (JobKind::Finding(FindingJobKind::Engage), Some(fid)) = (job.kind, job.finding_id) else {
         return Ok(false);
     };
-    if !kept_to_publish(job) {
+    if !kept_to_publish(job, None) {
         return Ok(false);
     }
     let Some(ps) = store.get_pr_state(fid).await? else {
@@ -1553,7 +1562,8 @@ async fn give_up_checkpoint<'s>(mode: Pick<'s>, job: &Job, repo: &str, why: &str
 
 /// End the checkpoint of `job`'s chain, which the give-up ceiling retired
 /// (`why`) after it spent `total`, when `mode` runs (a preview only skips
-/// it): [`Resumable::GaveUp`] once that landed.
+/// it): [`Resumable::GaveUp`] once that landed, with `step`, the fix's
+/// step record the checkpoint had.
 ///
 /// The chain's end counts as a failure of its work, where its tier or the
 /// resume tier caught it ([`count_given_up_chain`],
@@ -1564,7 +1574,7 @@ async fn give_up_checkpoint<'s>(mode: Pick<'s>, job: &Job, repo: &str, why: &str
 async fn give_up_chain<'s>(
     mode: Pick<'s>,
     job: &Job,
-    repo: &str,
+    (repo, step): (&str, Option<String>),
     total: i64,
     why: &str,
 ) -> Resumable<'s> {
@@ -1576,7 +1586,11 @@ async fn give_up_chain<'s>(
         return Resumable::No;
     };
     if end_checkpoint(scope, job, &msg).await {
-        Resumable::GaveUp { why: msg, scope }
+        Resumable::GaveUp {
+            why: msg,
+            scope,
+            step,
+        }
     } else {
         Resumable::No
     }
@@ -1586,11 +1600,17 @@ async fn give_up_chain<'s>(
 /// budget ([`hold_over_budget`]).
 const CHAIN_OVER_BUDGET: &str = "resume chain over budget";
 
+/// The first line of a fix held because its chain, past the fixer's
+/// implementation, made no progress in too many attempts
+/// ([`hold_over_budget`]).
+const CHAIN_STUCK: &str = "resume chain stuck";
+
 /// Hold fix `fid` for the operator as `gave_up`, `job`'s chain as its
-/// checkpoint, when the give-up ceiling's cost arm ends that chain: the
-/// chain's branch and transcript are kept for a `continue`, where
-/// dropping the checkpoint would start the fix over and pay again for
-/// work that already cost several times its kind's typical.
+/// checkpoint, when the give-up ceiling ends that chain by its cost, or by
+/// its attempts once its fixer has finished the fix: the chain's branch
+/// and transcript are kept for a `continue`, where dropping the checkpoint
+/// would start the fix over and pay again for work that already cost
+/// several times its kind's typical, or for a finished fix.
 ///
 /// Never drops the checkpoint. A hold that did not land is skipped: a
 /// failed write is tried again by the next selection, and `false` from
@@ -1628,11 +1648,13 @@ enum Resumable<'s> {
     /// Continue it with this plan.
     Yes(Box<ResumePlan>),
     /// The chain was past the give-up ceiling, and its checkpoint is now
-    /// ended: why. Only a [`Pick::Run`] ends one, so this carries its
-    /// scope, which counting the end against the work takes.
+    /// ended: why, and the step record a fix's checkpoint had. Only a
+    /// [`Pick::Run`] ends one, so this carries its scope, which counting
+    /// the end against the work takes.
     GaveUp {
         why: String,
         scope: &'s CycleScope<'s>,
+        step: Option<String>,
     },
     /// Not resumable for any other reason.
     No,
@@ -1640,6 +1662,47 @@ enum Resumable<'s> {
     /// ([`hold_over_budget`]): neither continued nor started over. When
     /// the hold `landed`, held work has changed under the selection.
     Held { landed: bool },
+}
+
+/// `job`'s finding and the step record its fix continues from
+/// ([`review::StepRecord`]), when it is a fix; one that cannot be read
+/// is a cold start's.
+async fn fix_record(store: &Store, job: &Job) -> anyhow::Result<Option<(i64, review::StepRecord)>> {
+    let (JobKind::Finding(FindingJobKind::Fix), Some(fid)) = (job.kind, job.finding_id) else {
+        return Ok(None);
+    };
+    let json = store.fix_step(fid).await?;
+    let record = review::StepRecord::read(json.as_deref()).unwrap_or_default();
+    Ok(Some((fid, record)))
+}
+
+/// Why the give-up ceiling holds a fix at `record` rather than giving its
+/// chain up ([`hold_over_budget`]), its `own` stats since the operator's
+/// last release: a fix this far over its budget (`over_budget`, the cost)
+/// is held rather than dropped, since its tree holds a branch the chain
+/// paid for, and starting over would pay for it again with no reason to
+/// expect a cheaper ending; so is one stuck past its implementation (a
+/// review, an answer or a curation that keeps stopping), whose fix is
+/// finished, and which starting over would throw away. `None`: the chain
+/// is given up.
+fn held_fix(
+    record: &review::StepRecord,
+    own: &crate::store::ResumeChainStats,
+    over_budget: Option<&str>,
+) -> Option<String> {
+    match over_budget {
+        Some(cost) => Some(format!(
+            "{CHAIN_OVER_BUDGET}: {} tok across the chain ({cost})",
+            own.total
+        )),
+        None => record.implemented().then(|| {
+            format!(
+                "{CHAIN_STUCK}: {} attempts without progress, the limit, at {}",
+                own.attempts,
+                record.step()
+            )
+        }),
+    }
 }
 
 /// How to continue one resumable job, or why it cannot be.
@@ -1753,29 +1816,22 @@ async fn resume_plan<'s>(
     // ceiling, and a chain kept offline counts nothing in its streak
     // either: without this, a flapping network would retry it forever.
     let excess = own.total - own.max_single;
+    // A fix attempt that moved its work on to another step is no attempt
+    // here, but it is a run: a chain that keeps moving without finishing
+    // is bounded by its cost.
     let too_many = own.attempts >= MAX_RESUME_ATTEMPTS;
-    // A review's grant suspensions are no attempt, but they are runs: a
-    // chain that keeps running out of grant in its review is bounded here.
     let too_costly = z > 0 && own.runs >= 2 && excess > GIVE_UP_MULTIPLE * z;
-    let publish_only = kept_to_publish(&job);
+    let fix = fix_record(store, &job).await?;
+    let publish_only = kept_to_publish(&job, fix.as_ref().map(|(_, r)| r));
     let spared = publish_only && spared_by_ceiling(store, job.id, released_at).await?;
     if (too_many || too_costly || publish_only) && !spared {
         let cost =
             format!("{excess} tok outside its largest attempt > {GIVE_UP_MULTIPLE}x {z} typical");
-        // A fix this far over its budget is held rather than dropped: its
-        // tree holds a branch the chain paid for, and starting over would
-        // pay for it again with no reason to expect a cheaper ending. Not
-        // one kept only to publish: its spare's end is what retires it,
-        // the cost having bought finished work, not a stuck chain.
-        if too_costly
-            && !publish_only
-            && let (JobKind::Finding(FindingJobKind::Fix), Some(fid)) = (job.kind, job.finding_id)
+        if !publish_only
+            && let Some((fid, record)) = &fix
+            && let Some(detail) = held_fix(record, &own, too_costly.then_some(cost.as_str()))
         {
-            let detail = format!(
-                "{CHAIN_OVER_BUDGET}: {} tok across the chain ({cost})",
-                own.total
-            );
-            return Ok(hold_over_budget(mode, &job, fid, &detail).await);
+            return Ok(hold_over_budget(mode, &job, *fid, &detail).await);
         }
         let why = if too_many {
             format!("{} attempts, the limit", own.attempts)
@@ -1784,7 +1840,8 @@ async fn resume_plan<'s>(
         } else {
             format!("kept to publish {MAX_PUBLISH_REFUSALS} times, the limit")
         };
-        return Ok(give_up_chain(mode, &job, &repo.name, own.total, &why).await);
+        let step = fix.map(|(_, record)| record.json());
+        return Ok(give_up_chain(mode, &job, (&repo.name, step), own.total, &why).await);
     }
 
     // An unreadable transcript, or one with no usage record at all,
@@ -1793,7 +1850,8 @@ async fn resume_plan<'s>(
     // per-kind typical than a zero that would reserve nothing and
     // let the ramp grant a job it cannot afford.
     let ctx = crate::backends::omp_scavenge::harness::ctx_at_suspension(&session_file).unwrap_or(z);
-    let free = publishes_for_free(&job, &workspace, publish_only && after_hold.is_none()).await;
+    let as_kept = publish_only && after_hold.is_none();
+    let free = publishes_for_free(&workspace, fix.as_ref().map(|(_, r)| r), as_kept).await;
     let anticipated = if free {
         0
     } else {
@@ -2060,18 +2118,16 @@ const MAX_CONSECUTIVE_SAME_FAILURE: i64 = 3;
 /// `Killed` because nothing was spawned — there was no run to kill, the
 /// attempt could not start.
 ///
-/// `shutdown` and `grant` are no run's end: a fix job the daemon's
-/// shutdown, or a spent grant, stopped between its worker runs (the
-/// pre-PR review, [`review::review_fix`]), with the fixer's transcript to
-/// continue. Each is a pause, as a cap is. So is [`AUTH_UNAVAILABLE`] on
-/// a job with a transcript: the review suspended it before a curation
-/// whose run was refused its credentials (the run itself, which spawned
-/// nothing, has none).
+/// `shutdown` is no run's end: a fix job the daemon's shutdown stopped
+/// between its runs (its pre-PR review, [`review::review_fix`]), with the
+/// fixer's transcript to continue. It is a pause, as a cap is, and so is a
+/// grant spent between those runs, recorded as the cap it is. So is
+/// [`AUTH_UNAVAILABLE`] on a job with a transcript: the review suspended
+/// it before a curation whose run was refused its credentials (the run
+/// itself, which spawned nothing, has none).
 fn job_state(rr: &RunResult) -> FinishedState {
     match rr.killed_reason.as_deref() {
-        Some("cap" | review::STOPPED | review::GRANT | AUTH_UNAVAILABLE)
-            if rr.session_file.is_some() =>
-        {
+        Some("cap" | review::STOPPED | AUTH_UNAVAILABLE) if rr.session_file.is_some() => {
             FinishedState::Suspended
         }
         Some("wallclock") if rr.session_file.is_some() && rr.tokens_new > 0 => {
@@ -2147,6 +2203,20 @@ pub async fn record_job(
     model: Option<&str>,
     resume: Option<&ResumePlan>,
 ) -> anyhow::Result<RecordedJob> {
+    record_job_at(store, running, rr, (model, None, false), resume).await
+}
+
+/// [`record_job`], for a fix attempt that ended at the step record `step`
+/// ([`review::StepRecord`]), which the job's record keeps with its end,
+/// and kept as its work item's checkpoint when `kept`
+/// ([`JobOutcome::kept`]).
+async fn record_job_at(
+    store: &Store,
+    running: RunningJob,
+    rr: &RunResult,
+    (model, step, kept): (Option<&str>, Option<&str>, bool),
+    resume: Option<&ResumePlan>,
+) -> anyhow::Result<RecordedJob> {
     let job_id = running.id();
     let state = job_state(rr);
     let notes = if state != FinishedState::Done && !rr.stdout_tail.is_empty() {
@@ -2166,6 +2236,8 @@ pub async fn record_job(
             model,
             usage_delta: rr.usage_delta,
             finished_at: now_ms(),
+            step,
+            kept,
         })
         .await?;
 
@@ -4164,7 +4236,8 @@ pub async fn run_recheck(
             .and_then(|v| v.verdict)
             .is_some_and(|v| !matches!(v, RecheckOutcome::Unknown(_)));
     if !final_verdict && let Some(report) = blocked_report(&ws.tree)? {
-        let held = hold_on_report(store, FindingJobKind::Recheck, fid, job, &ws, &report).await;
+        let held =
+            hold_on_report(store, FindingJobKind::Recheck, fid, job, &ws, &report, None).await;
         close_workspace(lane, ws).await;
         if !held? {
             anyhow::bail!("recheck #{fid}: BLOCKED.md, but it is no longer rechecking");
@@ -5487,9 +5560,10 @@ fn blocked_report(tree: &Path) -> std::io::Result<Option<String>> {
 
 /// Hold `kind`'s work for the operator on the worker's `BLOCKED.md`
 /// (WORK-MODEL.md §9.1): reason `prerequisite`, the report as the detail,
-/// `job` as the checkpoint. Then the report leaves the tree, so the hold
-/// owns it and a resume cannot mistake it for its own outcome. `false`
-/// when nothing was held: the finding has left the kind's tier.
+/// `job` as the checkpoint, and a fix's step record (`step`) as where its
+/// `continue` resumes. Then the report leaves the tree, so the hold owns
+/// it and a resume cannot mistake it for its own outcome. `false` when
+/// nothing was held: the finding has left the kind's tier.
 async fn hold_on_report(
     store: &JobStore,
     kind: FindingJobKind,
@@ -5497,11 +5571,22 @@ async fn hold_on_report(
     job: i64,
     ws: &Workspace,
     report: &str,
+    step: Option<&str>,
 ) -> anyhow::Result<bool> {
-    if !store
-        .hold_work(fid, kind, HoldReason::Prerequisite, report, Some(job))
-        .await?
-    {
+    let reason = HoldReason::Prerequisite;
+    let held = match step {
+        Some(step) => {
+            store
+                .hold_fix_at(fid, (reason, report), Some(job), step)
+                .await?
+        }
+        None => {
+            store
+                .hold_work(fid, kind, reason, report, Some(job))
+                .await?
+        }
+    };
+    if !held {
         return Ok(false);
     }
     std::fs::remove_file(ws.tree.join(BLOCKED_REPORT))?;
@@ -5515,18 +5600,21 @@ async fn hold_on_report(
     Ok(true)
 }
 
-/// The worker's prompt, and whether it resumes the fixer on a review
-/// hold's pending issues ([`review::held_resume_prompt`]), which any
-/// operator's `continue` does while they are pending, whichever hold it
-/// released. The playbook builders run on a resume too: the session
-/// already holds the playbook, but a builder that fails is a
+/// The fixer's prompt for an attempt that runs it: the playbook on a cold
+/// start, [`RESUME_PROMPT`] when its transcript is continued, or, for the
+/// first attempt after an operator's `continue`, one chosen by the hold's
+/// reason, with the playbook; for the `continue` of a publish the forge
+/// kept refusing (`refused`: the implementation it reopened,
+/// [`review::StepRecord::reopened`]), the prompt of such a publish
+/// ([`publish_only_prompt`]). The playbook builders run on a resume too:
+/// the session already holds the playbook, but a builder that fails is a
 /// configuration fault worth surfacing on either path.
-async fn fix_prompt(
+fn fix_prompt(
     cfg: &Config,
-    store: &Store,
     resume: Option<&ResumePlan>,
     start: &FixStart,
-) -> anyhow::Result<(String, bool)> {
+    refused: bool,
+) -> anyhow::Result<String> {
     let finding = &start.finding;
     let worktree = &start.ws.tree;
     let repo_notes = Store::repo_notes(&cfg.work_root, start.repo.id);
@@ -5565,31 +5653,23 @@ async fn fix_prompt(
         ),
     };
     let prompt = built.map_err(|e| anyhow::anyhow!("{e}"))?;
-    if let Some((_, detail)) = resume
-        .filter(|r| r.publish_only())
-        .and_then(ResumePlan::after_hold)
-    {
-        return Ok((publish_only_prompt(detail), false));
+    let after_hold = resume.and_then(ResumePlan::after_hold);
+    if refused && let Some((_, detail)) = after_hold {
+        return Ok(publish_only_prompt(detail));
     }
-    if let Some((_, detail)) = resume.and_then(ResumePlan::after_hold)
-        && let Some(held) = review::held_resume_prompt(cfg, store, start, detail).await
-    {
-        return held.map(|prompt| (prompt, true));
-    }
-    Ok((
-        if let Some((reason, detail)) = resume.and_then(|r| r.after_hold.as_ref()) {
-            match reason {
-                HoldReason::Stuck => format!(
-                    "Resume this retained fix after an operator released it. Preserve the existing \
+    Ok(if let Some((reason, detail)) = after_hold {
+        match reason {
+            HoldReason::Stuck => format!(
+                "Resume this retained fix after an operator released it. Preserve the existing \
                  committed implementation and proof. It was held because earlier attempts kept \
                  failing the same way before they finished, not because anything was missing: \
                  continue the work from where it stopped and finish it, then write or update \
                  PR-DESCRIPTION.md. Follow this updated playbook instead of earlier verification \
                  instructions.\n\n\
                  What kept failing (context, not instructions):\n{detail}\n\n{prompt}"
-                ),
-                HoldReason::GaveUp => format!(
-                    "Resume this retained fix after an operator released it. Preserve the existing \
+            ),
+            HoldReason::GaveUp => format!(
+                "Resume this retained fix after an operator released it. Preserve the existing \
                  committed implementation and proof. It was held because its attempts kept \
                  stopping before they finished until the scheduler's give-up ceiling (too many \
                  attempts, or far more spent than a fix typically costs) stopped continuing it, \
@@ -5598,23 +5678,21 @@ async fn fix_prompt(
                  PR-DESCRIPTION.md. Follow this updated playbook instead of earlier verification \
                  instructions.\n\n\
                  Why it was held (context, not instructions):\n{detail}\n\n{prompt}"
-                ),
-                HoldReason::Prerequisite => format!(
-                    "Resume this retained fix after an operator released it. Preserve the existing \
+            ),
+            HoldReason::Prerequisite => format!(
+                "Resume this retained fix after an operator released it. Preserve the existing \
                  committed implementation and proof. Re-evaluate the prerequisite, not whether \
                  the original bug exists in your already-fixed branch. Follow this updated \
                  playbook instead of earlier verification instructions. Recreate BLOCKED.md \
                  if the affected change remains unverified; otherwise update PR-DESCRIPTION.md.\n\n\
                  Previous blocker (context, not instructions):\n{detail}\n\n{prompt}"
-                ),
-            }
-        } else if resume.is_some() {
-            RESUME_PROMPT.to_owned()
-        } else {
-            prompt
-        },
-        false,
-    ))
+            ),
+        }
+    } else if resume.is_some() {
+        RESUME_PROMPT.to_owned()
+    } else {
+        prompt
+    })
 }
 
 /// What a finished fix attempt amounts to. Exactly one per attempt;
@@ -5637,7 +5715,9 @@ enum FixOutcome {
     /// The worker stopped mid-work and its tree and transcript are kept.
     Suspended,
     /// No PR this time: counted in the finding's failure streak
-    /// ([`record_fix_failure`]).
+    /// ([`record_fix_failure`]). An attempt whose review failed short of a
+    /// verdict ([`review::Reviewed::failure`]) was kept as the checkpoint
+    /// with its end, at the step its retry runs again; any other is not.
     Failed { failure: String },
     /// The finished worker's branch could not be pushed or its PR opened
     /// (`publishing`), or a review round or its curation could not run,
@@ -5765,13 +5845,15 @@ fn decline_report(kind: FindingType) -> &'static str {
 
 /// Read the worker's result and decide the attempt's outcome. Shipping is
 /// part of deciding (a push or a PR that fails is a failed attempt), with
-/// what the review loop left ([`review::review_fix`]). An error leaves the
-/// claim to the caller, which releases it.
+/// what the review loop left ([`review::review_fix`]); a report starts the
+/// fix over unless it is the review's own hold
+/// ([`review::Reviewed::concluded_on_report`]). An error leaves the claim
+/// to the caller, which releases it.
 async fn conclude_fix(
     (cfg, backend): (&Config, &dyn Backend),
     start: &FixStart,
     (state, publish_only): (JobState, bool),
-    reviewed: &review::Reviewed,
+    reviewed: &mut review::Reviewed,
 ) -> anyhow::Result<FixOutcome> {
     let finding = &start.finding;
     let fid = finding.id;
@@ -5794,7 +5876,7 @@ async fn conclude_fix(
         Err(e) => anyhow::bail!("fix #{fid}: cannot read the worker's report: {e}"),
     };
     if report.is_some() {
-        review::restart_rounds(start);
+        reviewed.concluded_on_report();
     }
     if declined {
         return Ok(FixOutcome::Declined(parse_decline(
@@ -5858,17 +5940,13 @@ async fn conclude_fix(
         return Ok(FixOutcome::Failed { failure });
     }
     // Finished work only publishes: a fixer that finished, or a retry of
-    // an attempt kept only to publish, which ships its saved verdict
-    // however its own run ended. A fixer that failed or was killed partway
-    // (shipped anyway with review off) is not finished, and is not kept as
-    // if it were.
+    // an attempt kept only to publish, which ships its verdict however its
+    // own run ended. A fixer that failed or was killed partway (shipped
+    // anyway with review off) is not finished, and is not kept as if it
+    // were. Kept to publish, refused or offline, the job is at its publish
+    // ([`review::Step::Publish`]): the retry ships this same verdict on
+    // this same tree, without reviewing it again.
     let finished = state == JobState::Done || publish_only;
-    if finished {
-        // Kept to publish, refused or offline: the retry ships this same
-        // verdict on this same tree however its own run ends, without
-        // reviewing it again.
-        review::keep_for_publish(start, &ending).await;
-    }
     if let Some(host) = forge_unreachable_now(cfg, &start.repo.url, backend).await {
         return Ok(FixOutcome::Offline {
             outage: Outage::Unreachable(host),
@@ -5886,10 +5964,14 @@ async fn conclude_fix(
 /// [`MAX_CONSECUTIVE_SAME_FAILURE`]th identical failure holds the work for
 /// the operator ([`Store::hold_work`]) as `at_limit` — `stuck`, or
 /// `gave_up` when the give-up ceiling's failure completed the streak —
-/// with `job` as its checkpoint if a worker ran in it; short of that the
-/// fix tier tries again. `detail` follows the failure in the hold and the
-/// event: the worker's output tail, why a chain gave up, or why a tree
-/// could not be made.
+/// with `job` as its checkpoint if a worker ran in it, at `step`, the step
+/// record `job` ended with, when there is one: a checkpoint dropped before
+/// this count (a given-up chain, a publish that failed before the forge)
+/// lost its step with it, and a `continue` resumes where `job` stopped,
+/// not at the fixer's playbook. Short of the limit the fix tier tries
+/// again. `detail` follows the failure in the hold and the event: the
+/// worker's output tail, why a chain gave up, or why a tree could not be
+/// made.
 ///
 /// Every failed fix is counted here — a worker's ([`record_fix_outcome`]),
 /// a given-up resume chain ([`count_given_up_chain`]) and a tree that could
@@ -5898,8 +5980,7 @@ async fn conclude_fix(
 /// recorded is reported as such and ends nothing.
 async fn record_fix_failure(
     store: &JobStore,
-    fid: i64,
-    job: i64,
+    (fid, job, step): (i64, i64, Option<&str>),
     failure: &str,
     detail: &str,
     at_limit: HoldReason,
@@ -5933,10 +6014,19 @@ async fn record_fix_failure(
         return;
     }
     let report = format!("{failure}\n\n{detail}");
-    let message = match store
-        .hold_work(fid, FindingJobKind::Fix, at_limit, &report, Some(job))
-        .await
-    {
+    let held = match step {
+        Some(step) => {
+            store
+                .hold_fix_at(fid, (at_limit, &report), Some(job), step)
+                .await
+        }
+        None => {
+            store
+                .hold_work(fid, FindingJobKind::Fix, at_limit, &report, Some(job))
+                .await
+        }
+    };
+    let message = match held {
         Ok(true) => {
             summary.outcome = Some("held".into());
             summary.attempts = Some(streak);
@@ -6120,8 +6210,7 @@ async fn runner_failed(
         FindingJobKind::Fix => {
             record_fix_failure(
                 store,
-                fid,
-                job,
+                (fid, job, None),
                 RUNNER_ERROR,
                 &err.to_string(),
                 HoldReason::Stuck,
@@ -6180,8 +6269,7 @@ async fn count_unmade_tree(
     // failure is ([`record_fix_outcome`]).
     record_fix_failure(
         store,
-        fid,
-        job,
+        (fid, job, None),
         TREE_NOT_MADE,
         why,
         HoldReason::Stuck,
@@ -6193,15 +6281,15 @@ async fn count_unmade_tree(
     summary
 }
 
-/// Count a fix whose tree could not be put back to the one a failed review
-/// round's reviewer was shown ([`review::restore_reviewed`]) as a failed
-/// attempt under the fixed [`review::TREE_NOT_RESTORED`], with `why` as
-/// the detail ([`record_fix_failure`]), and end it. No worker ran: the job
-/// fails unstarted, so the kept checkpoint stays and the next attempt tries
-/// again; the third such failure in a row holds the fix `stuck`, with `why`
-/// in the report, for the operator to clean the tree up. A review hold's
-/// issues stay pending through that hold: its `continue` resumes the fixer
-/// on them.
+/// Count a fix whose tree could not be put back to the one a reviewer or a
+/// curator was shown ([`review::put_back`]) as a failed attempt under the
+/// fixed [`review::TREE_NOT_RESTORED`], with `why` as the detail
+/// ([`record_fix_failure`]), and end it. No worker ran: the job fails
+/// unstarted, so the kept checkpoint and its step record stay, and the
+/// next attempt tries again; the third such failure in a row holds the fix
+/// `stuck`, with `why` in the report, for the operator to clean the tree
+/// up. Its `continue` resumes the fix at the step it was at, the review
+/// hold's issues to answer among them.
 async fn count_unrestored_tree(
     lane: &mut Lane,
     store: &JobStore,
@@ -6226,8 +6314,7 @@ async fn count_unrestored_tree(
     // failure is ([`record_fix_outcome`]).
     record_fix_failure(
         store,
-        fid,
-        job,
+        (fid, job, None),
         review::TREE_NOT_RESTORED,
         why,
         HoldReason::Stuck,
@@ -6435,14 +6522,15 @@ async fn fix_event(
 }
 
 /// A worker's `BLOCKED.md`: the fix is held for the operator as a missing
-/// prerequisite ([`hold_on_report`]), and the claim goes back to `queued`,
-/// where the fix tier skips held work. The budget override is left alone:
-/// nothing concluded.
+/// prerequisite ([`hold_on_report`]), at the step record `step` its
+/// `continue` resumes, and the claim goes back to `queued`, where the fix
+/// tier skips held work. The budget override is left alone: nothing
+/// concluded.
 async fn hold_prerequisite(
     store: &JobStore,
     start: &FixStart,
     claim: FixClaim,
-    report: &str,
+    (report, step): (&str, &str),
     summary: &mut CycleSummary,
 ) -> anyhow::Result<()> {
     let fid = claim.finding_id();
@@ -6453,6 +6541,7 @@ async fn hold_prerequisite(
         start.job,
         &start.ws,
         report,
+        Some(step),
     )
     .await;
     release_claim(claim).await;
@@ -6545,12 +6634,14 @@ fn shipped_message(fid: i64, pr_url: &str, recovered: bool, titled: bool) -> Str
 /// hold, a decline, and an attempt that could not publish offline (none of
 /// them concluded the work's attempt; a streak's hold did, and spends it);
 /// any outcome that leaves the finding `fixing` returns it to `queued`.
-/// Every outcome ends `claim`.
+/// An outcome that keeps the attempt as the checkpoint keeps `step`, the
+/// step record it ended with, as where the fix continues. Every outcome
+/// ends `claim`.
 async fn record_fix_outcome(
     store: &JobStore,
     (start, claim): (&FixStart, FixClaim),
     outcome: FixOutcome,
-    stdout_tail: &str,
+    (stdout_tail, step): (&str, &str),
     summary: &mut CycleSummary,
 ) -> anyhow::Result<()> {
     let finding = &start.finding;
@@ -6561,7 +6652,7 @@ async fn record_fix_outcome(
     // the finding has moved on to `pr_open`.
     let unreleased = match outcome {
         FixOutcome::Held { report } => {
-            return hold_prerequisite(store, start, claim, &report, summary).await;
+            return hold_prerequisite(store, start, claim, (&report, step), summary).await;
         }
         FixOutcome::Declined(decline) => {
             record_declined_fix(store, finding, start, claim, decline, summary).await;
@@ -6618,14 +6709,14 @@ async fn record_fix_outcome(
             Some(claim)
         }
         FixOutcome::Failed { failure } => {
-            record_failed_fix(store, (fid, job), &failure, tail, summary).await;
+            record_failed_fix(store, (fid, job, step), &failure, tail, summary).await;
             Some(claim)
         }
         FixOutcome::Unpublished { failure } => {
             // Kept to publish, so nothing concluded: a one-shot override
             // is kept for the attempt that publishes, as offline. A hold
             // from the streak concludes it, and spends the override.
-            record_unpublished_fix(store, (fid, job), failure, tail, summary).await;
+            record_unpublished_fix(store, (fid, job, step), failure, tail, summary).await;
             if summary.outcome.as_deref() != Some("held") {
                 release_claim(claim).await;
                 return Ok(());
@@ -6636,7 +6727,7 @@ async fn record_fix_outcome(
             // Nothing concluded, so a one-shot override is kept for the
             // attempt that publishes.
             log_write_failure(
-                store.keep_attempt_as_checkpoint(job).await,
+                store.keep_attempt_as_checkpoint(job, Some(step)).await,
                 format_args!("job {job}: keeping the unpublished attempt as the checkpoint"),
             );
             *summary = outage
@@ -6653,14 +6744,15 @@ async fn record_fix_outcome(
     Ok(())
 }
 
-/// Count a failed fix ([`FixOutcome::Failed`]) in its streak. A refused
-/// publish of unfinished work (review off ships a failed fixer's commits)
-/// is not kept, but counts under the same key as a kept one
+/// Count a failed fix ([`FixOutcome::Failed`]) in its streak, a hold at
+/// its limit keeping `step`, the step record the attempt ended with. A
+/// refused publish of unfinished work (review off ships a failed fixer's
+/// commits) is not kept, but counts under the same key as a kept one
 /// ([`PUBLISH_REFUSED`]): the forge's text differs on every try and would
 /// reset the streak each time.
 async fn record_failed_fix(
     store: &JobStore,
-    (fid, job): (i64, i64),
+    (fid, job, step): (i64, i64, &str),
     failure: &str,
     tail: &str,
     summary: &mut CycleSummary,
@@ -6669,8 +6761,7 @@ async fn record_failed_fix(
         let detail = format!("{failure}\n\n{tail}");
         record_fix_failure(
             store,
-            fid,
-            job,
+            (fid, job, Some(step)),
             PUBLISH_REFUSED,
             &detail,
             HoldReason::Stuck,
@@ -6679,57 +6770,61 @@ async fn record_failed_fix(
         .await;
         summary.failure = Some(failure.to_owned());
     } else {
-        record_fix_failure(store, fid, job, failure, tail, HoldReason::Stuck, summary).await;
+        record_fix_failure(
+            store,
+            (fid, job, Some(step)),
+            failure,
+            tail,
+            HoldReason::Stuck,
+            summary,
+        )
+        .await;
     }
 }
 
 /// Record a finished fix the forge would not publish
-/// ([`FixOutcome::Unpublished`]): the attempt becomes the checkpoint, and
-/// the failure counts under the step's name ([`failure_key`]), with the
-/// forge's text and the worker's tail as the detail.
+/// ([`FixOutcome::Unpublished`]): the attempt becomes the checkpoint, at
+/// its step record `step`, and the failure counts under the step's name
+/// ([`failure_key`]), with the forge's text and the worker's tail as the
+/// detail.
 async fn record_unpublished_fix(
     store: &JobStore,
-    (fid, job): (i64, i64),
+    (fid, job, step): (i64, i64, &str),
     failure: String,
     tail: &str,
     summary: &mut CycleSummary,
 ) {
     log_write_failure(
-        store.keep_attempt_as_checkpoint(job).await,
+        store.keep_attempt_as_checkpoint(job, Some(step)).await,
         format_args!("job {job}: keeping the unpublished attempt as the checkpoint"),
     );
     let detail = format!("{failure}\n\n{tail}");
     let key = failure_key(&failure);
-    record_fix_failure(store, fid, job, key, &detail, HoldReason::Stuck, summary).await;
+    record_fix_failure(
+        store,
+        (fid, job, Some(step)),
+        key,
+        &detail,
+        HoldReason::Stuck,
+        summary,
+    )
+    .await;
     summary.failure = Some(failure);
 }
 
 /// Run a fix's or an engage's worker on `prompt`, continuing `resume`'s
 /// session, if any: unless that continuation only publishes the tree
-/// its predecessor was kept with ([`ResumePlan::publishes_as_kept`]), or
-/// `paused`, its predecessor was suspended between its runs with its
-/// worker finished ([`review::suspended_between_runs`]). Then no worker runs:
-/// resuming the session would re-send its whole transcript only to be
-/// told to change nothing and end. The attempt finishes at once, having
-/// spent nothing, on the predecessor's transcript, which a later
-/// continuation of the chain resumes.
+/// its predecessor was kept with ([`ResumePlan::publishes_as_kept`]). Then
+/// no worker runs ([`unrun`]): resuming the session would re-send its
+/// whole transcript only to be told to change nothing and end.
 async fn worker_run(
     backend: &dyn Backend,
     ws: &Workspace,
     (prompt, cap, max_wall_s): (&str, Option<i64>, i64),
-    (resume, paused): (Option<&ResumePlan>, bool),
+    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<RunResult> {
-    if let Some(plan) = resume.filter(|r| r.publishes_as_kept() || paused) {
-        return Ok(RunResult {
-            exit_code: Some(0),
-            killed_reason: None,
-            tokens_new: 0,
-            calls: 0,
-            session_file: Some(plan.session_file.to_string_lossy().into_owned()),
-            duration_s: 0.0,
-            stdout_tail: String::new(),
-            usage_delta: None,
-        });
+    if let Some(plan) = resume.filter(|r| r.publishes_as_kept()) {
+        return Ok(unrun(plan));
     }
     backend
         .run(
@@ -6743,9 +6838,26 @@ async fn worker_run(
         .await
 }
 
-/// Run a fix job (`scheduler.run_fix`): start it ([`start_fix`]), run the
-/// worker, then decide ([`conclude_fix`]) and record
-/// ([`record_fix_outcome`]) what the attempt amounts to.
+/// The run of a continuation whose worker does not run: it finishes at
+/// once, having spent nothing, on the predecessor's transcript, which a
+/// later run continues.
+fn unrun(plan: &ResumePlan) -> RunResult {
+    RunResult {
+        exit_code: Some(0),
+        killed_reason: None,
+        tokens_new: 0,
+        calls: 0,
+        session_file: Some(plan.session_file.to_string_lossy().into_owned()),
+        duration_s: 0.0,
+        stdout_tail: String::new(),
+        usage_delta: None,
+    }
+}
+
+/// Run a fix job (`scheduler.run_fix`): start it ([`start_fix`]), run its
+/// steps from the one its record names ([`review::Step`]), then decide
+/// ([`conclude_fix`]) and record ([`record_fix_outcome`]) what the attempt
+/// amounts to.
 #[allow(
     clippy::too_many_lines,
     reason = "the attempt's steps in the order they must run, each with its own early end"
@@ -6765,85 +6877,125 @@ pub async fn run_fix(
     };
     // Any early return from here on drops `running`: the cycle's settle
     // records the abandoned job.
-    // A curation the daemon died in is undone before anything reads the
-    // tree, and owed again.
-    review::recover_curation(lane, store, &start).await;
-    // A review round's reviewer or a curator whose changes could not be
-    // undone left the tree as it changed it, however the attempt then ended
-    // (a hold, offline, a pinned commit whose publish failed): it is put
-    // back to the reviewed commit before any worker runs in it, or none does.
-    if let Err(why) = review::restore_reviewed(lane, store, &start).await {
-        return Ok(count_unrestored_tree(lane, store, (start, running, claim), &why).await);
-    }
-    // A fix owing only its curation runs no fixer, whatever hold an
-    // operator released: its review is through, and the curation runs with
-    // its own checks. One the review suspended between its runs goes
-    // straight back to the review, its fixer having finished; unless an
-    // operator released a hold since, whose prompt the fixer has to act on.
-    let paused = resume.is_some_and(|r| {
-        review::owes_curation(&start)
-            || (r.after_hold().is_none()
-                && review::suspended_between_runs(&start, r.predecessor_id()))
-    });
-    // What a paused resume found, to put back if it runs nothing (below).
-    let found = paused.then(|| review::ProgressSnapshot::take(&start));
-    let (prompt, answers_held) = match fix_prompt(cfg, store, resume, &start).await {
-        Ok(prompted) => prompted,
+    let mut record = match review::begin(store, &start, resume.is_some()).await {
+        Ok(record) => record,
         Err(e) => {
             release_claim(claim).await;
             return Err(e);
         }
     };
-    let model = cfg.model_for("fix");
-    let rr = match worker_run(
-        backend,
-        &start.ws,
-        (&prompt, start.cap, cfg.fix_max_wall_s),
-        (resume, paused),
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            // Counted while the claim still holds the finding, as a
-            // worker's failure is.
-            let ran = (WorkOf::Finding(FindingJobKind::Fix, fid), running);
-            let denied = runner_failed(store, (cfg, backend, &start.repo.url), ran, &e).await;
-            release_claim(claim).await;
-            close_workspace(lane, start.ws).await;
-            return denied.ok_or_else(|| counted(e));
-        }
-    };
-    let ran = (WorkOf::Finding(FindingJobKind::Fix, fid), running);
-    let running = match held_unstarted(store, cfg, backend, &start.repo.url, ran, &rr).await {
-        ControlFlow::Continue(running) => running,
-        ControlFlow::Break(denied) => {
-            release_claim(claim).await;
-            close_workspace(lane, start.ws).await;
-            return Ok(denied);
-        }
-    };
-    // The fixer ran on a review hold's pending issues: no later `continue`
-    // sends them again. Before the review, which may hold on new ones.
-    if answers_held {
-        review::mark_held_sent(&start);
+    // A reviewer or a curator that the daemon died in, or whose changes
+    // could not be undone, left the tree as it changed it, however the
+    // attempt then ended (a hold, offline, a pinned commit whose publish
+    // failed): it is put back to the reviewed commit before any worker runs
+    // in it, or none does.
+    if let Err(why) = review::put_back(lane, store, &start, &mut record).await {
+        return Ok(count_unrestored_tree(lane, store, (start, running, claim), &why).await);
     }
-    // A finished fix is reviewed before it ships, all within this job: the
-    // reviewer and the fixer's answers run under the same grant, and the
-    // row records what all of them spent.
-    let reviewed = review::review_fix(scope, lane, cfg, backend, &start, rr).await;
-    // A paused resume ran no fixer; when an outage stopped every run it
+    // The fixer runs only at its implementation; every other step runs its
+    // own runs, on the fixer's transcript. An operator's `continue` of a
+    // publish the forge kept refusing (the released hold's attempt was kept
+    // only to publish, [`ResumePlan::publish_only`]) goes back to the
+    // implementation, whatever step it shipped at: the publish, its verdict
+    // kept, so a fixer that changes nothing publishes on it; or a review or
+    // a curation whose changes could not be undone (its pinned commit, the
+    // tree put back above), so a review reads what the fixer's answer to
+    // the forge leaves, and the forge's answer reaches an agent instead of
+    // a curation that knows nothing of it. One cut off resumes as any
+    // implementation does ([`review::StepRecord::reopen`]).
+    // The reopened step is recorded before the fixer runs: the release
+    // reaches only this attempt, so a resume after a daemon that died in
+    // the fixer must find the implementation, not a publish that would
+    // review and ship the fixer's half-done tree. The record says it was
+    // reopened until its fixer starts, so the fixer is told only to publish
+    // by whichever attempt first runs it: one that failed before its fixer
+    // started leaves the release's checkpoint as it was, and the next
+    // attempt the same hold to tell it. Once the fixer has started, its
+    // transcript holds that prompt, and its attempt's end records the
+    // reopening done: the `continue` of a later hold (one over budget, say)
+    // is told what that hold was.
+    let after_hold = resume.and_then(ResumePlan::after_hold);
+    if resume.is_some_and(ResumePlan::publish_only) && after_hold.is_some() {
+        record.reopen();
+        if let Err(e) = store.set_fix_step(start.finding.id, &record.json()).await {
+            release_claim(claim).await;
+            return Err(e.into());
+        }
+    }
+    let fixes = record.step() == review::Step::Implement;
+    // What a resume that runs no fixer found, to put back if it runs
+    // nothing (below). A cold start always runs its fixer.
+    let found = (!fixes).then(|| record.json());
+    let model = cfg.model_for("fix");
+    let (rr, running) = if let Some(plan) = resume.filter(|_| !fixes) {
+        (unrun(plan), running)
+    } else {
+        let prompt = match fix_prompt(cfg, resume, &start, record.reopened()) {
+            Ok(prompt) => prompt,
+            Err(e) => {
+                release_claim(claim).await;
+                return Err(e);
+            }
+        };
+        let rr = match worker_run(
+            backend,
+            &start.ws,
+            (&prompt, start.cap, cfg.fix_max_wall_s),
+            resume,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                // Counted while the claim still holds the finding, as
+                // a worker's failure is.
+                let ran = (WorkOf::Finding(FindingJobKind::Fix, fid), running);
+                let denied = runner_failed(store, (cfg, backend, &start.repo.url), ran, &e).await;
+                release_claim(claim).await;
+                close_workspace(lane, start.ws).await;
+                return denied.ok_or_else(|| counted(e));
+            }
+        };
+        let ran = (WorkOf::Finding(FindingJobKind::Fix, fid), running);
+        match held_unstarted(store, cfg, backend, &start.repo.url, ran, &rr).await {
+            ControlFlow::Continue(running) => {
+                record.fixer_started();
+                (rr, running)
+            }
+            ControlFlow::Break(denied) => {
+                release_claim(claim).await;
+                close_workspace(lane, start.ws).await;
+                return Ok(denied);
+            }
+        }
+    };
+    // The rest of the fix (its review, the fixer's answers, the curation)
+    // runs within this job: under the same grant, and the row records what
+    // all of them spent.
+    let mut reviewed = review::review_fix(
+        scope,
+        lane,
+        (cfg, backend),
+        &start,
+        (rr, record),
+        after_hold,
+    )
+    .await;
+    // A resume that ran no fixer, when an outage stopped every run it
     // started before any did work (a reviewer, an answer or a curator
-    // refused its credentials, or failed offline), it ran nothing at all:
-    // its progress is put back as it found it and it is closed as never
+    // refused its credentials, or failed offline), ran nothing at all: its
+    // step record is put back as it found it and it is closed as never
     // started, as a refused fixer is (`held_unstarted`), so the attempt it
-    // continues stays the checkpoint, its resume still answers what it
+    // continues stays the checkpoint, its resume still runs the step it
     // owes, and an outage that keeps refusing grows no chain.
     if let Some(found) = found
         && reviewed.rr.tokens_new == 0
         && let Some(outage) = reviewed.offline.clone()
     {
-        found.restore(&start);
+        log_write_failure(
+            store.set_fix_step(fid, &found).await,
+            format_args!("fix #{fid}: putting the step record back"),
+        );
         let job = running.id();
         log_write_failure(
             running.fail_unstarted(&outage.to_string()).await,
@@ -6854,9 +7006,22 @@ pub async fn run_fix(
         let kind = FindingJobKind::Fix.into();
         return Ok(outage.denial(store, kind, Some(fid), Some(job)).await);
     }
-    let rr = &reviewed.rr;
+    // An attempt about to publish is kept as the checkpoint, at its step,
+    // until shipping moves the finding on: a daemon that dies while it
+    // pushes or opens the PR resumes the publish, or with a pinned commit
+    // puts the tree back and has that step again. So is one whose review
+    // failed short of a verdict, at the step its retry runs again
+    // ([`review::Reviewed::kept`]).
+    let publishing = reviewed.publishing();
     let recorded = log_write_failure(
-        record_job(store, running, rr, model, resume).await,
+        record_job_at(
+            store,
+            running,
+            &reviewed.rr,
+            (model, Some(&reviewed.step()), reviewed.kept()),
+            resume,
+        )
+        .await,
         format_args!("job {}: recording outcome", start.job),
     );
     let state = recorded
@@ -6868,12 +7033,13 @@ pub async fn run_fix(
         job_id: Some(start.job),
         state: Some(state),
         branch: Some(start.branch.clone()),
-        tokens_new: Some(rr.tokens_new),
+        tokens_new: Some(reviewed.rr.tokens_new),
         ..Default::default()
     };
     let publish_only = resume.is_some_and(ResumePlan::publish_only);
-    let outcome = match conclude_fix((cfg, backend), &start, (state, publish_only), &reviewed).await
-    {
+    let concluded =
+        conclude_fix((cfg, backend), &start, (state, publish_only), &mut reviewed).await;
+    let outcome = match concluded {
         Ok(outcome) => outcome,
         Err(e) => {
             release_claim(claim).await;
@@ -6904,11 +7070,24 @@ pub async fn run_fix(
             format_args!("job {}: failing ({failure})", start.job),
         );
     }
+    // Kept to publish, but failed before reaching the forge (nothing to
+    // ship): not kept, as any other failure, and the next attempt starts
+    // cold.
+    if publishing && let FixOutcome::Failed { failure } = &outcome {
+        let message = format!("#{fid} {failure}: not kept to publish");
+        log_write_failure(
+            store
+                .drop_checkpoint(fid, FindingJobKind::Fix, start.job, &message)
+                .await,
+            format_args!("job {}: dropping the publish's checkpoint", start.job),
+        );
+    }
+    let step = reviewed.step();
     record_fix_outcome(
         store,
         (&start, claim),
         outcome,
-        &rr.stdout_tail,
+        (&reviewed.rr.stdout_tail, &step),
         &mut summary,
     )
     .await?;
@@ -7840,7 +8019,7 @@ async fn withdraw_pr(
             let unmoved = branch_unmoved(start).await;
             if unmoved {
                 log_write_failure(
-                    store.keep_attempt_as_checkpoint(job).await,
+                    store.keep_attempt_as_checkpoint(job, None).await,
                     format_args!("job {job}: keeping the unpublished withdrawal as the checkpoint"),
                 );
             } else {
@@ -8338,7 +8517,7 @@ async fn record_failed_engage(
     let kept = finished && !fail.starts_with(UNFINISHED_REWIND) && branch_unmoved(start).await;
     if kept {
         log_write_failure(
-            store.keep_attempt_as_checkpoint(job).await,
+            store.keep_attempt_as_checkpoint(job, None).await,
             format_args!("job {job}: keeping the unpublished attempt as the checkpoint"),
         );
     }
@@ -8705,7 +8884,7 @@ async fn unpublished_offline(
         );
     }
     log_write_failure(
-        store.keep_attempt_as_checkpoint(job).await,
+        store.keep_attempt_as_checkpoint(job, None).await,
         format_args!("job {job}: keeping the unpublished attempt as the checkpoint"),
     );
     Some(
@@ -8810,7 +8989,7 @@ pub async fn run_engage(
         backend,
         &start.ws,
         (&prompt, start.cap, cfg.fix_max_wall_s),
-        (resume, false),
+        resume,
     )
     .await
     {
@@ -8986,6 +9165,7 @@ async fn engage_blocked(
         start.job,
         &start.ws,
         report,
+        None,
     )
     .await;
     if !held? {
@@ -9265,7 +9445,7 @@ async fn harvest_blocked(
     ws: OpenWorkspace,
     report: &str,
 ) -> anyhow::Result<CycleSummary> {
-    let held = hold_on_report(store, FindingJobKind::Harvest, fid, job, &ws, report).await;
+    let held = hold_on_report(store, FindingJobKind::Harvest, fid, job, &ws, report, None).await;
     close_workspace(lane, ws).await;
     let outcome = if held? {
         "held"
