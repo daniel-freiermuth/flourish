@@ -326,7 +326,7 @@ impl Rounds<'_> {
             paused_by: Some(self.start.job),
             ..progress
         };
-        write_progress(self.start, &progress);
+        write_progress(self.start, &progress, "recording the review's progress");
         job.rr.killed_reason = Some(reason.to_owned());
         job.rr.exit_code = None;
         let fid = self.start.finding.id;
@@ -397,7 +397,7 @@ impl Rounds<'_> {
             follow_ups: follow_ups.to_vec(),
             ..Progress::default()
         };
-        write_progress(start, &again);
+        write_progress(start, &again, "recording the review's progress");
         let message = format!("{host} unreachable; kept to review round {round} again");
         log_round(self.store(), start, round, &message).await;
         Some(host)
@@ -665,7 +665,7 @@ async fn ship_saved(
         follow_ups: follow_ups.clone(),
         ..Progress::default()
     };
-    write_progress(start, &taken);
+    write_progress(start, &taken, "recording the review's progress");
     let rounds = Rounds {
         scope,
         cfg,
@@ -900,9 +900,7 @@ async fn curated_head(
         return Curated::Not;
     };
     let marker = start.ws.root.join(CURATING_FILE);
-    let recorded = serde_json::to_vec(&curating)
-        .map_err(std::io::Error::other)
-        .and_then(|bytes| std::fs::write(&marker, bytes));
+    let recorded = write_json(&marker, &curating);
     if let Err(e) = recorded {
         note(format!("skipped (cannot record the reviewed tree: {e})")).await;
         return Curated::Not;
@@ -1004,6 +1002,7 @@ fn owe_curation(start: &FixStart) {
             owed: Some(Owed::Curation),
             ..Progress::default()
         },
+        "recording the review's progress",
     );
 }
 
@@ -1138,15 +1137,7 @@ async fn end_loop(
         follow_ups,
         ..Progress::default()
     };
-    let reset = serde_json::to_vec(&progress)
-        .map_err(std::io::Error::other)
-        .and_then(|bytes| std::fs::write(root.join(PROGRESS_FILE), bytes));
-    if let Err(e) = reset {
-        tracing::warn!(
-            "fix #{}: resetting the review's progress: {e}",
-            start.finding.id
-        );
-    }
+    write_progress(start, &progress, "resetting the review's progress");
     let _ = std::fs::remove_file(root.join(ENDING_FILE));
     let _ = std::fs::remove_file(root.join(HELD_FILE));
     if keep {
@@ -1161,9 +1152,7 @@ async fn save_ending(start: &FixStart, ending: &Ending) {
         title: ending.title.clone(),
         tree: tree_state(&start.ws.tree).await,
     };
-    let written = serde_json::to_vec(&saved)
-        .map_err(std::io::Error::other)
-        .and_then(|bytes| std::fs::write(start.ws.root.join(ENDING_FILE), bytes));
+    let written = write_json(&start.ws.root.join(ENDING_FILE), &saved);
     if let Err(e) = written {
         tracing::warn!("fix #{}: recording the review's end: {e}", start.finding.id);
     }
@@ -1288,9 +1277,7 @@ fn hold(
         sent: Some(false),
         report: None,
     };
-    let written = serde_json::to_vec(&held)
-        .map_err(std::io::Error::other)
-        .and_then(|bytes| std::fs::write(root.join(HELD_FILE), bytes))
+    let written = write_json(&root.join(HELD_FILE), &held)
         .and_then(|()| std::fs::write(start.ws.tree.join(BLOCKED_REPORT), &report));
     if let Err(e) = written {
         tracing::warn!("fix #{}: holding on the review: {e}", start.finding.id);
@@ -1299,15 +1286,7 @@ fn hold(
     }
     // The continued fix is reviewed from round 1 again, under the same
     // title and with the follow-ups found so far.
-    let kept = serde_json::to_vec(progress)
-        .map_err(std::io::Error::other)
-        .and_then(|bytes| std::fs::write(root.join(PROGRESS_FILE), bytes));
-    if let Err(e) = kept {
-        tracing::warn!(
-            "fix #{}: keeping the review's progress: {e}",
-            start.finding.id
-        );
-    }
+    write_progress(start, progress, "keeping the review's progress");
     let _ = std::fs::remove_file(root.join(ENDING_FILE));
     true
 }
@@ -1322,9 +1301,7 @@ pub(super) const TREE_NOT_RESTORED: &str = "reviewed tree not restored";
 /// [`restore_reviewed`] ([`RESTORE_FILE`]). A failure is logged: the tree
 /// then stays as the agent left it.
 fn record_restore(start: &FixStart, left: &Restore) {
-    let written = serde_json::to_vec(left)
-        .map_err(std::io::Error::other)
-        .and_then(|bytes| std::fs::write(start.ws.root.join(RESTORE_FILE), bytes));
+    let written = write_json(&start.ws.root.join(RESTORE_FILE), left);
     if let Err(e) = written {
         tracing::warn!(
             "fix #{}: recording the reviewed tree to put back: {e}",
@@ -1446,9 +1423,7 @@ pub(super) fn mark_held_sent(start: &FixStart) {
         return;
     };
     held.sent = Some(true);
-    let written = serde_json::to_vec(&held)
-        .map_err(std::io::Error::other)
-        .and_then(|bytes| std::fs::write(&path, bytes));
+    let written = write_json(&path, &held);
     if let Err(e) = written {
         tracing::warn!(
             "fix #{}: recording the held issues as sent: {e}",
@@ -1483,12 +1458,7 @@ async fn send_back(
 ) -> Answered {
     let start = rounds.start;
     let (fid, round) = (start.finding.id, progress.rounds);
-    let written = serde_json::to_vec(progress)
-        .map_err(std::io::Error::other)
-        .and_then(|bytes| std::fs::write(start.ws.root.join(PROGRESS_FILE), bytes));
-    if let Err(e) = written {
-        tracing::warn!("fix #{fid}: recording review round {round}: {e}");
-    }
+    write_progress(start, progress, &format!("recording review round {round}"));
     let fx = match answer_review(rounds, issues, &job.rr).await {
         Ok(fx) => fx,
         Err(why) => {
@@ -1574,20 +1544,16 @@ pub(super) fn restart_rounds(start: &FixStart) {
                 follow_ups: progress.follow_ups,
                 ..Progress::default()
             },
+            "recording the review's progress",
         );
     }
 }
 
-/// Write `progress` to [`PROGRESS_FILE`]; a failure is logged.
-fn write_progress(start: &FixStart, progress: &Progress) {
-    let written = serde_json::to_vec(progress)
-        .map_err(std::io::Error::other)
-        .and_then(|bytes| std::fs::write(start.ws.root.join(PROGRESS_FILE), bytes));
-    if let Err(e) = written {
-        tracing::warn!(
-            "fix #{}: recording the review's progress: {e}",
-            start.finding.id
-        );
+/// Write `progress` to [`PROGRESS_FILE`]; a failure is logged as `what`.
+fn write_progress(start: &FixStart, progress: &Progress, what: &str) {
+    let path = start.ws.root.join(PROGRESS_FILE);
+    if let Err(e) = write_json(&path, progress) {
+        tracing::warn!("fix #{}: {what}: {e}", start.finding.id);
     }
 }
 
@@ -2297,6 +2263,12 @@ fn tally(issues: &[serde_json::Value]) -> String {
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
     serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
+fn write_json<T: serde::Serialize + ?Sized>(path: &Path, value: &T) -> std::io::Result<()> {
+    serde_json::to_vec(value)
+        .map_err(std::io::Error::other)
+        .and_then(|bytes| std::fs::write(path, bytes))
 }
 
 /// What is left of the job's grant after `spent`: `None` for a job with no
