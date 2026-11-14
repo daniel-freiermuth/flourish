@@ -171,10 +171,23 @@ function hasKeyableRepoWork(repo: Record<string, unknown>): boolean {
   return holds && failing;
 }
 
-/** `FindingDetail` reads `detail.jobs.length` and keys each row by `job.id`. */
+function hasKeyableReviewRounds(detail: Record<string, unknown>): boolean {
+  const rounds = detail.fix_review_rounds;
+  // Absent when the daemon predates the field; the panel reads it as `[]`.
+  if (rounds === undefined || rounds === null) return true;
+  return isKeyedList(rounds, "id", "number")
+    && rounds.every((r) => isKeyedList(r.issues, "id", "number"));
+}
+
+/**
+ * `FindingDetail` reads `detail.jobs.length` and keys each row by `job.id`,
+ * and keys the fix review's rounds by `round.id` and each round's issues
+ * by `issue.id`, reading `round.issues.length` with no guard.
+ */
 export function isFindingDetail(v: unknown): v is FindingDetail {
   if (!isObject(v)) return false;
   if (!isKeyedList(v.jobs, "id", "number")) return false;
+  if (!hasKeyableReviewRounds(v)) return false;
   // Nullable by contract, so absent is fine, but a non-object non-null
   // would be read as a record by the PR block.
   return v.pr_state === null || v.pr_state === undefined || isObject(v.pr_state);

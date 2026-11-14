@@ -44,6 +44,9 @@
     void store.revision;
     load();
   });
+
+  // Absent when talking to a daemon that predates the field.
+  let reviewRounds = $derived(detail?.fix_review_rounds ?? []);
 </script>
 
 {#if loading}
@@ -126,6 +129,45 @@
         <span class="pr-label">Synced</span>
         <span class="dim">{datetime(pr.synced_at)}</span>
       </div>
+    </div>
+  {/if}
+
+  <!-- The review a fix had before its PR opened, newest round first -->
+  {#if reviewRounds.length > 0}
+    <div class="section">
+      <h4 class="section-title">Fix Review</h4>
+      <ul class="rounds">
+        {#each reviewRounds as round (round.id)}
+          <li>
+            <span
+              class="state"
+              class:ok={round.verdict === "ok"}
+              class:bad={round.verdict === "failed"}
+              class:dim={round.verdict !== "ok" && round.verdict !== "failed"}
+            >
+              {round.verdict}
+            </span>
+            <span class="dim">job {round.job_id ?? "–"} · {datetime(round.finished_at)}</span>
+            {#if round.failure}
+              <span class="dim">— {round.failure}</span>
+            {/if}
+            {#if round.issues.length > 0}
+              <ul class="issues">
+                {#each round.issues as issue (issue.id)}
+                  <li>
+                    <span class="kind" class:warn={issue.blocking}>
+                      {issue.blocking ? "blocking " : ""}{issue.kind}
+                    </span>
+                    {issue.summary}
+                  </li>
+                {/each}
+              </ul>
+            {:else if round.verdict === "ok"}
+              <span class="dim">— no issues</span>
+            {/if}
+          </li>
+        {/each}
+      </ul>
     </div>
   {/if}
 {/if}
@@ -237,6 +279,27 @@
   .pr-value.dim { color: var(--text-dim); }
 
   .warn {
+    color: var(--sev-medium);
+  }
+
+  .rounds,
+  .issues {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    font-size: 0.75rem;
+  }
+  .rounds > li + li {
+    margin-top: 0.25rem;
+  }
+  .issues {
+    padding-left: 1rem;
+  }
+  .kind {
+    color: var(--text-dim);
+    font-size: 0.6875rem;
+  }
+  .kind.warn {
     color: var(--sev-medium);
   }
 </style>

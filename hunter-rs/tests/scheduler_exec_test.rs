@@ -330,6 +330,7 @@ async fn create_and_update_job_round_trip() {
         model: Some("claude-4"),
         usage_delta: Some(0.03),
         finished_at: 2000,
+        step: None,
     })
     .await
     .unwrap();
@@ -615,6 +616,7 @@ async fn a_downgrade_fails_the_recorded_job_and_no_other() {
             model: None,
             usage_delta: None,
             finished_at: 2000,
+            step: None,
         };
         recorded.push(job.complete(&outcome).await.unwrap());
     }
@@ -760,6 +762,7 @@ async fn a_settled_claim_spares_a_finding_a_running_job_works_on() {
             model: None,
             usage_delta: None,
             finished_at: 2000,
+            step: None,
         })
         .await
         .unwrap();

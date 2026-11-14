@@ -447,7 +447,7 @@ pub enum Side {
 }
 
 impl Side {
-    /// The word GitHub's review API and `pr_review_issues.side` use.
+    /// The word GitHub's review API and `review_issues.side` use.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Right => "RIGHT",
@@ -459,7 +459,7 @@ impl Side {
 /// One issue of a [`ReviewPost`] placed on a line of the PR's diff.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InlineComment {
-    /// The `pr_review_issues` row this comment carries.
+    /// The `review_issues` row this comment carries.
     pub issue_id: i64,
     /// The file's path in the head (in the base, for a deleted file).
     pub path: String,

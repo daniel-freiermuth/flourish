@@ -333,6 +333,7 @@ async fn a_rediscovery_does_not_steal_attribution() {
             model: None,
             usage_delta: None,
             finished_at: 2000,
+            step: None,
         })
         .await
         .unwrap();

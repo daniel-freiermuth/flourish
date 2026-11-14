@@ -130,25 +130,31 @@ new ──recheck──> new / superseded / rejected
   the change reads the whole branch diff and writes its issues outside
   the tree. Every issue it raises (blocking or not; `blocking` ranks
   them) goes back to the fixer's own session
-  (`playbooks/review_followup.md`), which fixes each one with commits or
-  rebuts it with evidence in a `## Review` section of
-  `PR-DESCRIPTION.md` (or declines or writes `BLOCKED.md` after all);
-  then the whole branch is reviewed again, until a review raises no
-  issue or `review.maxRounds` reviews have run. The reviewer reads the
-  `## Review` section and does not raise a rebutted issue again without
-  new code evidence. Defects outside the change's scope are reported as
-  `follow-up`s: never answered and never keeping the loop going, they are
-  collected across rounds and ship in a "## Follow-ups from review"
-  section of the PR body. When issues are left after the last round, any
-  of them holds the fix for you like a `BLOCKED.md`, with the remaining
-  issues as the hold's report: a review still finding something after
-  `review.maxRounds` rounds is not converging. `continue` resumes the
-  fixer on them and the review runs again. When the grant is spent before
+  (`playbooks/review_followup.md`) with the id it is recorded by; the
+  fixer fixes each one with commits or rebuts it with evidence, and
+  answers each by id in an answers file outside the tree (or declines or
+  writes `BLOCKED.md` after all). Then the whole branch is reviewed
+  again: the reviewer is shown the issues still open with the fixer's
+  answers, judges each by id (`addressed`, `rebuttal-accepted` or
+  `open`), and raises new issues only for defects not already among
+  them. An issue it judges open, or does not judge at all, goes back to
+  the fixer with the round's new ones, until a round raises none and
+  leaves none open, or `review.maxRounds` reviews have run. Rounds,
+  issues, answers and verdicts are recorded in the fix's review (the
+  finding's detail shows them), and the PR body gets a short summary of
+  the review rendered from that record. Defects outside the change's
+  scope are reported as `follow-up`s: never answered and never keeping
+  the loop going, they are collected across rounds and ship in a
+  "## Follow-ups from review" section of the PR body. When issues are
+  left open after the last round, any of them holds the fix for you like
+  a `BLOCKED.md`, with the remaining issues as the hold's report: a
+  review still finding something after `review.maxRounds` rounds is not
+  converging. `continue` resumes the fixer on the issues still open and
+  the review runs again. When the grant is spent before
   the review is through (before a round, by a reviewer killed at its cap,
-  or before the fixer can answer a round), the job is suspended, and its
-  resume, under a fresh grant, answers the issues left or has the
-  cut-off round again, without first resuming the finished fixer: a
-  review cut short never ships as one. When the fixer's answer fails
+  or before the fixer can answer a round), the job is suspended at that
+  step, and its resume, under a fresh grant, answers the issues left or
+  has the cut-off round again: a review cut short never ships as one. When the fixer's answer fails
   without doing work while the forge is reachable (offline, the attempt
   is kept and retried), a blocking issue holds the fix the same way and
   non-blocking ones ship in an "Unresolved review issues" section of the
@@ -179,14 +185,21 @@ new ──recheck──> new / superseded / rejected
   `stuck`. Until a fixer has run on the review's issues, any `continue`
   resumes it on them, whichever hold it released. A fixer
   that did not finish ships nothing while the review is on. Every run is
-  metered into the one fix job, under its one budget grant. Details:
-  `hunter-rs/WORK-MODEL.md` §5.7. Before the push, a multi-commit fix is
-  curated into a few logical commits of the same tree (`review.curate`); a
-  curation whose changes cannot be undone is put back the same way as
-  a reviewer's before any later attempt runs a worker. A curation cut
-  short (a grant that runs out before or during it, a restart, a rewrite
-  that had to be put back) is owed: the next attempt runs no fixer and
-  curates before it ships, as for any other part of the fix.
+  metered into the one fix job, under its one budget grant. Before the
+  push, a multi-commit fix is curated into a few logical commits of the
+  same tree (`review.curate`); a curation whose changes cannot be undone
+  is put back the same way as a reviewer's before any later attempt runs
+  a worker. The fix job moves through steps (implement, review N,
+  answer N, curate, publish), recorded on the finding's fix work item
+  (`finding_work.step`) as each one completes and with the attempt's end:
+  whatever stops an attempt (a grant that runs out, a cap, a shutdown, a
+  restart, a host out of reach), the next one runs the step it stopped
+  at, a reviewer, the fixer's answer, the curator or just the publish,
+  without first resuming the finished fixer. A resume that moved the fix
+  on to another step is not counted toward the give-up ceiling's
+  attempts; a chain stuck at one step past its implementation is held
+  for you with its work instead of being given up and fixed again.
+  Details: `hunter-rs/WORK-MODEL.md` §5.7.
 - **Held work** is not a status. When a worker writes `BLOCKED.md`
   (a verification prerequisite, dependency, or human decision is
   missing; every finding kind's playbook says when: a recheck that cannot
@@ -572,7 +585,7 @@ trust check here rests on that, and resolving its threads needs it too
 first); a request where hunter's login cannot push fails saying so.
 
 Each round fetches the PR's head (`refs/pull/N/head` or
-`refs/merge-requests/N/head`) and runs a reviewer (`playbooks/pr_review.md`;
+`refs/merge-requests/N/head`) and runs a reviewer (`playbooks/review.md`;
 it may build and run targeted tests, but must leave the tree as it found
 it) in a tree detached at that head. The first round reviews from the
 merge-base with the PR's base branch. Later rounds review only from the
@@ -770,7 +783,7 @@ itself. If a thread hunter
 resolved is found unresolved, a human reopened it and the issue is open
 again — unless hunter itself set out to unresolve it: a post marks the
 resolution it sets out to make before the forge call
-(`pr_review_issues.resolving`), so a read that overlaps the call, or
+(`pr_review_threads.resolving`), so a read that overlaps the call, or
 comes after one that failed once the forge acted, takes the thread as
 hunter left it, records hunter's step, and reopens nothing. A failed
 read is logged and the round goes on without replies. The
@@ -786,7 +799,7 @@ only where somebody other than hunter replied) or `open`, each with a
 one-sentence note. An issue it does not name stays as it was — silence
 never resolves anything — and a failed round records no verdict.
 
-Nothing records an issue's status: `pr_review_verdicts` keeps every
+Nothing records an issue's status: `review_verdicts` keeps every
 round's verdicts and notes, and the status is derived from them (the
 `pr_review_issue_state` view): the newest verdict of a round not
 discarded — `addressed`, `rebutted` or `open` — or *reopened* once a human
@@ -1072,19 +1085,31 @@ for the schema — most columns carry comments explaining *why*, not just *what*
 - **`findings`** — one row per finding across all five types (type
   discriminator column), status, common fields, plus per-type nullable
   columns (bug\_class, dep\_update ecosystem/package/versions, test\_gap
-  missing\_tests, refactor smell\_type, modernization\_class), and retry
-  streak tracking (fix/recheck) for the give-up mechanism.
+  missing\_tests, refactor smell\_type, modernization\_class).
+- **`finding_work`** — one row per (finding, kind) of work (recheck, fix,
+  engage, harvest): its failure streak, its checkpoint (the attempt it
+  continues from), and for a fix the step record (`step`: the step its
+  next attempt runs, the PR title, the review's follow-ups and verdict, a
+  tree to put back), cleared with the checkpoint. **`work_holds`** — the
+  holds on that work and how each was released.
 - **`jobs`** — one row per worker invocation: kind, cap/actual tokens,
-  exit/kill reason, timing, and `resumed_from` (the suspended attempt this
-  one continues). States are `running | done | failed | killed | suspended |
+  exit/kill reason, timing, `resumed_from` (the suspended attempt this
+  one continues), and for a fix the step it ended at (`ended_step`). States are `running | done | failed | killed | suspended |
   denied`; `suspended` is a pause with a session file to
   continue, everything else killed is terminal. The audit trail for "what
   did hunter actually spend, and on what."
 - **`pr_state`** — one row per finding with an open/merged PR: forge state,
   attention fingerprint + suppression marker (state-based, see § PR
   follow-up loop), harvest tracking.
-- **`pr_reviews`**, **`pr_review_rounds`**, **`pr_review_issues`**,
-  **`pr_review_verdicts`** — requested reviews of PRs hunter did not open
+- **`reviews`**, **`review_rounds`**, **`review_issues`**,
+  **`review_verdicts`**, **`review_answers`** — the review model every
+  review shares: a review of one subject (`pr`: its `pr_reviews` row;
+  `fix`/`engage`: a finding and the job that began the chain), its rounds
+  (`base..head`, merge-base, verdict, spend), the issues each reported,
+  each later round's verdict per earlier issue, and the other side's
+  answers. A PR review's own state extends them one to one:
+  **`pr_reviews`**, **`pr_review_posts`** (per round),
+  **`pr_review_threads`** (per issue) — requested reviews of PRs hunter did not open
   (PR, the repo URL it was requested under and its binding to it, author,
   Watch, auto-post, the trust decision (vouches, the fork owner decided
   about) and the fork owner read last, newest and last reviewed head,
