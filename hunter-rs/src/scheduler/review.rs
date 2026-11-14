@@ -23,7 +23,15 @@
 //! the finding's detail shows. Which issues are open, and so what goes back
 //! to the fixer and what holds the fix, is read from there
 //! ([`Rounds::open`]); the PR body's account of the review is rendered from
-//! it too ([`review_summary`]). How far the loop got is kept in its files.
+//! it too ([`review_summary`]).
+//!
+//! The fix job moves through its steps ([`Step`]): the fixer implements
+//! the fix, each review round is had, the fixer answers what a round left
+//! open, the curator rewrites the reviewed history, and the fix is
+//! published. Where the job is, and what the steps carry from one attempt
+//! to the next, is one record on its work item ([`StepRecord`]), written
+//! as each step completes and with the attempt's end: whatever stops an
+//! attempt, the next one runs the step it stopped at.
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -36,7 +44,7 @@ use super::{BLOCKED_REPORT, FixStart, decline_report, fix_event, job_state};
 use crate::backend::{Backend, JobClass};
 use crate::clones::{Lane, Unheld};
 use crate::config::Config;
-use crate::domain::FinishedState;
+use crate::domain::{FinishedState, HoldReason};
 use crate::playbooks::{self, ReviewOutputs};
 use crate::recovery::CycleScope;
 use crate::store::{
@@ -47,85 +55,200 @@ use crate::types::{JobPhase, RunResult};
 use crate::workspace::Workspace;
 
 /// The `killed_reason` of a fix job the daemon's shutdown stopped between
-/// two of its runs: a pause on the fixer's transcript (`job_state`).
+/// two of its runs: a pause on the fixer's transcript (`job_state`), and
+/// no resume attempt (`Store::resume_chain_stats`).
 pub(super) const STOPPED: &str = "shutdown";
 
-/// The `killed_reason` of a fix job the review suspended between two of
-/// its runs because its grant was spent ([`Rounds::spent`],
-/// [`Rounds::curation_owed`]): a pause on the fixer's transcript, as a
-/// cap is (`job_state`), but not a resume attempt, as a shutdown stop is
-/// not (`Store::resume_chain_stats`): the work is done up to there, and
-/// the resume only carries on with it.
-pub(super) const GRANT: &str = "grant";
-
-/// In the workspace root: how far an unfinished review loop got
-/// ([`Progress`]). A resumed attempt reviews from the round after the
-/// last one sent back, so a fixer suspended while answering a review does
-/// not restart the count. Reset to round 0 once the loop ends, keeping the
-/// title and the follow-ups for any later review of the chain.
-const PROGRESS_FILE: &str = "review-progress.json";
-
-/// In the workspace root: the verdict a review loop reached ([`Saved`]),
-/// for the tree it reviewed. An attempt that finds the tree exactly so (an
-/// offline push retried) ships on it without another review; any other
-/// tree is reviewed again.
-const ENDING_FILE: &str = "review-ending.json";
-
-/// In the workspace root, while a curation runs ([`curate`]): the tree
-/// it started from ([`ReviewedTree`]). Left behind only when the daemon
-/// died during the curation; the next attempt puts the tree back to it
-/// before anything reads the tree ([`recover_curation`]).
-const CURATING_FILE: &str = "review-curating.json";
-
-/// In the workspace root: the tree an agent was shown whose changes could
-/// not be undone, and which agent that was ([`Restore`]): a failed round's
-/// reviewer, or a curator, rejected or cut off by a restart
-/// ([`recover_curation`]). Recorded before the attempt goes on, whatever
-/// it then amounts to (a hold, a retry once a host is reachable again, a
-/// pinned commit whose publish failed), so every later attempt of the
-/// chain puts the tree back to it before any worker runs in it
-/// ([`restore_reviewed`]).
-const RESTORE_FILE: &str = "review-restore.json";
+/// The `killed_reason` of a fix job whose grant ran out between two of its
+/// runs ([`Rounds::spent`]): the job's cap killed it, as it kills a run,
+/// and its resume carries on under a fresh grant.
+const SPENT: &str = "cap";
 
 /// In the workspace root: the fixer's answers to the issues it was sent
 /// (`review_followup.md`), one per issue id, written as it goes. Read into
 /// the chain's review ([`record_answers`]) once the fixer's run ends, and
-/// by the next attempt when the run that wrote it was cut short or was the
-/// attempt's own fixer resumed on a review hold; removed once read, and
-/// before the fixer is sent issues, so no answer is read twice for
-/// another round.
+/// by the next attempt when the run that wrote it was cut short; removed
+/// once read, and before the fixer is sent issues, so no answer is read
+/// twice for another round.
 const ANSWERS_FILE: &str = "review-answers.json";
 
+/// Where a fix job is: the part of the fix its next run is ([`StepRecord`]).
+/// Each part that completes moves the job on to the next before the next
+/// runs; a stop of any kind (a cap, the wall clock, the daemon's shutdown
+/// or death, a host out of reach, a grant spent) leaves it where it was,
+/// and the attempt that continues it runs that part.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(into = "String", try_from = "String")]
+pub(super) enum Step {
+    /// The fixer: its playbook on a cold start, its transcript continued on
+    /// a resume, the prompt for the hold an operator released after one.
+    #[default]
+    Implement,
+    /// Review round `.0`: a fresh reviewer, and nothing else.
+    Review(u32),
+    /// The fixer's answer to the issues the review left open after round
+    /// `.0`: 0 for those a hold held, after which the review starts over
+    /// at round 1.
+    Answer(u32),
+    /// The curator, the review being through.
+    Curate,
+    /// The push and the PR, on the review's verdict: no model runs.
+    Publish,
+}
+
+impl std::fmt::Display for Step {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Implement => f.write_str("implement"),
+            Self::Review(round) => write!(f, "review {round}"),
+            Self::Answer(round) => write!(f, "answer {round}"),
+            Self::Curate => f.write_str("curate"),
+            Self::Publish => f.write_str("publish"),
+        }
+    }
+}
+
+/// A step as its record keeps it: `implement`, `review N`, `answer N`,
+/// `curate` or `publish`, which is also the job's `ended_step`.
+impl From<Step> for String {
+    fn from(step: Step) -> Self {
+        step.to_string()
+    }
+}
+
+impl TryFrom<String> for Step {
+    type Error = String;
+
+    fn try_from(text: String) -> Result<Self, String> {
+        let round = |n: &str| n.parse::<u32>().map_err(|e| format!("step {text:?}: {e}"));
+        match (text.as_str(), text.split_once(' ')) {
+            ("implement", _) => Ok(Self::Implement),
+            ("curate", _) => Ok(Self::Curate),
+            ("publish", _) => Ok(Self::Publish),
+            (_, Some(("review", n))) => round(n).map(Self::Review),
+            (_, Some(("answer", n))) => round(n).map(Self::Answer),
+            _ => Err(format!("no such step: {text:?}")),
+        }
+    }
+}
+
+/// What a fix job keeps from one attempt to the next, on its work item
+/// (`finding_work.step`, JSON): the step its next attempt runs, and what
+/// the steps carry over. Which issues are open is not here: the chain's
+/// review has them ([`Rounds::open`]). Written as each step completes,
+/// before the next one runs ([`Rounds::go`]), and with the attempt's end,
+/// in the transaction that records it (`Store::complete_job`, a hold, an
+/// attempt kept to publish); gone with the checkpoint, when the next
+/// attempt starts cold. None is a cold start: [`Step::Implement`], nothing
+/// kept.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub(super) struct StepRecord {
+    step: Step,
+    /// [`Ending::title`], taken before round 1 and kept through every
+    /// later round, hold and attempt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    /// The follow-ups the rounds so far raised ([`merge_follow_ups`]).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    follow_ups: Vec<ReportedIssue>,
+    /// The verdict the review reached, and the tree it covers: what
+    /// [`Step::Curate`] curates and [`Step::Publish`] ships, as long as the
+    /// tree is exactly so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verdict: Option<Saved>,
+    /// The tree an agent (a reviewer, or a curator) was shown, and which
+    /// it may have changed: set before it runs, and cleared once its
+    /// changes are undone or accepted. Left set (the daemon died while it
+    /// ran, or its changes could not be undone), every later attempt puts
+    /// the tree back to it before anything runs ([`put_back`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rewrite: Option<ReviewedTree>,
+}
+
+impl StepRecord {
+    /// The record `json` holds, as `finding_work.step` keeps it; `None` is
+    /// a cold start.
+    pub(super) fn read(json: Option<&str>) -> Result<Self, String> {
+        json.map_or_else(
+            || Ok(Self::default()),
+            |json| serde_json::from_str(json).map_err(|e| e.to_string()),
+        )
+    }
+
+    /// The step the next attempt runs.
+    pub(super) const fn step(&self) -> Step {
+        self.step
+    }
+
+    /// The record as `finding_work.step` keeps it. Every field serializes,
+    /// so the fallback, a record no different from none, is never written.
+    pub(super) fn json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| "{}".to_owned())
+    }
+
+    /// Whether the fix is past its implementation: the fixer finished it,
+    /// and its review, curation or publish is what remains.
+    pub(super) fn implemented(&self) -> bool {
+        self.step != Step::Implement
+    }
+
+    /// Start the fix over at [`Step::Implement`], as a report that
+    /// concludes it does, keeping the title, the follow-ups and any tree
+    /// still to put back, and no verdict.
+    fn restart(&mut self) {
+        self.step = Step::Implement;
+        self.verdict = None;
+    }
+}
+
+/// The step record `start`'s attempt begins at. A cold start begins
+/// afresh, at [`Step::Implement`], and records so, so nothing a dropped
+/// earlier attempt of the work recorded outlives it. A resume continues
+/// the work item's ([`Store::fix_step`]); one that cannot be read is
+/// logged, and the fix starts over at [`Step::Implement`], on the fixer's
+/// transcript.
+pub(super) async fn begin(
+    store: &JobStore,
+    start: &FixStart,
+    resumed: bool,
+) -> anyhow::Result<StepRecord> {
+    let fid = start.finding.id;
+    if !resumed {
+        let fresh = StepRecord::default();
+        store.set_fix_step(fid, &fresh.json()).await?;
+        return Ok(fresh);
+    }
+    let json = store.fix_step(fid).await?;
+    Ok(match StepRecord::read(json.as_deref()) {
+        Ok(record) => record,
+        Err(why) => {
+            let message =
+                format!("#{fid} the fix's step record could not be read ({why}); implementing");
+            let _ = fix_event(store, "fix", fid, start.job, message).await;
+            StepRecord::default()
+        }
+    })
+}
+
+/// Whether the next attempt of a fix at `record`, in `ws`, has only to
+/// publish, running no model: it is at [`Step::Publish`], no tree is to be
+/// put back, and its verdict covers the tree exactly as it is.
+pub(super) async fn publishes_as_reviewed(record: &StepRecord, ws: &Workspace) -> bool {
+    let Some(saved) = record.verdict.as_ref() else {
+        return false;
+    };
+    record.step == Step::Publish
+        && record.rewrite.is_none()
+        && covers(saved, &tree_state(&ws.tree).await)
+}
+
 /// A reviewed tree to put back to ([`undo`]), and the fixer's description:
-/// the one a curation started from ([`CURATING_FILE`]), or the one an
-/// agent was shown and could not be undone from ([`Restore`]).
-#[derive(Debug, Serialize, Deserialize)]
+/// the one a reviewer or a curator was shown ([`StepRecord::rewrite`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ReviewedTree {
     before: TreeState,
     description: Vec<u8>,
-}
-
-/// Which agent changed a tree that is put back to the one it was shown.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum LeftBy {
-    /// A failed review round's reviewer: the fixer's session never saw
-    /// its changes.
-    #[default]
-    Reviewer,
-    /// A curator, which ran in the fixer's session: its curation is owed
-    /// again once its changes are undone ([`owe_curation`]).
-    Curator,
-}
-
-/// What [`RESTORE_FILE`] holds: the tree to put back to, and whose
-/// changes that undoes.
-#[derive(Debug, Serialize, Deserialize)]
-struct Restore {
-    #[serde(flatten)]
-    tree: ReviewedTree,
-    #[serde(default)]
-    by: LeftBy,
 }
 
 /// What the review loop leaves for the job's record and its PR.
@@ -135,16 +258,43 @@ pub(super) struct Reviewed {
     /// decides the job's state ([`STOPPED`] when shutdown stopped the loop);
     /// the session file stays the fixer's.
     pub rr: RunResult,
-    /// What to ship with, once the tree may ship: the loop ended in this
-    /// attempt, a saved verdict covers the tree as it is, or the review is
-    /// off. `None` otherwise -- the fixer did not finish (a pause, a
-    /// failure, half an answer to a review), left nothing to ship, or the
-    /// daemon stopped the loop -- and then nothing ships.
+    /// What to ship with, once the tree may ship: the review reached its
+    /// verdict, a verdict covers the tree as it is, or the review is off.
+    /// `None` otherwise -- the fixer did not finish (a pause, a failure,
+    /// half an answer to a review), left nothing to ship, or the job was
+    /// suspended -- and then nothing ships.
     pub ending: Option<Ending>,
-    /// The fixer's answer to a review failed without doing work while this
-    /// host is unreachable: the network's failure, not the fix's. The
-    /// attempt is kept unpublished for a retry (`FixOutcome::Offline`).
+    /// A run failed without doing work while this host is unreachable: the
+    /// network's failure, not the fix's. The attempt is kept for a retry
+    /// of its step (`FixOutcome::Offline`).
     pub offline: Option<String>,
+    /// Where the job is as the attempt ends: what its end records for the
+    /// next attempt ([`Self::step`]).
+    pub record: StepRecord,
+    /// A report in the tree that concludes the attempt with the record as
+    /// it is: the review's own hold ([`Rounds::hold`]), or a report no hold
+    /// recorded, found where no fixer runs. Any other report starts the fix
+    /// over ([`Self::concluded_on_report`]).
+    held: bool,
+}
+
+impl Reviewed {
+    /// The step record the attempt ended with, as the store keeps it.
+    pub(super) fn step(&self) -> String {
+        self.record.json()
+    }
+
+    /// The attempt concludes on a report (`BLOCKED.md`, a decline): unless
+    /// it is the review's own hold, the fix starts over at
+    /// [`Step::Implement`], keeping the title and the follow-ups. However
+    /// the report came to be (the fixer's first run, an answer, an answer
+    /// cut off at its cap), the operator's `continue` of its hold is a
+    /// fresh start, reviewed from round 1.
+    pub(super) fn concluded_on_report(&mut self) {
+        if !self.held {
+            self.record.restart();
+        }
+    }
 }
 
 /// How the review loop ended: what `ship_pr` ships.
@@ -153,9 +303,9 @@ pub(super) struct Ending {
     /// Appended to the PR body: unresolved issues, or why the review
     /// failed. `None` for a clean review, or no review.
     pub note: Option<String>,
-    /// The commit to ship in place of `HEAD`: set when a reviewer moved
-    /// `HEAD`, so what ships is what was reviewed, not the reviewer's
-    /// commits.
+    /// The commit to ship in place of `HEAD`: set when a reviewer or a
+    /// curator changed the tree and it could not be put back, so what
+    /// ships is what was reviewed, not that agent's commits.
     pub head: Option<String>,
     /// The PR title: the subject of the commit the fixer finished on
     /// before the first review round, so commits answering the review do
@@ -163,55 +313,18 @@ pub(super) struct Ending {
     pub title: Option<String>,
 }
 
-/// A verdict the review reached, kept for the tree it covers. Only a
-/// reviewer's verdict is kept (clean, or issues left after the last
-/// round): a review that failed, or issues the fixer never got to answer,
-/// are had again on the next attempt.
-#[derive(Debug, Serialize, Deserialize)]
+/// The verdict the review reached ([`StepRecord::verdict`]): the PR body's
+/// note, for the tree it covers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Saved {
     note: Option<String>,
-    title: Option<String>,
     tree: TreeState,
 }
 
-/// How far an unfinished review loop got ([`PROGRESS_FILE`]).
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct Progress {
-    /// The last round whose issues went back to the fixer, or are owed
-    /// to it ([`Owed::Answer`]).
-    rounds: u32,
-    /// [`Ending::title`], taken before round 1.
-    title: Option<String>,
-    /// The follow-ups the rounds so far raised ([`merge_follow_ups`]).
-    #[serde(default)]
-    follow_ups: Vec<ReportedIssue>,
-    /// The part of the fix a suspended job still owes ([`Rounds::pause`]),
-    /// which its resume carries out first; `None` when the resume goes on
-    /// with the next review round.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    owed: Option<Owed>,
-    /// The job the review suspended between its runs, its fixer's last one
-    /// finished ([`Rounds::pause`]): the attempt that continues it has no
-    /// fixer run to continue, and goes straight back to the loop
-    /// ([`suspended_between_runs`]).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    paused_by: Option<i64>,
-}
-
-/// What a job suspended between its runs still owes, besides reviewing
-/// again ([`Progress::owed`]).
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum Owed {
-    /// The fixer's answer to round [`Progress::rounds`]'s issues: the
-    /// review's open issues when the job was suspended, as an earlier
-    /// daemon wrote and read them. The resume sends the review's open
-    /// issues as they are now ([`owed_answer`]): this says only that some
-    /// are owed.
-    Answer(Vec<ReportedIssue>),
-    /// The curation of a review that is through, its verdict saved for the
-    /// tree ([`ENDING_FILE`]).
-    Curation,
+/// Whether `saved` covers the tree as it is `now`: its commit, branch,
+/// uncommitted state and description are exactly so.
+fn covers(saved: &Saved, now: &TreeState) -> bool {
+    saved.tree.head.is_some() && saved.tree == *now
 }
 
 /// One review round's verdict.
@@ -230,11 +343,11 @@ enum RoundVerdict {
     /// they ship unresolved.
     Failed {
         why: String,
-        /// The tree before the reviewer ran, when it could not be put back
-        /// to it: its commit is the one that ships, and the one every later
-        /// attempt puts the tree back to before a worker runs
-        /// ([`RESTORE_FILE`]).
-        left: Option<ReviewedTree>,
+        /// The commit the reviewer was shown, when its changes could not
+        /// be undone: the one that ships, and the one every later attempt
+        /// puts the tree back to before anything runs
+        /// ([`StepRecord::rewrite`]).
+        head: Option<String>,
         issues: Vec<ReportedIssue>,
     },
 }
@@ -253,13 +366,31 @@ struct Rounds<'a> {
     cfg: &'a Config,
     backend: &'a dyn Backend,
     start: &'a FixStart,
-    /// [`Ending::title`], kept across attempts and holds.
-    title: Option<String>,
 }
 
 impl Rounds<'_> {
-    fn store(&self) -> &Store {
+    fn store(&self) -> &JobStore {
         self.scope.store()
+    }
+
+    /// Record `job`'s step record as where its work item continues from
+    /// (`Store::set_fix_step`).
+    async fn save(&self, job: &Reviewed) -> sqlx::Result<()> {
+        self.store()
+            .set_fix_step(self.start.finding.id, &job.record.json())
+            .await
+    }
+
+    /// Move `job` on to `step`, recorded before its next run starts, so an
+    /// attempt the daemon's death cuts off resumes there. A write that
+    /// fails is logged: the attempt goes on, and its end records where it
+    /// got to.
+    async fn go(&self, job: &mut Reviewed, step: Step) {
+        job.record.step = step;
+        if let Err(e) = self.save(job).await {
+            let fid = self.start.finding.id;
+            tracing::warn!("fix #{fid}: recording step {step}: {e}");
+        }
     }
 
     /// The chain's review as the store has it ([`Store::fix_review`]), or
@@ -290,88 +421,35 @@ impl Rounds<'_> {
     }
 
     /// Stop the job for the daemon's shutdown, before another run starts
-    /// ([`Self::suspend`]). `owed`: the round reviewed last, and its
-    /// issues the fixer has not been sent yet.
-    async fn stopped(
-        &self,
-        job: &mut Reviewed,
-        owed: (u32, &[ChainIssue]),
-        follow_ups: &[ReportedIssue],
-    ) -> bool {
+    /// ([`Self::suspend`]); `what` names the step for the event.
+    async fn stopped(&self, job: &mut Reviewed, what: &str) -> bool {
         if !self.scope.stopping() {
             return false;
         }
-        let stop = "the daemon is stopping; suspended";
-        self.suspend(job, owed, follow_ups, (STOPPED, stop)).await
+        let stop = format!("{what}: the daemon is stopping; suspended");
+        self.suspend(job, STOPPED, &stop).await
     }
 
     /// Suspend the job when its grant is spent before the review is
-    /// through (`why`): before a round could run, by the reviewer it
-    /// killed, or before the fixer could answer a round ([`Self::suspend`],
-    /// as a cap kill). The resume, under a fresh grant, carries on where
-    /// this one stopped: a review cut short is never shipped as one.
-    async fn spent(
-        &self,
-        job: &mut Reviewed,
-        owed: (u32, &[ChainIssue]),
-        follow_ups: &[ReportedIssue],
-        why: &str,
-    ) -> bool {
-        let stop = format!("{why}; suspended to go on under a fresh grant");
-        self.suspend(job, owed, follow_ups, (GRANT, &stop)).await
+    /// through (`why`): before a run could start, or by a reviewer it
+    /// killed ([`Self::suspend`], as a cap kill). The resume, under a fresh
+    /// grant, runs the step this one stopped at: a review cut short is
+    /// never shipped as one. `what` names the step for the event.
+    async fn spent(&self, job: &mut Reviewed, what: &str, why: &str) -> bool {
+        let stop = format!("{what}: {why}; suspended to go on under a fresh grant");
+        self.suspend(job, SPENT, &stop).await
     }
 
     /// Suspend the job between two of its runs, the fixer's last one
     /// finished, as `reason` (its `killed_reason`, which `job_state` makes
-    /// a suspension), logging `stop`. `owed` is the round reviewed last
-    /// and its issues the fixer has not been sent: the progress records
-    /// them, so the resume sends them before it reviews again, and names
-    /// this job as paused, so its resume runs no fixer before that
-    /// ([`suspended_between_runs`]). Only with a transcript to resume;
-    /// without one, `false`, and the loop goes on as if there were no stop.
-    async fn suspend(
-        &self,
-        job: &mut Reviewed,
-        (reviewed, issues): (u32, &[ChainIssue]),
-        follow_ups: &[ReportedIssue],
-        (reason, stop): (&str, &str),
-    ) -> bool {
-        let progress = Progress {
-            rounds: reviewed,
-            title: self.title.clone(),
-            follow_ups: follow_ups.to_vec(),
-            owed: (!issues.is_empty()).then(|| Owed::Answer(reported(issues))),
-            ..Progress::default()
-        };
-        let round = if issues.is_empty() {
-            reviewed + 1
-        } else {
-            reviewed
-        };
-        let logged = format!("review round {round}: {stop}");
-        self.pause(job, progress, (reason, &logged)).await
-    }
-
-    /// Suspend the job between two of its runs, the fixer's last one
-    /// finished, as `reason` (its `killed_reason`, which `job_state` makes
-    /// a suspension), logging `stop`: `progress` is recorded, naming this
-    /// job as paused, so its resume runs no fixer and goes straight back
-    /// to where this one stopped ([`suspended_between_runs`]). Only with a
-    /// transcript to resume; without one, `false`, and nothing is written.
-    async fn pause(
-        &self,
-        job: &mut Reviewed,
-        progress: Progress,
-        (reason, stop): (&str, &str),
-    ) -> bool {
+    /// a suspension), logging `stop`. The job's record stays at the step it
+    /// is at, and its resume runs that step. Only with a transcript to
+    /// resume; without one, `false`, and the loop goes on as if there were
+    /// no stop.
+    async fn suspend(&self, job: &mut Reviewed, reason: &str, stop: &str) -> bool {
         if job.rr.session_file.is_none() {
             return false;
         }
-        let progress = Progress {
-            paused_by: Some(self.start.job),
-            ..progress
-        };
-        write_progress(self.start, &progress);
         job.rr.killed_reason = Some(reason.to_owned());
         job.rr.exit_code = None;
         let fid = self.start.finding.id;
@@ -380,34 +458,69 @@ impl Rounds<'_> {
         true
     }
 
-    /// Suspend the job before its curation, the review through and its
-    /// verdict (`ending`) saved for the tree, so its resume curates and
-    /// ships without another review ([`Progress::curate`]). The daemon's
-    /// shutdown suspends it as `shutdown`, a spent grant (`why`) as `cap`.
-    async fn curation_owed(
-        &self,
-        job: &mut Reviewed,
-        ending: &Ending,
-        follow_ups: &[ReportedIssue],
-        why: &str,
-    ) -> bool {
+    /// Suspend the job before its curation (`why`), the review through and
+    /// its verdict recorded, so its resume curates and ships without
+    /// another review. The daemon's shutdown suspends it as `shutdown`, a
+    /// spent grant as `cap`.
+    async fn curation_owed(&self, job: &mut Reviewed, why: &str) -> bool {
         let reason = if self.scope.stopping() {
             STOPPED
         } else {
-            GRANT
-        };
-        if job.rr.session_file.is_none() {
-            return false;
-        }
-        save_ending(self.start, ending).await;
-        let progress = Progress {
-            title: self.title.clone(),
-            follow_ups: follow_ups.to_vec(),
-            owed: Some(Owed::Curation),
-            ..Progress::default()
+            SPENT
         };
         let stop = format!("curation: {why}; suspended to curate under a fresh grant");
-        self.pause(job, progress, (reason, &stop)).await
+        self.suspend(job, reason, &stop).await
+    }
+
+    /// Hold the fix for the operator on review round `round`'s unanswered
+    /// `issues` (`stop` says why no answer comes): the report goes where a
+    /// worker's would (`BLOCKED.md`, which `conclude_fix` turns into a
+    /// `prerequisite` hold with this attempt as its checkpoint), and the
+    /// job moves on to answering them once the operator continues
+    /// ([`Step::Answer`] 0), after which the review starts over at round
+    /// 1, under the same title and with the follow-ups so far. A tree to
+    /// put back ([`StepRecord::rewrite`]: a reviewer's changes that could
+    /// not be undone) is put back before the fixer resumes; the report
+    /// says so. `false` when the report could not be written: the fix
+    /// ships with the issues unresolved instead.
+    async fn hold(
+        &self,
+        job: &mut Reviewed,
+        round: u32,
+        issues: &[ReportedIssue],
+        stop: &str,
+    ) -> bool {
+        let start = self.start;
+        let mut report = format!(
+            "# Held by the pre-PR review\n\nThe automated pre-PR review stopped at round \
+             {round} ({stop}) with issues unresolved. Continue to have the fixer \
+             answer them; the review then runs again from round 1.\n\n"
+        );
+        let restoring = job.record.rewrite.as_ref();
+        if let Some(commit) = restoring.and_then(|tree| tree.before.head.as_deref()) {
+            let _ = write!(
+                report,
+                "The reviewer's changes to the tree could not be undone. Before the fixer \
+                 resumes, the fix branch is put back to the reviewed commit `{commit}` and what \
+                 the reviewer added is removed; while that fails, the fixer does not run (the \
+                 attempt fails as `{TREE_NOT_RESTORED}`), and `{}` needs cleaning up by hand.\n\n",
+                start.ws.tree.display()
+            );
+        }
+        report.push_str("## Remaining review issues\n");
+        issue_list(&mut report, issues);
+        let follow_ups = &job.record.follow_ups;
+        if !follow_ups.is_empty() {
+            let _ = write!(report, "\n\n{}", follow_ups_note(follow_ups));
+        }
+        if let Err(e) = std::fs::write(start.ws.tree.join(BLOCKED_REPORT), &report) {
+            tracing::warn!("fix #{}: holding on the review: {e}", start.finding.id);
+            return false;
+        }
+        job.held = true;
+        job.record.verdict = None;
+        self.go(job, Step::Answer(0)).await;
+        true
     }
 }
 
@@ -416,10 +529,10 @@ impl Rounds<'_> {
 enum Unanswered {
     /// An answer is coming: send them back to the fixer.
     No,
-    /// The fix is held for the operator ([`hold`]).
+    /// The fix is held for the operator ([`Rounds::hold`]).
     Held,
-    /// They ship unresolved; `keep` saves the verdict for the tree.
-    Ship(Ending, bool),
+    /// They ship unresolved.
+    Ship(Ending),
     /// A run did no work while this host is unreachable: retry later.
     Offline(String),
     /// The grant is spent: the job is suspended, and its resume answers
@@ -428,67 +541,41 @@ enum Unanswered {
 }
 
 impl Rounds<'_> {
-    /// Whether a run of round `round` that did no work did so because a
-    /// host the work needs is unreachable ([`super::unreachable_now`]):
-    /// the network's failure, handled as the fix's other offline failures
-    /// are (`FixOutcome::Offline`). The progress is rewound so the retry
-    /// reviews that round again, keeping the title and `follow_ups`.
-    async fn offline(&self, round: u32, follow_ups: &[ReportedIssue]) -> Option<String> {
+    /// Whether a run of round `round`'s `what` (`review`, `answer`) that
+    /// did no work did so because a host the work needs is unreachable
+    /// ([`super::unreachable_now`]): the network's failure, handled as the
+    /// fix's other offline failures are (`FixOutcome::Offline`). The job's
+    /// record stays at its step, so the retry has it again.
+    async fn offline(&self, round: u32, what: &str) -> Option<String> {
         let start = self.start;
         let host = super::unreachable_now(self.cfg, &start.repo.url, self.backend).await?;
-        let again = Progress {
-            rounds: round.saturating_sub(1),
-            title: self.title.clone(),
-            follow_ups: follow_ups.to_vec(),
-            ..Progress::default()
-        };
-        write_progress(start, &again);
-        let message = format!("{host} unreachable; kept to review round {round} again");
+        let message = format!("{host} unreachable; kept to {what} round {round} again");
         log_round(self.store(), start, round, &message).await;
         Some(host)
     }
 
-    /// What a failed round amounts to (`why`). A reviewer whose changes
-    /// could not be undone (`left`) has the tree it was shown recorded
-    /// first ([`record_restore`]), however the round ends: no later worker
-    /// builds on what it left. With a host the work needs unreachable,
-    /// whatever the reviewer did, the network's failure
+    /// What a failed round amounts to (`why`). With a host the work needs
+    /// unreachable, whatever the reviewer did, the network's failure
     /// ([`Self::offline`]): an outage that cut a review off mid-way is no
-    /// more the fix's than one that kept it from starting.
-    /// Otherwise the fix ships, saying why it was not reviewed: the
-    /// reviewer never holds it hostage. But issues the reviewer wrote
-    /// before the round failed hold the fix as an answered round's would
-    /// ([`Self::holds`]).
+    /// more the fix's than one that kept it from starting. Otherwise the
+    /// fix ships, saying why it was not reviewed: the reviewer never holds
+    /// it hostage. But issues the reviewer wrote before the round failed
+    /// hold the fix as an answered round's would ([`Self::holds`]). A
+    /// reviewer whose changes could not be undone (`head`, the commit it
+    /// was shown) leaves the tree to put back in the record, however the
+    /// round ends: no later worker builds on what it left.
     async fn failed_round(
         &self,
+        job: &mut Reviewed,
         round: u32,
-        (why, left, issues): (&str, Option<ReviewedTree>, &[ReportedIssue]),
-        follow_ups: &[ReportedIssue],
+        (why, head, issues): (&str, Option<String>, &[ReportedIssue]),
         also: &str,
     ) -> Unanswered {
         let start = self.start;
-        let head = left.and_then(|tree| {
-            let head = tree.before.head.clone();
-            record_restore(
-                start,
-                &Restore {
-                    tree,
-                    by: LeftBy::Reviewer,
-                },
-            );
-            head
-        });
-        if let Some(host) = self.offline(round, follow_ups).await {
+        if let Some(host) = self.offline(round, "review").await {
             return Unanswered::Offline(host);
         }
-        let progress = Progress {
-            rounds: 0,
-            title: self.title.clone(),
-            follow_ups: follow_ups.to_vec(),
-            ..Progress::default()
-        };
-        let restoring = head.as_deref();
-        if self.holds(round, issues) && hold(start, round, issues, (&progress, why, restoring)) {
+        if self.holds(round, issues) && self.hold(job, round, issues, why).await {
             let message = format!(
                 "failed: {why}; {}{also}; held for the operator",
                 tally(issues)
@@ -498,7 +585,7 @@ impl Rounds<'_> {
         }
         let message = format!("failed: {why}; {}{also}; shipping", tally(issues));
         log_round(self.store(), start, round, &message).await;
-        Unanswered::Ship(failed(round, why, head, issues), false)
+        Unanswered::Ship(failed(round, why, head, issues))
     }
 
     /// Whether round `round`'s unanswered `issues` hold the fix for the
@@ -516,16 +603,15 @@ impl Rounds<'_> {
     /// something after `review.maxRounds` rounds is not converging, and its
     /// change is not shipped on the hope that the rest is harmless. When
     /// the grant is spent (a reviewer killed at its cap) and leaves nothing
-    /// to answer them with, the job is suspended for its resume to answer
-    /// them ([`Rounds::spent`]); only a job with no transcript to resume
-    /// holds the fix for a blocking issue and ships the rest unresolved.
+    /// to answer them with, the job is suspended at answering them
+    /// ([`Rounds::spent`]); only a job with no transcript to resume holds
+    /// the fix for a blocking issue and ships the rest unresolved.
     /// `raised` is the round's tally for the event.
     async fn unanswered(
         &self,
         job: &mut Reviewed,
         round: u32,
         (issues, undone): (&[ChainIssue], bool),
-        follow_ups: &[ReportedIssue],
         raised: &str,
     ) -> Unanswered {
         let (start, max) = (self.start, self.cfg.review_max_rounds);
@@ -541,19 +627,15 @@ impl Rounds<'_> {
             || format!("the last of {max} rounds"),
             |why| format!("{why} to answer them"),
         );
-        let owed = (round, issues);
-        let suspended = format!("{raised}, {stop}");
-        if why.is_some() && self.spent(job, owed, follow_ups, &suspended).await {
-            return Unanswered::Suspended;
+        if why.is_some() {
+            self.go(job, Step::Answer(round)).await;
+            let what = format!("review round {round}");
+            if self.spent(job, &what, &format!("{raised}, {stop}")).await {
+                return Unanswered::Suspended;
+            }
         }
-        let progress = Progress {
-            rounds: 0,
-            title: self.title.clone(),
-            follow_ups: follow_ups.to_vec(),
-            ..Progress::default()
-        };
         let issues = reported(issues);
-        if self.holds(round, &issues) && hold(start, round, &issues, (&progress, &stop, None)) {
+        if self.holds(round, &issues) && self.hold(job, round, &issues, &stop).await {
             let message = format!("{raised}, {stop}; held for the operator");
             log_round(self.store(), start, round, &message).await;
             return Unanswered::Held;
@@ -564,270 +646,176 @@ impl Rounds<'_> {
         if undone && let Some(note) = &mut ending.note {
             let _ = write!(note, "\n\n{}", undone_note(round));
         }
-        Unanswered::Ship(ending, why.is_none())
+        Unanswered::Ship(ending)
     }
 }
 
-/// Review the fixer's finished work in `start`'s tree, and send every
-/// issue the reviewer raises back to it, until a review raises none and
-/// leaves none open, or `review.maxRounds` reviews have run. Whether an
+impl Unanswered {
+    /// Where the loop goes when no answer is coming: the fix ships
+    /// ([`finish`]), or the attempt ends on its state (held, suspended, or
+    /// kept for a retry while a host is unreachable).
+    async fn ended(self, rounds: &Rounds<'_>, job: &mut Reviewed) -> Flow {
+        match self {
+            Self::Ship(ending) => finish(rounds, job, ending).await,
+            Self::Offline(host) => {
+                job.offline = Some(host);
+                Flow::End
+            }
+            Self::Held | Self::No | Self::Suspended => Flow::End,
+        }
+    }
+}
+
+/// Where a step leaves the attempt.
+enum Flow {
+    /// On to the step the job's record now names, in this attempt.
+    On,
+    /// On to [`Step::Answer`], with the review's open issues after the
+    /// round just had, and their tally.
+    Answer(Vec<ChainIssue>, String),
+    /// The attempt ends on its state, shipping [`Reviewed::ending`] if it
+    /// is set.
+    End,
+}
+
+/// Run the fix job from the step its record names (`record`) until it
+/// ships, is held, or stops: the review of the fixer's finished work, the
+/// fixer's answers to it, the curation and the publish ([`Step`]). Each
+/// review round's issues go back to the fixer, until a review raises none
+/// and leaves none open, or `review.maxRounds` reviews have run. Whether an
 /// issue is `blocking` only orders it and marks it for the human; every
 /// one is answered but a follow-up, which is collected across rounds and
-/// shipped in the PR body ([`follow_ups_note`]). `fixer` is the attempt's
-/// first run; the result sums it with every run after it.
+/// shipped in the PR body ([`follow_ups_note`]). `fixer` is the
+/// attempt's fixer run, when [`Step::Implement`] or an operator's
+/// `continue` of a publish ran one (`run_fix`), and otherwise stands in
+/// for none, on the fixer's transcript; the result sums it with every run
+/// after it. `after_hold` is the hold an operator released to get here: an
+/// attempt that starts at [`Step::Answer`] tells the fixer so.
 ///
-/// Answers a fixer left before the review (its own run, resumed on a
-/// review hold's issues or cut short mid-answer) are recorded first
-/// ([`record_answers`]). A saved verdict that covers the tree exactly as
-/// it is ships it, however this attempt's fixer run ended: a retried
-/// offline push whose resume failed before doing anything changed nothing
-/// that was reviewed. Otherwise nothing is reviewed unless the fixer would
-/// ship as it stands ([`ready_to_ship`]). A fixer that is suspended or
-/// writes a report while answering a review ends the loop there: the job
-/// is recorded on its state and `conclude_fix` reads its report, as for
-/// any fix. So does the daemon's shutdown, checked before every run
-/// ([`Rounds::stopped`]), and a grant spent before the review is through
-/// ([`Rounds::spent`]): either suspends the job, and its resume carries on
-/// with the issues still open ([`owed_answer`]), or else with the round
-/// that did not run to its end.
+/// Answers a fixer left before the attempt (one cut short mid-answer) are
+/// recorded first ([`record_answers`]). A report in the tree no hold has
+/// recorded (the daemon died before it did) ends an attempt that would
+/// run no fixer at once: it holds the fix as it is. A fixer that is
+/// suspended or writes a report while answering a review ends the attempt
+/// there: the job is recorded on its state and `conclude_fix` reads its
+/// report, as for any fix. So does the daemon's shutdown, checked before
+/// every run ([`Rounds::stopped`]), and a grant spent before the review is
+/// through ([`Rounds::spent`]): either suspends the job at its step.
 pub(super) async fn review_fix(
     scope: &CycleScope<'_>,
     lane: &mut Lane,
-    cfg: &Config,
-    backend: &dyn Backend,
+    (cfg, backend): (&Config, &dyn Backend),
     start: &FixStart,
-    fixer: RunResult,
+    (fixer, record): (RunResult, StepRecord),
+    after_hold: Option<&(HoldReason, String)>,
 ) -> Reviewed {
     record_answers(scope.store(), start).await;
+    let rounds = Rounds {
+        scope,
+        cfg,
+        backend,
+        start,
+    };
     let mut job = Reviewed {
         rr: fixer,
         ending: None,
         offline: None,
+        record,
+        held: false,
     };
-    // Off, or a saved verdict that covers the tree: no review to run.
-    job.ending = if cfg.review_max_rounds == 0 {
-        Some(Ending::default())
-    } else {
-        saved_ending(start).await
-    };
-    if let Some(ending) = job.ending.take() {
-        let rounds = (scope, cfg, backend, start);
-        return ship_saved(rounds, lane, job, ending).await;
+    if job.record.implemented() && has_report(start) {
+        job.held = true;
+        return job;
+    }
+    let mut after_hold = after_hold.filter(|_| matches!(job.record.step, Step::Answer(_)));
+    let mut owed = None;
+    loop {
+        let flow = match job.record.step {
+            Step::Implement => implemented(&rounds, &mut job).await,
+            Step::Review(round) => next_round(&rounds, lane, &mut job, round).await,
+            Step::Answer(round) => {
+                let released = after_hold.take();
+                answer(&rounds, &mut job, (round, owed.take()), released).await
+            }
+            Step::Curate => curation(&rounds, lane, &mut job).await,
+            Step::Publish => publish(&rounds, &mut job).await,
+        };
+        match flow {
+            Flow::On => {}
+            Flow::Answer(issues, raised) => owed = Some((issues, raised)),
+            Flow::End => return job,
+        }
+    }
+}
+
+/// Whether `start`'s tree holds a report: `BLOCKED.md`, or a decline.
+fn has_report(start: &FixStart) -> bool {
+    let tree = &start.ws.tree;
+    tree.join(BLOCKED_REPORT).exists() || tree.join(decline_report(start.finding.kind)).exists()
+}
+
+/// Where the fixer's run leaves the fix ([`Step::Implement`]). With the
+/// review off, it ships as it stands, as it always has, and a fixer that
+/// finished moves it on to [`Step::Publish`] on an empty verdict for the
+/// tree, which a retry of its publish ships. Otherwise a fix that would
+/// ship as it stands ([`ready_to_ship`]) goes on to review round 1,
+/// titled by the commit the fixer finished on unless a title was taken
+/// before; anything else ends the attempt, for `conclude_fix` to decide.
+async fn implemented(rounds: &Rounds<'_>, job: &mut Reviewed) -> Flow {
+    let start = rounds.start;
+    if rounds.cfg.review_max_rounds == 0 {
+        job.ending = Some(Ending::default());
+        if job_state(&job.rr) == FinishedState::Done {
+            let tree = tree_state(&start.ws.tree).await;
+            job.record.verdict = Some(Saved { note: None, tree });
+            rounds.go(job, Step::Publish).await;
+        }
+        return Flow::End;
     }
     if !ready_to_ship(start, &job.rr).await {
-        return job;
+        return Flow::End;
     }
-    let root = &start.ws.root;
-    let progress = read_json::<Progress>(&root.join(PROGRESS_FILE)).unwrap_or_default();
-    let title = match progress.title {
-        Some(title) => Some(title),
-        None => head_subject(&start.ws.tree).await,
-    };
-    let rounds = Rounds {
-        scope,
-        cfg,
-        backend,
-        start,
-        title: title.clone(),
-    };
-    // The round reviewed last, and whether the fixer is owed its open
-    // issues: a suspended attempt's, sent before anything is reviewed again.
-    let mut round = progress.rounds;
-    let mut owed = matches!(&progress.owed, Some(Owed::Answer(issues)) if !issues.is_empty());
-    let mut follow_ups = progress.follow_ups;
-    let (mut ending, keep) = loop {
-        let owing = if std::mem::take(&mut owed) {
-            owed_answer(&rounds, &mut job, round, &follow_ups).await
-        } else {
-            Owing::Nothing
-        };
-        let (issues, raised) = match owing {
-            Owing::Answer(issues, raised) => (issues, raised),
-            Owing::End => return job,
-            Owing::Nothing => {
-                round += 1;
-                match next_round(&rounds, lane, &mut job, round, &mut follow_ups).await {
-                    Next::Answer { issues, raised } => (issues, raised),
-                    Next::Ship(ending, keep) => break (ending, keep),
-                    Next::End => return job,
-                }
-            }
-        };
-        if rounds
-            .stopped(&mut job, (round, &issues), &follow_ups)
-            .await
-        {
-            return job;
-        }
-        let message = format!("{raised}; back to the fixer");
-        log_round(rounds.store(), start, round, &message).await;
-        let progress = Progress {
-            rounds: round,
-            title: title.clone(),
-            follow_ups: follow_ups.clone(),
-            ..Progress::default()
-        };
-        match send_back(&rounds, &mut job, &progress, &issues).await {
-            Answered::ReviewAgain => {}
-            Answered::Conclude | Answered::Held => return job,
-            Answered::Offline(host) => {
-                job.offline = Some(host);
-                return job;
-            }
-            Answered::Ship(ending) => break (ending, false),
-        }
-    };
-    ending.title = title;
-    if finish(&rounds, lane, &mut job, &mut ending, follow_ups, keep).await {
-        job.ending = Some(ending);
+    if job.record.title.is_none() {
+        job.record.title = head_subject(&start.ws.tree).await;
     }
-    job
+    rounds.go(job, Step::Review(1)).await;
+    Flow::On
 }
 
-/// What a job suspended with issues owed to the fixer does first
-/// ([`owed_answer`]).
-enum Owing {
-    /// Nothing is owed: the loop goes on with the next round.
-    Nothing,
-    /// Send these issues back to the fixer; the string is their tally.
-    Answer(Vec<ChainIssue>, String),
-    /// The job was suspended again.
-    End,
-}
-
-/// What a job suspended with issues owed to the fixer after round
-/// `round` sends it first: the review's open issues as they are now
-/// ([`Rounds::open`]). None open, or a record that cannot be read
-/// (logged), owes nothing: the next round reviews the whole change again.
-/// Owed issues get the grant check a round's own get
-/// ([`Rounds::unanswered`]): a fixer run before them (an operator's
-/// `continue`) may have spent it all.
-async fn owed_answer(
-    rounds: &Rounds<'_>,
-    job: &mut Reviewed,
-    round: u32,
-    follow_ups: &[ReportedIssue],
-) -> Owing {
-    let issues = match rounds.open().await {
-        Ok(issues) => issues,
-        Err(why) => {
-            let message = format!("the issues owed since the job was suspended: {why}");
-            log_round(rounds.store(), rounds.start, round, &message).await;
-            Vec::new()
-        }
-    };
-    if issues.is_empty() {
-        return Owing::Nothing;
-    }
-    let tallied = tally(issues.iter().map(|i| &i.issue));
-    let raised = format!("{tallied} owed since the job was suspended");
-    if let Err(why) = rounds.allowance(&job.rr) {
-        let stop = format!("{raised}, {why} to answer them");
-        if rounds.spent(job, (round, &issues), follow_ups, &stop).await {
-            return Owing::End;
-        }
-    }
-    Owing::Answer(issues, raised)
-}
-
-/// Ship on `ending`, a saved verdict that covers the tree, curating first
-/// when the job this attempt continues was suspended with its curation
-/// owed ([`Progress::curate`]). The mark is taken here: a later attempt
-/// curates only if this one is suspended again.
-async fn ship_saved(
-    (scope, cfg, backend, start): (&CycleScope<'_>, &Config, &dyn Backend, &FixStart),
-    lane: &mut Lane,
-    mut job: Reviewed,
-    mut ending: Ending,
-) -> Reviewed {
-    let progress = read_json::<Progress>(&start.ws.root.join(PROGRESS_FILE)).unwrap_or_default();
-    if !matches!(progress.owed, Some(Owed::Curation)) {
-        job.ending = Some(ending);
-        return job;
-    }
-    let follow_ups = progress.follow_ups;
-    let taken = Progress {
-        title: progress.title.clone(),
-        follow_ups: follow_ups.clone(),
-        ..Progress::default()
-    };
-    write_progress(start, &taken);
-    let rounds = Rounds {
-        scope,
-        cfg,
-        backend,
-        start,
-        title: progress.title,
-    };
-    match curate(&rounds, lane, &mut job, &mut ending, &follow_ups).await {
-        Curated::Accepted => save_ending(start, &ending).await,
-        Curated::Not => {}
-        Curated::Suspended => return job,
-    }
-    job.ending = Some(ending);
-    job
-}
-
-/// Where review round `round` leaves the loop ([`next_round`]).
-enum Next {
-    /// The review's open issues go back to the fixer; `raised` is their
-    /// tally.
-    Answer {
-        issues: Vec<ChainIssue>,
-        raised: String,
-    },
-    /// The fix ships; `keep` saves the verdict for the tree.
-    Ship(Ending, bool),
-    /// The job ends on its state: held, suspended, or kept while a host
-    /// is unreachable.
-    End,
-}
-
-/// Run review round `round`, unless the daemon is stopping or the grant
-/// is spent, either of which suspends the job, as does a reviewer killed
-/// at its cap before it wrote an issue ([`Rounds::spent`]): the resume
-/// has the round again. The reviewer is shown the issues earlier rounds
-/// left open, with the fixer's answers, and judges them. Then what the
-/// round amounts to: the fix ships once the review has no issue left open
-/// ([`Rounds::open`]), new or earlier; otherwise every open one goes back
-/// to the fixer ([`Rounds::unanswered`]).
-async fn next_round(
-    rounds: &Rounds<'_>,
-    lane: &mut Lane,
-    job: &mut Reviewed,
-    round: u32,
-    follow_ups: &mut Vec<ReportedIssue>,
-) -> Next {
+/// Run review round `round` ([`Step::Review`]), unless the daemon is
+/// stopping or the grant is spent, either of which suspends the job, as
+/// does a reviewer killed at its cap before it wrote an issue
+/// ([`Rounds::spent`]): the resume has the round again. The reviewer is
+/// shown the issues earlier rounds left open, with the fixer's answers,
+/// and judges them. Then what the round amounts to: the fix ships once the
+/// review has no issue left open ([`Rounds::open`]), new or earlier;
+/// otherwise every open one goes back to the fixer ([`Rounds::unanswered`]).
+async fn next_round(rounds: &Rounds<'_>, lane: &mut Lane, job: &mut Reviewed, round: u32) -> Flow {
     let start = rounds.start;
-    let before = (round - 1, &[][..]);
-    if rounds.stopped(job, before, follow_ups).await {
-        return Next::End;
+    let what = format!("review round {round}");
+    if rounds.stopped(job, &what).await {
+        return Flow::End;
     }
     let (cap, wall) = match rounds.allowance(&job.rr) {
         Ok(allowance) => allowance,
         Err(why) => {
             let why = format!("{why} to review it");
-            if rounds.spent(job, before, follow_ups, &why).await {
-                return Next::End;
+            if rounds.spent(job, &what, &why).await {
+                return Flow::End;
             }
-            return Next::Ship(failed(round, &why, None, &[]), false);
+            return finish(rounds, job, failed(round, &why, None, &[])).await;
         }
     };
     let earlier = match rounds.open().await {
         Ok(earlier) => earlier,
         Err(why) => {
-            log_round(
-                rounds.store(),
-                start,
-                round,
-                &format!("failed: {why}; shipping"),
-            )
-            .await;
-            return Next::Ship(failed(round, &why, None, &[]), false);
+            let message = format!("failed: {why}; shipping");
+            log_round(rounds.store(), start, round, &message).await;
+            return finish(rounds, job, failed(round, &why, None, &[])).await;
         }
     };
     let (run, head, verdict, raised_follow_ups) =
-        review_round(rounds, lane, round, (cap, wall), &earlier).await;
+        review_round(rounds, lane, job, round, (cap, wall), &earlier).await;
     let shown = (run.as_ref(), head.as_deref());
     let verdict = record_round(
         rounds,
@@ -844,19 +832,19 @@ async fn next_round(
         add_spend(&mut job.rr, run);
     }
     let also = follow_up_tally(raised_follow_ups.len());
-    merge_follow_ups(follow_ups, raised_follow_ups);
+    merge_follow_ups(&mut job.record.follow_ups, raised_follow_ups);
     let (written, undone) = match verdict {
         // The grant ran out on a reviewer that wrote nothing: no review
         // was had, and the resume has it again.
-        RoundVerdict::Failed { why, left, .. }
-            if capped && left.is_none() && rounds.spent(job, before, follow_ups, &why).await =>
-        {
-            return Next::End;
+        RoundVerdict::Failed {
+            why, head: None, ..
+        } if capped && rounds.spent(job, &what, &why).await => {
+            return Flow::End;
         }
-        RoundVerdict::Failed { why, left, issues } => {
-            let failure = (why.as_str(), left, issues.as_slice());
-            let failed = rounds.failed_round(round, failure, follow_ups, &also).await;
-            return failed.ended(job);
+        RoundVerdict::Failed { why, head, issues } => {
+            let failure = (why.as_str(), head, issues.as_slice());
+            let failed = rounds.failed_round(job, round, failure, &also).await;
+            return failed.ended(rounds, job).await;
         }
         RoundVerdict::Clean => (Vec::new(), false),
         RoundVerdict::Issues { issues, undone } => (issues, undone),
@@ -866,37 +854,25 @@ async fn next_round(
         Ok(issues) => issues,
         Err(why) => {
             let failure = (why.as_str(), None, written.as_slice());
-            let failed = rounds.failed_round(round, failure, follow_ups, &also).await;
-            return failed.ended(job);
+            let failed = rounds.failed_round(job, round, failure, &also).await;
+            return failed.ended(rounds, job).await;
         }
     };
     if issues.is_empty() {
         let message = format!("no issues to answer{also}; shipping");
         log_round(rounds.store(), start, round, &message).await;
-        return Next::Ship(Ending::default(), true);
+        return finish(rounds, job, Ending::default()).await;
     }
     let raised = format!("{}{also}", raised(&issues, &earlier, undone));
     match rounds
-        .unanswered(job, round, (&issues, undone), follow_ups, &raised)
+        .unanswered(job, round, (&issues, undone), &raised)
         .await
     {
-        Unanswered::No => Next::Answer { issues, raised },
-        unanswered => unanswered.ended(job),
-    }
-}
-
-impl Unanswered {
-    /// Where the loop goes when no answer is coming: it ships, or the job
-    /// ends on its state (kept for a retry while a host is unreachable).
-    fn ended(self, job: &mut Reviewed) -> Next {
-        match self {
-            Self::Ship(ending, keep) => Next::Ship(ending, keep),
-            Self::Offline(host) => {
-                job.offline = Some(host);
-                Next::End
-            }
-            Self::Held | Self::No | Self::Suspended => Next::End,
+        Unanswered::No => {
+            rounds.go(job, Step::Answer(round)).await;
+            Flow::Answer(issues, raised)
         }
+        unanswered => unanswered.ended(rounds, job).await,
     }
 }
 
@@ -969,12 +945,12 @@ async fn record_round(
     match verdict {
         RoundVerdict::Clean => RoundVerdict::Failed {
             why,
-            left: None,
+            head: None,
             issues: Vec::new(),
         },
         RoundVerdict::Issues { issues, .. } => RoundVerdict::Failed {
             why,
-            left: None,
+            head: None,
             issues,
         },
         failed @ RoundVerdict::Failed { .. } => failed,
@@ -1013,36 +989,115 @@ async fn read_verdicts(rounds: &Rounds<'_>, round: u32, earlier: &[ChainIssue]) 
     }
 }
 
-/// End a loop that ships: the review's summary ([`review_summary`]) and
-/// the follow-ups go into the PR body, the loop's files are ended (the
-/// verdict saved for the reviewed tree when `keep`), and the history is
-/// curated ([`curate`]); an accepted curation saves the verdict again, for
-/// the curated tree. Saving before the curation is what lets an attempt
-/// that recovers from a curation the daemon died in ship the reviewed tree
-/// without another review. `false` when the job was suspended before its
-/// curation instead: nothing ships in this attempt. A review whose record
-/// cannot be read ships without its summary, logged.
-async fn finish(
-    rounds: &Rounds<'_>,
-    lane: &mut Lane,
-    job: &mut Reviewed,
-    ending: &mut Ending,
-    follow_ups: Vec<ReportedIssue>,
-    keep: bool,
-) -> bool {
+/// The review reached `ending`: the review's summary ([`review_summary`])
+/// and the follow-ups go into the PR body, under the fix's title, and the
+/// verdict is recorded for the tree as it is ([`StepRecord::verdict`]),
+/// for the curation ([`Step::Curate`]) and the publish that follow. One
+/// that ships a commit a reviewer was shown in place of `HEAD`, the tree
+/// as that reviewer left it, covers no tree: it ships in this attempt, and
+/// any later one puts the tree back and reviews it again from round 1. A
+/// review whose record cannot be read ships without its summary, logged.
+async fn finish(rounds: &Rounds<'_>, job: &mut Reviewed, mut ending: Ending) -> Flow {
     let start = rounds.start;
     match rounds.review().await {
-        Ok(review) => with_summary(ending, review_summary(&review)),
+        Ok(review) => with_summary(&mut ending, review_summary(&review)),
         Err(why) => tracing::warn!("fix #{}: no review summary: {why}", start.finding.id),
     }
-    with_follow_ups(ending, &follow_ups);
-    end_loop(start, ending, follow_ups.clone(), keep).await;
-    match curate(rounds, lane, job, ending, &follow_ups).await {
-        Curated::Accepted => end_loop(start, ending, follow_ups, keep).await,
-        Curated::Not => {}
-        Curated::Suspended => return false,
+    with_follow_ups(&mut ending, &job.record.follow_ups);
+    ending.title.clone_from(&job.record.title);
+    if ending.head.is_some() {
+        job.record.verdict = None;
+        rounds.go(job, Step::Review(1)).await;
+        job.ending = Some(ending);
+        return Flow::End;
     }
-    true
+    let tree = tree_state(&start.ws.tree).await;
+    job.record.verdict = Some(Saved {
+        note: ending.note,
+        tree,
+    });
+    rounds.go(job, Step::Curate).await;
+    Flow::On
+}
+
+/// Curate the reviewed fix ([`Step::Curate`], [`curate`]), then publish
+/// it: on the curated tree, whose verdict is the review's, or on the
+/// reviewed one. A rewrite that could not be undone ships the reviewed
+/// commit in place of `HEAD` in this attempt, and leaves the record at the
+/// curation, the curator's tree to put back: any later attempt puts the
+/// tree back and curates again. A job with no verdict (a record an
+/// operator wrote) is reviewed again ([`review_again`]).
+async fn curation(rounds: &Rounds<'_>, lane: &mut Lane, job: &mut Reviewed) -> Flow {
+    let Some(saved) = job.record.verdict.clone() else {
+        return review_again(rounds, job).await;
+    };
+    let mut ending = Ending {
+        note: saved.note,
+        head: None,
+        title: job.record.title.clone(),
+    };
+    match curate(rounds, lane, job, &mut ending).await {
+        Curated::Accepted => {
+            let tree = tree_state(&rounds.start.ws.tree).await;
+            job.record.verdict = Some(Saved {
+                note: ending.note,
+                tree,
+            });
+        }
+        Curated::Not if ending.head.is_some() => {
+            if let Err(e) = rounds.save(job).await {
+                let fid = rounds.start.finding.id;
+                tracing::warn!("fix #{fid}: recording the curator's tree to put back: {e}");
+            }
+            job.ending = Some(ending);
+            return Flow::End;
+        }
+        Curated::Not => {}
+        Curated::Suspended => return Flow::End,
+    }
+    rounds.go(job, Step::Publish).await;
+    Flow::On
+}
+
+/// Publish the fix ([`Step::Publish`]) on its verdict, when that covers
+/// the tree exactly as it is: nothing runs, however this attempt's fixer
+/// run (an operator's `continue` of a refused publish) ended. With the
+/// review off, on an empty verdict for the tree as it is. Any other tree
+/// (the fixer changed it since) is reviewed again ([`review_again`]).
+async fn publish(rounds: &Rounds<'_>, job: &mut Reviewed) -> Flow {
+    let now = tree_state(&rounds.start.ws.tree).await;
+    match &job.record.verdict {
+        Some(saved) if covers(saved, &now) => {
+            job.ending = Some(Ending {
+                note: saved.note.clone(),
+                head: None,
+                title: job.record.title.clone(),
+            });
+            Flow::End
+        }
+        _ if rounds.cfg.review_max_rounds == 0 => {
+            job.ending = Some(Ending::default());
+            job.record.verdict = Some(Saved {
+                note: None,
+                tree: now,
+            });
+            Flow::End
+        }
+        _ => review_again(rounds, job).await,
+    }
+}
+
+/// The tree has no verdict that covers it: it is reviewed again from round
+/// 1, under the same title and with the follow-ups so far, when it would
+/// ship as it stands ([`ready_to_ship`]); otherwise the attempt ends on
+/// its fixer's state.
+async fn review_again(rounds: &Rounds<'_>, job: &mut Reviewed) -> Flow {
+    job.record.verdict = None;
+    if !ready_to_ship(rounds.start, &job.rr).await {
+        return Flow::End;
+    }
+    rounds.go(job, Step::Review(1)).await;
+    Flow::On
 }
 
 /// Have the fixer curate its reviewed history before it ships
@@ -1055,23 +1110,18 @@ async fn finish(
 /// the pinned commit. Otherwise the tree is put back to the reviewed
 /// commit ([`undo`]) and the original commits ship. Curation never holds,
 /// fails or counts against the fix, and is skipped when it is off, there
-/// is one commit, there is no transcript to resume, or `ending` already
-/// pins a commit (a reviewer moved `HEAD`). The daemon's shutdown, a grant
-/// with nothing left, or a curator killed at its cap (its rewrite undone)
-/// suspend the job instead, its curation owed ([`Rounds::curation_owed`]):
-/// a fix is not shipped uncurated because the budget ran out. When the
-/// tree cannot be put back, `ending` pins the reviewed commit, so that is
-/// what ships.
+/// is one commit, or there is no transcript to resume. The daemon's
+/// shutdown, a grant with nothing left, or a curator killed at its cap
+/// (its rewrite undone) suspend the job at its curation instead
+/// ([`Rounds::curation_owed`]): a fix is not shipped uncurated because the
+/// budget ran out. When the tree cannot be put back, `ending` pins the
+/// reviewed commit, so that is what ships.
 async fn curate(
     rounds: &Rounds<'_>,
     lane: &mut Lane,
     job: &mut Reviewed,
     ending: &mut Ending,
-    follow_ups: &[ReportedIssue],
 ) -> Curated {
-    if ending.head.is_some() {
-        return Curated::Not;
-    }
     let Some(due) = curation_due(rounds, job).await else {
         return Curated::Not;
     };
@@ -1081,11 +1131,11 @@ async fn curate(
         rounds.allowance(&job.rr).err()
     };
     if let Some(why) = stop
-        && rounds.curation_owed(job, ending, follow_ups, why).await
+        && rounds.curation_owed(job, why).await
     {
         return Curated::Suspended;
     }
-    curated_head(rounds, lane, job, (ending, follow_ups), due).await
+    curated_head(rounds, lane, job, ending, due).await
 }
 
 /// How a curation went.
@@ -1095,7 +1145,7 @@ enum Curated {
     /// Skipped or rejected: the original commits ship, or the reviewed
     /// commit `ending` now pins when a rejected rewrite could not be undone.
     Not,
-    /// The job was suspended with its curation owed.
+    /// The job was suspended at its curation.
     Suspended,
 }
 
@@ -1119,14 +1169,16 @@ async fn curation_due(rounds: &Rounds<'_>, job: &Reviewed) -> Option<(usize, Str
     Some((commits, session))
 }
 
-/// [`curate`]'s work. While it runs, [`CURATING_FILE`] records the
-/// reviewed tree, so a daemon that dies in it leaves the next attempt
-/// what to put back ([`recover_curation`]).
+/// [`curate`]'s work. While it runs, the job's record holds the reviewed
+/// tree to put back ([`StepRecord::rewrite`]), so a daemon that dies in it
+/// leaves the next attempt what to put back before it curates again; a
+/// tree the curator's rejected rewrite could not be undone from stays
+/// there, for every later attempt to put back.
 async fn curated_head(
     rounds: &Rounds<'_>,
     lane: &mut Lane,
     job: &mut Reviewed,
-    (ending, follow_ups): (&mut Ending, &[ReportedIssue]),
+    ending: &mut Ending,
     (commits, session): (usize, String),
 ) -> Curated {
     let (cfg, start) = (rounds.cfg, rounds.start);
@@ -1150,11 +1202,9 @@ async fn curated_head(
     else {
         return Curated::Not;
     };
-    let marker = start.ws.root.join(CURATING_FILE);
-    let recorded = serde_json::to_vec(&curating)
-        .map_err(std::io::Error::other)
-        .and_then(|bytes| std::fs::write(&marker, bytes));
-    if let Err(e) = recorded {
+    job.record.rewrite = Some(curating.clone());
+    if let Err(e) = rounds.save(job).await {
+        job.record.rewrite = None;
         note(format!("skipped (cannot record the reviewed tree: {e})")).await;
         return Curated::Not;
     }
@@ -1184,18 +1234,20 @@ async fn curated_head(
             }
         }
     };
-    let outcome = match verdict {
+    match verdict {
         Ok(curated) => {
+            job.record.rewrite = None;
             note(format!("{commits} commits rewritten into {curated}")).await;
             Curated::Accepted
         }
         Err(why) => {
-            let undone = undo_or_record(lane, start, curating).await;
-            let _ = std::fs::remove_file(&marker);
+            let undone = undo(lane, start, &curating.before, &curating.description).await;
+            if undone.is_ok() {
+                job.record.rewrite = None;
+            }
             // A curator the grant ran out on curated nothing: the resume
             // has it again, once its rewrite is undone.
-            if capped && undone.is_ok() && rounds.curation_owed(job, ending, follow_ups, &why).await
-            {
+            if capped && undone.is_ok() && rounds.curation_owed(job, &why).await {
                 return Curated::Suspended;
             }
             if undone.is_err() {
@@ -1210,60 +1262,7 @@ async fn curated_head(
             .await;
             Curated::Not
         }
-    };
-    let _ = std::fs::remove_file(&marker);
-    outcome
-}
-
-/// Put the tree back to the reviewed commit when the daemon died during a
-/// curation ([`CURATING_FILE`] left behind): [`undo`] to the reviewed tree
-/// and description. Run first in a later attempt of the chain, before
-/// anything reads the tree. The curation is owed again ([`owe_curation`]):
-/// the attempt runs no fixer, and curates on the verdict saved for the
-/// reviewed tree before it ships, as any part of the fix a stop cut short
-/// is had again. A tree that could not be put back is recorded for
-/// [`restore_reviewed`] ([`undo_or_record`]), which runs next: no worker
-/// runs on it until it is.
-pub(super) async fn recover_curation(lane: &mut Lane, store: &Store, start: &FixStart) {
-    let marker = start.ws.root.join(CURATING_FILE);
-    let Some(curating) = read_json::<ReviewedTree>(&marker) else {
-        return;
-    };
-    let undone = undo_or_record(lane, start, curating).await;
-    let outcome = match &undone {
-        Ok(()) => "the reviewed commit restored".to_owned(),
-        Err(e) => format!("restoring the reviewed commit failed: {e}"),
-    };
-    owe_curation(start);
-    let _ = std::fs::remove_file(&marker);
-    let fid = start.finding.id;
-    let message =
-        format!("#{fid} curation: interrupted by a restart; {outcome}; to be curated again");
-    let _ = fix_event(store, "review", fid, start.job, message).await;
-}
-
-/// Record that `start`'s fix owes its curation again ([`Owed::Curation`]),
-/// its review through and its verdict saved for the reviewed tree: a
-/// curation cut short by a restart, or whose changes had to be put back.
-fn owe_curation(start: &FixStart) {
-    let progress = read_json::<Progress>(&start.ws.root.join(PROGRESS_FILE)).unwrap_or_default();
-    write_progress(
-        start,
-        &Progress {
-            title: progress.title,
-            follow_ups: progress.follow_ups,
-            owed: Some(Owed::Curation),
-            ..Progress::default()
-        },
-    );
-}
-
-/// Whether `start`'s fix owes only its curation ([`Owed::Curation`]): its
-/// review is through, so the attempt runs no fixer, whatever the hold an
-/// operator released, and goes straight to the curation.
-pub(super) fn owes_curation(start: &FixStart) -> bool {
-    read_json::<Progress>(&start.ws.root.join(PROGRESS_FILE))
-        .is_some_and(|progress| matches!(progress.owed, Some(Owed::Curation)))
+    }
 }
 
 /// How many commits `start`'s branch has on top of its pinned commit, if
@@ -1351,310 +1350,57 @@ fn with_follow_ups(ending: &mut Ending, follow_ups: &[ReportedIssue]) {
     });
 }
 
-/// The saved verdict ([`ENDING_FILE`]), if it covers `start`'s tree
-/// exactly as it is now.
-async fn saved_ending(start: &FixStart) -> Option<Ending> {
-    let saved = covering_verdict(&start.ws).await?;
-    Some(Ending {
-        note: saved.note,
-        head: None,
-        title: saved.title,
-    })
-}
-
-/// The verdict saved in `ws` ([`ENDING_FILE`]), if it covers its tree
-/// exactly as it is now. A file left from a verdict whose tree has since
-/// changed (a rejected curation that could not be undone, which pins the
-/// reviewed commit instead) covers nothing.
-async fn covering_verdict(ws: &Workspace) -> Option<Saved> {
-    let saved = read_json::<Saved>(&ws.root.join(ENDING_FILE))?;
-    let now = tree_state(&ws.tree).await;
-    // A verdict saved by an earlier daemon holds its status trimmed at
-    // both ends, which dropped the first line's leading blank: compare
-    // the statuses as that trim leaves them.
-    let status = |t: &TreeState| t.status.as_deref().map(str::trim_start).map(str::to_owned);
-    let covers = saved.tree.head.is_some()
-        && (
-            &saved.tree.head,
-            &saved.tree.branch,
-            &saved.tree.description,
-        ) == (&now.head, &now.branch, &now.description)
-        && status(&saved.tree) == status(&now);
-    covers.then_some(saved)
-}
-
-/// End the loop's files. Its progress is reset to round 0, keeping the
-/// title and the `follow_ups`: a later attempt that finds the tree changed
-/// (an offline push retried after the fixer went on) is reviewed from
-/// round 1 again, under the same title and with them. `ending` is saved
-/// for the tree as it is when `keep` (a reviewer's own verdict).
-async fn end_loop(start: &FixStart, ending: &Ending, follow_ups: Vec<ReportedIssue>, keep: bool) {
-    let root = &start.ws.root;
-    let progress = Progress {
-        rounds: 0,
-        title: ending.title.clone(),
-        follow_ups,
-        ..Progress::default()
-    };
-    let reset = serde_json::to_vec(&progress)
-        .map_err(std::io::Error::other)
-        .and_then(|bytes| std::fs::write(root.join(PROGRESS_FILE), bytes));
-    if let Err(e) = reset {
-        tracing::warn!(
-            "fix #{}: resetting the review's progress: {e}",
-            start.finding.id
-        );
-    }
-    let _ = std::fs::remove_file(root.join(ENDING_FILE));
-    let _ = std::fs::remove_file(root.join(HELD_FILE));
-    if keep {
-        save_ending(start, ending).await;
-    }
-}
-
-/// Save `ending` ([`ENDING_FILE`]) for `start`'s tree as it is now.
-async fn save_ending(start: &FixStart, ending: &Ending) {
-    let saved = Saved {
-        note: ending.note.clone(),
-        title: ending.title.clone(),
-        tree: tree_state(&start.ws.tree).await,
-    };
-    let written = serde_json::to_vec(&saved)
-        .map_err(std::io::Error::other)
-        .and_then(|bytes| std::fs::write(start.ws.root.join(ENDING_FILE), bytes));
-    if let Err(e) = written {
-        tracing::warn!("fix #{}: recording the review's end: {e}", start.finding.id);
-    }
-}
-
-/// Keep `ending`, which the forge refused to publish, for the retry of
-/// the kept attempt: whatever the review loop decided about saving it (a
-/// failed round or unanswered issues ship with a note and are otherwise
-/// reviewed again), the retry only has to publish the same verdict, on the
-/// same tree, however its own run ends. Anything the fixer changes since
-/// is reviewed afresh, as for any saved verdict. One that ships a
-/// reviewer-pinned commit in place of `HEAD` is not kept, and is reviewed
-/// again: a verdict is saved for `HEAD` only.
-pub(super) async fn keep_for_publish(start: &FixStart, ending: &Ending) {
-    if ending.head.is_none() {
-        save_ending(start, ending).await;
-    }
-}
-
-/// Whether `ws` holds a saved verdict that covers its tree as it is now
-/// ([`covering_verdict`]): a kept fix's retry then ships on it without a
-/// review.
-pub(super) async fn has_kept_verdict(ws: &Workspace) -> bool {
-    covering_verdict(ws).await.is_some()
-}
-
-/// Whether the next attempt in `ws` will curate: a curation is owed
-/// ([`Owed::Curation`]), or will be once a curation the daemon died in is
-/// recovered ([`CURATING_FILE`]) or a curator's tree is put back
-/// ([`RESTORE_FILE`], [`LeftBy::Curator`]). Such an attempt runs a model,
-/// so its continuation is never free.
-pub(super) fn curation_pending(ws: &Workspace) -> bool {
-    let owed = read_json::<Progress>(&ws.root.join(PROGRESS_FILE))
-        .is_some_and(|progress| matches!(progress.owed, Some(Owed::Curation)));
-    let restoring = read_json::<Restore>(&ws.root.join(RESTORE_FILE))
-        .is_some_and(|restore| restore.by == LeftBy::Curator);
-    owed || restoring || ws.root.join(CURATING_FILE).exists()
-}
-
-/// In the workspace root: the review stop a hold was made for ([`Held`]),
-/// so the operator's `continue` resumes the fixer on the issues still open.
-const HELD_FILE: &str = "review-held.json";
-
-/// A review hold, made on issues left unanswered. The issues are the
-/// review's open ones ([`Rounds::open`]), read when the fixer resumes. They
-/// are pending until a fixer has run on them ([`mark_held_sent`]): every
-/// attempt that follows an operator's `continue` while they are pending
-/// resumes the fixer on them ([`held_resume_prompt`]), whichever hold that
-/// `continue` released. A hold made since on an attempt no fixer ran in
-/// (`stuck` on a tree that could not be put back, say) stands between the
-/// review's hold and the fixer, but the issues are still the work left.
-/// The issues an earlier daemon wrote here are no longer read.
-#[derive(Debug, Serialize, Deserialize)]
-struct Held {
-    /// A fixer has run on the issues: later continues of the chain resume
-    /// it as any other hold's do. Every file this daemon writes has it;
-    /// one without it is a legacy file ([`Held::pending`]).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    sent: Option<bool>,
-    /// A legacy file's hold report, as its `BLOCKED.md` gave it: read to
-    /// decide whether its issues are pending, never written.
-    #[serde(default, skip_serializing)]
-    report: Option<String>,
-}
-
-impl Held {
-    /// Whether the issues are pending for an attempt resumed after the
-    /// operator continued a hold whose detail is `detail`. A file with
-    /// `sent` says so itself. A legacy one (an earlier daemon's, without
-    /// `sent`) never recorded it: it stayed behind after its issues were
-    /// answered, and was used only on a `continue` of its own hold, whose
-    /// detail is its `report`; so it still is, and only then.
-    fn pending(&self, detail: &str) -> bool {
-        match self.sent {
-            Some(sent) => !sent,
-            None => self.report.as_deref() == Some(detail),
-        }
-    }
-}
-
-/// Hold the fix for the operator on review round `round`'s unanswered
-/// `issues` (`stop` says why no answer comes): the report goes where a
-/// worker's would (`BLOCKED.md`, which `conclude_fix` turns into a
-/// `prerequisite` hold with this attempt as its checkpoint), and the hold
-/// to [`HELD_FILE`] for the resume. `progress` (round 0, the title and the
-/// follow-ups so far) replaces the loop's progress, so a continued fix is
-/// reviewed from round 1 under the same title and keeps them.
-/// `restoring`: the commit the round's reviewer was shown, when its changes
-/// could not be undone, which every later attempt puts the tree back to
-/// before the fixer resumes ([`RESTORE_FILE`]); the report says so.
-/// `false` when the report could not be written: the fix ships with the
-/// issues unresolved instead.
-fn hold(
-    start: &FixStart,
-    round: u32,
-    issues: &[ReportedIssue],
-    (progress, stop, restoring): (&Progress, &str, Option<&str>),
-) -> bool {
-    let follow_ups = &progress.follow_ups;
-    let root = &start.ws.root;
-    let mut report = format!(
-        "# Held by the pre-PR review\n\nThe automated pre-PR review stopped at round \
-         {round} ({stop}) with issues unresolved. Continue to have the fixer \
-         answer them; the review then runs again from round 1.\n\n"
-    );
-    if let Some(commit) = restoring {
-        let _ = write!(
-            report,
-            "The reviewer's changes to the tree could not be undone. Before the fixer \
-             resumes, the fix branch is put back to the reviewed commit `{commit}` and what \
-             the reviewer added is removed; while that fails, the fixer does not run (the \
-             attempt fails as `{TREE_NOT_RESTORED}`), and `{}` needs cleaning up by hand.\n\n",
-            start.ws.tree.display()
-        );
-    }
-    report.push_str("## Remaining review issues\n");
-    issue_list(&mut report, issues);
-    if !follow_ups.is_empty() {
-        let _ = write!(report, "\n\n{}", follow_ups_note(follow_ups));
-    }
-    let held = Held {
-        sent: Some(false),
-        report: None,
-    };
-    let written = serde_json::to_vec(&held)
-        .map_err(std::io::Error::other)
-        .and_then(|bytes| std::fs::write(root.join(HELD_FILE), bytes))
-        .and_then(|()| std::fs::write(start.ws.tree.join(BLOCKED_REPORT), &report));
-    if let Err(e) = written {
-        tracing::warn!("fix #{}: holding on the review: {e}", start.finding.id);
-        let _ = std::fs::remove_file(root.join(HELD_FILE));
-        return false;
-    }
-    // The continued fix is reviewed from round 1 again, under the same
-    // title and with the follow-ups found so far.
-    let kept = serde_json::to_vec(progress)
-        .map_err(std::io::Error::other)
-        .and_then(|bytes| std::fs::write(root.join(PROGRESS_FILE), bytes));
-    if let Err(e) = kept {
-        tracing::warn!(
-            "fix #{}: keeping the review's progress: {e}",
-            start.finding.id
-        );
-    }
-    let _ = std::fs::remove_file(root.join(ENDING_FILE));
-    true
-}
-
 /// Why an attempt could not put its tree back to the one an agent whose
-/// changes could not be undone was shown ([`restore_reviewed`]): the
-/// failure its streak counts.
+/// changes could not be undone was shown ([`put_back`]): the failure its
+/// streak counts.
 pub(super) const TREE_NOT_RESTORED: &str = "reviewed tree not restored";
 
-/// Record `left`, the tree an agent (a failed round's reviewer, or a
-/// curator) was shown and could not be undone from, for
-/// [`restore_reviewed`] ([`RESTORE_FILE`]). A failure is logged: the tree
-/// then stays as the agent left it.
-fn record_restore(start: &FixStart, left: &Restore) {
-    let written = serde_json::to_vec(left)
-        .map_err(std::io::Error::other)
-        .and_then(|bytes| std::fs::write(start.ws.root.join(RESTORE_FILE), bytes));
-    if let Err(e) = written {
-        tracing::warn!(
-            "fix #{}: recording the reviewed tree to put back: {e}",
-            start.finding.id
-        );
-    }
-}
-
-/// [`undo`] a curator's changes back to `reviewed`; when that fails, the
-/// tree is recorded as the curator's for [`restore_reviewed`]
-/// ([`record_restore`]), so no later worker runs on, and no later review
-/// ships, what the curator left.
-async fn undo_or_record(
-    lane: &mut Lane,
-    start: &FixStart,
-    reviewed: ReviewedTree,
-) -> Result<(), String> {
-    let undone = undo(lane, start, &reviewed.before, &reviewed.description).await;
-    if undone.is_err() {
-        let left = Restore {
-            tree: reviewed,
-            by: LeftBy::Curator,
-        };
-        record_restore(start, &left);
-    }
-    undone
-}
-
-/// Put `start`'s tree back to the one a failed round's reviewer or a
-/// curator was shown ([`undo`]) when it was left as that agent changed it
-/// ([`RESTORE_FILE`]), whatever the attempt then amounted to: a hold, a
-/// retry kept while a host was unreachable, a pinned commit whose publish
-/// failed. Run first in every later attempt of the chain, before anything
-/// reads the tree, so no worker builds on a reviewer's commit or leftovers
-/// and none of them ships. Done once: the record then goes, so a later
-/// attempt keeps the fixer's own work. A curator's changes put back leave
-/// its curation owed again ([`owe_curation`]). An error says what still
-/// differs; no worker may run in the tree then.
+/// Put `start`'s tree back to the one a reviewer or a curator was shown
+/// ([`undo`]) when the job's `record` says it may have been left as that
+/// agent changed it ([`StepRecord::rewrite`]): the daemon died while the
+/// agent ran, or its changes could not be undone, whatever the attempt
+/// then amounted to (a hold, a retry kept while a host was unreachable, a
+/// pinned commit whose publish failed). Run first in every attempt of the
+/// chain, before anything reads the tree, so no worker builds on what an
+/// agent left and none of it ships. Done once: the record then says so, so
+/// a later attempt keeps the fixer's own work. The step the record names
+/// is the one to run then: a curator's tree put back is curated again. An
+/// error says what still differs; no worker may run in the tree then, and
+/// the record keeps the tree to put back.
 ///
 /// A `BLOCKED.md` in the tree is a review hold's own report, which no hold
-/// has recorded yet: the daemon died between [`hold`] writing it and
-/// `conclude_fix` recording it (once recorded it leaves the tree, and no
-/// worker runs before this). [`undo`] removes reports as a reviewer's, so
-/// it is put back whatever undo did: it holds the fix once this attempt
+/// has recorded yet: the daemon died between [`Rounds::hold`] writing it
+/// and `conclude_fix` recording it (once recorded it leaves the tree, and
+/// no worker runs before this). [`undo`] removes reports as a reviewer's,
+/// so it is put back whatever undo did: it holds the fix once this attempt
 /// ends, as any report no hold has recorded does.
-pub(super) async fn restore_reviewed(
+pub(super) async fn put_back(
     lane: &mut Lane,
-    store: &Store,
+    store: &JobStore,
     start: &FixStart,
+    record: &mut StepRecord,
 ) -> Result<(), String> {
-    let path = start.ws.root.join(RESTORE_FILE);
-    let Some(Restore { tree: reviewed, by }) = read_json::<Restore>(&path) else {
+    let Some(shown) = &record.rewrite else {
         return Ok(());
     };
-    let commit = reviewed.before.head.as_deref().unwrap_or_default();
+    let commit = shown.before.head.clone().unwrap_or_default();
     let unrecorded = start.ws.tree.join(BLOCKED_REPORT);
     let report = std::fs::read(&unrecorded).ok();
-    let undone = undo(lane, start, &reviewed.before, &reviewed.description).await;
+    let undone = undo(lane, start, &shown.before, &shown.description).await;
     if let Some(report) = report {
         std::fs::write(&unrecorded, report)
             .map_err(|e| format!("keeping the review's unrecorded {BLOCKED_REPORT}: {e}"))?;
     }
     undone.map_err(|e| format!("putting the tree back to the reviewed commit {commit}: {e}"))?;
-    std::fs::remove_file(&path)
-        .map_err(|e| format!("recording the tree as put back to {commit}: {e}"))?;
+    record.rewrite = None;
     let fid = start.finding.id;
-    let agent = match by {
-        LeftBy::Reviewer => "a reviewer",
-        LeftBy::Curator => {
-            owe_curation(start);
-            "a curator"
-        }
+    if let Err(e) = store.set_fix_step(fid, &record.json()).await {
+        tracing::warn!("fix #{fid}: recording the tree as put back to {commit}: {e}");
+    }
+    let agent = if record.step == Step::Curate {
+        "a curator"
+    } else {
+        "a reviewer"
     };
     let message =
         format!("#{fid} the tree {agent} left was put back to the reviewed commit {commit}");
@@ -1662,177 +1408,144 @@ pub(super) async fn restore_reviewed(
     Ok(())
 }
 
-/// The prompt a fix resumed after an operator's `continue` of a hold whose
-/// detail is `detail` gets while a review hold's issues are pending
-/// ([`Held::pending`]), or `None` when none are: the follow-up playbook
-/// with the review's open issues as they are now ([`FixReview::open`]),
-/// so the fixer answers them, into [`ANSWERS_FILE`], before the review
-/// runs again. `None` as well when the review has none open (an earlier
-/// daemon's hold, whose issues it never recorded): the resume is then the
-/// plain one, whose hold detail lists them. Once a fixer has run on it,
-/// [`mark_held_sent`] says so.
-pub(super) async fn held_resume_prompt(
-    cfg: &Config,
-    store: &Store,
-    start: &FixStart,
-    detail: &str,
-) -> Option<anyhow::Result<String>> {
-    read_json::<Held>(&start.ws.root.join(HELD_FILE)).filter(|held| held.pending(detail))?;
-    let open = match store.fix_review(chain(start)).await {
-        Ok(review) => review.open(),
-        Err(e) => {
-            return Some(Err(anyhow::anyhow!(
-                "reading the held review's issues: {e}"
-            )));
-        }
+/// The fixer's answer to the issues the review left open after round
+/// `round` ([`Step::Answer`]): `owed`, the round's own as the attempt just
+/// reviewed them, or, for an attempt that starts here, the review's open
+/// issues as they are now ([`Rounds::open`]). None open, or a record that
+/// cannot be read (logged), owes nothing: the review goes on with the next
+/// round. The daemon's shutdown suspends the job here first
+/// ([`Rounds::stopped`]); `after_hold`, the hold an operator released for
+/// this attempt, is what the fixer is told first ([`answer_review`]).
+async fn answer(
+    rounds: &Rounds<'_>,
+    job: &mut Reviewed,
+    (round, owed): (u32, Option<(Vec<ChainIssue>, String)>),
+    after_hold: Option<&(HoldReason, String)>,
+) -> Flow {
+    let start = rounds.start;
+    let (issues, raised) = if let Some(owed) = owed {
+        owed
+    } else {
+        let issues = match rounds.open().await {
+            Ok(issues) => issues,
+            Err(why) => {
+                let message = format!("the issues the fixer owes an answer: {why}");
+                log_round(rounds.store(), start, round, &message).await;
+                Vec::new()
+            }
+        };
+        let tallied = tally(issues.iter().map(|i| &i.issue));
+        let raised = if after_hold.is_some() {
+            format!("{tallied} an operator released")
+        } else {
+            format!("{tallied} owed since the job was suspended")
+        };
+        (issues, raised)
     };
-    if open.is_empty() {
-        return None;
+    if issues.is_empty() {
+        rounds.go(job, Step::Review(round + 1)).await;
+        return Flow::On;
     }
-    let built = followup_prompt(cfg, start, &open);
-    Some(built.map(|prompt| {
-        format!(
-            "An operator released this fix, which was held because the pre-PR review \
-             left issues unanswered. Preserve the committed work; answer the \
-             issues below.\n\n{prompt}"
-        )
-    }))
-}
-
-/// Record that a fixer ran on the prompt [`held_resume_prompt`] gave: the
-/// review hold's issues are no longer pending. Unrecorded, a later
-/// `continue` sends them again.
-pub(super) fn mark_held_sent(start: &FixStart) {
-    let path = start.ws.root.join(HELD_FILE);
-    let Some(mut held) = read_json::<Held>(&path) else {
-        return;
-    };
-    held.sent = Some(true);
-    let written = serde_json::to_vec(&held)
-        .map_err(std::io::Error::other)
-        .and_then(|bytes| std::fs::write(&path, bytes));
-    if let Err(e) = written {
-        tracing::warn!(
-            "fix #{}: recording the held issues as sent: {e}",
-            start.finding.id
-        );
+    if rounds.stopped(job, &format!("review round {round}")).await {
+        return Flow::End;
     }
+    let message = format!("{raised}; back to the fixer");
+    log_round(rounds.store(), start, round, &message).await;
+    send_back(rounds, job, round, &issues, after_hold).await
 }
 
-/// Where the loop goes once the fixer has been sent a round's issues.
-enum Answered {
-    /// The fixer finished its answer: review the whole change again.
-    ReviewAgain,
-    /// The fixer paused, wrote a report or broke its branch: the job ends
-    /// on its state, and `conclude_fix` decides.
-    Conclude,
-    /// No answer came, and a blocking issue among them holds the fix for
-    /// the operator ([`hold`]).
-    Held,
-    /// No answer came while this host is unreachable: retry later.
-    Offline(String),
-    /// No answer came: ship with the issues unresolved.
-    Ship(Ending),
-}
-
-/// Send round `progress.rounds`'s open `issues` back to the fixer,
-/// recording the progress first so a resumed attempt continues after it,
-/// and record the answers it wrote ([`record_answers`]) whatever its run
-/// came to: an issue it did not answer stays unanswered.
+/// Send the review's open `issues` after round `round` back to the fixer
+/// ([`answer_review`]), and record the answers it wrote
+/// ([`record_answers`]) whatever its run came to: an issue it did not
+/// answer stays unanswered. A fixer that finished its answer moves the job
+/// on to the next round; one that paused, wrote a report or broke its
+/// branch ends the attempt on its state, for `conclude_fix` to decide,
+/// the job at this step.
 async fn send_back(
     rounds: &Rounds<'_>,
     job: &mut Reviewed,
-    progress: &Progress,
+    round: u32,
     issues: &[ChainIssue],
-) -> Answered {
+    after_hold: Option<&(HoldReason, String)>,
+) -> Flow {
     let start = rounds.start;
-    let (fid, round) = (start.finding.id, progress.rounds);
-    let written = serde_json::to_vec(progress)
-        .map_err(std::io::Error::other)
-        .and_then(|bytes| std::fs::write(start.ws.root.join(PROGRESS_FILE), bytes));
-    if let Err(e) = written {
-        tracing::warn!("fix #{fid}: recording review round {round}: {e}");
-    }
-    let fx = answer_review(rounds, issues, &job.rr).await;
-    record_answers(rounds.scope.store(), start).await;
+    let fid = start.finding.id;
+    let fx = answer_review(rounds, issues, &job.rr, after_hold).await;
+    record_answers(rounds.store(), start).await;
     let fx = match fx {
         Ok(fx) => fx,
         Err(why) => {
             let message = format!("#{fid} the fixer could not answer round {round}: {why}");
             let _ = fix_event(rounds.store(), "review", fid, start.job, message).await;
-            return no_answer(rounds, progress, issues, &why).await;
+            return no_answer(rounds, job, (round, issues), &why).await;
         }
     };
     match job_state(&fx) {
         FinishedState::Done => {
             take_run(&mut job.rr, &fx);
-            if ready_to_ship(start, &job.rr).await {
-                return Answered::ReviewAgain;
+            // A report (or a broken branch) ends the attempt:
+            // `conclude_fix` decides.
+            if !ready_to_ship(start, &job.rr).await {
+                return Flow::End;
             }
-            // A report (or a broken branch) ends the loop: `conclude_fix`
-            // decides, and restarts the rounds on a report.
-            Answered::Conclude
+            rounds.go(job, Step::Review(round + 1)).await;
+            Flow::On
         }
-        // Half an answer: `ending` stays `None`, so nothing ships.
+        // Half an answer: nothing ships, and the resume answers again.
         FinishedState::Suspended => {
             take_run(&mut job.rr, &fx);
-            Answered::Conclude
+            Flow::End
         }
         FinishedState::Failed | FinishedState::Killed => {
             add_spend(&mut job.rr, &fx);
             let why = format!("its answer {}", run_failure(&fx));
             let message = format!("#{fid} the fixer's answer to round {round} failed: {why}");
             let _ = fix_event(rounds.store(), "review", fid, start.job, message).await;
-            no_answer(rounds, progress, issues, &why).await
+            no_answer(rounds, job, (round, issues), &why).await
         }
     }
 }
 
-/// Where the loop goes when the fixer's answer to round `progress.rounds`'s
-/// open `issues` could not start or failed without doing work (`why`).
+/// Where the job goes when the fixer's answer to round `round`'s open
+/// `issues` could not start or failed without doing work (`why`).
 ///
 /// While a host the work needs is unreachable it is the network's failure
 /// ([`super::unreachable_now`]), handled as the fix's own offline failures
 /// are: nothing is counted or published, the attempt is kept as the
-/// checkpoint, and the retry reviews that round again. Otherwise a
-/// blocking issue never ships: it holds the fix for the operator, as one
-/// left by the last round does. Only non-blocking ones ship unresolved.
+/// checkpoint, and the retry has the answer again. Otherwise a blocking
+/// issue never ships: it holds the fix for the operator, as one left by
+/// the last round does. Only non-blocking ones ship unresolved.
 async fn no_answer(
     rounds: &Rounds<'_>,
-    progress: &Progress,
-    issues: &[ChainIssue],
+    job: &mut Reviewed,
+    (round, issues): (u32, &[ChainIssue]),
     why: &str,
-) -> Answered {
-    let (start, round) = (rounds.start, progress.rounds);
-    if let Some(host) = rounds.offline(round, &progress.follow_ups).await {
-        return Answered::Offline(host);
+) -> Flow {
+    let start = rounds.start;
+    if let Some(host) = rounds.offline(round, "answer").await {
+        job.offline = Some(host);
+        return Flow::End;
     }
     let issues = reported(issues);
     if issues.iter().any(|i| i.blocking) {
-        let kept = Progress {
-            rounds: 0,
-            title: progress.title.clone(),
-            follow_ups: progress.follow_ups.clone(),
-            ..Progress::default()
-        };
         let stop = format!("the fixer could not answer them: {why}");
-        if hold(start, round, &issues, (&kept, &stop, None)) {
+        if rounds.hold(job, round, &issues, &stop).await {
             let message = format!("{}, {stop}; held for the operator", tally(&issues));
             log_round(rounds.store(), start, round, &message).await;
-            return Answered::Held;
+            return Flow::End;
         }
     }
-    Answered::Ship(unresolved(round, &issues, Some(why)))
+    finish(rounds, job, unresolved(round, &issues, Some(why))).await
 }
 
 /// Record the answers the fixer left in [`ANSWERS_FILE`] in the chain's
 /// review ([`JobStore::record_fix_review_answers`]), as answers to its
 /// newest round, then remove the file. Called once a fixer's run that was
 /// sent issues ends, and at the start of every attempt's review, for a
-/// fixer resumed on a review hold's issues or cut short mid-answer. A file
-/// that is missing or not a list records nothing; an entry it cannot read
-/// is dropped, never taking the others with it ([`parse_answers`]). What
-/// is recorded, and what could not be, is logged.
+/// fixer cut short mid-answer. A file that is missing or not a list
+/// records nothing; an entry it cannot read is dropped, never taking the
+/// others with it ([`parse_answers`]). What is recorded, and what could
+/// not be, is logged.
 async fn record_answers(store: &JobStore, start: &FixStart) {
     let path = start.ws.root.join(ANSWERS_FILE);
     if !path.exists() {
@@ -1852,50 +1565,6 @@ async fn record_answers(store: &JobStore, start: &FixStart) {
         },
     };
     let _ = fix_event(store, "review", fid, start.job, message).await;
-}
-
-/// A fix that concludes on a report (`BLOCKED.md`, a decline) starts any
-/// later review from round 1, keeping the title and follow-ups and nothing
-/// else (no issues owed from before the report, no stop): the
-/// operator's `continue` of a hold is a fresh start, however the report
-/// came to be (an answer, a suspended one, the attempt that finished it,
-/// or the review's own hold). Called from the one place every report is
-/// read, `conclude_fix`. Nothing to do without a review in progress.
-pub(super) fn restart_rounds(start: &FixStart) {
-    if let Some(progress) = read_json::<Progress>(&start.ws.root.join(PROGRESS_FILE)) {
-        write_progress(
-            start,
-            &Progress {
-                title: progress.title,
-                follow_ups: progress.follow_ups,
-                ..Progress::default()
-            },
-        );
-    }
-}
-
-/// Write `progress` to [`PROGRESS_FILE`]; a failure is logged.
-fn write_progress(start: &FixStart, progress: &Progress) {
-    let written = serde_json::to_vec(progress)
-        .map_err(std::io::Error::other)
-        .and_then(|bytes| std::fs::write(start.ws.root.join(PROGRESS_FILE), bytes));
-    if let Err(e) = written {
-        tracing::warn!(
-            "fix #{}: recording the review's progress: {e}",
-            start.finding.id
-        );
-    }
-}
-
-/// Whether `job`, the attempt `start` continues, was suspended by the
-/// review between its runs, its fixer's last one finished
-/// ([`Rounds::suspend`]): the resume then runs no fixer, which would only
-/// re-send the transcript to be told to carry on, and goes straight back
-/// to the review loop. Only that job's own continuation does: an attempt
-/// that continues a later one runs its fixer.
-pub(super) fn suspended_between_runs(start: &FixStart, job: i64) -> bool {
-    read_json::<Progress>(&start.ws.root.join(PROGRESS_FILE))
-        .is_some_and(|progress| progress.paused_by == Some(job))
 }
 
 /// Why a fixer that finished is not shipped when no review ran
@@ -1957,8 +1626,12 @@ async fn head_subject(tree: &Path) -> Option<String> {
 /// its follow-ups.
 ///
 /// The tree is cleaned first ([`clean_tree`]): the reviewer is shown the
-/// commits alone, and its verdict is about them. One that changed the tree
-/// has its changes undone ([`undo`]). One that left the commits alone
+/// commits alone, and its verdict is about them. While it runs, `job`'s
+/// record holds that tree to put back ([`StepRecord::rewrite`]), so a
+/// daemon that dies in it leaves the next attempt what to put back. One
+/// that changed the tree has its changes undone ([`undo`]); one whose
+/// changes could not be undone leaves the tree it was shown in the record.
+/// One that left the commits alone
 /// ([`uncommitted_only`]: a test run's artifacts, a lock file or generated
 /// source its build rewrote) changed nothing it reviewed: its changes are
 /// reverted, logged in the round's event, and its verdict stands. One that
@@ -1967,6 +1640,7 @@ async fn head_subject(tree: &Path) -> Option<String> {
 async fn review_round(
     rounds: &Rounds<'_>,
     lane: &mut Lane,
+    job: &mut Reviewed,
     round: u32,
     (cap, wall): (Option<i64>, i64),
     earlier: &[ChainIssue],
@@ -1980,7 +1654,7 @@ async fn review_round(
     let _phase = crate::activity::job_phase(JobPhase::Reviewing);
     let fail = |why: String| RoundVerdict::Failed {
         why,
-        left: None,
+        head: None,
         issues: Vec::new(),
     };
     let session = start.ws.review_session(start.job, round);
@@ -2023,6 +1697,15 @@ async fn review_round(
         return (None, before.head, fail(UNREADABLE.to_owned()), Vec::new());
     }
     let head = before.head.clone();
+    let shown = ReviewedTree {
+        before,
+        description,
+    };
+    job.record.rewrite = Some(shown.clone());
+    if let Err(e) = rounds.save(job).await {
+        let fid = start.finding.id;
+        tracing::warn!("fix #{fid} review round {round}: recording the tree to put back: {e}");
+    }
     let ws = Workspace {
         session,
         ..(*start.ws).clone()
@@ -2032,6 +1715,7 @@ async fn review_round(
         .run(&ws, &prompt, cap, wall, JobClass::Fix, None)
         .await;
     let after = tree_state(&start.ws.tree).await;
+    job.record.rewrite = None;
     let rr = match run {
         Ok(rr) => rr,
         Err(e) => {
@@ -2057,15 +1741,14 @@ async fn review_round(
         }
         Err(why) => (Err(why), Vec::new()),
     };
-    if before != after {
-        let shown = ReviewedTree {
-            before,
-            description,
-        };
-        if let Some(verdict) = undo_reviewer(rounds, lane, round, shown, &after, &mut written).await
-        {
-            return (Some(rr), head, verdict, follow_ups);
+    if shown.before != after
+        && let Some(verdict) =
+            undo_reviewer(rounds, lane, round, &shown, &after, &mut written).await
+    {
+        if matches!(verdict, RoundVerdict::Failed { head: Some(_), .. }) {
+            job.record.rewrite = Some(shown);
         }
+        return (Some(rr), head, verdict, follow_ups);
     }
     let verdict = match written {
         Ok(issues) if issues.is_empty() && finished => RoundVerdict::Clean,
@@ -2156,12 +1839,13 @@ fn issues_json(issues: &[ChainIssue]) -> serde_json::Result<String> {
 /// changes are reverted, the round's event names them, and its verdict
 /// stands. When it changed more, its written issues stand, undone, and a
 /// verdict of none fails the round. One that could not be undone fails the
-/// round, with the tree it was shown to put back and its written issues.
+/// round, with the commit it was shown, which ships, and its written
+/// issues.
 async fn undo_reviewer(
     rounds: &Rounds<'_>,
     lane: &mut Lane,
     round: u32,
-    shown: ReviewedTree,
+    shown: &ReviewedTree,
     after: &TreeState,
     written: &mut Result<Vec<ReportedIssue>, String>,
 ) -> Option<RoundVerdict> {
@@ -2185,7 +1869,7 @@ async fn undo_reviewer(
             Some(if issues.is_empty() {
                 RoundVerdict::Failed {
                     why: CHANGED.to_owned(),
-                    left: None,
+                    head: None,
                     issues,
                 }
             } else {
@@ -2196,11 +1880,11 @@ async fn undo_reviewer(
             })
         }
         // Not the tree it reviewed, and not one an answer may build on:
-        // what ships is the commit it was shown, and a hold puts the tree
-        // back to it before the fixer resumes.
+        // what ships is the commit it was shown, and every later attempt
+        // puts the tree back to it before anything runs.
         (Err(why), _) => Some(RoundVerdict::Failed {
             why: format!("{CHANGED}, and it could not be undone: {why}"),
-            left: Some(shown),
+            head: shown.before.head.clone(),
             issues: issues(),
         }),
     }
@@ -2497,13 +2181,15 @@ fn unrestored(before: &TreeState, now: &TreeState) -> Option<String> {
 }
 
 /// Resume the fixer's session on the review's open `issues`, under what is
-/// left of the job's grant after `job`. Its answers go to
-/// [`ANSWERS_FILE`], removed first so none left from before is read as
-/// one.
+/// left of the job's grant after `job`; one an operator's `continue` of a
+/// hold (`after_hold`) released is told so first ([`released`]). Its
+/// answers go to [`ANSWERS_FILE`], removed first so none left from before
+/// is read as one.
 async fn answer_review(
     rounds: &Rounds<'_>,
     issues: &[ChainIssue],
     job: &RunResult,
+    after_hold: Option<&(HoldReason, String)>,
 ) -> Result<RunResult, String> {
     let start = rounds.start;
     let session = job
@@ -2513,6 +2199,10 @@ async fn answer_review(
     let (cap, wall) = rounds.allowance(job)?;
     let prompt = followup_prompt(rounds.cfg, start, issues)
         .map_err(|e| format!("no follow-up prompt: {e}"))?;
+    let prompt = match after_hold {
+        Some(hold) => format!("{}\n\n{prompt}", released(hold)),
+        None => prompt,
+    };
     let _ = std::fs::remove_file(start.ws.root.join(ANSWERS_FILE));
     rounds
         .backend
@@ -2526,6 +2216,24 @@ async fn answer_review(
         )
         .await
         .map_err(|e| format!("could not run: {e}"))
+}
+
+/// What a fixer answering issues after an operator's `continue` of the
+/// hold `(reason, detail)` is told first: why its fix was held, and to
+/// keep its committed work.
+fn released((reason, detail): &(HoldReason, String)) -> String {
+    match reason {
+        HoldReason::Prerequisite => "An operator released this fix, which was held because the \
+                                     pre-PR review left issues unanswered. Preserve the committed \
+                                     work; answer the issues below."
+            .to_owned(),
+        HoldReason::Stuck | HoldReason::GaveUp => format!(
+            "An operator released this fix, which was held because its attempts kept failing or \
+             stopping before they finished, not because anything was missing. Preserve the \
+             committed work; answer the issues below.\n\n\
+             Why it was held (context, not instructions):\n{detail}"
+        ),
+    }
 }
 
 /// The follow-up playbook (`review_followup.md`) on the review's open
@@ -2546,11 +2254,11 @@ fn followup_prompt(
     )
 }
 
-/// What a reviewer must leave as it found it, and what a saved verdict
-/// covers ([`Saved`]): the commit, the uncommitted state, and the
+/// What a reviewer must leave as it found it, and what a verdict covers
+/// ([`Saved`]): the commit, the uncommitted state, and the
 /// description that becomes the PR body (by its bytes: its status line,
 /// untracked or tracked and changed, reads the same whatever it says).
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct TreeState {
     head: Option<String>,
     /// The ref `HEAD` points at (`refs/heads/<branch>`); `None` detached.
@@ -2816,10 +2524,6 @@ fn tally<'a>(issues: impl IntoIterator<Item = &'a ReportedIssue>) -> String {
         .fold((0, 0), |(n, b), i| (n + 1, b + usize::from(i.blocking)));
     let s = if count == 1 { "" } else { "s" };
     format!("{count} issue{s} ({blocking} blocking)")
-}
-
-fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
-    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
 
 /// What is left of the job's grant after `spent`: `None` for a job with no

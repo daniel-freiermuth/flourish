@@ -2562,6 +2562,8 @@ enum Act {
     FixScratched,
     /// The fixer resumed to curate its reviewed history, as `.0` says.
     Curate(Curation),
+    /// The daemon dies while this run is in flight.
+    Dies,
 }
 
 /// How a scripted fixer run that does not finish ends.
@@ -2920,6 +2922,10 @@ fn reviewed_worker_stopping(
 }
 
 /// Run `act`, the `i`th run of a reviewed fix, against `run`'s tree.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per act, and the acts are the scripted fix's vocabulary"
+)]
 fn run_act(run: &support::Run, i: usize, act: Act) -> hunter::types::RunResult {
     let tree = run.tree.as_path();
     let commit = |name: &str, message: &str| {
@@ -3016,6 +3022,7 @@ fn run_act(run: &support::Run, i: usize, act: Act) -> hunter::types::RunResult {
             result
         }
         Act::Curate(how) => curate_as(tree, &run.prompt, how, continued()),
+        Act::Dies => panic!("the daemon died"),
         Act::AnswerSuspended => {
             commit("HALF.md", "fix: half of the answer");
             ended(continued(), Ending::Capped)
@@ -3980,71 +3987,6 @@ async fn a_continued_review_hold_sends_its_issues_once() {
     );
 }
 
-/// A `review-held.json` an earlier daemon wrote (`report` and `issues`,
-/// no `sent`) is pending only for a `continue` of its own hold, as that
-/// daemon read it: left behind once its issues were answered, it does not
-/// send them again on a later hold's `continue`. The issues sent are the
-/// review's open ones, as recorded, never the file's.
-#[tokio::test]
-async fn a_legacy_review_hold_file_sends_its_issues_only_on_its_own_hold() {
-    let legacy = |report: &str| {
-        serde_json::json!({
-            "report": report,
-            "issues": [{"summary": "a legacy issue", "blocking": true}],
-        })
-        .to_string()
-    };
-    let (f, worker, _bins) = held_by_review("fix-review-legacy-own").await;
-    let root = worker.runs()[0].tree.parent().unwrap().to_owned();
-    let detail = held(&f).await.expect("held").detail;
-    std::fs::write(root.join("review-held.json"), legacy(&detail)).unwrap();
-    support::release(
-        &f.store,
-        f.fid,
-        FindingJobKind::Fix,
-        ReleaseAction::Continue,
-    )
-    .await;
-    let plan = pending_resume(&f).await;
-    let answering = reviewed_worker(vec![Act::Report(
-        "BLOCKED.md",
-        "needs the vendor's spec",
-        None,
-    )]);
-
-    let summary = resume(&f, &plan, &answering).await;
-
-    assert_eq!(summary.outcome.as_deref(), Some("held"), "{summary:?}");
-    let prompt = &answering.runs()[0].prompt;
-    assert!(
-        prompt.contains("the sibling parser still breaks") && !prompt.contains("a legacy issue"),
-        "its own hold, with the review's open issues: {prompt}"
-    );
-
-    // As the earlier daemon left it after the fixer answered: the file
-    // stays, naming the review's hold, while a later hold is continued.
-    std::fs::write(root.join("review-held.json"), legacy(&detail)).unwrap();
-    support::release(
-        &f.store,
-        f.fid,
-        FindingJobKind::Fix,
-        ReleaseAction::Continue,
-    )
-    .await;
-    let plan = pending_resume(&f).await;
-    let resumed = reviewed_worker(vec![Act::Answer, Act::Review(CLEAN)]);
-
-    let summary = resume(&f, &plan, &resumed).await;
-
-    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
-    let prompt = &resumed.runs()[0].prompt;
-    assert!(
-        prompt.contains("needs the vendor's spec")
-            && !prompt.contains("the sibling parser still breaks"),
-        "{prompt}"
-    );
-}
-
 /// A reviewer that changes the tree has not reviewed it: the fix ships
 /// with a note saying so, and what ships is the commit the fixer left,
 /// not the reviewer's.
@@ -4209,12 +4151,11 @@ async fn a_spent_grant_suspends_the_review_and_the_resume_answers_its_issues() {
     }
 }
 
-/// Only the attempt that continues a review's suspension skips its fixer:
-/// an answer that attempt has cut off at its cap is suspended as any
-/// fixer's is, and the next resume continues that fixer before the review
-/// goes on.
+/// An answer cut off at its cap is had again by the resume, the job still
+/// at its answer: the fixer, in its own transcript, is sent the issues
+/// still open, and the review goes on once it has answered.
 #[tokio::test]
-async fn only_the_resume_of_a_review_suspension_skips_the_fixer() {
+async fn an_answer_cut_off_at_its_cap_is_had_again() {
     let bins = support::FakeBins::acquire("fix-review-pause-once");
     bins.ok("gh", "https://github.com/acme/widget/pull/42");
     let f = reviewed_fixture("fix-review-pause-once", 3).await;
@@ -4228,17 +4169,23 @@ async fn only_the_resume_of_a_review_suspension_skips_the_fixer() {
     assert_eq!(summary.outcome.as_deref(), Some("suspended"), "{summary:?}");
     assert!(answering.runs()[0].prompt.starts_with("answer"));
     let plan = pending_resume(&f).await;
-    let resumed = reviewed_worker(vec![Act::Continue, Act::Review(CLEAN)]);
+    let resumed = reviewed_worker(vec![Act::Answer, Act::Review(CLEAN)]);
 
     let summary = resume(&f, &plan, &resumed).await;
 
     assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
     let runs = resumed.runs();
-    assert_eq!(runs.len(), 2, "the fixer continued, then a review");
+    assert_eq!(runs.len(), 2, "the answer again, then a review");
     assert!(
-        !runs[0].prompt.starts_with("answer") && !runs[0].prompt.starts_with("review"),
+        runs[0].prompt.starts_with("answer")
+            && runs[0].prompt.contains("the sibling parser still breaks"),
         "{}",
         runs[0].prompt
+    );
+    assert_eq!(
+        runs[0].resume_from.as_deref(),
+        Some(worker.runs()[0].session.join("session.jsonl").as_path()),
+        "in the fixer's transcript"
     );
     assert!(runs[1].prompt.starts_with("review"), "{}", runs[1].prompt);
 }
@@ -4355,30 +4302,20 @@ async fn an_owed_curation_keeps_the_title_and_follow_ups() {
     }
 }
 
-/// Owed issues get the same grant check as a round's own: when an
-/// operator's `continue` runs the fixer first and that run spends the
-/// whole grant, the job is suspended again with the issues still owed,
-/// neither held nor shipped as unresolved, and the next resume answers
-/// them.
+/// An operator's `continue` of a fix held while it owes answers resumes it
+/// at its answer: the fixer is told why the fix was held, and sent the
+/// review's open issues, with no fixer run before it, and the review goes
+/// on once it has answered.
 #[tokio::test]
-async fn owed_issues_with_no_grant_left_are_owed_again() {
-    let bins = support::FakeBins::acquire("fix-review-owed-spent");
+async fn a_continued_fix_owing_answers_has_its_fixer_answer_them() {
+    let bins = support::FakeBins::acquire("fix-review-owed-continued");
     bins.ok("gh", "https://github.com/acme/widget/pull/42");
-    let f = reviewed_fixture("fix-review-owed-spent", 3).await;
+    let f = reviewed_fixture("fix-review-owed-continued", 3).await;
     let worker =
         reviewed_worker(vec![Act::Fix, Act::ReviewKilled(BLOCKING)]).granting(Some(10_000));
     let summary = fix(&f, &worker).await;
     assert_eq!(summary.outcome.as_deref(), Some("suspended"), "{summary:?}");
     let plan = released_resume(&f).await;
-    let continued = reviewed_worker(vec![Act::Continue]).granting(Some(1_000));
-
-    let summary = resume(&f, &plan, &continued).await;
-
-    assert_eq!(summary.outcome.as_deref(), Some("suspended"), "{summary:?}");
-    assert_eq!(continued.runs().len(), 1, "the fixer, then no answer");
-    assert!(held(&f).await.is_none(), "nothing is held");
-    assert!(bins.calls_to("gh").is_empty(), "nothing ships");
-    let plan = pending_resume(&f).await;
     let answering = reviewed_worker(vec![Act::Answer, Act::Review(CLEAN)]);
 
     let summary = resume(&f, &plan, &answering).await;
@@ -4386,11 +4323,15 @@ async fn owed_issues_with_no_grant_left_are_owed_again() {
     assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
     let runs = answering.runs();
     assert_eq!(runs.len(), 2, "the owed answer, then a review");
+    let prompt = &runs[0].prompt;
     assert!(
-        runs[0].prompt.contains("the sibling parser still breaks"),
-        "{}",
-        runs[0].prompt
+        prompt.starts_with("An operator released this fix")
+            && prompt.contains("push failed: HTTP 500")
+            && prompt.contains("answer into")
+            && prompt.contains("the sibling parser still breaks"),
+        "{prompt}"
     );
+    assert!(runs[1].prompt.starts_with("review"), "{}", runs[1].prompt);
 }
 
 /// A grant spent before a round could run, or by a reviewer killed at its
@@ -4546,7 +4487,9 @@ async fn the_job_records_every_run_and_each_run_gets_what_is_left_of_the_grant()
 /// A fixer that did not finish has not been reviewed, so it ships
 /// nothing, even when it left commits and a description behind: not a
 /// first run that stopped after describing its fix, and not half an
-/// answer to a review, however often its resume stops again.
+/// answer to a review, however often its resume stops again. Each resume
+/// of a half answer has the answer again; one that fails holds the
+/// blocking issue it was to answer, as any failed answer does.
 #[tokio::test]
 async fn a_fixer_that_did_not_finish_ships_nothing_while_the_review_is_on() {
     for (ending, outcome) in [(Ending::Capped, "suspended"), (Ending::Failed, "requeued")] {
@@ -4570,7 +4513,7 @@ async fn a_fixer_that_did_not_finish_ships_nothing_while_the_review_is_on() {
     let worker = reviewed_worker(vec![Act::Fix, Act::Review(BLOCKING), Act::AnswerSuspended]);
     let summary = fix(&f, &worker).await;
     assert_eq!(summary.outcome.as_deref(), Some("suspended"), "{summary:?}");
-    for (ending, outcome) in [(Ending::Capped, "suspended"), (Ending::Failed, "requeued")] {
+    for (ending, outcome) in [(Ending::Capped, "suspended"), (Ending::Failed, "held")] {
         let plan = pending_resume(&f).await;
         let again = reviewed_worker(vec![Act::ContinueThen(ending)]);
         let summary = resume(&f, &plan, &again).await;
@@ -4614,12 +4557,13 @@ async fn a_fixer_suspended_mid_answer_ships_nothing_and_its_resume_reviews_the_n
     );
 }
 
-/// A fix that could not publish offline is continued, and its fixer may
-/// commit more before the push is retried. What the review concluded
-/// covers the tree it reviewed, not the one that ships now: the new tree
-/// is reviewed, and the commit a reviewer moved `HEAD` away from does not
-/// drop the newer commits. The PR keeps the title the fix had before its
-/// first review and the follow-ups the first loop found.
+/// A fix that could not publish offline is kept at its publish; an
+/// operator's `continue` has its fixer act on what the forge answered, and
+/// it may commit more before the push is retried. What the review
+/// concluded covers the tree it reviewed, not the one that ships now: the
+/// new tree is reviewed again, and ships whole. The PR keeps the title the
+/// fix had before its first review and the follow-ups the first review
+/// found.
 #[tokio::test]
 async fn work_after_an_unpublished_review_is_reviewed_again_and_ships_whole() {
     let bins = support::FakeBins::acquire("fix-review-offline");
@@ -4631,8 +4575,7 @@ async fn work_after_an_unpublished_review_is_reviewed_again_and_ships_whole() {
     let nowhere = f.cfg.work_root.join("no-such-remote.git");
     route_push(&f, Some(&nowhere.to_string_lossy()));
     let host = "github.com";
-    let worker =
-        reviewed_worker(vec![Act::Fix, Act::TamperingReview(FOLLOW_UP_ONLY)]).offline(&[host]);
+    let worker = reviewed_worker(vec![Act::Fix, Act::Review(FOLLOW_UP_ONLY)]).offline(&[host]);
 
     let summary = fix(&f, &worker).await;
 
@@ -4642,23 +4585,21 @@ async fn work_after_an_unpublished_review_is_reviewed_again_and_ships_whole() {
     git(&f.repo_dir, &["config", "--unset-all", &nowhere_key]);
     route_push(&f, None);
     f.cfg.network_gate = false;
-    let plan = pending_resume(&f).await;
+    let plan = released_resume(&f).await;
     let resumed = reviewed_worker(vec![Act::FixMore, Act::Review(CLEAN)]);
 
     let summary = resume(&f, &plan, &resumed).await;
 
     assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
-    assert_eq!(resumed.runs().len(), 2, "the new work is reviewed");
+    let runs = resumed.runs();
+    assert_eq!(runs.len(), 2, "the new work is reviewed");
+    assert!(runs[1].prompt.starts_with("review"), "{}", runs[1].prompt);
     assert_eq!(shipped_subject(&f), "fix: more of it");
     let body = pr_body(&bins);
     assert!(body.starts_with("the body\n\n"), "{body}");
     assert!(
-        !body.contains("failed"),
-        "the earlier failure is moot: {body}"
-    );
-    assert!(
         body.contains("the other feeds parse dates the same broken way"),
-        "the first loop's follow-ups are kept: {body}"
+        "the first review's follow-ups are kept: {body}"
     );
     assert_eq!(
         pr_title(&bins),
@@ -4987,10 +4928,11 @@ async fn a_kept_fix_publishes_past_a_spent_budget_and_an_unreachable_provider() 
 }
 
 /// A kept fix the cycle falls back to while its pick is denied, and whose
-/// retry errors before it concludes (here a playbook typo its prompt
-/// cannot be rendered past), is counted as `cycle error` like the pick's
-/// own: three in a row hold it, instead of the fallback offering it, and
-/// failing on it, every cycle.
+/// retry errors before it concludes (here a database that refuses its
+/// job: the retry only publishes, so it renders no prompt a playbook typo
+/// could break), is counted as `cycle error` like the pick's own: three in
+/// a row hold it, instead of the fallback offering it, and failing on it,
+/// every cycle.
 #[tokio::test]
 async fn a_free_retry_that_errors_is_held_at_the_streak_limit() {
     let _bins = support::FakeBins::acquire("fix-kept-free-error");
@@ -5000,10 +4942,7 @@ async fn a_free_retry_that_errors_is_held_at_the_streak_limit() {
     route_push(&f, Some(&nowhere.to_string_lossy()));
     let refused = fix(&f, &reviewed_worker(vec![Act::Fix, Act::Review(CLEAN)])).await;
     assert_eq!(refused.outcome.as_deref(), Some("requeued"), "{refused:?}");
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
+    let pool = support::open_pool(&f.db).await;
     sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
         .bind(24 * 60 * 60_000_i64)
         .execute(&pool)
@@ -5014,10 +4953,12 @@ async fn a_free_retry_that_errors_is_held_at_the_streak_limit() {
         .set_finding_status(f.fid - 1, hunter::domain::FindingStatus::Queued)
         .await
         .unwrap();
-    std::fs::write(
-        f.cfg.root.join("playbooks").join("fix.md"),
-        "fix {{WORKTREE}} {{NO_SUCH_SLOT}}\n",
+    sqlx::raw_sql(
+        "CREATE TRIGGER refuse_job BEFORE INSERT ON jobs \
+         BEGIN SELECT RAISE(ABORT, 'injected'); END;",
     )
+    .execute(&pool)
+    .await
     .unwrap();
     let spent = reviewed_worker(vec![]).denying_above(-1);
 
@@ -5031,7 +4972,7 @@ async fn a_free_retry_that_errors_is_held_at_the_streak_limit() {
     let hold = support::hold_of(&f.store, f.fid, hunter::domain::FindingJobKind::Fix)
         .await
         .expect("held at the limit");
-    assert!(hold.detail.contains("NO_SUCH_SLOT"), "{hold:?}");
+    assert!(hold.detail.contains("injected"), "{hold:?}");
 }
 
 /// A kept fix keeps its rank behind an older queued fix, whether its
@@ -5846,12 +5787,11 @@ async fn a_refused_fix_with_a_pinned_verdict_is_reserved_for_and_reviewed_again(
     );
 }
 
-/// Only a saved verdict that covers the kept tree spares its retry the
-/// review, and so the reservation: one left from a tree that has changed
-/// since (a curation that pinned the reviewed commit leaves the clean
-/// review's verdict behind) is no verdict, and the retry is reserved for.
+/// Only a verdict that covers the kept tree spares its retry the review,
+/// and so the reservation: once the tree has changed since (a file left
+/// in it), the verdict covers nothing, and the retry is reserved for.
 #[tokio::test]
-async fn a_saved_verdict_for_another_tree_does_not_spare_the_reservation() {
+async fn a_verdict_for_another_tree_does_not_spare_the_reservation() {
     let _bins = support::FakeBins::acquire("fix-refused-stale-verdict");
     let mut f = fixture("fix-refused-stale-verdict").await;
     review_on(&mut f, 3);
@@ -5867,15 +5807,14 @@ async fn a_saved_verdict_for_another_tree_does_not_spare_the_reservation() {
         .unwrap();
     let plan = pending_resume(&f).await;
     assert_eq!(plan.anticipated(), 0, "its verdict covers the kept tree");
-    std::fs::write(
-        plan.workspace().root.join("review-ending.json"),
-        r#"{"note":null,"title":null,"tree":{"head":"0123456789abcdef0123456789abcdef01234567","branch":null,"status":null,"description":null}}"#,
-    )
-    .unwrap();
+    std::fs::write(plan.workspace().tree.join("NOTES.md"), "left behind\n").unwrap();
 
     let plan = pending_resume(&f).await;
 
-    assert!(plan.anticipated() > 0, "a stale verdict covers nothing");
+    assert!(
+        plan.anticipated() > 0,
+        "a verdict for another tree covers nothing"
+    );
 }
 
 /// Refused publishes hold the fix only at the sixth in a row, not the
@@ -6500,13 +6439,14 @@ async fn a_stop_before_the_curation_suspends_and_the_resume_curates() {
     assert_eq!(shipped_commits(&f), ["fix: the real bug, curated"]);
 }
 
-/// A suspension because the grant ran out between the review's runs costs
-/// the chain no resume attempt, as a shutdown stop does not: a fix whose
-/// fixer was already cut off at its cap three times, and that is then
-/// owed only its curation, is resumed and ships, where a counted fourth
-/// attempt would give the chain up and throw the reviewed fix away.
+/// An attempt that moved the fix on to another step costs the chain no
+/// resume attempt, however it stopped: a fix whose fixer was already cut
+/// off at its cap three times, and whose fourth attempt finished it and
+/// had it reviewed, its grant then spent before the curation, is resumed
+/// and ships, where a counted fourth attempt would give the chain up and
+/// throw the reviewed fix away.
 #[tokio::test]
-async fn a_spent_grant_between_runs_costs_the_chain_no_resume_attempt() {
+async fn an_attempt_that_moved_a_step_on_costs_the_chain_no_resume_attempt() {
     let bins = support::FakeBins::acquire("fix-review-grant-uncounted");
     bins.ok("gh", "https://github.com/acme/widget/pull/42");
     let mut f = reviewed_fixture("fix-review-grant-uncounted", 7).await;
@@ -6539,12 +6479,13 @@ async fn a_spent_grant_between_runs_costs_the_chain_no_resume_attempt() {
     assert_eq!(shipped_commits(&f), ["fix: the real bug, curated"]);
 }
 
-/// A review that keeps running out of grant is bounded all the same: its
-/// grant suspensions are no attempt, but they count as runs for the cost
-/// arm of the give-up ceiling, so the chain is held for the operator with
-/// its work kept, instead of being resumed for ever, a full grant each.
+/// A review that keeps running out of grant is bounded all the same: each
+/// attempt ends where the one it continued did, at the review's round, so
+/// it counts toward the give-up ceiling's attempts, and the chain, past its
+/// implementation, is held for the operator with its work kept, instead of
+/// being resumed for ever, a full grant each, or given up and fixed again.
 #[tokio::test]
-async fn a_review_that_keeps_running_out_of_grant_is_held_for_its_cost() {
+async fn a_review_that_keeps_running_out_of_grant_is_held_with_its_work() {
     let bins = support::FakeBins::acquire("fix-review-grant-endless");
     bins.ok("gh", "https://github.com/acme/widget/pull/42");
     let f = reviewed_fixture("fix-review-grant-endless", 3).await;
@@ -6570,9 +6511,15 @@ async fn a_review_that_keeps_running_out_of_grant_is_held_for_its_cost() {
         resumes += 1;
     }
 
-    let hold = held(&f).await.expect("held for its cost");
+    let hold = held(&f).await.expect("held, its work kept");
     assert_eq!(hold.reason, HoldReason::GaveUp, "{hold:?}");
-    assert!(hold.detail.contains("over budget"), "{}", hold.detail);
+    assert!(
+        hold.detail
+            .starts_with("resume chain stuck: 4 attempts without progress")
+            && hold.detail.ends_with("at review 1"),
+        "{}",
+        hold.detail
+    );
     assert!(checkpoint(&f).await.is_some(), "its work is kept");
     assert!(bins.calls_to("gh").is_empty(), "nothing ships unreviewed");
 }
@@ -6619,10 +6566,10 @@ async fn a_failed_answer_holds_a_blocking_issue_and_ships_only_non_blocking_ones
 /// An answer that fails without doing work while the forge is unreachable
 /// is the network's failure, handled as the fix's other offline failures
 /// are: nothing is published or counted, the attempt is kept, and the retry
-/// reviews that round (here round 2) again before anything ships, not
-/// round 1.
+/// has the answer again, before anything ships: no fixer resumed first,
+/// and no review of the round the issues came from again.
 #[tokio::test]
-async fn an_answer_that_fails_offline_is_kept_and_its_round_reviewed_again() {
+async fn an_answer_that_fails_offline_is_kept_and_answered_again() {
     let bins = support::FakeBins::acquire("fix-review-answer-offline");
     bins.ok("gh", "https://github.com/acme/widget/pull/42");
     let mut f = reviewed_fixture("fix-review-answer-offline", 7).await;
@@ -6645,34 +6592,30 @@ async fn an_answer_that_fails_offline_is_kept_and_its_round_reviewed_again() {
     assert_eq!(fix_streak(&f).await.streak, 0, "nothing is counted");
     f.cfg.network_gate = false;
     let plan = pending_resume(&f).await;
-    let retry = reviewed_worker(vec![
-        Act::Continue,
-        Act::Review(BLOCKING),
-        Act::FixMore,
-        Act::Review(CLEAN),
-    ]);
+    let retry = reviewed_worker(vec![Act::Answer, Act::Review(CLEAN)]);
 
     let summary = resume(&f, &plan, &retry).await;
 
     assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
     let runs = retry.runs();
-    assert_eq!(
-        runs.len(),
-        4,
-        "the resume, the round again, its answer, a review"
+    assert_eq!(runs.len(), 2, "the answer again, then the next round");
+    assert!(
+        runs[0].prompt.starts_with("answer")
+            && runs[0].prompt.contains("the sibling parser still breaks"),
+        "{}",
+        runs[0].prompt
     );
     assert_eq!(
         runs[1].session,
-        review_dir(&runs[0].session, summary.job_id, 2),
-        "round 2 again"
+        review_dir(&worker.runs()[0].session, summary.job_id, 3),
+        "round 3, after round 2's answer"
     );
-    assert!(runs[2].prompt.contains("the sibling parser still breaks"));
 }
 
 /// A reviewer that fails while a host is unreachable, before its first
 /// call or cut off mid-review, failed for the network: handled as the
-/// fix's other offline failures are. Nothing ships unreviewed; the retry reviews the
-/// round again.
+/// fix's other offline failures are. Nothing ships unreviewed; the retry
+/// reviews the round again, and runs nothing before it.
 #[tokio::test]
 async fn a_reviewer_that_fails_offline_is_kept_and_its_round_reviewed_again() {
     // Before its first call, and cut off after doing work.
@@ -6712,15 +6655,16 @@ async fn a_reviewer_fails_offline(reviewer: Act) {
     );
     f.cfg.network_gate = false;
     let plan = pending_resume(&f).await;
-    let retry = reviewed_worker(vec![Act::Continue, Act::Review(CLEAN)]);
+    let retry = reviewed_worker(vec![Act::Review(CLEAN)]);
 
     let summary = resume(&f, &plan, &retry).await;
 
     assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
     let runs = retry.runs();
+    assert_eq!(runs.len(), 1, "only the round again");
     assert_eq!(
-        runs[1].session,
-        review_dir(&runs[0].session, summary.job_id, 1)
+        runs[0].session,
+        review_dir(&worker.runs()[0].session, summary.job_id, 1)
     );
     assert_eq!(
         pr_body(&bins),
@@ -6733,9 +6677,9 @@ async fn a_reviewer_fails_offline(reviewer: Act) {
 /// and kept the index locked so its commit could not be undone, keeps the
 /// attempt with the tree as the reviewer left it, and the tree it was shown
 /// recorded: the retry puts the tree back to it before any worker runs.
-/// While the lock is in the way no worker runs, and the attempt fails as
-/// `reviewed tree not restored`; once it is gone, the fixer resumes on the
-/// reviewed commit and the reviewer's commit never ships.
+/// While the lock is in the way nothing runs, and the attempt fails as
+/// `reviewed tree not restored`; once it is gone, the round is reviewed
+/// again on the reviewed commit and the reviewer's commit never ships.
 #[tokio::test]
 async fn a_round_cut_off_offline_by_an_undoable_reviewer_resumes_on_the_reviewed_commit() {
     let bins = support::FakeBins::acquire("fix-review-locked-offline");
@@ -6760,7 +6704,7 @@ async fn a_round_cut_off_offline_by_an_undoable_reviewer_resumes_on_the_reviewed
     );
     let reviewed = git(&tree, &["rev-parse", "HEAD^"]).trim().to_owned();
     f.cfg.network_gate = false;
-    let retry = reviewed_worker(vec![Act::Continue, Act::Review(CLEAN)]);
+    let retry = reviewed_worker(vec![Act::Review(CLEAN)]);
     let plan = pending_resume(&f).await;
 
     let blocked = resume(&f, &plan, &retry).await;
@@ -6782,7 +6726,7 @@ async fn a_round_cut_off_offline_by_an_undoable_reviewer_resumes_on_the_reviewed
     let summary = resume(&f, &plan, &retry).await;
 
     assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
-    assert_eq!(retry.runs().len(), 2, "the fixer, then the round again");
+    assert_eq!(retry.runs().len(), 1, "the round again, and nothing else");
     assert_eq!(
         shipped_commits(&f),
         ["fix: the real bug"],
@@ -7511,12 +7455,9 @@ async fn a_review_hold_the_daemon_died_before_recording_survives_the_tree_put_ba
         "the tree was put back all the same"
     );
     let issue = "the test misses the empty input";
-    let runs = resumed.runs();
-    assert_eq!(runs.len(), 1, "no review of a held fix");
     assert!(
-        !runs[0].prompt.contains(issue),
-        "the issues go to the operator first: {}",
-        runs[0].prompt
+        resumed.runs().is_empty(),
+        "nothing runs on a held fix: the issues go to the operator first"
     );
     // The operator's `continue` then has the fixer answer them.
     support::release(
@@ -8054,8 +7995,8 @@ async fn a_curated_fix_retried_after_an_offline_push_ships_on_its_saved_verdict(
 
 /// A daemon that dies during a curation leaves the branch half rewritten,
 /// mid-rebase. The next attempt puts it back to the reviewed commit before
-/// anything reads the tree and owes the curation again: it runs no fixer,
-/// curates on the verdict saved for the reviewed tree, without another
+/// anything reads the tree and resumes at the curation: it runs no fixer,
+/// curates on the verdict recorded for the reviewed tree, without another
 /// review, and ships the curated history.
 #[tokio::test]
 async fn a_curation_the_daemon_died_in_is_undone_and_had_again() {
@@ -8098,9 +8039,9 @@ async fn a_curation_the_daemon_died_in_is_undone_and_had_again() {
     assert_eq!(pr_body(&bins), ANSWERED_BODY);
     let events = f.store.recent_events(40).await.unwrap();
     assert!(
-        events.iter().any(|e| e.message.contains(
-            "interrupted by a restart; the reviewed commit restored; to be curated again"
-        )),
+        events.iter().any(|e| e
+            .message
+            .contains("the tree a curator left was put back to the reviewed commit")),
         "{events:?}"
     );
 }
@@ -8214,13 +8155,21 @@ async fn a_retry_that_will_curate_is_not_free() {
     let key = format!("url.{}.insteadOf", nowhere.display());
     git(&f.repo_dir, &["config", "--unset-all", &key]);
     route_push(&f, None);
-    // The operator clears the lock and puts the branch back by hand.
+    // The operator clears the lock and puts the branch back by hand, to
+    // the reviewed commit the fix's record names.
     std::fs::remove_file(index_lock(&tree)).unwrap();
-    let restore: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(tree.parent().unwrap().join("review-restore.json")).unwrap(),
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    let reviewed: String = sqlx::query_scalar(
+        "SELECT json_extract(step, '$.rewrite.before.head') FROM finding_work \
+         WHERE finding_id = ?1 AND kind = 'fix'",
     )
+    .bind(f.fid)
+    .fetch_one(&pool)
+    .await
     .unwrap();
-    let reviewed = restore["before"]["head"].as_str().unwrap().to_owned();
     let description = std::fs::read(tree.join("PR-DESCRIPTION.md")).unwrap();
     git(
         &tree,
@@ -8228,10 +8177,6 @@ async fn a_retry_that_will_curate_is_not_free() {
     );
     git(&tree, &["clean", "-ffdq"]);
     std::fs::write(tree.join("PR-DESCRIPTION.md"), description).unwrap();
-    let pool =
-        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
-            .await
-            .unwrap();
     sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
         .bind(24 * 60 * 60_000_i64)
         .execute(&pool)
@@ -8322,18 +8267,16 @@ async fn a_saved_verdict_does_not_cover_a_tree_that_changed_since() {
     assert_eq!(retry.runs().len(), 2, "the changed tree is reviewed again");
 }
 
-/// A verdict saved by a daemon from before this change still covers its
-/// unchanged tree: a fix kept only to publish across the upgrade ships on
-/// it, with no run, as it would have before. That daemon saved the tree
-/// as its commit, branch, `git status` (trimmed at both ends, so a first
-/// line's leading blank was lost, as for a tracked, edited description)
-/// and description digest.
+/// A fix kept only to publish ships on its verdict, with no run, when its
+/// tree is exactly as reviewed: also a tree whose `git status` begins with
+/// a blank, as a tracked, edited description's (` M PR-DESCRIPTION.md`)
+/// does, which the verdict records and compares as git reports it.
 #[tokio::test]
-async fn a_verdict_saved_by_an_earlier_daemon_still_covers_its_tree() {
+async fn a_kept_fix_ships_on_the_verdict_for_its_tree() {
     for (label, fixer, status) in [
-        ("fix-review-saved-legacy", Act::Fix, None),
+        ("fix-review-kept-verdict", Act::Fix, None),
         (
-            "fix-review-saved-legacy-tracked",
+            "fix-review-kept-verdict-tracked",
             Act::FixTrackedDescription,
             Some(" M PR-DESCRIPTION.md"),
         ),
@@ -8354,25 +8297,12 @@ async fn a_verdict_saved_by_an_earlier_daemon_still_covers_its_tree() {
         route_push(&f, None);
         f.cfg.network_gate = false;
         let plan = pending_resume(&f).await;
-        // As the earlier daemon wrote it: those four fields, nothing else,
-        // the status trimmed at both ends.
-        let path = plan.workspace().root.join("review-ending.json");
-        let mut saved: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        let tree = &saved["tree"];
-        let mut legacy: serde_json::Map<String, serde_json::Value> =
-            ["head", "branch", "status", "description"]
-                .into_iter()
-                .map(|key| (key.to_owned(), tree[key].clone()))
-                .collect();
-        assert!(legacy["head"].is_string(), "{saved}");
-        let kept = legacy["status"].as_str().expect("a status").to_owned();
         if let Some(status) = status {
-            assert_eq!(kept, status, "the status this case is about");
+            let tree = &plan.workspace().tree;
+            let listed = git(tree, &["status", "--porcelain"]);
+            assert_eq!(listed.trim_end(), status, "the status this case is about");
         }
-        legacy.insert("status".to_owned(), kept.trim().into());
-        saved["tree"] = legacy.into();
-        std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        assert!(plan.free(), "{label}: a retry that only publishes");
         let retry = reviewed_worker(vec![]);
 
         let summary = resume(&f, &plan, &retry).await;
@@ -8455,4 +8385,151 @@ async fn a_round_without_a_readable_review_ships_saying_why() {
         assert!(body.contains(why), "{why}: {body}");
         drop(bins);
     }
+}
+
+/// Run the fixture's fix cold with `acts`, the daemon dying in the last
+/// one, and settle the job it left running, as the next start does.
+async fn fix_until_the_daemon_dies(f: &Fixture, acts: Vec<Act>) -> ScriptedBackend {
+    use futures_util::FutureExt;
+    let worker = reviewed_worker(acts);
+    let died = std::panic::AssertUnwindSafe(fix(f, &worker))
+        .catch_unwind()
+        .await;
+    assert!(died.is_err(), "the daemon died");
+    support::jobs(&f.store)
+        .settle_unsettled(&f.cfg.work_root)
+        .await
+        .unwrap();
+    worker
+}
+
+/// A daemon that dies at a step of a fix leaves the job at that step: the
+/// attempt that resumes it runs that step, and nothing before it. In a
+/// review round, a fresh reviewer has the round again, no fixer first; in
+/// an answer, the fixer is sent the round's issues again, no reviewer
+/// first. (A curation the daemon died in:
+/// [`a_curation_the_daemon_died_in_is_undone_and_had_again`].)
+#[tokio::test]
+async fn a_fix_the_daemon_died_in_resumes_at_its_step() {
+    for (label, died_in, resumed, first) in [
+        (
+            "fix-died-reviewing",
+            vec![Act::Fix, Act::Dies],
+            vec![Act::Review(CLEAN)],
+            "review",
+        ),
+        (
+            "fix-died-answering",
+            vec![Act::Fix, Act::Review(BLOCKING), Act::Dies],
+            vec![Act::Answer, Act::Review(CLEAN)],
+            "answer",
+        ),
+    ] {
+        let bins = support::FakeBins::acquire(label);
+        bins.ok("gh", "https://github.com/acme/widget/pull/42");
+        let f = reviewed_fixture(label, 3).await;
+        let worker = fix_until_the_daemon_dies(&f, died_in).await;
+        let plan = pending_resume(&f).await;
+        let retry = reviewed_worker(resumed.clone());
+
+        let summary = resume(&f, &plan, &retry).await;
+
+        assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{label}");
+        let runs = retry.runs();
+        assert_eq!(runs.len(), resumed.len(), "{label}: the step, then on");
+        assert!(
+            runs[0].prompt.starts_with(first),
+            "{label}: {}",
+            runs[0].prompt
+        );
+        if first == "review" {
+            assert_eq!(
+                runs[0].session,
+                review_dir(&worker.runs()[0].session, summary.job_id, 1),
+                "{label}: round 1 again"
+            );
+        }
+        drop(bins);
+    }
+}
+
+/// A stop between a round and its answer resumes at the answer: the
+/// resume sends the round's issues to the fixer, running neither the
+/// fixer's own continuation nor the reviewer again.
+#[tokio::test]
+async fn a_stop_between_a_review_and_its_answer_resumes_at_the_answer() {
+    let bins = support::FakeBins::acquire("fix-step-stop-answer");
+    bins.ok("gh", "https://github.com/acme/widget/pull/42");
+    let f = reviewed_fixture("fix-step-stop-answer", 3).await;
+    let (summary, worker) = fix_until_stopped(&f, vec![Act::Fix, Act::Review(BLOCKING)], 1).await;
+    assert_eq!(summary.outcome.as_deref(), Some("suspended"), "{summary:?}");
+    let plan = pending_resume(&f).await;
+    let resumed = reviewed_worker(vec![Act::Answer, Act::Review(CLEAN)]);
+
+    let summary = resume(&f, &plan, &resumed).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    let runs = resumed.runs();
+    assert!(runs[0].prompt.starts_with("answer"), "{}", runs[0].prompt);
+    assert_eq!(
+        runs[1].session,
+        review_dir(&worker.runs()[0].session, summary.job_id, 2),
+        "no review of round 1 again"
+    );
+}
+
+/// A publish the forge refused is retried at the publish: no model runs,
+/// neither a fixer nor a reviewer nor a curator, and the fix ships on its
+/// recorded verdict.
+#[tokio::test]
+async fn a_publish_only_retry_runs_no_model() {
+    let bins = support::FakeBins::acquire("fix-step-publish-only");
+    bins.ok("gh", "https://github.com/acme/widget/pull/42");
+    let mut f = fixture("fix-step-publish-only").await;
+    review_on(&mut f, 3);
+    f.cfg.review_curate = true;
+    let nowhere = f.cfg.work_root.join("refusing.git");
+    route_push(&f, Some(&nowhere.to_string_lossy()));
+    let worker = reviewed_worker(vec![
+        Act::Fix,
+        Act::Review(BLOCKING),
+        Act::Answer,
+        Act::Review(CLEAN),
+        Act::Curate(Curation::Squash),
+    ]);
+    let refused = fix(&f, &worker).await;
+    assert_eq!(refused.outcome.as_deref(), Some("requeued"), "{refused:?}");
+    let key = format!("url.{}.insteadOf", nowhere.display());
+    git(&f.repo_dir, &["config", "--unset-all", &key]);
+    route_push(&f, None);
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    sqlx::query("UPDATE jobs SET finished_at = finished_at - ?1")
+        .bind(24 * 60 * 60_000_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let plan = pending_resume(&f).await;
+    assert!(plan.free(), "a retry that only publishes is free");
+    let retry = reviewed_worker(vec![]);
+
+    let summary = resume(&f, &plan, &retry).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    assert!(retry.runs().is_empty(), "no model ran");
+    assert_eq!(shipped_commits(&f), ["fix: the real bug, curated"]);
+}
+
+/// An operator's `restart` of a held fix ends its step record with its
+/// checkpoint: the next attempt starts cold, at the fixer's playbook.
+#[tokio::test]
+async fn a_restart_release_starts_the_fix_over() {
+    let (f, _worker, _bins) = held_by_review("fix-step-restart").await;
+    assert!(f.store.fix_step(f.fid).await.unwrap().is_some());
+    support::release(&f.store, f.fid, FindingJobKind::Fix, ReleaseAction::Restart).await;
+
+    assert_eq!(f.store.fix_step(f.fid).await.unwrap(), None);
+    assert!(checkpoint(&f).await.is_none());
 }

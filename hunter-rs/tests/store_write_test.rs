@@ -361,6 +361,7 @@ async fn create_job_refuses_a_second_running_job_on_one_place() {
         model: None,
         usage_delta: None,
         finished_at: 2000,
+        step: None,
     })
     .await
     .unwrap();
@@ -438,6 +439,7 @@ fn ended(state: FinishedState) -> JobOutcome<'static> {
         model: None,
         usage_delta: None,
         finished_at: 2000,
+        step: None,
     }
 }
 
@@ -2695,7 +2697,7 @@ async fn every_repo_kind_keeps_a_checkpoint_and_can_be_held() {
         let jobs = support::scope(&store);
         let jobs = jobs.store();
 
-        jobs.keep_attempt_as_checkpoint(10).await.unwrap();
+        jobs.keep_attempt_as_checkpoint(10, None).await.unwrap();
         assert_eq!(
             store
                 .repo_checkpoint_job(1, kind)
@@ -3987,23 +3989,25 @@ async fn a_failure_counts_only_while_the_finding_is_in_the_kinds_tier() {
     }
 }
 
-/// An attempt the daemon's shutdown stopped between a fix's review runs,
-/// or the review suspended for a spent grant, costs the work no try, but
-/// what it spent is spent: it counts in the chain's total and largest
-/// attempt, which the resume reservation and the give-up ceiling's spend
-/// arm read. A grant suspension still counts as a run, which gates that
-/// arm, so a chain of them is bounded.
+/// An attempt the daemon's shutdown stopped between a fix's runs costs
+/// the work no try, nor does one that moved the fix on to another step
+/// than the attempt it continued, but what either spent is spent: it
+/// counts in the chain's total and largest attempt, which the resume
+/// reservation and the give-up ceiling's spend arm read. An attempt that
+/// made progress still counts as a run, which gates that arm, so a chain
+/// of them is bounded; one that ended at the step its predecessor ended
+/// at counts as an attempt.
 #[tokio::test]
-async fn chain_stats_count_review_stops_as_spend_not_as_attempts() {
+async fn chain_stats_count_review_stops_and_progress_as_spend_not_as_attempts() {
     let (_dir, path, pool) = fresh_db().await;
     seed_repo_and_findings(&pool).await;
     sqlx::raw_sql(
         "INSERT INTO jobs (id, kind, repo_id, finding_id, state, tokens_new, resumed_from, \
-                           killed_reason, started_at) VALUES \
-         (10, 'fix', 1, 2, 'suspended', 100, NULL, 'cap', 1000), \
-         (11, 'fix', 1, 2, 'suspended', 400, 10, 'shutdown', 2000), \
-         (12, 'fix', 1, 2, 'suspended', 300, 11, 'cap', 3000), \
-         (13, 'fix', 1, 2, 'suspended', 200, 12, 'grant', 4000);",
+                           killed_reason, ended_step, started_at) VALUES \
+         (10, 'fix', 1, 2, 'suspended', 100, NULL, 'cap', 'implement', 1000), \
+         (11, 'fix', 1, 2, 'suspended', 400, 10, 'shutdown', 'review 1', 2000), \
+         (12, 'fix', 1, 2, 'suspended', 300, 11, 'cap', 'review 1', 3000), \
+         (13, 'fix', 1, 2, 'suspended', 200, 12, 'cap', 'curate', 4000);",
     )
     .execute(&pool)
     .await

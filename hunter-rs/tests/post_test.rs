@@ -2450,6 +2450,7 @@ async fn held_fix_state() -> (TestState, i64, String) {
             model: None,
             usage_delta: None,
             finished_at: 2000,
+            step: None,
         })
         .await
         .unwrap()
