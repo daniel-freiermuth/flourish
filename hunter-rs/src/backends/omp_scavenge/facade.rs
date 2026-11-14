@@ -620,7 +620,8 @@ impl Backend for OmpScavengeBackend {
         let db = self.agent_db.clone();
         let provider = self.cfg.llm_provider;
         let windows =
-            tokio::task::spawn_blocking(move || capacity::read_windows(&db, provider, now)).await?;
+            crate::child::spawn_blocking(move || capacity::read_windows(&db, provider, now))
+                .await?;
         // The same `now` as the read: a reset landing between two clock
         // reads would leave an un-rolled window that `decide_inner` skips.
         self.decide_with_windows(&windows, anticipated_tokens, now)
@@ -632,7 +633,8 @@ impl Backend for OmpScavengeBackend {
         let db = self.agent_db.clone();
         let provider = self.cfg.llm_provider;
         let windows =
-            tokio::task::spawn_blocking(move || capacity::read_windows(&db, provider, now)).await?;
+            crate::child::spawn_blocking(move || capacity::read_windows(&db, provider, now))
+                .await?;
 
         self.observe(&windows).await?;
         if self.is_fresh(&windows) {
@@ -643,7 +645,7 @@ impl Backend for OmpScavengeBackend {
             let omp = self.cfg.omp_bin.clone();
             let prober = self.prober.clone();
             let provider_name = self.cfg.llm_provider.name();
-            tokio::task::spawn_blocking(move || {
+            crate::child::spawn_blocking(move || {
                 prober.run(
                     &[
                         omp.as_str(),
@@ -661,7 +663,7 @@ impl Backend for OmpScavengeBackend {
         let omp = self.cfg.omp_bin.clone();
         let prober = self.prober.clone();
         let provider_name = self.cfg.llm_provider.name();
-        let (rc, _out) = tokio::task::spawn_blocking(move || {
+        let (rc, _out) = crate::child::spawn_blocking(move || {
             prober.run(&[omp.as_str(), "usage", "--provider", provider_name], 30)
         })
         .await?;
@@ -686,7 +688,7 @@ impl Backend for OmpScavengeBackend {
     /// ([`AuthGateway::health`]); always `None` without a gateway.
     async fn auth_unavailable(&self) -> Option<String> {
         let gateway = self.gateway.clone()?;
-        tokio::task::spawn_blocking(move || gateway.health())
+        crate::child::spawn_blocking(move || gateway.health())
             .await
             .unwrap_or_else(|e| Some(format!("auth: health check failed: {e}")))
     }
@@ -696,7 +698,7 @@ impl Backend for OmpScavengeBackend {
         let db = self.agent_db.clone();
         let provider = self.cfg.llm_provider;
         let windows =
-            tokio::task::spawn_blocking(move || capacity::read_windows(&db, provider, now_ms))
+            crate::child::spawn_blocking(move || capacity::read_windows(&db, provider, now_ms))
                 .await?;
 
         if windows.is_empty() {
@@ -740,7 +742,7 @@ impl Backend for OmpScavengeBackend {
         let pre = {
             let db = self.agent_db.clone();
             let provider = self.cfg.llm_provider;
-            tokio::task::spawn_blocking(move || Self::usage_snapshot_sync(&db, provider)).await?
+            crate::child::spawn_blocking(move || Self::usage_snapshot_sync(&db, provider)).await?
         };
 
         let model = self
@@ -752,7 +754,13 @@ impl Backend for OmpScavengeBackend {
         let prompt_owned = prompt.to_owned();
         let resume_owned = resume_from.map(std::path::Path::to_owned);
         let auth_gateway = self.gateway.clone();
-        let mut rr = tokio::task::spawn_blocking(move || {
+        // The worker runs on a blocking thread, which dropping this
+        // future would not stop. The guard kills it instead, from the
+        // drop: a worker never runs on once nothing waits to record it.
+        // After the run has ended, cutting is a no-op.
+        let leash = crate::child::Leash::default();
+        let _cut = leash.cut_on_drop();
+        let mut rr = crate::child::spawn_blocking(move || {
             // The token lives in this closure and nowhere else: it is
             // withdrawn when the closure returns or unwinds, so it ends
             // with the run whatever ends the run.
@@ -772,6 +780,7 @@ impl Backend for OmpScavengeBackend {
                 model.as_deref(),
                 resume_owned.as_deref(),
                 token.as_ref().map(ClientToken::worker_auth).as_ref(),
+                &leash,
             )
         })
         .await?;
@@ -779,7 +788,7 @@ impl Backend for OmpScavengeBackend {
         let post = {
             let db = self.agent_db.clone();
             let provider = self.cfg.llm_provider;
-            tokio::task::spawn_blocking(move || Self::usage_snapshot_sync(&db, provider)).await?
+            crate::child::spawn_blocking(move || Self::usage_snapshot_sync(&db, provider)).await?
         };
 
         rr.usage_delta = match (pre, post) {

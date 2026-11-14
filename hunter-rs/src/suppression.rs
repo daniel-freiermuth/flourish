@@ -182,7 +182,7 @@ pub async fn suppressed(
 pub async fn suppression_list(repo: &Repo, entries: Vec<Suppressed>, at: &str) -> Vec<Suppression> {
     let clone = PathBuf::from(&repo.path);
     let at = at.to_owned();
-    tokio::task::spawn_blocking(move || {
+    crate::child::spawn_blocking(move || {
         entries
             .into_iter()
             .map(|(f, anchor)| {
@@ -245,7 +245,7 @@ pub async fn reopen_if_changed(
         return Ok(false);
     };
     let clone = PathBuf::from(&repo.path);
-    let lapsed = tokio::task::spawn_blocking(move || changed_since(&clone, &anchor, &at))
+    let lapsed = crate::child::spawn_blocking(move || changed_since(&clone, &anchor, &at))
         .await
         .ok()
         .flatten()

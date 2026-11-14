@@ -35,15 +35,19 @@
 //! an orphaned gateway, answers health checks but reads another clients
 //! file and would refuse every token. A child whose port is taken exits
 //! at once (`EADDRINUSE`), and the hold then says the port is taken by
-//! another process. Each child gets `PR_SET_PDEATHSIG`, so a daemon that
-//! dies without stopping it leaves no orphan behind.
+//! another process. Each child runs in a cgroup of its own
+//! ([`crate::child`]): a daemon that stops ends it with everything it
+//! started, and a later daemon refuses to start beside one left running.
+//! A daemon killed outright ends nothing itself, but each child gets
+//! `PR_SET_PDEATHSIG` ([`crate::child::Command::die_with_spawner`]), so
+//! it takes them along: no orphaned gateway admits a dead run's token.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread::JoinHandle;
@@ -55,7 +59,6 @@ use super::harness::WorkerAuth;
 use crate::backend::AUTH_UNAVAILABLE;
 use crate::config::Config;
 use crate::types::RunResult;
-use crate::util::kill_tree;
 
 /// The variable that points an Anthropic worker at the gateway.
 const BASE_URL_ENV: &str = "ANTHROPIC_BASE_URL";
@@ -278,13 +281,14 @@ impl AuthGateway {
         })
     }
 
-    /// [`Self::health`], asked until it is `None` or `timeout` has passed;
-    /// the last answer. Blocking.
-    pub fn await_healthy(&self, timeout: Duration) -> Option<String> {
+    /// [`Self::health`], asked until it is `None`, `timeout` has passed or
+    /// `stopping` says the daemon is (a stop during startup cuts the wait
+    /// short); the last answer. Blocking.
+    pub fn await_healthy(&self, timeout: Duration, stopping: impl Fn() -> bool) -> Option<String> {
         let deadline = Instant::now() + timeout;
         loop {
             let why = self.health()?;
-            if Instant::now() >= deadline {
+            if Instant::now() >= deadline || stopping() {
                 return Some(why);
             }
             std::thread::sleep(READY_POLL);
@@ -456,6 +460,9 @@ pub struct AuthServices {
     /// One per supervisor, never sent on: dropping it is the stop.
     stops: Vec<mpsc::Sender<()>>,
     supervisors: Vec<JoinHandle<()>>,
+    /// The unit of work both children run in (`crate::child`), ended once
+    /// the supervisors have stopped them.
+    unit: crate::child::Unit,
 }
 
 impl AuthServices {
@@ -494,14 +501,19 @@ impl AuthServices {
         let mut started = Self {
             stops: Vec::new(),
             supervisors: Vec::new(),
+            unit: crate::child::Unit::new("gateway")?,
         };
         for service in services {
             let (stop, stopped) = mpsc::channel();
             started.stops.push(stop);
+            let unit = started.unit.clone();
             // On error `started` drops, stopping what already runs.
             let handle = std::thread::Builder::new()
                 .name(format!("auth-{}", service.name))
-                .spawn(move || supervise(&service, &Stop(stopped)))?;
+                .spawn(move || {
+                    let _in = unit.enter();
+                    supervise(&service, &Stop(stopped));
+                })?;
             started.supervisors.push(handle);
         }
         Ok(started)
@@ -516,6 +528,7 @@ impl Drop for AuthServices {
                 tracing::error!("auth: a supervisor thread panicked");
             }
         }
+        self.unit.end();
     }
 }
 
@@ -535,42 +548,29 @@ impl Stop {
 
 /// Run `service` until `stop`, restarting it whenever it exits with a
 /// doubling backoff ([`RESTART_MIN`]..[`RESTART_MAX`]). On `stop` the
-/// child's process group is terminated ([`kill_tree`]).
+/// child's whole tree is terminated ([`crate::child::Child::kill_tree`]).
 fn supervise(service: &Service, stop: &Stop) {
     let name = service.name;
     let mut backoff = RESTART_MIN;
     loop {
         let started = Instant::now();
-        let mut cmd = Command::new(&service.omp_bin);
+        // Through `crate::child` like every child of the daemon, which
+        // also gives it a process group of its own, so a Ctrl-C to the
+        // daemon's terminal does not take the gateway down under a worker
+        // the daemon is still letting finish.
+        let mut cmd = crate::child::command(&service.omp_bin);
         cmd.args(&service.args)
-            .envs(service.env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        // Its own group: `kill_tree` stops all of it, and a Ctrl-C to the
-        // daemon's terminal does not take the gateway down under a
-        // worker the daemon is still letting finish.
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-            // A daemon that dies without stopping it (SIGKILL, a crash)
-            // takes it along: the kernel sends SIGTERM when the thread that
-            // spawned it ends, and this supervisor thread outlives its child
-            // on every other path. Without it, an orphaned gateway would
-            // hold the port the next daemon's child needs.
-            #[allow(
-                unsafe_code,
-                reason = "pre_exec is the only way to set PR_SET_PDEATHSIG in the child"
-            )]
-            // SAFETY: the closure runs between fork and exec and only calls
-            // prctl(2), which is async-signal-safe and touches no memory of
-            // the parent.
-            unsafe {
-                cmd.pre_exec(|| {
-                    nix::sys::prctl::set_pdeathsig(nix::sys::signal::Signal::SIGTERM)
-                        .map_err(io::Error::from)
-                });
-            }
+            .stderr(Stdio::piped())
+            // A daemon killed outright takes it along: this supervisor
+            // thread, which spawns it, ends it before it ends on every
+            // other path. An orphaned gateway would admit the dead run's
+            // token, its worker spending on with no cap, and hold the port
+            // the next daemon's child needs.
+            .die_with_spawner();
+        for (key, value) in &service.env {
+            cmd.env(key, value);
         }
         match cmd.spawn() {
             Ok(mut child) => {
@@ -581,8 +581,8 @@ fn supervise(service: &Service, stop: &Stop) {
                     state.tail.clear();
                 }
                 let logs = [
-                    log_lines(name, child.stdout.take(), Arc::clone(&service.state)),
-                    log_lines(name, child.stderr.take(), Arc::clone(&service.state)),
+                    log_lines(name, child.take_stdout(), Arc::clone(&service.state)),
+                    log_lines(name, child.take_stderr(), Arc::clone(&service.state)),
                 ];
                 let exited = loop {
                     match child.try_wait() {
@@ -594,7 +594,7 @@ fn supervise(service: &Service, stop: &Stop) {
                 };
                 // Also after an exit of its own: a descendant left behind
                 // would hold the pipes the log threads read to the end.
-                kill_tree(&mut child);
+                child.kill_tree();
                 for log in logs {
                     let _ = log.join();
                 }

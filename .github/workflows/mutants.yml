@@ -150,6 +150,9 @@ jobs:
         #
         # The timeout floor (minimum_test_timeout) lives in
         # .cargo/mutants.toml, so a local run uses the same one.
+        #
+        # In a cgroup the tests may manage, as CI's test job: the tests
+        # start their children in cgroups of their own (src/child.rs).
         env:
           BASE_REF: ${{ github.base_ref }}
           SHARD: ${{ matrix.shard }}
@@ -157,7 +160,8 @@ jobs:
         run: |
           git diff --no-color --relative "origin/$BASE_REF"...HEAD -- . > /tmp/pr.diff
           set +e
-          timeout 35m cargo mutants --test-tool nextest \
+          timeout 35m ./scripts/in-delegated-cgroup.sh \
+            cargo mutants --test-tool nextest \
             --in-diff /tmp/pr.diff -j 2 --colors never \
             --shard "$SHARD/$SHARDS"
           rc=$?

@@ -259,6 +259,20 @@ scaffolding you keep is scaffolding you maintain. `cargo test` would
 race silently, so `require_process_isolation` asserts on
 `NEXTEST_EXECUTION_MODE` and fails with an explanation instead.
 
+It also needs a **cgroup it may manage**: every process the daemon
+starts, a test's `git` or fake worker included, runs in a cgroup of its
+own below the one the test runs in (`src/child.rs`). `just test` and CI
+run the suite through `hunter-rs/scripts/in-delegated-cgroup.sh`: in
+place where the current cgroup is writable (the daemon's own check), so
+a hunter worker running the gate keeps it inside its worker cgroup, which
+ends it; in a new `systemd-run --user --scope -p Delegate=yes` only
+elsewhere. Outside a manageable cgroup, spawning tests fail and say so;
+none skips. A test that runs the daemon itself first moves into a cgroup
+of its own (`support::private_cgroup`), since the daemon refuses to claim
+a cgroup where other tests' children run. (A worker can still start its
+own `systemd-run` and leave its cgroup on purpose; keeping it from the
+user's systemd is the worker sandbox's job.)
+
 `tests/runner_engage_test.rs` is the worked example: a real git repo, a
 scripted `gh`, a scripted worker, the real `run_engage`, and assertions
 on what was persisted. Start from it.
@@ -413,9 +427,10 @@ Frontends are not required to.
 Every project enforces at minimum:
 1. `cargo fmt --check`
 2. `cargo clippy` with deny-level lints
-3. `cargo nextest run --profile ci` — the command CI runs. Plain
-   `cargo test` is not an equivalent here: `require_process_isolation`
-   fails every test under it (see *nextest-only*, above).
+3. `cargo nextest run --profile ci` — the command CI runs, inside a
+   delegated cgroup (`just test`). Plain `cargo test` is not an
+   equivalent here: `require_process_isolation` fails every test under
+   it (see *nextest-only*, above).
 4. The `cargo-mutants` gate on the PR's diff (see *Mutation testing*,
    above).
 

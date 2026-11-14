@@ -165,6 +165,20 @@ fn install_signal(kind: SignalKind, name: &str) -> Option<Signal> {
         .ok()
 }
 
+/// Whether this process inherited SIGHUP as ignored (`nohup`): bit 0 of
+/// `SigIgn` in `/proc/self/status`. Unreadable reads as not ignored.
+fn sighup_ignored() -> bool {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|l| l.strip_prefix("SigIgn:"))
+                .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+        })
+        .is_some_and(|mask| mask & 1 != 0)
+}
+
 /// The next delivery of `sig`; never, if its handler failed to install.
 async fn next_signal(sig: Option<Signal>) {
     match sig {
@@ -587,8 +601,11 @@ pub async fn supervise_duty<F, Fut>(
     F: Fn() -> Fut,
     Fut: Future<Output = DutyRun> + Send + 'static,
 {
+    // Each run is a unit of work of its own: what it starts is ended with
+    // whatever it left when the run ends (`crate::child`).
+    let label = format!("admin-{task:?}").to_lowercase();
     while !*shutdown.borrow() {
-        match tokio::spawn(run()).await {
+        match tokio::spawn(crate::child::in_unit(&label, run())).await {
             Ok(done) => {
                 if done.made_work() {
                     job_wake.notify_one();
@@ -799,14 +816,69 @@ pub fn next_wake_ms(now_ms: i64, sleep_s: f64) -> i64 {
 pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     // The lock first, then the store under it: the daemon's startup
     // token comes only with the lock, and the store holds the lock until
-    // its last clone is gone. Before anything else reads the job table:
-    // every `running` row and every `fixing` claim is the dead prior
-    // process's. The lanes need the `Recovered` the token becomes, so
-    // this runs exactly once and before any job exists. The sweep below
-    // then releases the trees of the chains this ended.
+    // its last clone is gone. A second daemon on this work root stops
+    // here, before it so much as looks at this one's cgroups.
     let lock = crate::recovery::DaemonLock::acquire(&cfg.work_root, &cfg.db_path)?;
+    // One shutdown source for the whole daemon, latched: a signal future
+    // built inside the loop's select! cannot replay a delivery that
+    // predates it, so a signal arriving while the cycle body ran would be
+    // dropped on the floor; latching it here means the next wait observes
+    // it. SIGTERM (systemctl stop), SIGINT and SIGHUP all stop the daemon,
+    // matching the single stop event in server.py. SIGHUP is the closing
+    // of the terminal a hand-run daemon was started from. One the daemon
+    // inherited as ignored (`nohup`) stays ignored: whoever started it so
+    // wants it to outlive the hangup.
+    //
+    // Installed here, right after the lock and before the daemon starts
+    // any process, and synchronously, not inside the task (which may not
+    // have run yet): until a handler is installed, each of these signals
+    // keeps its default action and kills the daemon outright, leaving
+    // every child it started running (`ctrl_c()` is no substitute: it
+    // installs only when first polled). A stop during startup is latched
+    // like any other: the startup's own steps finish (the wait for the
+    // auth gateway is cut short), no lane starts work, and the daemon
+    // stops the way it always does.
+    let sigterm = install_signal(SignalKind::terminate(), "SIGTERM");
+    let sigint = install_signal(SignalKind::interrupt(), "SIGINT");
+    let sighup = if sighup_ignored() {
+        None
+    } else {
+        install_signal(SignalKind::hangup(), "SIGHUP")
+    };
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let signal_handle = tokio::spawn(async move {
+        let name = tokio::select! {
+            () = next_signal(sigint) => "SIGINT",
+            () = next_signal(sigterm) => "SIGTERM",
+            () = next_signal(sighup) => "SIGHUP",
+        };
+        tracing::info!("received {name}: finishing the lanes' current work, then stopping");
+        shutdown_tx.send_replace(true);
+        // Hold the sender forever: dropping it would make `changed()`
+        // resolve instantly with an error on every iteration, spinning
+        // the scheduler loop.
+        std::future::pending::<()>().await;
+    });
     let (store, unreconciled) = Store::connect_exclusive(lock).await?;
     let store = Arc::new(store);
+    // Every process the daemon starts runs in a cgroup of its own, below
+    // the one the daemon runs in, inside the cgroup of its unit of work
+    // (`crate::child`): that is what keeps any of them from outliving it.
+    // Without a cgroup it may manage, or with a process of an earlier run
+    // still in one (here, or where the daemon last ran for this work
+    // root), the daemon does not start: nothing of it has run yet. The
+    // claim, dropped on every way out of here before the store (and with
+    // it the lock), ends whatever is left in the daemon's cgroups once
+    // its work is done.
+    let _claimed = crate::child::start(&cfg.work_root)?;
+    // Git run through ssh by anything the daemon starts shares no ssh
+    // connection (`child::install_ssh_wrapper`).
+    crate::child::install_ssh_wrapper(&cfg.work_root);
+    // Before anything else reads the job table: every `running` row and
+    // every `fixing` claim is the dead prior process's, and no worker of
+    // it runs (`child::start`). The lanes need the `Recovered` the token
+    // becomes, so this runs exactly once and before any job exists. The
+    // sweep below then releases the trees of the chains this ended.
     let (recovered, settled) =
         crate::recovery::reconcile_and_log(unreconciled, &cfg.work_root).await?;
     tracing::info!("startup reconcile: {settled:?}");
@@ -842,9 +914,11 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
             let gateway = Arc::new(AuthGateway::new(&cfg));
             let (services, health) = {
                 let (cfg, gateway) = (cfg.clone(), gateway.clone());
-                tokio::task::spawn_blocking(move || {
+                let stopping = shutdown_rx.clone();
+                crate::child::spawn_blocking(move || {
                     let services = AuthServices::start(&cfg, &gateway)?;
-                    anyhow::Ok((services, gateway.await_healthy(AUTH_STARTUP)))
+                    let health = gateway.await_healthy(AUTH_STARTUP, || *stopping.borrow());
+                    anyhow::Ok((services, health))
                 })
                 .await??
             };
@@ -892,34 +966,6 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     let addr = std::net::SocketAddr::new(cfg.serve_host, cfg.serve_port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("daemon started: ui http://{addr}/ -- job and admin lanes live");
-
-    // One shutdown source for the whole daemon, created before the loop.
-    // A signal future built inside the loop's select! cannot replay a
-    // delivery that predates it, so a signal arriving while the cycle body
-    // ran would be dropped on the floor; latching it here means the next
-    // wait observes it. Both SIGTERM (systemctl stop) and SIGINT stop the
-    // daemon, matching the single stop event in server.py.
-    //
-    // Both handlers are installed here, synchronously, not inside the
-    // task: a spawned task may not have run yet when the UI below starts
-    // answering, and until a handler is installed SIGTERM keeps its default
-    // action and kills the process outright instead of stopping it cleanly.
-    // (`ctrl_c()` is no substitute: it installs only when first polled.)
-    let sigterm = install_signal(SignalKind::terminate(), "SIGTERM");
-    let sigint = install_signal(SignalKind::interrupt(), "SIGINT");
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    let signal_handle = tokio::spawn(async move {
-        let name = tokio::select! {
-            () = next_signal(sigint) => "SIGINT",
-            () = next_signal(sigterm) => "SIGTERM",
-        };
-        tracing::info!("received {name}: finishing the lanes' current work, then stopping");
-        shutdown_tx.send_replace(true);
-        // Hold the sender forever: dropping it would make `changed()`
-        // resolve instantly with an error on every iteration, spinning
-        // the scheduler loop.
-        std::future::pending::<()>().await;
-    });
 
     // UI server task, stopped by its own handle rather than by the
     // signal. A private `ctrl_c()` made the two halves answer the same
@@ -1083,7 +1129,7 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     }
     // Only now that no worker runs: the last cycle's went through them.
     if let Some(services) = auth_services {
-        let _ = tokio::task::spawn_blocking(move || drop(services)).await;
+        let _ = crate::child::spawn_blocking(move || drop(services)).await;
     }
     signal_handle.abort();
     prober_handle.abort();

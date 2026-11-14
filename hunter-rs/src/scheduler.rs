@@ -587,8 +587,8 @@ async fn select(
     queued.retain(not_held(FindingJobKind::Fix));
     // A place a job is running on takes no second attempt: the insert
     // would be refused (migration 031). It is skipped like held work, so a
-    // job left `running` by a stray worker keeps only its own place, not
-    // the whole selection, from being picked.
+    // job still `running` keeps only its own place, not the whole
+    // selection, from being picked.
     let running = store.running_places().await?;
     let busy = |place: JobPlace| running.contains(&place);
     for tier in [
@@ -3524,7 +3524,7 @@ pub async fn run_hunt(
         // First hunt: last 3 weeks or 30 commits (bounded)
         let rps = rp_str.clone();
         let h = head.clone();
-        let (_rc, base) = tokio::task::spawn_blocking(move || {
+        let (_rc, base) = crate::child::spawn_blocking(move || {
             Unheld::LastBefore {
                 rev: &h,
                 before: "3 weeks ago",
@@ -3537,7 +3537,7 @@ pub async fn run_hunt(
         if base.is_empty() || base == head {
             let rps = rp_str.clone();
             let h = head.clone();
-            let base2 = tokio::task::spawn_blocking(move || {
+            let base2 = crate::child::spawn_blocking(move || {
                 crate::workspace::resolve(Path::new(&rps), &format!("{h}~30"))
             })
             .await
@@ -4728,7 +4728,7 @@ async fn renovate_scan(
     let rn = repo.name.clone();
     let forge = repo.forge;
     let configured = cfg.renovate_github_token.clone();
-    tokio::task::spawn_blocking(move || {
+    crate::child::spawn_blocking(move || {
         let token = crate::dep_scan::github_token(
             forge,
             configured.as_ref().map(crate::config::Secret::expose),
@@ -6286,7 +6286,7 @@ async fn ship_pr(
     // commits as the worker's and ship them as a PR.
     let range = format!("{pinned}..{rev}");
     let (rc, commits) =
-        tokio::task::spawn_blocking(move || Unheld::Commits { range: &range }.run(&wt, 30))
+        crate::child::spawn_blocking(move || Unheld::Commits { range: &range }.run(&wt, 30))
             .await
             .unwrap_or((127, String::new()));
     let commits = commits.trim();
@@ -6312,7 +6312,7 @@ async fn ship_pr(
     // Always to the branch by name: a symbolic `HEAD` would push whatever
     // ref the tree has checked out, and nothing at all from a detached one.
     let refspec = format!("{rev}:refs/heads/{branch}");
-    let (prc, pout) = tokio::task::spawn_blocking(move || {
+    let (prc, pout) = crate::child::spawn_blocking(move || {
         Unheld::Push {
             force: Force::Always,
             url: &push_url,
@@ -6343,7 +6343,7 @@ async fn ship_pr(
         title.to_owned()
     } else {
         let wt = worktree.to_owned();
-        tokio::task::spawn_blocking(move || Unheld::Subject { rev: &rev }.run(&wt, 30))
+        crate::child::spawn_blocking(move || Unheld::Subject { rev: &rev }.run(&wt, 30))
             .await
             .map_or_else(|_| String::new(), |(_, out)| out)
     };
@@ -7139,7 +7139,7 @@ async fn sync_one_pr(pass: &PrSyncPass, cfg: &Config, f: &Finding) -> SyncResult
     // On a blocking thread: the view is several `gh`/`glab` round
     // trips, and the job lane and the UI share this runtime.
     let (forge_name, repo_url, bots) = (repo.forge, repo.url.clone(), cfg.review_bots.clone());
-    let viewed = tokio::task::spawn_blocking(move || {
+    let viewed = crate::child::spawn_blocking(move || {
         forge::forge_for(forge_name).view_pr_sync(&repo_url, pr_number, &bots)
     })
     .await
@@ -8069,7 +8069,7 @@ async fn push_then_reply(
         // the lease.
         let expected = own_push(&start.ws.root).unwrap_or_else(|| start.pinned.clone());
         let lease = format!("{head_ref}:{expected}");
-        let (prc, pout) = tokio::task::spawn_blocking(move || {
+        let (prc, pout) = crate::child::spawn_blocking(move || {
             Unheld::Push {
                 force: Force::Lease(&lease),
                 url: &push_url,
@@ -8411,7 +8411,7 @@ fn failure_key(fail: &str) -> &str {
 async fn remote_head(start: &EngageStart) -> Option<String> {
     let url = start.repo.url.clone();
     let (tree, branch) = (start.ws.tree.clone(), start.head_ref.clone());
-    let (rc, out) = tokio::task::spawn_blocking(move || {
+    let (rc, out) = crate::child::spawn_blocking(move || {
         Unheld::RemoteHead {
             url: &url,
             branch: &branch,
@@ -8427,7 +8427,7 @@ async fn remote_head(start: &EngageStart) -> Option<String> {
 async fn commit_of(start: &EngageStart, rev: &str) -> Option<String> {
     let (tree, rev) = (start.ws.tree.clone(), rev.to_owned());
     let (rc, out) =
-        tokio::task::spawn_blocking(move || Unheld::Commit { rev: &rev }.run(&tree, 30))
+        crate::child::spawn_blocking(move || Unheld::Commit { rev: &rev }.run(&tree, 30))
             .await
             .unwrap_or((127, String::new()));
     (rc == 0).then(|| out.trim().to_owned())
@@ -8438,7 +8438,7 @@ async fn commit_of(start: &EngageStart, rev: &str) -> Option<String> {
 /// cannot say.
 async fn ancestor_rc(start: &EngageStart, ancestor: &str, rev: &str) -> i32 {
     let (tree, ancestor, rev) = (start.ws.tree.clone(), ancestor.to_owned(), rev.to_owned());
-    tokio::task::spawn_blocking(move || {
+    crate::child::spawn_blocking(move || {
         Unheld::IsAncestor {
             ancestor: &ancestor,
             rev: &rev,
@@ -8510,7 +8510,7 @@ async fn engage_tree_branch(tree: &Path, head_ref: &str) -> Result<String, Strin
     let own = crate::workspace::tree_branch(tree);
     let (tree, rev) = (tree.to_owned(), format!("refs/heads/{own}"));
     let (rc, out) =
-        tokio::task::spawn_blocking(move || Unheld::Commit { rev: &rev }.run(&tree, 30))
+        crate::child::spawn_blocking(move || Unheld::Commit { rev: &rev }.run(&tree, 30))
             .await
             .unwrap_or((127, "spawn error".to_owned()));
     match rc {
@@ -8529,7 +8529,7 @@ async fn engage_tree_branch(tree: &Path, head_ref: &str) -> Result<String, Strin
 /// when there are none. What git cannot list counts as left.
 async fn dropped_left(start: &EngageStart, branch: &str, base: &str) -> Option<String> {
     let (tree, from, to) = (start.ws.tree.clone(), branch.to_owned(), base.to_owned());
-    let (rc, paths) = tokio::task::spawn_blocking(move || {
+    let (rc, paths) = crate::child::spawn_blocking(move || {
         Unheld::ChangedPaths {
             from: &from,
             to: &to,
@@ -8547,7 +8547,7 @@ async fn dropped_left(start: &EngageStart, branch: &str, base: &str) -> Option<S
         return None;
     }
     let tree = start.ws.tree.clone();
-    let (_, out) = tokio::task::spawn_blocking(move || {
+    let (_, out) = crate::child::spawn_blocking(move || {
         Unheld::TrackedStatusOf { paths: &paths }.run(&tree, 60)
     })
     .await
@@ -9806,7 +9806,7 @@ pub async fn run_harvest(
         } else if resume.is_some() {
             let clone = PathBuf::from(&repo.path);
             let tip = format!("origin/{}", repo.default_branch);
-            tokio::task::spawn_blocking(move || crate::workspace::resolve(&clone, &tip))
+            crate::child::spawn_blocking(move || crate::workspace::resolve(&clone, &tip))
                 .await
                 .ok()
                 .flatten()
@@ -10293,18 +10293,24 @@ pub async fn run_cycle(
     }
     // The cycle is one lane: its runners take clone permits in it, and
     // none can outlive it. Its helpers report their phases to the lane's
-    // status (`crate::activity::job_phase`).
+    // status (`crate::activity::job_phase`). Everything it starts -- the
+    // git its job needs, the job's worker runs -- runs in one unit of work,
+    // ended with whatever it left when the cycle ends (`crate::child`).
     let status = jobs.status();
     let scope = jobs.scope();
-    let ran = crate::activity::reporting_job_phases(
-        status,
-        // Boxed: the cycle is the largest future in the daemon, and the
-        // task-local scope would otherwise carry it inline.
-        Box::pin(
-            store.lane(async |lane| run_scoped_cycle(scope, lane, cfg, backend, force_repo).await),
-        ),
-    )
-    .await;
+    let ran =
+        crate::child::in_unit(
+            "cycle",
+            crate::activity::reporting_job_phases(
+                status,
+                // Boxed: the cycle is the largest future in the daemon, and the
+                // task-local scope would otherwise carry it inline.
+                Box::pin(store.lane(async |lane| {
+                    run_scoped_cycle(scope, lane, cfg, backend, force_repo).await
+                })),
+            ),
+        )
+        .await;
     ran.unwrap_or_else(|e| CycleSummary {
         error: Some(e.to_string()),
         ..Default::default()

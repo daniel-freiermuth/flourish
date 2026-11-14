@@ -36,7 +36,11 @@ zero token cost and only spends against a budget it never overshoots.
 Requires a Rust toolchain and Node/npm (the daemon binary and the UI
 bundle), `omp` on `PATH` (the headless worker CLI this project is built
 around), `git`, and the `gh` CLI (or `glab` for GitLab repos)
-authenticated for whatever repos you register.
+authenticated for whatever repos you register. The daemon runs every
+process it starts in a cgroup (v2) of its own, so it needs a cgroup it
+may manage: run it as the systemd unit (§ Running as a service) or under
+`systemd-run --user --scope -p Delegate=yes` as below. Without one it
+refuses to start and says so.
 
 ```sh
 cp hunter/config.anthropic.example.json hunter/config.json  # or config.openai-codex.example.json / config.github-copilot.example.json
@@ -44,7 +48,8 @@ cp hunter/config.anthropic.example.json hunter/config.json  # or config.openai-c
 cd hunter-rs
 just build                                # UI bundle (ui-svelte/ -> hunter/ui/) + release binary
 ./target/release/hunter --root ../hunter user add <you>  # your login (see § Users)
-./target/release/hunter --root ../hunter  # run forever: UI (:8377) + scheduler loop
+systemd-run --user --scope --unit=hunter -p Delegate=yes \
+  ./target/release/hunter --root ../hunter  # run forever: UI (:8377) + scheduler loop
 ```
 
 Then open `http://localhost:8377`, log in, go to **Repos**, and add a
@@ -412,8 +417,11 @@ The broker and gateway count as up only while the daemon's own children
 run on their ports: a port another process holds (a second daemon with
 the same ports, an orphan) answers health checks but would refuse every
 token, so its child, which exits with `EADDRINUSE`, holds the work with
-`auth: gateway port 4000 is taken by another process`. The children get
-`PR_SET_PDEATHSIG`, so a daemon that is killed outright takes them along.
+`auth: gateway port 4000 is taken by another process`. The children run
+in cgroups of their own like every worker (§ Running as a service), so a
+daemon that stops takes them along. They also get `PR_SET_PDEATHSIG`, so
+a daemon that is killed outright takes them along too: no orphaned
+gateway goes on admitting a dead run's token.
 A curation refused its token costs the fix no resume attempt, and a resume
 that only owed its curation and is refused again is closed as never
 started, so an outage grows no resume chain.
@@ -547,7 +555,7 @@ are gated against two linear ramps:
 - A granted job's token cap is the ramp's remaining headroom, verbatim —
   there is no separate configured per-kind cap. Workers are metered
   **externally**: the harness tails the worker's live session JSONL and
-  SIGTERMs the process group at that cap, never depending on the worker
+  SIGTERMs the worker's processes at that cap, never depending on the worker
   cooperating with its own limit. A grant with no headroom figure carries
   no token bound, and `maxWallS` alone stops it.
 - Stale or missing usage data → conservative denial, never an optimistic
@@ -1087,6 +1095,7 @@ hunter-rs/src/
 ├── scheduler.rs    one cycle = one job; run_hunt/run_fix/run_engage/
 │                   run_harvest/run_recheck/pick_next/run_cycle
 ├── server.rs       axum JSON API + serves ui/
+├── child.rs        every spawn: a cgroup per process inside its unit of work's, ending them, the startup check
 └── util.rs         shared subprocess helpers
 
 hunter/
@@ -1297,6 +1306,79 @@ loginctl enable-linger $USER   # keep it running after you log out
 
 After a rebuild, `systemctl --user restart hunter.service`; `just build`
 deliberately does not reach into the service manager itself.
+
+No process the daemon started outlives it. Every one of them — the omp
+workers and whatever they start, Renovate, the auth broker and gateway,
+and the daemon's own git, `gh` and `glab` calls — runs in a cgroup of
+its own, which nothing started in it can leave by `setsid`, a double
+fork or daemonizing (`hunter-rs/src/child.rs`). Those cgroups sit inside
+one per unit of work: `cycle-<n>/` for a job-lane cycle (its job's git
+and worker runs; the log line `job <id> runs in cgroup cycle-<n>` ties
+the two), `admin-<duty>-<n>/` for one admin duty run, `gateway-<n>/`
+for the auth broker and gateway, `other/` for the rest (startup, the
+UI, the usage probes). A worker run is ended when it ends; what a git
+command leaves running is not ended per command but with its unit.
+Ending is the old process-group kill made complete: SIGTERM to every
+process at once, up to 10 s for them to exit, then SIGKILL to whatever
+is left. On `systemctl stop` (SIGTERM, and SIGHUP or SIGINT alike) the
+daemon finishes the worker run it is in, lets its admin duties finish
+their runs, then ends every unit still there, and exits. A daemon
+started with SIGHUP ignored (`nohup`) keeps ignoring it.
+
+Everything the daemon starts finds `<workRoot>/bin/ssh` first on its
+`PATH`, a wrapper the daemon writes at startup that runs your ssh with
+`-o ControlPath=none`. So none of it uses or starts a shared ssh
+connection (`ControlMaster`/`ControlPersist` in your ssh config) that
+ending its cgroup would cut under your own sessions, while
+`core.sshCommand` in your git config, or a `GIT_SSH_COMMAND` you export
+for the daemon (left as it is), still picks keys and options: their
+`ssh` is the wrapper. Only an ssh named by an absolute path there
+bypasses it. With no `ssh` on the daemon's `PATH` nothing is written.
+
+Other long-lived per-user agents the tools start on demand, such as
+gpg-agent for GPG commit signing (and keyboxd, dirmngr), should be
+started by systemd socket activation (`gpg-agent.socket` and friends,
+the default on systemd distributions): then the socket starts them in
+their own unit, outside the daemon's cgroups. Without it, an agent a
+worker's or the daemon's git starts belongs to that worker run or cycle
+and ends with it, cached passphrases included. Hunter does not keep
+such agents alive on purpose: nothing a worker starts may outlive it.
+
+For all this the unit has `Delegate=yes`: the daemon may manage the
+cgroup systemd gives it and moves itself into `daemon/` there. At start
+it asks systemd (`systemctl show -p Delegate`) and logs a warning when
+its unit does not delegate, or when no unit answers (a directory root
+made below `/sys/fs/cgroup`, handed to you and the daemon moved into,
+works too, but cannot be checked). `KillMode=mixed` still sends the
+stop's SIGTERM to the daemon alone, and if the daemon dies on its own
+(SIGKILL, a crash, the OOM killer), systemd ends everything left in the
+unit's cgroup, so a restarted daemon finds none of its predecessor's
+workers running and resumes their work from the transcripts they left.
+
+Run by hand, give it a cgroup the same way:
+`systemd-run --user --scope --unit=hunter -p Delegate=yes
+./target/release/hunter --root ../hunter`. A daemon killed outright then
+ends nothing itself. As cheap damage limitation the kernel sends SIGTERM
+(`PR_SET_PDEATHSIG`) to the auth broker and gateway and to each worker's
+omp, so the spending stops; everything else still running — what a
+worker started, what a git command left — is yours to end (`systemctl
+--user stop hunter.scope`). The daemon records the cgroup it claimed in its
+work root (`<workRoot>/cgroup`) and marks the cgroup with its claim (the
+extended attribute `user.hunter.claim`: work root, pid, start time),
+until it stops cleanly. A daemon started on the same work root — from
+any terminal — refuses to start while a process of an earlier run is
+left in its own cgroup or in the recorded one, naming each cgroup and
+its processes; it does not kill what it did not start. The recorded
+cgroup counts only while it still carries that claim: a scope of the
+same name started since, by another daemon or anything else, is left
+alone. Without a cgroup it may write to (`/sys/fs/cgroup/...`) it
+refuses to start as well.
+
+Upgrading to cgroup containment: stop the previous daemon
+with `systemctl --user stop hunter.service` (its `KillMode=mixed` ends
+its workers), not by killing it by hand, and add `Delegate=yes` to an
+installed unit (`hunter.service`). A worker the old daemon left running
+is in no cgroup the new one checks.
 
 Upgrading across migration 022 (`verdict_anchors`): suppressions that
 existed before it have no anchor and stay unconditional until a new verdict

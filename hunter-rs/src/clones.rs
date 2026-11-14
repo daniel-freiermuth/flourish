@@ -398,7 +398,7 @@ impl ClonePermit<'_> {
         R: Send + 'static,
     {
         let hold = CloneHold(Arc::clone(&self.hold.0));
-        tokio::task::spawn_blocking(move || {
+        crate::child::spawn_blocking(move || {
             let _one = lock(&hold.0.command);
             f(&hold)
         })
@@ -736,7 +736,7 @@ impl EveryClone<'_> {
             .iter()
             .map(|p| CloneHold(Arc::clone(&p.hold.0)))
             .collect();
-        tokio::task::spawn_blocking(move || {
+        crate::child::spawn_blocking(move || {
             // In id order, like the permits themselves.
             let _all: Vec<_> = holds.iter().map(|h| lock(&h.0.command)).collect();
             f(&holds)

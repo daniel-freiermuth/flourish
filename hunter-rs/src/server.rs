@@ -744,7 +744,7 @@ async fn login(
     let hash = candidate
         .as_ref()
         .map_or_else(|| auth::DECOY_HASH.to_owned(), |(_, h)| h.clone());
-    let matches = tokio::task::spawn_blocking(move || auth::verify_password(&password, &hash))
+    let matches = crate::child::spawn_blocking(move || auth::verify_password(&password, &hash))
         .await
         .map_err(|e| anyhow::anyhow!("password check: {e}"))?;
     let Some((user, _)) = candidate.filter(|_| matches) else {
@@ -2220,7 +2220,7 @@ fn pr_number_of(repo: &Repo, pr: &Value) -> Result<i64, ApiError> {
 async fn forge_call<T: Send + 'static>(
     f: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
 ) -> anyhow::Result<T> {
-    tokio::task::spawn_blocking(f).await?
+    crate::child::spawn_blocking(f).await?
 }
 
 /// POST /api/pr-review {`repo_id`, pr, watch, `auto_post`?, vouch?}: request

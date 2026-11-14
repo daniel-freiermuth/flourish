@@ -235,7 +235,7 @@ async fn test_read_windows_no_db_returns_empty() {
     let db = PathBuf::from("/nonexistent/agent.db");
     let now = now_ms();
     let windows =
-        tokio::task::spawn_blocking(move || read_windows(&db, LlmProvider::Anthropic, now))
+        hunter::child::spawn_blocking(move || read_windows(&db, LlmProvider::Anthropic, now))
             .await
             .unwrap();
     assert!(windows.is_empty());
@@ -248,7 +248,7 @@ async fn test_read_windows_empty_table_returns_empty() {
     let now = now_ms();
     let db = db_path.clone();
     let windows =
-        tokio::task::spawn_blocking(move || read_windows(&db, LlmProvider::Anthropic, now))
+        hunter::child::spawn_blocking(move || read_windows(&db, LlmProvider::Anthropic, now))
             .await
             .unwrap();
     assert!(windows.is_empty());
@@ -272,7 +272,7 @@ async fn test_read_windows_keeps_active_window() {
     .await;
     let db = db_path.clone();
     let windows =
-        tokio::task::spawn_blocking(move || read_windows(&db, LlmProvider::Anthropic, now))
+        hunter::child::spawn_blocking(move || read_windows(&db, LlmProvider::Anthropic, now))
             .await
             .unwrap();
     assert!(windows.contains_key("anthropic:7d"));
@@ -307,7 +307,7 @@ async fn test_read_windows_drops_expired_model_class() {
     .await;
     let db = db_path.clone();
     let windows =
-        tokio::task::spawn_blocking(move || read_windows(&db, LlmProvider::Anthropic, now))
+        hunter::child::spawn_blocking(move || read_windows(&db, LlmProvider::Anthropic, now))
             .await
             .unwrap();
     let keys: Vec<&String> = windows.keys().collect();
@@ -332,7 +332,7 @@ async fn test_read_windows_keeps_active_model_class() {
     )
     .await;
     let windows =
-        tokio::task::spawn_blocking(move || read_windows(&db_path, LlmProvider::Anthropic, now))
+        hunter::child::spawn_blocking(move || read_windows(&db_path, LlmProvider::Anthropic, now))
             .await
             .unwrap();
     let keys: Vec<&String> = windows.keys().collect();
@@ -361,7 +361,7 @@ async fn test_read_windows_rolls_forward_expired_5h() {
     .await;
     let db = db_path.clone();
     let windows =
-        tokio::task::spawn_blocking(move || read_windows(&db, LlmProvider::Anthropic, now))
+        hunter::child::spawn_blocking(move || read_windows(&db, LlmProvider::Anthropic, now))
             .await
             .unwrap();
     let w = &windows["anthropic:5h"];
@@ -400,7 +400,7 @@ async fn test_read_windows_rolls_forward_expired_7d() {
     .await;
     let db = db_path.clone();
     let windows =
-        tokio::task::spawn_blocking(move || read_windows(&db, LlmProvider::Anthropic, now))
+        hunter::child::spawn_blocking(move || read_windows(&db, LlmProvider::Anthropic, now))
             .await
             .unwrap();
     let w = &windows["anthropic:7d"];
@@ -429,7 +429,7 @@ async fn test_read_windows_rolls_forward_multiple_missed_cycles() {
     .await;
     let db = db_path.clone();
     let windows =
-        tokio::task::spawn_blocking(move || read_windows(&db, LlmProvider::Anthropic, now))
+        hunter::child::spawn_blocking(move || read_windows(&db, LlmProvider::Anthropic, now))
             .await
             .unwrap();
     let w = &windows["anthropic:5h"];
@@ -453,7 +453,7 @@ async fn test_read_windows_null_resets_kept() {
     .await;
     let db = db_path.clone();
     let windows =
-        tokio::task::spawn_blocking(move || read_windows(&db, LlmProvider::Anthropic, now))
+        hunter::child::spawn_blocking(move || read_windows(&db, LlmProvider::Anthropic, now))
             .await
             .unwrap();
     let w = &windows["anthropic:5h"];
@@ -473,7 +473,7 @@ async fn test_read_windows_zero_resets_kept() {
     .await;
     let db = db_path.clone();
     let windows =
-        tokio::task::spawn_blocking(move || read_windows(&db, LlmProvider::Anthropic, now))
+        hunter::child::spawn_blocking(move || read_windows(&db, LlmProvider::Anthropic, now))
             .await
             .unwrap();
     let w = &windows["anthropic:5h"];
@@ -615,7 +615,7 @@ async fn test_read_windows_unreadable_db_is_logged() {
     std::fs::write(&db_path, b"this is not a sqlite database").unwrap();
     let now = now_ms();
     let db = db_path.clone();
-    let (windows, logs) = tokio::task::spawn_blocking(move || {
+    let (windows, logs) = hunter::child::spawn_blocking(move || {
         capture_logs(|| read_windows(&db, LlmProvider::Anthropic, now))
     })
     .await
@@ -650,7 +650,7 @@ async fn test_read_windows_empty_sources_log_nothing() {
     let empty_db = make_agent_db(&dir, &[]).await;
     let missing = PathBuf::from("/nonexistent/agent.db");
     let now = now_ms();
-    let ((), logs) = tokio::task::spawn_blocking(move || {
+    let ((), logs) = hunter::child::spawn_blocking(move || {
         capture_logs(|| {
             read_windows(&missing, LlmProvider::Anthropic, now);
             read_windows(&empty_db, LlmProvider::Anthropic, now);
@@ -707,7 +707,7 @@ async fn test_read_windows_undecodable_row_degrades() {
     insert_undecodable_row(&db_path).await;
 
     let db = db_path.clone();
-    let (windows, logs) = tokio::task::spawn_blocking(move || {
+    let (windows, logs) = hunter::child::spawn_blocking(move || {
         capture_logs(|| read_windows(&db, LlmProvider::Anthropic, now))
     })
     .await
@@ -778,7 +778,7 @@ async fn copilot_read_windows_selects_provider_not_limit_prefix() {
     .await;
 
     let windows =
-        tokio::task::spawn_blocking(move || read_windows(&db, LlmProvider::GitHubCopilot, now))
+        hunter::child::spawn_blocking(move || read_windows(&db, LlmProvider::GitHubCopilot, now))
             .await
             .unwrap();
     assert_eq!(
@@ -821,10 +821,11 @@ async fn copilot_read_windows_discards_expired_monthly_quota() {
             )],
         )
         .await;
-        let windows =
-            tokio::task::spawn_blocking(move || read_windows(&db, LlmProvider::GitHubCopilot, now))
-                .await
-                .unwrap();
+        let windows = hunter::child::spawn_blocking(move || {
+            read_windows(&db, LlmProvider::GitHubCopilot, now)
+        })
+        .await
+        .unwrap();
         assert!(
             windows.is_empty(),
             "expired quota was fabricated at {timestamp}: {windows:?}"

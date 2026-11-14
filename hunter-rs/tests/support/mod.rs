@@ -515,6 +515,48 @@ fn set_executable(path: &Path) {
 fn set_executable(_path: &Path) {}
 
 // ---------------------------------------------------------------------------
+// What parent-death signal a fake program was started with
+// ---------------------------------------------------------------------------
+
+/// A `sh` body for a fake program that reports the parent-death signal
+/// it was started with (`PR_GET_PDEATHSIG`; `/proc` does not show it):
+/// the number, 0 for none, written to `<dir>/<its pid>`. Then it exits
+/// 0, or with `stays_up` sleeps until it is ended.
+///
+/// python3 `exec`ed by the script, so it is the very process the spawn
+/// set up (a fork clears the setting): a re-executed test binary would
+/// read it on libtest's test thread, where it is never set, and
+/// `prctl` reports the calling thread's.
+pub fn parent_death_signal_reporter(dir: &Path, stays_up: bool) -> String {
+    let then = if stays_up { "time.sleep(600)" } else { "pass" };
+    format!(
+        "exec python3 -c '\nimport ctypes, os, time\nsig = ctypes.c_int()\n\
+         assert ctypes.CDLL(None).prctl(2, ctypes.byref(sig)) == 0\n\
+         out = os.path.join(\"{dir}\", str(os.getpid()))\n\
+         open(out + \".new\", \"w\").write(str(sig.value))\n\
+         os.replace(out + \".new\", out)\n{then}\n'",
+        dir = dir.display(),
+    )
+}
+
+/// What each [`parent_death_signal_reporter`] that has run so far wrote
+/// to `dir`, by pid.
+pub fn parent_death_signals(dir: &Path) -> std::collections::BTreeMap<u32, String> {
+    std::fs::read_dir(dir).map_or_else(
+        |_| std::collections::BTreeMap::new(),
+        |entries| {
+            entries
+                .flatten()
+                .filter_map(|e| {
+                    let pid = e.file_name().to_str()?.parse().ok()?;
+                    Some((pid, std::fs::read_to_string(e.path()).ok()?))
+                })
+                .collect()
+        },
+    )
+}
+
+// ---------------------------------------------------------------------------
 // A healthy auth broker and gateway
 // ---------------------------------------------------------------------------
 
@@ -1252,3 +1294,48 @@ pub const FORGE_HOST: &str = "forge.example";
 
 /// The provider a test backend's worker talks to (`ScriptedBackend::needing`).
 pub const PROVIDER_HOST: &str = "provider.example";
+
+// ---------------------------------------------------------------------------
+// Processes
+// ---------------------------------------------------------------------------
+
+/// How many live processes work in `dir` (their working directory is in
+/// it): a test's children and whatever they left, found without knowing
+/// their pids. A zombie has no working directory left and does not count.
+pub fn processes_in(dir: &Path) -> usize {
+    let dir = dir.canonicalize().expect("canonicalize the directory");
+    std::fs::read_dir("/proc")
+        .expect("list /proc")
+        .flatten()
+        .filter(|p| std::fs::read_link(p.path().join("cwd")).is_ok_and(|cwd| cwd.starts_with(&dir)))
+        .count()
+}
+
+/// Poll `done` every 20 ms until it holds or `within` has passed; whether
+/// it held.
+pub fn eventually(within: std::time::Duration, mut done: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        if done() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Move this test's process into a cgroup of its own, below the one it
+/// runs in, and return that cgroup. For a test that runs the daemon:
+/// `hunter::child::start` claims the cgroup its process runs in, and
+/// refuses one where another process's children run, as they do in the
+/// cgroup nextest's processes share.
+pub fn private_cgroup(label: &str) -> PathBuf {
+    require_process_isolation();
+    let own = hunter::child::own_cgroup().expect("a cgroup v2 hierarchy");
+    let dir = own.join(format!("test-{label}-{}", std::process::id()));
+    std::fs::create_dir(&dir).expect("make a cgroup: run the tests in a delegated one");
+    std::fs::write(dir.join("cgroup.procs"), "0").expect("move into the test's cgroup");
+    dir
+}

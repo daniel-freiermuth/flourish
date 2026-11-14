@@ -178,7 +178,7 @@ pub async fn disable_user(store: &Store, username: &str) -> anyhow::Result<()> {
 }
 
 async fn hash_off_runtime(password: String) -> anyhow::Result<String> {
-    tokio::task::spawn_blocking(move || hash_password(&password))
+    crate::child::spawn_blocking(move || hash_password(&password))
         .await
         .map_err(|e| anyhow::anyhow!("hashing password: {e}"))?
 }

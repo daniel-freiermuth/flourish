@@ -147,7 +147,7 @@ pub(super) async fn run_pr_review(
     // is this round's to answer (taken below).
     let read_at = crate::util::now_ms();
     let (url, kind) = (repo.url.clone(), repo.forge);
-    let viewed = tokio::task::spawn_blocking(move || forge::forge_for(kind).view_pr_meta(&url, n))
+    let viewed = crate::child::spawn_blocking(move || forge::forge_for(kind).view_pr_meta(&url, n))
         .await
         .unwrap_or_else(|e| Err(anyhow::anyhow!("forge task: {e}")));
     let pr = match viewed {
@@ -811,7 +811,7 @@ pub async fn read_posted_threads(
         cfg.review_bots.clone(),
     );
     let refs: Vec<String> = posted.iter().map(|(_, r)| r.clone()).collect();
-    let threads = tokio::task::spawn_blocking(move || {
+    let threads = crate::child::spawn_blocking(move || {
         let refs: Vec<&str> = refs.iter().map(String::as_str).collect();
         forge::forge_for(kind).review_threads(&url, n, &refs, &author, &bots)
     })
@@ -1032,7 +1032,7 @@ pub async fn sync_pr_reviews(
             }
         }
         let fg = forge::forge_for(review.forge);
-        let viewed = tokio::task::spawn_blocking(move || fg.view_pr_meta(&url, n)).await;
+        let viewed = crate::child::spawn_blocking(move || fg.view_pr_meta(&url, n)).await;
         let pr = match viewed {
             Ok(Ok(pr)) => pr,
             Ok(Err(e)) => {

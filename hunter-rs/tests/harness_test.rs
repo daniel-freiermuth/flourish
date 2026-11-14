@@ -1,9 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-//! Harness tests — JSONL ledger parsing and `kill_tree`.
+//! Harness tests — JSONL ledger parsing. `kill_tree` is `child_test.rs`'s.
 
 use std::fs;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 
 use hunter::backends::omp_scavenge::harness;
 
@@ -235,54 +234,4 @@ fn test_ledger_dir_usage_ignores_scratch_jsonl() {
         harness::ledger_dir_usage(&run).unwrap(),
         Some((top, 175, 1))
     );
-}
-
-// ============================================================
-// kill_tree — spawn a sleep, verify it dies
-// ============================================================
-
-#[test]
-fn test_kill_tree_terminates_process() {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-
-        let mut child = Command::new("sleep")
-            .arg("999")
-            .process_group(0)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn sleep");
-
-        // Still running
-        assert!(child.try_wait().unwrap().is_none());
-
-        hunter::util::kill_tree(&mut child);
-
-        // After kill_tree, wait() should return immediately (cached status)
-        let status = child.wait().expect("wait after kill_tree");
-        assert!(!status.success(), "process should have been killed");
-    }
-}
-
-#[test]
-fn test_kill_tree_already_exited() {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-
-        let mut child = Command::new("true")
-            .process_group(0)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn true");
-
-        // Wait for it to finish naturally
-        child.wait().expect("wait");
-
-        // kill_tree on an already-exited process should not panic
-        hunter::util::kill_tree(&mut child);
-    }
 }
