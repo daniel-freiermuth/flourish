@@ -4452,7 +4452,7 @@ const SIMPLIFICATION_SPEC: AnalysisSpec = AnalysisSpec {
     also_files: &[],
     out_plural: "simplifications",
     no_output_noun: "simplifications",
-    scope_note: "Scan for complexity the code no longer needs: generality with one user, unreachable variants and states, over-powered data structures, accreted special cases, duplicated state, scaffolding of removed features, custom constructs where the conventional one would do.",
+    scope_note: "Scan for complexity the code no longer needs: generality with one user, unreachable variants and states, over-powered data structures, accreted special cases, duplicated state, two solutions to one problem where one can take over, scaffolding of removed features, custom constructs where the conventional one would do.",
     prompt_builder: playbooks::build_simplification_prompt,
 };
 

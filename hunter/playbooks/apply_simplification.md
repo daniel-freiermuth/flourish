@@ -49,6 +49,11 @@ payers rely on must not change.
   thing, keep everything else
 - No new abstraction, helper layer or dependency. If the simpler design needs one, it is
   (b)
+- For `parallel-solutions`, (a) is only for a move nobody can observe: the survivor is used
+  as it stands and behaves the same for the users you move. If the survivor has to be
+  adapted, or the moved users would see anything different, it is (b): the plan names each
+  difference and who sees it. If moving them would need options, modes or callbacks that only
+  they use, keeping both is the answer, and that is a DECLINED.md
 - Never loosen a type to get there: no enum turned into a string or int, no struct into a
   map or tuple, no typed data into untyped JSON. The compiler or type checker must enforce
   at least as much after the change as before. A proposal that only works by loosening a

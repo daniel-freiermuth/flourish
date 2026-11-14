@@ -71,7 +71,7 @@ refused: a push over it would send your credentials unencrypted.
 | `refactor` | Conservative, safe, mechanical refactoring opportunities | `playbooks/refactor.md` |
 | `modernization` | SOTA-drift — deprecated deps, language-feature gaps, format/protocol shifts, CI/CD gaps, platform EOL | `playbooks/modernization.md` |
 | `standards` | Structural deviations from `CODING_STANDARDS.md` | `playbooks/standards.md` |
-| `simplification` | Complexity the code no longer needs — generality with one user, unreachable variants, over-powered data structures, accreted special cases, duplicated state, scaffolding of removed features, custom constructs where the conventional one would do. Never by loosening types | `playbooks/simplification.md` |
+| `simplification` | Complexity the code no longer needs — generality with one user, unreachable variants, over-powered data structures, accreted special cases, duplicated state, two solutions to one problem where one can take over, scaffolding of removed features, custom constructs where the conventional one would do. Never by loosening types | `playbooks/simplification.md` |
 
 All seven share one `findings` table (see [Data model](#data-model)) and one
 triage/fix pipeline; the UI's type filter and colored badges are the only
