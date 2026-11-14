@@ -2402,6 +2402,15 @@ const NOT_BLOCKING: &str = r#"[
 /// A review with no issue at all.
 const CLEAN: &str = "[]";
 
+/// The PR body of a fix whose review raised [`BLOCKING`] in round 1, and
+/// whose round 2 judged both addressed and raised nothing new: the
+/// fixer's description, then the review's summary, rendered from its
+/// record.
+const ANSWERED_BODY: &str = "the body\n\n## Review\n\nAn automated reviewer read this \
+    change in 2 rounds before its PR was opened, and raised 2 issues: 2 addressed, 0 \
+    rebutted, 0 unresolved.\n\n- Addressed: **the sibling parser still breaks**\n- \
+    Addressed: **a minor edge case**\n";
+
 /// A review whose only issue is outside the change's scope.
 const FOLLOW_UP_ONLY: &str = r#"[
   {"kind": "follow-up", "blocking": false, "file": "src/feed.rs", "line": 12,
@@ -2473,8 +2482,13 @@ enum Act {
     FixMore,
     /// The fixer continuing its transcript, then ending `.0` at once.
     ContinueThen(Ending),
-    /// A reviewer writing `.0` as its review.
+    /// A reviewer writing `.0` as its review, and judging every earlier
+    /// issue it is shown addressed.
     Review(&'static str),
+    /// A reviewer writing `.0` as its review, and judging every earlier
+    /// issue it is shown as `.1` says: with that verdict word, or, for
+    /// `None`, writing no verdicts file at all.
+    ReviewJudging(&'static str, Option<&'static str>),
     /// A reviewer that finishes without writing any review file.
     ReviewSilent,
     /// A reviewer that writes `.0` and is then killed at its cap, having
@@ -2508,9 +2522,15 @@ enum Act {
     /// untracked description included (`git add -A`), then writes a clean
     /// review.
     SweepingReview,
-    /// The fixer answering a review: one more fix commit and a Review
-    /// section in the description.
+    /// The fixer answering a review: one more fix commit, and every issue
+    /// it was sent answered `addressed` with that commit.
     Answer,
+    /// The fixer answering a review: every issue it was sent `rebutted`,
+    /// with no commit.
+    Rebut,
+    /// The fixer answering a review: one more fix commit, and `.0` written
+    /// verbatim as its answers file.
+    AnswerFile(&'static str),
     /// The fixer answering a review with report `.0` holding `.1`, ending
     /// as `.2` when given.
     Report(&'static str, &'static str, Option<Ending>),
@@ -2577,13 +2597,82 @@ fn ended(mut result: hunter::types::RunResult, ending: Ending) -> hunter::types:
 }
 
 /// The file a stub reviewer prompt names for its issues
-/// (`review {{BASE}} into {{OUT_PATH}}`).
+/// (`review {{BASE}} into {{OUT_PATH}}`, its first line).
 fn out_path(prompt: &str) -> std::path::PathBuf {
     let (_, out) = prompt
-        .trim()
-        .split_once(" into ")
+        .lines()
+        .next()
+        .and_then(|line| line.split_once(" into "))
         .expect("a reviewer prompt");
     std::path::PathBuf::from(out)
+}
+
+/// The JSON array of issues a stub prompt shows after its line starting
+/// with `marker` (`{{EARLIER_ISSUES}}`, `{{ISSUES}}`), if it has one.
+fn shown_issues(prompt: &str, marker: &str) -> Vec<serde_json::Value> {
+    let Some(at) = prompt.find(marker) else {
+        return Vec::new();
+    };
+    let rest = &prompt[at..];
+    let Some(open) = rest.find('[') else {
+        return Vec::new();
+    };
+    let close = rest.rfind(']').expect("the issues' JSON array");
+    serde_json::from_str(&rest[open..=close]).unwrap()
+}
+
+/// The ids of `issues`, as a prompt shows them.
+fn ids(issues: &[serde_json::Value]) -> Vec<i64> {
+    issues.iter().map(|i| i["id"].as_i64().unwrap()).collect()
+}
+
+/// What the stub prompt of a reviewer shown earlier issues names after
+/// `Verdicts file: `, and the earlier issues it shows.
+fn earlier_shown(prompt: &str) -> Option<(std::path::PathBuf, Vec<serde_json::Value>)> {
+    let path = prompt
+        .lines()
+        .find_map(|line| line.strip_prefix("Verdicts file: "))?;
+    Some((path.into(), shown_issues(prompt, "# Earlier issues")))
+}
+
+/// Judge every earlier issue a reviewer's `prompt` shows as `verdict`
+/// says ([`Act::ReviewJudging`]).
+fn judge_earlier(prompt: &str, verdict: Option<&str>) {
+    let (Some((path, earlier)), Some(word)) = (earlier_shown(prompt), verdict) else {
+        return;
+    };
+    let verdicts: Vec<_> = ids(&earlier)
+        .into_iter()
+        .map(|id| serde_json::json!({"id": id, "verdict": word, "note": "checked"}))
+        .collect();
+    std::fs::write(path, serde_json::to_string(&verdicts).unwrap()).unwrap();
+}
+
+/// The answers file a stub follow-up prompt names
+/// (`answer into {{ANSWERS_FILE}}`), and the issues it shows.
+fn answering(prompt: &str) -> (std::path::PathBuf, Vec<serde_json::Value>) {
+    let path = prompt
+        .lines()
+        .find_map(|line| line.strip_prefix("answer into "))
+        .expect("a follow-up prompt");
+    (path.into(), shown_issues(prompt, "answer into "))
+}
+
+/// Answer every issue a fixer's follow-up `prompt` shows as `answer`, with
+/// `commit` when given. A prompt that is not a follow-up's (a plain
+/// resume) has nothing to answer.
+fn answer_all(prompt: &str, answer: &str, commit: Option<&str>) {
+    if !prompt.contains("answer into ") {
+        return;
+    }
+    let (path, issues) = answering(prompt);
+    let answers: Vec<_> = ids(&issues)
+        .into_iter()
+        .map(|id| {
+            serde_json::json!({"id": id, "answer": answer, "text": "see the code", "commit": commit})
+        })
+        .collect();
+    std::fs::write(path, serde_json::to_string(&answers).unwrap()).unwrap();
 }
 
 /// A worker run that wrote report `name` holding `text`, ending as `result`
@@ -2696,21 +2785,25 @@ fn curate_as(
 /// A reviewer run `act` that touches the tree, if at all, without
 /// committing a file of its own. A review it writes is written with the
 /// tree's `git status --porcelain --ignored` as the reviewer found it
-/// ([`seen`]).
+/// ([`seen`]), and, but for [`Act::ReviewJudging`], judges every earlier
+/// issue it is shown addressed.
 fn review_as(run: &support::Run, act: Act) -> hunter::types::RunResult {
     let tree = run.tree.as_path();
     let found = git(tree, &["status", "--porcelain", "--ignored"]);
-    let reviewed = |review: &str| {
+    let judged = |review: &str, verdict: Option<&str>| {
         let out = out_path(&run.prompt);
         std::fs::write(out.with_extension("seen"), &found).unwrap();
         if let Ok(description) = std::fs::read(tree.join("PR-DESCRIPTION.md")) {
             std::fs::write(out.with_extension("description"), description).unwrap();
         }
         std::fs::write(out, review).unwrap();
+        judge_earlier(&run.prompt, verdict);
         support::done()
     };
+    let reviewed = |review: &str| judged(review, Some("addressed"));
     match act {
         Act::Review(review) => reviewed(review),
+        Act::ReviewJudging(review, verdict) => judged(review, verdict),
         Act::ReviewKilled(review) => {
             let mut result = ended(reviewed(review), Ending::Capped);
             result.tokens_new = run.cap_tokens.expect("a cap to be killed at");
@@ -2869,6 +2962,7 @@ fn run_act(run: &support::Run, i: usize, act: Act) -> hunter::types::RunResult {
         }
         Act::ContinueThen(ending) => ended(continued(), ending),
         act @ (Act::Review(_)
+        | Act::ReviewJudging(..)
         | Act::ReviewKilled(_)
         | Act::ReviewCrashed(_)
         | Act::SweepingReview
@@ -2901,9 +2995,17 @@ fn run_act(run: &support::Run, i: usize, act: Act) -> hunter::types::RunResult {
         }
         Act::Answer => {
             commit(&format!("ANSWER-{i}.md"), "fix: the sibling parser too");
-            let description = tree.join("PR-DESCRIPTION.md");
-            let body = std::fs::read_to_string(&description).unwrap();
-            std::fs::write(&description, format!("{body}\n\n## Review\naddressed")).unwrap();
+            let sha = git(tree, &["rev-parse", "HEAD"]);
+            answer_all(&run.prompt, "addressed", Some(sha.trim()));
+            continued()
+        }
+        Act::Rebut => {
+            answer_all(&run.prompt, "rebutted", None);
+            continued()
+        }
+        Act::AnswerFile(answers) => {
+            commit(&format!("ANSWER-{i}.md"), "fix: the sibling parser too");
+            std::fs::write(answering(&run.prompt).0, answers).unwrap();
             continued()
         }
         Act::Report(name, text, end) => report(tree, name, text, end, continued()),
@@ -3044,10 +3146,14 @@ fn review_on(f: &mut Fixture, rounds: u32) {
     let playbooks = f.cfg.root.join("playbooks");
     std::fs::write(
         playbooks.join("review.md"),
-        "review {{BASE}} into {{OUT_PATH}}\n",
+        "review {{BASE}} into {{OUT_PATH}}\n{{VERDICTS_FILE}}\n{{EARLIER_ISSUES}}",
     )
     .unwrap();
-    std::fs::write(playbooks.join("review_followup.md"), "answer {{ISSUES}}\n").unwrap();
+    std::fs::write(
+        playbooks.join("review_followup.md"),
+        "answer into {{ANSWERS_FILE}}\n{{ISSUES}}\n",
+    )
+    .unwrap();
     std::fs::write(
         playbooks.join("curate.md"),
         "curate {{BASE}} {{REVIEWED}}\n",
@@ -3250,10 +3356,10 @@ async fn a_blocking_issue_resumes_the_fixer_and_the_answer_ships_once_clean() {
         "fix: the real bug",
         "an answer to the review does not retitle the fix"
     );
-    assert_eq!(pr_body(&bins), "the body\n\n## Review\naddressed");
+    assert_eq!(pr_body(&bins), ANSWERED_BODY);
     let events = f.store.recent_events(20).await.unwrap();
     let reviews: Vec<_> = events.iter().filter(|e| e.kind == "review").collect();
-    assert_eq!(reviews.len(), 2, "{events:?}");
+    assert_eq!(reviews.len(), 3, "two rounds and the answer: {events:?}");
     assert!(
         reviews.iter().any(|e| e
             .message
@@ -3416,6 +3522,253 @@ async fn a_round_without_a_review_is_recorded_as_failed() {
     }
 }
 
+/// The fixture's fix review, as its loop reads it, for the chain job
+/// `origin` began.
+async fn fix_review(f: &Fixture, origin: Option<i64>) -> hunter::store::FixReview {
+    f.store.fix_review((f.fid, origin.unwrap())).await.unwrap()
+}
+
+/// The summaries `prompt` shows its issues by, in order, with their ids.
+fn shown(prompt: &str, marker: &str) -> Vec<(i64, String)> {
+    shown_issues(prompt, marker)
+        .iter()
+        .map(|i| {
+            let summary = i["summary"].as_str().unwrap().to_owned();
+            (i["id"].as_i64().unwrap(), summary)
+        })
+        .collect()
+}
+
+/// The fixer is sent every issue with the id it is recorded by, and its
+/// answer to each is recorded against that id and the round it answered,
+/// with the commit that fixes it. The next round's reviewer is shown the
+/// issues with those answers, and its verdict on each is recorded.
+#[tokio::test]
+async fn the_fixers_answers_and_the_next_reviewers_verdicts_are_recorded_per_issue() {
+    let bins = support::FakeBins::acquire("fix-review-answered");
+    bins.ok("gh", "https://github.com/acme/widget/pull/42");
+    let f = reviewed_fixture("fix-review-answered", 3).await;
+    let worker = reviewed_worker(vec![
+        Act::Fix,
+        Act::Review(BLOCKING),
+        Act::Answer,
+        Act::Review(CLEAN),
+    ]);
+
+    let summary = fix(&f, &worker).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    let review = fix_review(&f, summary.job_id).await;
+    let [first, second] = review.rounds[..] else {
+        panic!("two kept rounds: {review:?}");
+    };
+    let raised: Vec<(i64, String)> = review
+        .issues
+        .iter()
+        .map(|i| (i.id, i.issue.summary.clone()))
+        .collect();
+    let runs = worker.runs();
+    assert_eq!(shown(&runs[2].prompt, "answer into "), raised);
+    assert_eq!(shown(&runs[3].prompt, "# Earlier issues"), raised);
+    let (_, earlier) = earlier_shown(&runs[3].prompt).expect("round 2 judges round 1");
+    let answer_commit = &shipped_range(&f).0[0];
+    for (issue, shown) in review.issues.iter().zip(&earlier) {
+        assert_eq!(issue.round_id, first);
+        assert_eq!(issue.answers.len(), 1, "{issue:?}");
+        let answer = &issue.answers[0];
+        assert_eq!(answer.answer, hunter::store::AnswerKind::Addressed);
+        assert_eq!(answer.commit.as_ref(), Some(answer_commit));
+        assert_eq!(shown["answer"]["answer"], "addressed", "{shown}");
+        let verdicts: Vec<_> = issue
+            .verdicts
+            .iter()
+            .map(|v| (v.round_id, v.verdict, v.note.as_str()))
+            .collect();
+        assert_eq!(
+            verdicts,
+            [(second, hunter::store::IssueVerdict::Addressed, "checked")]
+        );
+    }
+    assert!(review.open().is_empty());
+}
+
+/// An earlier issue the next round judges still open goes back to the
+/// fixer with that round's new issues, and with why it is still open; the
+/// issues it settled do not.
+#[tokio::test]
+async fn an_issue_judged_open_goes_back_with_the_rounds_new_issues() {
+    let bins = support::FakeBins::acquire("fix-review-still-open");
+    bins.ok("gh", "https://github.com/acme/widget/pull/42");
+    let f = reviewed_fixture("fix-review-still-open", 3).await;
+    let worker = reviewed_worker(vec![
+        Act::Fix,
+        Act::Review(BLOCKING),
+        Act::Answer,
+        Act::ReviewJudging(NOT_BLOCKING, Some("open")),
+        Act::Answer,
+        Act::Review(CLEAN),
+    ]);
+
+    let summary = fix(&f, &worker).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    let runs = worker.runs();
+    assert_eq!(runs.len(), 6, "{runs:?}");
+    let resent: Vec<String> = shown(&runs[4].prompt, "answer into ")
+        .into_iter()
+        .map(|(_, summary)| summary)
+        .collect();
+    assert_eq!(
+        resent,
+        [
+            "the sibling parser still breaks",
+            "a minor edge case",
+            "the test misses the empty input",
+        ],
+        "blocking first, then the rest, oldest first"
+    );
+    let still_open = shown_issues(&runs[4].prompt, "answer into ");
+    assert_eq!(still_open[0]["still_open"], "checked");
+    assert!(still_open[2].get("still_open").is_none());
+    let events = f.store.recent_events(30).await.unwrap();
+    assert!(
+        events.iter().any(|e| e.message.ends_with(
+            "review round 2: 3 issues (1 blocking), 2 of them still open from earlier rounds; \
+             back to the fixer"
+        )),
+        "{events:?}"
+    );
+    assert!(
+        pr_body(&bins)
+            .contains("in 3 rounds before its PR was opened, and raised 3 issues: 3 addressed"),
+        "{}",
+        pr_body(&bins)
+    );
+}
+
+/// A rebuttal the next round accepts settles its issue: it is not sent
+/// back, and the PR body counts it as rebutted. One claimed accepted for an
+/// issue the fixer did not rebut is no verdict: the issue stays open.
+#[tokio::test]
+async fn an_accepted_rebuttal_settles_its_issue() {
+    let bins = support::FakeBins::acquire("fix-review-rebutted");
+    bins.ok("gh", "https://github.com/acme/widget/pull/42");
+    let f = reviewed_fixture("fix-review-rebutted", 3).await;
+    let worker = reviewed_worker(vec![
+        Act::Fix,
+        Act::Review(BLOCKING),
+        Act::Rebut,
+        Act::ReviewJudging(NOT_BLOCKING, Some("rebuttal-accepted")),
+        Act::Answer,
+        Act::ReviewJudging(CLEAN, Some("rebuttal-accepted")),
+        Act::Answer,
+        Act::Review(CLEAN),
+    ]);
+
+    let summary = fix(&f, &worker).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("held"), "{summary:?}");
+    let runs = worker.runs();
+    assert_eq!(runs.len(), 6, "no answer after the last round: {runs:?}");
+    let summaries = |prompt: &str, marker: &str| -> Vec<String> {
+        shown(prompt, marker).into_iter().map(|(_, s)| s).collect()
+    };
+    assert_eq!(
+        summaries(&runs[4].prompt, "answer into "),
+        ["the test misses the empty input"],
+        "the rebutted issues are settled"
+    );
+    // Round 3 claims a rebuttal accepted for an issue that was addressed,
+    // not rebutted: no verdict, so it is still open after the last round.
+    let hold = held(&f).await.expect("held");
+    assert!(
+        hold.detail.contains("round 3 (the last of 3 rounds)")
+            && hold.detail.contains("the test misses the empty input")
+            && !hold.detail.contains("the sibling parser still breaks"),
+        "{}",
+        hold.detail
+    );
+    let review = fix_review(&f, summary.job_id).await;
+    let rebutted = Some(hunter::store::IssueVerdict::RebuttalAccepted);
+    let settled: Vec<_> = review
+        .issues
+        .iter()
+        .map(hunter::store::ChainIssue::settled)
+        .collect();
+    assert_eq!(settled, [rebutted, rebutted, None]);
+}
+
+/// Issues still open after the last round hold the fix: whether its
+/// reviewer judged them open, or wrote no verdicts at all, which is no
+/// verdict, so they stay open. A reviewer that never judges cannot keep
+/// the loop going past `review.maxRounds`.
+#[tokio::test]
+async fn earlier_issues_left_open_by_the_last_round_hold_the_fix() {
+    for verdict in [Some("open"), None] {
+        let bins = support::FakeBins::acquire("fix-review-open-at-last");
+        bins.ok("gh", "https://github.com/acme/widget/pull/42");
+        let f = reviewed_fixture("fix-review-open-at-last", 2).await;
+        let worker = reviewed_worker(vec![
+            Act::Fix,
+            Act::Review(BLOCKING),
+            Act::Answer,
+            Act::ReviewJudging(CLEAN, verdict),
+        ]);
+
+        let summary = fix(&f, &worker).await;
+
+        assert_eq!(summary.outcome.as_deref(), Some("held"), "{verdict:?}");
+        assert_eq!(worker.runs().len(), 4, "{verdict:?}");
+        assert!(bins.calls_to("gh").is_empty(), "{verdict:?}: no PR");
+        let detail = held(&f).await.expect("held").detail;
+        assert!(
+            detail.contains("round 2 (the last of 2 rounds)")
+                && detail.contains("- [blocking] **the sibling parser still breaks**")
+                && detail.contains("**a minor edge case**"),
+            "{verdict:?}: {detail}"
+        );
+        drop(bins);
+    }
+}
+
+/// An answers file the fixer left unreadable records no answer: the
+/// issues stay unanswered, and the next reviewer is shown them without
+/// one and still judges them.
+#[tokio::test]
+async fn an_unreadable_answers_file_leaves_the_issues_unanswered_and_judged() {
+    let bins = support::FakeBins::acquire("fix-review-bad-answers");
+    bins.ok("gh", "https://github.com/acme/widget/pull/42");
+    let f = reviewed_fixture("fix-review-bad-answers", 3).await;
+    let worker = reviewed_worker(vec![
+        Act::Fix,
+        Act::Review(BLOCKING),
+        Act::AnswerFile("addressed, all of them"),
+        Act::Review(CLEAN),
+    ]);
+
+    let summary = fix(&f, &worker).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    let runs = worker.runs();
+    let (_, earlier) = earlier_shown(&runs[3].prompt).expect("round 2 judges round 1");
+    assert_eq!(earlier.len(), 2);
+    assert!(
+        earlier.iter().all(|i| i.get("answer").is_none()),
+        "{earlier:?}"
+    );
+    let review = fix_review(&f, summary.job_id).await;
+    assert!(review.issues.iter().all(|i| i.answers.is_empty()));
+    assert!(review.open().is_empty(), "judged addressed all the same");
+    let events = f.store.recent_events(30).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.message.contains("the fixer's answers were not read")),
+        "{events:?}"
+    );
+    assert_eq!(pr_body(&bins), ANSWERED_BODY);
+}
+
 /// Non-blocking issues left after the last round hold the fix as a
 /// blocking one does: a review still finding something after its last
 /// round is not converging, so nothing ships on the hope the rest is
@@ -3558,8 +3911,13 @@ async fn a_continued_review_hold_answers_the_issues_and_is_reviewed_again() {
     );
     let body = pr_body(&bins);
     assert!(
-        body.starts_with("the body\n\n## Review\naddressed\n\n## Review\naddressed\n\n"),
-        "{body}"
+        body.starts_with(
+            "the body\n\n## Review\n\nAn automated reviewer read this change in 3 rounds \
+             before its PR was opened, and raised 3 issues: 3 addressed, 0 rebutted, 0 \
+             unresolved.\n\n- Addressed: **the sibling parser still breaks**\n- Addressed: \
+             **the sibling parser still breaks**\n- Addressed: **a minor edge case**\n\n"
+        ),
+        "the review's summary covers the rounds before the hold: {body}"
     );
     assert!(
         body.contains("## Follow-ups from review")
@@ -3625,7 +3983,8 @@ async fn a_continued_review_hold_sends_its_issues_once() {
 /// A `review-held.json` an earlier daemon wrote (`report` and `issues`,
 /// no `sent`) is pending only for a `continue` of its own hold, as that
 /// daemon read it: left behind once its issues were answered, it does not
-/// send them again on a later hold's `continue`.
+/// send them again on a later hold's `continue`. The issues sent are the
+/// review's open ones, as recorded, never the file's.
 #[tokio::test]
 async fn a_legacy_review_hold_file_sends_its_issues_only_on_its_own_hold() {
     let legacy = |report: &str| {
@@ -3657,7 +4016,10 @@ async fn a_legacy_review_hold_file_sends_its_issues_only_on_its_own_hold() {
 
     assert_eq!(summary.outcome.as_deref(), Some("held"), "{summary:?}");
     let prompt = &answering.runs()[0].prompt;
-    assert!(prompt.contains("a legacy issue"), "its own hold: {prompt}");
+    assert!(
+        prompt.contains("the sibling parser still breaks") && !prompt.contains("a legacy issue"),
+        "its own hold, with the review's open issues: {prompt}"
+    );
 
     // As the earlier daemon left it after the fixer answered: the file
     // stays, naming the review's hold, while a later hold is continued.
@@ -3677,7 +4039,8 @@ async fn a_legacy_review_hold_file_sends_its_issues_only_on_its_own_hold() {
     assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
     let prompt = &resumed.runs()[0].prompt;
     assert!(
-        prompt.contains("needs the vendor's spec") && !prompt.contains("a legacy issue"),
+        prompt.contains("needs the vendor's spec")
+            && !prompt.contains("the sibling parser still breaks"),
         "{prompt}"
     );
 }
@@ -3836,7 +4199,12 @@ async fn a_spent_grant_suspends_the_review_and_the_resume_answers_its_issues() {
         );
         assert!(runs[1].prompt.starts_with("review"), "{}", runs[1].prompt);
         assert_eq!(shipped_subject(&f), "fix: the sibling parser too");
-        assert_eq!(pr_body(&bins), "the body\n\n## Review\naddressed");
+        let body = pr_body(&bins);
+        assert!(
+            body.starts_with("the body\n\n## Review\n\n")
+                && body.contains(&format!("- Addressed: **{summary_of}**")),
+            "{body}"
+        );
         drop(bins);
     }
 }
@@ -4238,7 +4606,7 @@ async fn a_fixer_suspended_mid_answer_ships_nothing_and_its_resume_reviews_the_n
         review_dir(&runs[0].session, summary.job_id, 2)
     );
     assert_eq!(shipped_subject(&f), "fix: half of the answer");
-    assert_eq!(pr_body(&bins), "the body");
+    assert_eq!(pr_body(&bins), ANSWERED_BODY);
     assert_eq!(
         pr_title(&bins),
         "fix: the real bug",
@@ -5633,6 +6001,7 @@ async fn every_review_run_gets_the_full_per_run_wall_limit() {
             }
             _ => {
                 std::fs::write(out_path(&run.prompt), CLEAN).unwrap();
+                judge_earlier(&run.prompt, Some("addressed"));
                 support::done()
             }
         }
@@ -5795,7 +6164,12 @@ async fn a_review_with_only_non_blocking_issues_is_answered_before_shipping() {
         runs[2].prompt
     );
     assert_eq!(shipped_subject(&f), "fix: the sibling parser too");
-    assert_eq!(pr_body(&bins), "the body\n\n## Review\naddressed");
+    assert_eq!(
+        pr_body(&bins),
+        "the body\n\n## Review\n\nAn automated reviewer read this change in 2 rounds before \
+         its PR was opened, and raised 1 issue: 1 addressed, 0 rebutted, 0 unresolved.\n\n- \
+         Addressed: **the test misses the empty input**\n"
+    );
 }
 
 /// By default the review runs up to seven rounds: a reviewer that keeps
@@ -6778,12 +7152,21 @@ async fn a_committed_then_updated_description_is_reviewed_every_round() {
     assert_eq!(seen(&runs[1]), " M PR-DESCRIPTION.md\n");
     assert_eq!(described(&runs[1]), "the updated body");
     assert_eq!(seen(&runs[3]), " M PR-DESCRIPTION.md\n");
-    let answered = "the updated body\n\n## Review\naddressed";
-    assert_eq!(described(&runs[3]), answered);
-    assert_eq!(pr_body(&bins), answered, "shipped as reviewed");
+    // The answer leaves the description alone: the review's account is the
+    // daemon's, rendered into the PR body.
+    assert_eq!(described(&runs[3]), "the updated body");
+    assert_eq!(
+        pr_body(&bins),
+        ANSWERED_BODY.replacen("the body", "the updated body", 1),
+        "shipped as reviewed"
+    );
     let events = f.store.recent_events(30).await.unwrap();
     let reviews: Vec<_> = events.iter().filter(|e| e.kind == "review").collect();
-    assert_eq!(reviews.len(), 3, "two rounds and the revert: {events:?}");
+    assert_eq!(
+        reviews.len(),
+        4,
+        "two rounds, the answer and the revert: {events:?}"
+    );
     assert!(
         !events
             .iter()
@@ -7509,11 +7892,7 @@ async fn a_curation_that_changes_the_tree_ships_the_original_commits() {
             "{how:?}: {events:?}"
         );
         assert_eq!(fix_streak(&f).await.streak, 0, "{how:?}");
-        assert_eq!(
-            pr_body(&bins),
-            "the body\n\n## Review\naddressed",
-            "{how:?}"
-        );
+        assert_eq!(pr_body(&bins), ANSWERED_BODY, "{how:?}");
         assert!(
             !worker.runs()[0].tree.join("curation.log").exists(),
             "{how:?}"
@@ -7716,7 +8095,7 @@ async fn a_curation_the_daemon_died_in_is_undone_and_had_again() {
     assert_eq!(runs.len(), 1, "no fixer, no new review: the curation");
     assert!(runs[0].prompt.starts_with("curate"), "{}", runs[0].prompt);
     assert_eq!(shipped_commits(&f), ["fix: the real bug, curated"]);
-    assert_eq!(pr_body(&bins), "the body\n\n## Review\naddressed");
+    assert_eq!(pr_body(&bins), ANSWERED_BODY);
     let events = f.store.recent_events(40).await.unwrap();
     assert!(
         events.iter().any(|e| e.message.contains(

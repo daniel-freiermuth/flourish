@@ -5515,8 +5515,9 @@ async fn hold_on_report(
 /// released. The playbook builders run on a resume too: the session
 /// already holds the playbook, but a builder that fails is a
 /// configuration fault worth surfacing on either path.
-fn fix_prompt(
+async fn fix_prompt(
     cfg: &Config,
+    store: &Store,
     resume: Option<&ResumePlan>,
     start: &FixStart,
 ) -> anyhow::Result<(String, bool)> {
@@ -5565,7 +5566,7 @@ fn fix_prompt(
         return Ok((publish_only_prompt(detail), false));
     }
     if let Some((_, detail)) = resume.and_then(ResumePlan::after_hold)
-        && let Some(held) = review::held_resume_prompt(cfg, start, detail)
+        && let Some(held) = review::held_resume_prompt(cfg, store, start, detail).await
     {
         return held.map(|prompt| (prompt, true));
     }
@@ -6700,7 +6701,7 @@ pub async fn run_fix(
             || (r.after_hold().is_none()
                 && review::suspended_between_runs(&start, r.predecessor_id()))
     });
-    let (prompt, answers_held) = match fix_prompt(cfg, resume, &start) {
+    let (prompt, answers_held) = match fix_prompt(cfg, store, resume, &start).await {
         Ok(prompted) => prompted,
         Err(e) => {
             release_claim(claim).await;

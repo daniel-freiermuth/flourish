@@ -130,20 +130,27 @@ new ──recheck──> new / superseded / rejected
   the change reads the whole branch diff and writes its issues outside
   the tree. Every issue it raises (blocking or not; `blocking` ranks
   them) goes back to the fixer's own session
-  (`playbooks/review_followup.md`), which fixes each one with commits or
-  rebuts it with evidence in a `## Review` section of
-  `PR-DESCRIPTION.md` (or declines or writes `BLOCKED.md` after all);
-  then the whole branch is reviewed again, until a review raises no
-  issue or `review.maxRounds` reviews have run. The reviewer reads the
-  `## Review` section and does not raise a rebutted issue again without
-  new code evidence. Defects outside the change's scope are reported as
-  `follow-up`s: never answered and never keeping the loop going, they are
-  collected across rounds and ship in a "## Follow-ups from review"
-  section of the PR body. When issues are left after the last round, any
-  of them holds the fix for you like a `BLOCKED.md`, with the remaining
-  issues as the hold's report: a review still finding something after
-  `review.maxRounds` rounds is not converging. `continue` resumes the
-  fixer on them and the review runs again. When the grant is spent before
+  (`playbooks/review_followup.md`) with the id it is recorded by; the
+  fixer fixes each one with commits or rebuts it with evidence, and
+  answers each by id in an answers file outside the tree (or declines or
+  writes `BLOCKED.md` after all). Then the whole branch is reviewed
+  again: the reviewer is shown the issues still open with the fixer's
+  answers, judges each by id (`addressed`, `rebuttal-accepted` or
+  `open`), and raises new issues only for defects not already among
+  them. An issue it judges open, or does not judge at all, goes back to
+  the fixer with the round's new ones, until a round raises none and
+  leaves none open, or `review.maxRounds` reviews have run. Rounds,
+  issues, answers and verdicts are recorded in the fix's review (the
+  finding's detail shows them), and the PR body gets a short summary of
+  the review rendered from that record. Defects outside the change's
+  scope are reported as `follow-up`s: never answered and never keeping
+  the loop going, they are collected across rounds and ship in a
+  "## Follow-ups from review" section of the PR body. When issues are
+  left open after the last round, any of them holds the fix for you like
+  a `BLOCKED.md`, with the remaining issues as the hold's report: a
+  review still finding something after `review.maxRounds` rounds is not
+  converging. `continue` resumes the fixer on the issues still open and
+  the review runs again. When the grant is spent before
   the review is through (before a round, by a reviewer killed at its cap,
   or before the fixer can answer a round), the job is suspended, and its
   resume, under a fresh grant, answers the issues left or has the

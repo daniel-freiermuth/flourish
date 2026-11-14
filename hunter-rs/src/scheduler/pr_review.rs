@@ -36,12 +36,10 @@ mod post;
 
 pub use post::post_pr_reviews;
 
-use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::ops::ControlFlow;
-use std::path::Path;
 
-use super::review::{parse_review, tree_state};
+use super::review::{Judged, parse_review, parse_verdicts, tree_state};
 use super::{
     BudgetDecision, CycleSummary, Fetcher, WorkOf, budget_gate, close_workspace, fetch_held,
     job_refused, log_write_failure, offline_denial, open_workspace, record_job, runner_failed,
@@ -628,10 +626,6 @@ pub(super) async fn run_pr_review(
     })
 }
 
-/// The longest verdict note kept: one sentence of evidence, not an essay
-/// to post on somebody's PR.
-const NOTE_CAP_CHARS: usize = 600;
-
 /// The longest reply kept: every reply of every earlier issue goes into
 /// the next round's prompt, and one pasted log must not crowd out the rest.
 const REPLY_CAP_CHARS: usize = 4000;
@@ -644,55 +638,29 @@ fn capped_reply(body: String) -> String {
     }
 }
 
-/// The reviewer's verdicts on `earlier` from the file at `path`, read
-/// leniently: an entry naming no issue it was shown, or with a verdict
-/// word it does not know, is no verdict, and an issue named twice keeps
-/// its first. Silence is never a verdict: an issue the file does not name
-/// stays as it was. A rebuttal can only be accepted where somebody other
-/// than hunter replied in the issue's thread; claimed anywhere else it is
-/// no verdict either. `Err` when there is no usable file at all.
-fn parse_verdicts(path: &Path, earlier: &[EarlierIssue]) -> Result<Vec<Verdict>, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("no verdict file: {e}"))?;
-    let entries: Vec<serde_json::Value> =
-        serde_json::from_str(&text).map_err(|e| format!("unparseable verdict file: {e}"))?;
-    let mut named: HashSet<i64> = HashSet::new();
-    let mut verdicts = Vec::new();
-    for entry in &entries {
-        let Some(id) = entry.get("id").and_then(serde_json::Value::as_i64) else {
-            continue;
-        };
-        let Some(issue) = earlier.iter().find(|i| i.id == id) else {
-            continue;
-        };
-        let Some(verdict) = entry
-            .get("verdict")
-            .and_then(serde_json::Value::as_str)
-            .and_then(IssueVerdict::parse)
-        else {
-            continue;
-        };
-        let argued = issue.replies.iter().any(|r| !r.own);
-        if verdict == IssueVerdict::RebuttalAccepted && !argued {
-            continue;
-        }
-        if !named.insert(id) {
-            continue;
-        }
-        let note = entry
-            .get("note")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .trim();
-        verdicts.push(Verdict {
-            issue_id: id,
-            verdict,
-            note: note.chars().take(NOTE_CAP_CHARS).collect(),
-            answers_reply_at: issue.awaited_reply(),
-            seen_reopened_at: issue.reopened_at,
-            seen_reply_at: issue.newest_reply_at(),
-        });
+/// A PR review's earlier issue, as its round's verdicts are read
+/// ([`parse_verdicts`]): a rebuttal can only be accepted where somebody
+/// other than hunter replied in the issue's thread, and each verdict
+/// keeps what the round was shown of that thread.
+impl Judged for EarlierIssue {
+    fn id(&self) -> i64 {
+        self.id
     }
-    Ok(verdicts)
+
+    fn rebutted(&self) -> bool {
+        self.replies.iter().any(|r| !r.own)
+    }
+
+    fn verdict(&self, verdict: IssueVerdict, note: &str) -> Verdict {
+        Verdict {
+            issue_id: self.id,
+            verdict,
+            note: note.to_owned(),
+            answers_reply_at: self.awaited_reply(),
+            seen_reopened_at: self.reopened_at,
+            seen_reply_at: self.newest_reply_at(),
+        }
+    }
 }
 
 /// Whether `judged`, the verdicts read from a round's file (if any), holds

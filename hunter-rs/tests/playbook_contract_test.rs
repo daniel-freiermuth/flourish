@@ -224,38 +224,61 @@ fn apply_prompts_render() {
     }
 }
 
-/// The fix's pre-PR review: `review.md` for a finding's proposed change.
-fn fix_review_prompt(notes: &str, out: &Path) -> String {
+/// The fix's pre-PR review: `review.md` for a finding's proposed change,
+/// with the issues an earlier round left open when there are any.
+fn fix_review_prompt(notes: &str, out: &Path, earlier: Option<&str>) -> String {
     playbooks::build_review_prompt(
         &root(),
         &sample_finding(FindingType::Bug),
         Path::new("/tmp/worktree"),
         "abc123",
         "the author's description",
-        out,
+        playbooks::ReviewOutputs {
+            issues: out,
+            earlier: Path::new("/tmp/hunter-playbook-contract/verdicts.json"),
+        },
+        earlier,
         &sample_repo(),
         notes,
     )
     .expect("review.md must render with the slots build_review_prompt supplies")
 }
 
+/// An issue an earlier round of a fix's review left open, with the
+/// fixer's answer, as the fix's reviewer and fixer are shown it.
+const FIX_EARLIER: &str = r#"[{"id": 41, "summary": "drops the last row", "answer": {"answer": "rebutted", "text": "rows are never empty"}}]"#;
+
 #[test]
 fn review_prompts_render() {
-    let prompt = fix_review_prompt("repo notes", &out_path());
+    let prompt = fix_review_prompt("repo notes", &out_path(), None);
     assert_usable("review", &prompt);
-    // A fix's review has no earlier issues to judge, nor a file for it.
+    // A fix's first round has no earlier issues to judge, nor a file for it.
     assert!(!prompt.contains("Verdicts file"), "{prompt}");
-    assert!(!prompt.contains("# Earlier issues"), "{prompt}");
-    assert!(prompt.contains("## Review"), "{prompt}");
+    assert!(!prompt.contains("# Earlier issues\n"), "{prompt}");
+    // A later round's reviewer judges the issues still open by id.
+    let prompt = fix_review_prompt("repo notes", &out_path(), Some(FIX_EARLIER));
+    assert_usable("review", &prompt);
+    assert!(
+        prompt.contains("Verdicts file: /tmp/hunter-playbook-contract/verdicts.json"),
+        "{prompt}"
+    );
+    assert!(prompt.contains(FIX_EARLIER), "{prompt}");
+    assert!(!prompt.contains("## Review"), "{prompt}");
+    let answers = Path::new("/tmp/hunter-playbook-contract/answers.json");
     let prompt = playbooks::build_review_followup_prompt(
         &root(),
         Path::new("/tmp/worktree"),
         "abc123",
-        "[{\"blocking\": true, \"summary\": \"an issue\"}]",
+        FIX_EARLIER,
+        answers,
         "NOT-A-BUG.md",
     )
     .expect("review_followup.md must render with its builder's slots");
     assert_usable("review_followup", &prompt);
+    // The fixer is told where to answer, and not to answer in its
+    // description.
+    assert!(prompt.contains(&answers.display().to_string()), "{prompt}");
+    assert!(!prompt.contains("\"## Review\""), "{prompt}");
     let prompt = playbooks::build_curate_prompt(
         &root(),
         Path::new("/tmp/worktree"),
@@ -367,7 +390,7 @@ fn review_prompts_keep_round_data_after_the_instructions() {
             .to_owned()
     };
     let finding = sample_finding(FindingType::Bug);
-    let fix = fix_review_prompt("repo notes", &out_path());
+    let fix = fix_review_prompt("repo notes", &out_path(), Some(FIX_EARLIER));
     let static_part = instructions(&fix);
     for round_data in [
         "repo notes",
@@ -376,6 +399,7 @@ fn review_prompts_keep_round_data_after_the_instructions() {
         "/tmp/hunter-playbook-contract",
         finding.summary.as_str(),
         "the author's description",
+        "rows are never empty",
     ] {
         assert!(fix.contains(round_data), "{fix}");
         assert!(!static_part.contains(round_data), "{round_data}: {fix}");

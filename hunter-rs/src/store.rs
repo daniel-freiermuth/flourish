@@ -53,13 +53,16 @@ mod pr_state;
 mod review;
 
 pub use pr_review::{
-    ApprovedRound, EarlierIssue, HEAD_STABLE_MS, InlineState, IssueVerdict, NewPrReview,
-    POST_GIVE_UP_AT, PR_REVIEW_HOLD_AT, PR_REVIEW_RETRY_MS, PostDecided, PostDecision,
-    PostableIssue, PrReviewRound, PrReviewRow, REPLY_QUIET_MS, Reply, Requested, Said, ThreadSeen,
-    ThreadSteps, ThreadToSettle, ThreadsRead, Trust, Verdict,
+    ApprovedRound, EarlierIssue, HEAD_STABLE_MS, InlineState, NewPrReview, POST_GIVE_UP_AT,
+    PR_REVIEW_HOLD_AT, PR_REVIEW_RETRY_MS, PostDecided, PostDecision, PostableIssue, PrReviewRound,
+    PrReviewRow, REPLY_QUIET_MS, Reply, Requested, Said, ThreadSeen, ThreadSteps, ThreadToSettle,
+    ThreadsRead, Trust,
 };
 pub use pr_state::{PrRead, PrSyncPass};
-pub use review::{FixReviewRound, ReportedIssue};
+pub use review::{
+    AnswerKind, ChainIssue, FixReview, FixReviewRound, IssueAnswer, IssueJudged, IssueVerdict,
+    ReportedIssue, Verdict,
+};
 
 /// A `pr_state` row as the store read it ([`Store::get_pr_state`]).
 ///
@@ -6134,8 +6137,9 @@ impl JobStore {
     }
 
     /// Record one round of the review of `finding_id`'s fix chain that
-    /// job `origin_job_id` began, run by job `job_id`, with its issues.
-    /// See the private `Store` method of the same name.
+    /// job `origin_job_id` began, run by job `job_id`, with its issues and
+    /// its verdicts on earlier ones. See the private `Store` method of the
+    /// same name.
     pub async fn record_fix_review_round(
         &self,
         chain: (i64, i64),
@@ -6146,6 +6150,19 @@ impl JobStore {
     ) -> sqlx::Result<i64> {
         self.0
             .record_fix_review_round(chain, job_id, range, tokens_new, round)
+            .await
+    }
+
+    /// Record the answers job `job_id`'s fixer gave to the issues of the
+    /// fix chain's review. See the private `Store` method of the same name.
+    pub async fn record_fix_review_answers(
+        &self,
+        chain: (i64, i64),
+        job_id: i64,
+        answers: &[(i64, IssueAnswer)],
+    ) -> sqlx::Result<usize> {
+        self.0
+            .record_fix_review_answers(chain, job_id, answers)
             .await
     }
 }

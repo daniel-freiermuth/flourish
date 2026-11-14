@@ -525,26 +525,51 @@ struct ReviewRules {
 }
 
 /// The pre-PR review of a fix: its issues go back to the fixer, round
-/// after round, and its earlier rounds are answered in the description.
+/// after round, and the issues earlier rounds left open come with the
+/// fixer's answers and are judged by id.
 const FIX_REVIEW: ReviewRules = ReviewRules {
     discarded: "A review that changes the worktree is discarded.",
     answered: "\
 Every issue other than a follow-up goes back to the author, who must fix or
-rebut it, and the review repeats until a round reports none: an issue that
-is not worth that round trip does not belong in the file. A follow-up is
-handed to the human.",
+rebut it, and the review repeats until a round reports none and leaves no
+earlier one open: an issue that is not worth that round trip does not
+belong in the file. A follow-up is handed to the human.",
     earlier_rounds: "\
 # Earlier rounds
-If the author's PR description below has a \"## Review\" section, it is the
-author's answer to earlier review rounds: each issue listed as addressed
-(and how) or rebutted (with evidence). Read it before you report anything.
-- An addressed issue: check the fix in the code. Report it again only if it
-  is still broken, and say what the fix missed.
-- A rebutted issue: do NOT raise it again unless you refute the rebuttal
-  with NEW code evidence (file:line, a test or a trace) that the rebuttal
-  does not already account for. Restating the original concern is not a
-  refutation. When you do re-raise one, quote the rebuttal in `detail` and
-  show where it is wrong.",
+\"# Earlier issues\" near the end, when there is one, lists the issues
+earlier review rounds raised on this change that are still open. Each has
+an `id`, the author's `answer` when it gave one (`addressed`, with how and
+the commit, or `rebutted`, with its evidence), and, under `still_open`,
+why the last round that judged it did not accept that. Review the whole
+change as usual, but do NOT report an issue from the list again (judge it
+below instead): report a new issue only for a defect that is not already
+among them.
+
+## Judge every earlier issue
+Create the verdicts file (named under \"# Where to write\" at the end)
+containing `[]` as one of your first actions, next to the issues file. For
+each earlier issue, check it and the author's answer against the code at
+HEAD, and after each one rewrite the complete file with every verdict so
+far:
+
+```json
+[{\"id\": 12, \"verdict\": \"addressed\", \"note\": \"one sentence, with evidence\"}]
+```
+
+- `addressed`: the code at HEAD no longer has the problem. Verify it in the
+  code; an answer saying \"fixed\" is not evidence. The note names the
+  file:line or commit that fixes it.
+- `rebuttal-accepted`: the author rebutted it, and you checked the
+  rebuttal against the code and it holds. Never accept one on the author's
+  confidence alone; if you cannot confirm the argument in the code, the
+  issue stays `open`. The note says why the rebuttal holds.
+- `open`: it still stands. The note says what still breaks, and, for a
+  rebutted issue, the NEW code evidence (file:line, a test or a trace)
+  that refutes the rebuttal; restating the original concern is not a
+  refutation.
+
+An issue you do not list stays open and goes back to the author: never
+leave one out to make it go away.",
     issue_use: "\
 `blocking` ranks issues for the author and the human, and every issue but a
 follow-up is answered either way. An issue still open when the last review
@@ -618,8 +643,9 @@ struct ReviewSubject {
     /// What is reviewed and who wrote it (`{{SUBJECT}}`).
     subject: String,
     /// `{{REPLIES_ONLY}}`, `{{EARLIER_ISSUES}}` and `{{VERDICTS_FILE}}`:
-    /// a PR review's alone, empty for a fix's. Each a block of its own,
-    /// with the blank line that ends it.
+    /// empty where the round has none (a fix's review has no replies, nor
+    /// earlier issues on its first round). Each a block of its own, with
+    /// the blank line that ends it.
     replies_only: String,
     earlier_issues: String,
     verdicts_file: String,
@@ -653,14 +679,18 @@ fn build_reviewer_prompt(
 
 /// The pre-PR reviewer's prompt (`review.md`): a fresh session that reviews
 /// `<base>..HEAD` in `worktree` against the finding and the author's PR
-/// description, and writes its issues to `out_path`, outside the tree.
+/// description, and writes its issues to `out.issues`, outside the tree.
+/// `earlier`, when an earlier round left issues open, is them as JSON, with
+/// their ids and the author's answers: the reviewer judges each, writing
+/// its verdicts to `out.earlier`, as a PR review's reviewer does.
 pub fn build_review_prompt(
     root: &Path,
     finding: &Finding,
     worktree: &Path,
     base: &str,
     pr_description: &str,
-    out_path: &Path,
+    out: ReviewOutputs<'_>,
+    earlier: Option<&str>,
     repo: &Repo,
     repo_notes: &str,
 ) -> Result<String> {
@@ -680,18 +710,25 @@ it describes, in the scenario it reports.
         repo = repo.name,
         finding = finding_json(finding),
     );
+    let (earlier_issues, verdicts_file) = match earlier {
+        Some(earlier) => (
+            format!("# Earlier issues\n```json\n{earlier}\n```\n\n"),
+            format!("Verdicts file: {}", out.earlier.display()),
+        ),
+        None => (String::new(), String::new()),
+    };
     build_reviewer_prompt(
         root,
         repo_notes,
         worktree,
         base,
-        out_path,
+        out.issues,
         ReviewSubject {
             rules: &FIX_REVIEW,
             subject,
             replies_only: String::new(),
-            earlier_issues: String::new(),
-            verdicts_file: String::new(),
+            earlier_issues,
+            verdicts_file,
         },
     )
 }
@@ -705,7 +742,7 @@ pub struct PrUnderReview<'a> {
     pub author: &'a str,
 }
 
-/// Where a PR reviewer writes: its new issues, and its verdicts on the
+/// Where a reviewer writes: its new issues, and its verdicts on the
 /// earlier ones. Both outside the tree it reviews.
 #[derive(Debug, Clone, Copy)]
 pub struct ReviewOutputs<'a> {
@@ -792,15 +829,17 @@ Description:
     )
 }
 
-/// What a resumed fixer is told after a review round raised blocking
-/// issues (`review_followup.md`). `issues` is the reviewer's blocking
-/// entries as JSON, verbatim; `decline_file` is the file the fixer's own
-/// playbook declines with (`NOT-A-BUG.md` or `DECLINED.md`).
+/// What a resumed fixer is told after a review round left issues open
+/// (`review_followup.md`). `issues` is them as JSON, each with the id its
+/// answer names it by; `answers` is where it writes its answers, outside
+/// the tree; `decline_file` is the file the fixer's own playbook declines
+/// with (`NOT-A-BUG.md` or `DECLINED.md`).
 pub fn build_review_followup_prompt(
     root: &Path,
     worktree: &Path,
     base: &str,
     issues: &str,
+    answers: &Path,
     decline_file: &str,
 ) -> Result<String> {
     let template = read_template(root, "review_followup.md")?;
@@ -808,6 +847,7 @@ pub fn build_review_followup_prompt(
     slots.insert("WORKTREE", worktree.display().to_string());
     slots.insert("BASE", base.to_owned());
     slots.insert("ISSUES", issues.to_owned());
+    slots.insert("ANSWERS_FILE", answers.display().to_string());
     slots.insert("DECLINE_FILE", decline_file.to_owned());
     render(&template, &slots)
 }
