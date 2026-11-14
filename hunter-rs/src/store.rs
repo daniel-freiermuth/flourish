@@ -50,14 +50,16 @@ use crate::util::now_ms;
 
 mod pr_review;
 mod pr_state;
+mod review;
 
 pub use pr_review::{
     ApprovedRound, EarlierIssue, HEAD_STABLE_MS, InlineState, IssueVerdict, NewPrReview,
     POST_GIVE_UP_AT, PR_REVIEW_HOLD_AT, PR_REVIEW_RETRY_MS, PostDecided, PostDecision,
-    PostableIssue, PrReviewRound, PrReviewRow, REPLY_QUIET_MS, Reply, ReportedIssue, Requested,
-    Said, ThreadSeen, ThreadSteps, ThreadToSettle, ThreadsRead, Trust, Verdict,
+    PostableIssue, PrReviewRound, PrReviewRow, REPLY_QUIET_MS, Reply, Requested, Said, ThreadSeen,
+    ThreadSteps, ThreadToSettle, ThreadsRead, Trust, Verdict,
 };
 pub use pr_state::{PrRead, PrSyncPass};
+pub use review::ReportedIssue;
 
 /// A `pr_state` row as the store read it ([`Store::get_pr_state`]).
 ///
