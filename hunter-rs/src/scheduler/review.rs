@@ -22,8 +22,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{BLOCKED_REPORT, FixStart, decline_report, fix_event, job_state};
-use crate::backend::{Backend, JobClass};
+use super::{BLOCKED_REPORT, FixStart, Outage, decline_report, fix_event, job_state};
+use crate::backend::{AUTH_UNAVAILABLE, Backend, JobClass};
 use crate::clones::{Lane, Unheld};
 use crate::config::Config;
 use crate::domain::FinishedState;
@@ -119,10 +119,13 @@ pub(super) struct Reviewed {
     /// failure, half an answer to a review), left nothing to ship, or the
     /// daemon stopped the loop -- and then nothing ships.
     pub ending: Option<Ending>,
-    /// The fixer's answer to a review failed without doing work while this
-    /// host is unreachable: the network's failure, not the fix's. The
-    /// attempt is kept unpublished for a retry (`FixOutcome::Offline`).
-    pub offline: Option<String>,
+    /// The review cut short by an outage ([`Outage`]): a run that did no
+    /// work while a host is unreachable or workers get no credentials, or
+    /// a run refused its credentials. The machine's failure, not the
+    /// fix's: the attempt is kept unpublished for a retry
+    /// (`FixOutcome::Offline`), or, when it ran nothing at all, closed as
+    /// never started ([`ProgressSnapshot`]).
+    pub offline: Option<Outage>,
 }
 
 /// How the review loop ended: what `ship_pr` ships.
@@ -148,7 +151,7 @@ struct Saved {
 }
 
 /// How far an unfinished review loop got ([`PROGRESS_FILE`]).
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct Progress {
     /// The last round whose issues went back to the fixer, or are owed
     /// to it ([`Owed::Answer`]).
@@ -185,7 +188,7 @@ impl Progress {
 
 /// What a job suspended between its runs still owes, besides reviewing
 /// again ([`Progress::owed`]).
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Owed {
     /// The fixer's answer to round [`Progress::rounds`]'s issues.
@@ -353,6 +356,40 @@ impl Rounds<'_> {
         } else {
             GRANT
         };
+        let stop = format!("curation: {why}; suspended to curate under a fresh grant");
+        self.owe_curation(job, ending, follow_ups, (reason, &stop))
+            .await
+    }
+
+    /// Suspend the job before its curation, whose run `outage` refused its
+    /// credentials, as [`AUTH_UNAVAILABLE`]: as [`Self::curation_owed`], so
+    /// the resume curates and ships without another review. Not the
+    /// network path ([`Self::offline`]), which rewinds the review to a
+    /// round when the review is through. The caller keeps the attempt for
+    /// the outage (`Reviewed::offline`), so the cycle ends with its denial
+    /// as for a review round.
+    async fn curation_kept(
+        &self,
+        job: &mut Reviewed,
+        ending: &Ending,
+        follow_ups: &[serde_json::Value],
+        outage: &Outage,
+    ) -> bool {
+        let stop = format!("curation: {outage}; suspended to curate once it is back");
+        self.owe_curation(job, ending, follow_ups, (AUTH_UNAVAILABLE, &stop))
+            .await
+    }
+
+    /// Save `ending` for the tree and pause the job ([`Self::pause`]) as
+    /// `reason`, logging `stop`, with its curation owed. Only with a
+    /// transcript to resume; without one, `false`, and nothing is written.
+    async fn owe_curation(
+        &self,
+        job: &mut Reviewed,
+        ending: &Ending,
+        follow_ups: &[serde_json::Value],
+        (reason, stop): (&str, &str),
+    ) -> bool {
         if job.rr.session_file.is_none() {
             return false;
         }
@@ -361,8 +398,7 @@ impl Rounds<'_> {
             owed: Some(Owed::Curation),
             ..Progress::at(0, follow_ups.to_vec())
         };
-        let stop = format!("curation: {why}; suspended to curate under a fresh grant");
-        self.pause(job, progress, (reason, &stop)).await
+        self.pause(job, progress, (reason, stop)).await
     }
 }
 
@@ -375,36 +411,48 @@ enum Unanswered {
     Held,
     /// They ship unresolved; `keep` saves the verdict for the tree.
     Ship(Ending, bool),
-    /// A run did no work while this host is unreachable: retry later.
-    Offline(String),
+    /// A run did no work for an outage ([`Outage`]): retry later.
+    Offline(Outage),
     /// The grant is spent: the job is suspended, and its resume answers
     /// them ([`Rounds::spent`]).
     Suspended,
 }
 
 impl Rounds<'_> {
-    /// Whether a run of round `round` that did no work did so because a
-    /// host the work needs is unreachable ([`super::unreachable_now`]):
-    /// the network's failure, handled as the fix's other offline failures
-    /// are (`FixOutcome::Offline`). The progress is rewound so the retry
-    /// reviews that round again, keeping the `follow_ups`.
-    async fn offline(&self, round: u32, follow_ups: &[serde_json::Value]) -> Option<String> {
+    /// Whether a run of round `round` that did no work did so for an
+    /// outage, not the fix: `run` was refused its credentials
+    /// ([`Outage::of_run`]), or a host the work needs is unreachable or
+    /// workers get no credentials now ([`Outage::now`]). Handled as the
+    /// fix's other offline failures are (`FixOutcome::Offline`). The
+    /// progress is rewound so the retry reviews that round again, keeping
+    /// the `follow_ups`.
+    async fn offline(
+        &self,
+        round: u32,
+        follow_ups: &[serde_json::Value],
+        run: Option<&RunResult>,
+    ) -> Option<Outage> {
         let start = self.start;
-        let host = super::unreachable_now(self.cfg, &start.repo.url, self.backend).await?;
+        let outage = if let Some(outage) = run.and_then(Outage::of_run) {
+            outage
+        } else {
+            Outage::now(self.cfg, &start.repo.url, self.backend).await?
+        };
         let again = Progress::at(round.saturating_sub(1), follow_ups.to_vec());
         write_progress(start, &again, "recording the review's progress");
-        let message = format!("{host} unreachable; kept to review round {round} again");
+        let message = format!("{outage}; kept to review round {round} again");
         log_round(self.store(), start, round, &message).await;
-        Some(host)
+        Some(outage)
     }
 
-    /// What a failed round amounts to (`why`). A reviewer whose changes
-    /// could not be undone (`left`) has the tree it was shown recorded
-    /// first ([`record_restore`]), however the round ends: no later worker
-    /// builds on what it left. With a host the work needs unreachable,
-    /// whatever the reviewer did, the network's failure
-    /// ([`Self::offline`]): an outage that cut a review off mid-way is no
-    /// more the fix's than one that kept it from starting.
+    /// What a failed round amounts to (`why`), its reviewer's run `run`
+    /// when it had one. A reviewer whose changes could not be undone
+    /// (`left`) has the tree it was shown recorded first
+    /// ([`record_restore`]), however the round ends: no later worker builds
+    /// on what it left. A reviewer refused its credentials, or any while a
+    /// host the work needs is unreachable, failed for an outage
+    /// ([`Self::offline`]): one that cut a review off mid-way is no more
+    /// the fix's than one that kept it from starting.
     /// Otherwise the fix ships, saying why it was not reviewed: the
     /// reviewer never holds it hostage. But issues the reviewer wrote
     /// before the round failed hold the fix as an answered round's would
@@ -413,7 +461,7 @@ impl Rounds<'_> {
         &self,
         round: u32,
         (why, left, issues): (&str, Option<ReviewedTree>, &[serde_json::Value]),
-        follow_ups: &[serde_json::Value],
+        (follow_ups, run): (&[serde_json::Value], Option<&RunResult>),
         also: &str,
     ) -> Unanswered {
         let start = self.start;
@@ -428,8 +476,8 @@ impl Rounds<'_> {
             );
             head
         });
-        if let Some(host) = self.offline(round, follow_ups).await {
-            return Unanswered::Offline(host);
+        if let Some(outage) = self.offline(round, follow_ups, run).await {
+            return Unanswered::Offline(outage);
         }
         let progress = Progress::at(0, follow_ups.to_vec());
         let restoring = head.as_deref();
@@ -605,8 +653,8 @@ pub(super) async fn review_fix(
         match send_back(&rounds, &mut job, &progress, &issues).await {
             Answered::ReviewAgain => {}
             Answered::Conclude | Answered::Held => return job,
-            Answered::Offline(host) => {
-                job.offline = Some(host);
+            Answered::Offline(outage) => {
+                job.offline = Some(outage);
                 return job;
             }
             Answered::Ship(ending) => break (ending, false),
@@ -621,7 +669,10 @@ pub(super) async fn review_fix(
 /// Ship on `ending`, a saved verdict that covers the tree, curating first
 /// when the job this attempt continues was suspended with its curation
 /// owed ([`Progress::curate`]). The mark is taken here: a later attempt
-/// curates only if this one is suspended again.
+/// curates only if this one is suspended again. A curator refused its
+/// credentials ends the attempt for that outage (`Reviewed::offline`),
+/// having run nothing: `run_fix` puts the progress, the mark included,
+/// back as the attempt found it ([`ProgressSnapshot`]).
 async fn ship_saved(
     (scope, cfg, backend, start): (&CycleScope<'_>, &Config, &dyn Backend, &FixStart),
     lane: &mut Lane,
@@ -633,8 +684,7 @@ async fn ship_saved(
         job.ending = Some(ending);
         return job;
     }
-    let follow_ups = progress.follow_ups;
-    let taken = Progress::at(0, follow_ups.clone());
+    let taken = Progress::at(0, progress.follow_ups.clone());
     write_progress(start, &taken, "recording the review's progress");
     let rounds = Rounds {
         scope,
@@ -642,10 +692,23 @@ async fn ship_saved(
         backend,
         start,
     };
-    match curate(&rounds, lane, &mut job, &mut ending, &follow_ups).await {
+    match curate(&rounds, lane, &mut job, &mut ending, &progress.follow_ups).await {
         Curated::Accepted => save_ending(start, &ending).await,
         Curated::Not => {}
         Curated::Suspended => return job,
+        Curated::Refused(outage) => {
+            let message = format!("#{} curation: {outage}; owed again", start.finding.id);
+            let _ = fix_event(
+                rounds.store(),
+                "review",
+                start.finding.id,
+                start.job,
+                message,
+            )
+            .await;
+            job.offline = Some(outage);
+            return job;
+        }
     }
     job.ending = Some(ending);
     job
@@ -710,10 +773,11 @@ async fn next_round(
         }
         RoundVerdict::Failed { why, left, issues } => {
             let failure = (why.as_str(), left, issues.as_slice());
-            return match rounds.failed_round(round, failure, follow_ups, &also).await {
+            let context = (follow_ups.as_slice(), run.as_ref());
+            return match rounds.failed_round(round, failure, context, &also).await {
                 Unanswered::Ship(ending, keep) => Next::Ship(ending, keep),
-                Unanswered::Offline(host) => {
-                    job.offline = Some(host);
+                Unanswered::Offline(outage) => {
+                    job.offline = Some(outage);
                     Next::End
                 }
                 Unanswered::Held | Unanswered::No | Unanswered::Suspended => Next::End,
@@ -759,6 +823,17 @@ async fn finish(
         Curated::Accepted => end_loop(start, ending, follow_ups, keep).await,
         Curated::Not => {}
         Curated::Suspended => return false,
+        // This attempt did the review: it is suspended with its curation
+        // owed, kept for the outage.
+        Curated::Refused(outage) => {
+            if rounds
+                .curation_kept(job, ending, &follow_ups, &outage)
+                .await
+            {
+                job.offline = Some(outage);
+                return false;
+            }
+        }
     }
     true
 }
@@ -777,9 +852,10 @@ async fn finish(
 /// pins a commit (a reviewer moved `HEAD`). The daemon's shutdown, a grant
 /// with nothing left, or a curator killed at its cap (its rewrite undone)
 /// suspend the job instead, its curation owed ([`Rounds::curation_owed`]):
-/// a fix is not shipped uncurated because the budget ran out. When the
-/// tree cannot be put back, `ending` pins the reviewed commit, so that is
-/// what ships.
+/// a fix is not shipped uncurated because the budget ran out. Nor for a
+/// curator refused its credentials ([`Curated::Refused`]), which never
+/// ran. When the tree cannot be put back, `ending` pins the reviewed
+/// commit, so that is what ships.
 async fn curate(
     rounds: &Rounds<'_>,
     lane: &mut Lane,
@@ -815,6 +891,9 @@ enum Curated {
     Not,
     /// The job was suspended with its curation owed.
     Suspended,
+    /// The curator was refused its credentials and never ran, the tree as
+    /// it was: the curation is owed again once the outage is over.
+    Refused(Outage),
 }
 
 /// Whether a curation is due, and what it starts from: the commit count
@@ -889,6 +968,7 @@ async fn curated_head(
     let capped = run
         .as_ref()
         .is_ok_and(|rr| rr.killed_reason.as_deref() == Some("cap"));
+    let refused = run.as_ref().ok().and_then(Outage::of_run);
     let verdict = match &run {
         Err(e) => Err(format!("it could not run: {e}")),
         Ok(rr) => {
@@ -909,7 +989,12 @@ async fn curated_head(
             let undone = undo_or_record(lane, start, curating).await;
             let _ = std::fs::remove_file(&marker);
             // A curator the grant ran out on curated nothing: the resume
-            // has it again, once its rewrite is undone.
+            // has it again, once its rewrite is undone. One refused its
+            // credentials never ran: its caller decides what the outage
+            // makes of the attempt ([`Curated::Refused`]).
+            if let Some(outage) = refused.filter(|_| undone.is_ok()) {
+                return Curated::Refused(outage);
+            }
             if capped && undone.is_ok() && rounds.curation_owed(job, ending, follow_ups, &why).await
             {
                 return Curated::Suspended;
@@ -1402,8 +1487,8 @@ enum Answered {
     /// No answer came, and a blocking issue among them holds the fix for
     /// the operator ([`hold`]).
     Held,
-    /// No answer came while this host is unreachable: retry later.
-    Offline(String),
+    /// No answer came for an outage ([`Outage`]): retry later.
+    Offline(Outage),
     /// No answer came: ship with the issues unresolved.
     Ship(Ending),
 }
@@ -1424,7 +1509,7 @@ async fn send_back(
         Err(why) => {
             let message = format!("#{fid} the fixer could not answer round {round}: {why}");
             let _ = fix_event(rounds.store(), "review", fid, start.job, message).await;
-            return no_answer(rounds, progress, issues, &why).await;
+            return no_answer(rounds, progress, issues, (&why, None)).await;
         }
     };
     match job_state(&fx) {
@@ -1447,29 +1532,31 @@ async fn send_back(
             let why = format!("its answer {}", run_failure(&fx));
             let message = format!("#{fid} the fixer's answer to round {round} failed: {why}");
             let _ = fix_event(rounds.store(), "review", fid, start.job, message).await;
-            no_answer(rounds, progress, issues, &why).await
+            no_answer(rounds, progress, issues, (&why, Some(&fx))).await
         }
     }
 }
 
 /// Where the loop goes when the fixer's answer to round `progress.rounds`'s
-/// `issues` could not start or failed without doing work (`why`).
+/// `issues` could not start or failed without doing work (`why`; `run`,
+/// when it ran).
 ///
-/// While a host the work needs is unreachable it is the network's failure
-/// ([`super::unreachable_now`]), handled as the fix's own offline failures
-/// are: nothing is counted or published, the attempt is kept as the
-/// checkpoint, and the retry reviews that round again. Otherwise a
-/// blocking issue never ships: it holds the fix for the operator, as one
-/// left by the last round does. Only non-blocking ones ship unresolved.
+/// When the answer was refused its credentials, or a host the work needs
+/// is unreachable, it is an outage's failure ([`Rounds::offline`]),
+/// handled as the fix's own offline failures are: nothing is counted or
+/// published, the attempt is kept as the checkpoint, and the retry
+/// reviews that round again. Otherwise a blocking issue never ships: it
+/// holds the fix for the operator, as one left by the last round does.
+/// Only non-blocking ones ship unresolved.
 async fn no_answer(
     rounds: &Rounds<'_>,
     progress: &Progress,
     issues: &[serde_json::Value],
-    why: &str,
+    (why, run): (&str, Option<&RunResult>),
 ) -> Answered {
     let (start, round) = (rounds.start, progress.rounds);
-    if let Some(host) = rounds.offline(round, &progress.follow_ups).await {
-        return Answered::Offline(host);
+    if let Some(outage) = rounds.offline(round, &progress.follow_ups, run).await {
+        return Answered::Offline(outage);
     }
     if issues.iter().any(is_blocking) {
         let kept = Progress::at(0, progress.follow_ups.clone());
@@ -1517,6 +1604,35 @@ fn write_progress(start: &FixStart, progress: &Progress, what: &str) {
 pub(super) fn suspended_between_runs(start: &FixStart, job: i64) -> bool {
     read_json::<Progress>(&start.ws.root.join(PROGRESS_FILE))
         .is_some_and(|progress| progress.paused_by == Some(job))
+}
+
+/// The review's progress ([`PROGRESS_FILE`]) as an attempt found it. A
+/// resume of a job the review paused between its runs, or that owes only
+/// its curation, runs no fixer; when an outage stops every run it starts
+/// before any of them did work, it ran nothing, and `run_fix` puts the
+/// progress back as it was (what was owed, the `paused_by` mark) and
+/// closes the attempt as never started, so the attempt it continues stays
+/// the checkpoint and its resume carries on exactly where it would have.
+pub(super) struct ProgressSnapshot(Option<Vec<u8>>);
+
+impl ProgressSnapshot {
+    pub(super) fn take(start: &FixStart) -> Self {
+        Self(std::fs::read(start.ws.root.join(PROGRESS_FILE)).ok())
+    }
+
+    pub(super) fn restore(self, start: &FixStart) {
+        let path = start.ws.root.join(PROGRESS_FILE);
+        let restored = match self.0 {
+            Some(bytes) => std::fs::write(&path, bytes),
+            None => std::fs::remove_file(&path),
+        };
+        if let Err(e) = restored {
+            tracing::warn!(
+                "fix #{}: putting the review's progress back: {e}",
+                start.finding.id
+            );
+        }
+    }
 }
 
 /// Why a fixer that finished is not shipped when no review ran

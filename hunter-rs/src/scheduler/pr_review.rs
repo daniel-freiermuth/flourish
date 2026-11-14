@@ -44,8 +44,8 @@ use std::path::Path;
 use super::review::{parse_review, tree_state};
 use super::{
     BudgetDecision, CycleSummary, Fetcher, WorkOf, budget_gate, close_workspace, fetch_held,
-    job_refused, log_write_failure, offline_denial, open_workspace, record_job, runner_failed,
-    unmetered_offline, unreachable_now,
+    held_unstarted, job_refused, log_write_failure, offline_denial, open_workspace, record_job,
+    runner_failed, unreachable_now,
 };
 use crate::backend::{Backend, JobClass};
 use crate::clones::{Lane, Unheld};
@@ -446,14 +446,13 @@ pub(super) async fn run_pr_review(
         }
     };
     let after = tree_state(&ws.tree).await;
-    let running =
-        match unmetered_offline(store, cfg, backend, &repo.url, (work, running), &rr).await {
-            ControlFlow::Continue(running) => running,
-            ControlFlow::Break(denied) => {
-                close_workspace(lane, ws).await;
-                return Ok(denied);
-            }
-        };
+    let running = match held_unstarted(store, cfg, backend, &repo.url, (work, running), &rr).await {
+        ControlFlow::Continue(running) => running,
+        ControlFlow::Break(denied) => {
+            close_workspace(lane, ws).await;
+            return Ok(denied);
+        }
+    };
     let state = log_write_failure(
         record_job(store, running, &rr, model, None)
             .await

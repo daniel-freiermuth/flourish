@@ -48,6 +48,8 @@ struct RawConfig {
     renovate: RawRenovate,
     feedback: RawFeedback,
     network: RawNetwork,
+    #[serde(rename = "authGateway")]
+    auth_gateway: RawAuthGateway,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -131,6 +133,36 @@ struct RawFeedback {
 #[serde(default)]
 struct RawNetwork {
     gate: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawAuthGateway {
+    #[serde(rename = "brokerPort")]
+    broker_port: Option<u16>,
+    #[serde(rename = "gatewayPort")]
+    gateway_port: Option<u16>,
+}
+
+/// `authGateway` — the loopback ports of the `omp auth-broker` and `omp
+/// auth-gateway` the daemon runs as its children when workers reach their
+/// provider through a per-run gateway token
+/// (`crate::backends::omp_scavenge::gateway`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthGatewayConfig {
+    /// `authGateway.brokerPort`, default 8765.
+    pub broker_port: u16,
+    /// `authGateway.gatewayPort`, default 4000.
+    pub gateway_port: u16,
+}
+
+impl Default for AuthGatewayConfig {
+    fn default() -> Self {
+        Self {
+            broker_port: 8765,
+            gateway_port: 4000,
+        }
+    }
 }
 
 /// A credential read from config.json. `Debug` prints a placeholder, so
@@ -234,6 +266,10 @@ pub struct Config {
     /// machine that reaches them only through a proxy, where a direct
     /// connection never succeeds.
     pub network_gate: bool,
+    /// authGateway — where the daemon's auth broker and gateway listen.
+    /// Used only for a provider whose workers go through the gateway
+    /// (`backends::omp_scavenge::gateway`).
+    pub auth_gateway: AuthGatewayConfig,
 
     pub hunt_max_wall_s: i64,
     pub hunt_max_findings: i64,
@@ -440,6 +476,41 @@ impl Config {
                 cfg_path.display()
             );
         }
+        let defaults = AuthGatewayConfig::default();
+        let auth_gateway = AuthGatewayConfig {
+            broker_port: raw.auth_gateway.broker_port.unwrap_or(defaults.broker_port),
+            gateway_port: raw
+                .auth_gateway
+                .gateway_port
+                .unwrap_or(defaults.gateway_port),
+        };
+        // Port 0 binds anywhere, and the daemon must know where to reach
+        // both; one port for both cannot bind twice.
+        anyhow::ensure!(
+            auth_gateway.broker_port != 0
+                && auth_gateway.gateway_port != 0
+                && auth_gateway.broker_port != auth_gateway.gateway_port,
+            "{}: authGateway.brokerPort and authGateway.gatewayPort must be two different \
+             non-zero ports (got {} and {})",
+            cfg_path.display(),
+            auth_gateway.broker_port,
+            auth_gateway.gateway_port
+        );
+        // Anthropic workers reach their provider through the auth gateway
+        // with `--api-key`, and omp (18.12.3) refuses `--api-key` unless it
+        // is also told the model with `--model`: without one every worker
+        // exits at once, a resume always (omp takes no model from its
+        // settings when resuming). Each job class therefore needs a model.
+        let models = &raw.models;
+        let has_model = |class: &Option<String>| class.is_some() || models.default.is_some();
+        anyhow::ensure!(
+            llm_provider != LlmProvider::Anthropic
+                || has_model(&models.hunt) && has_model(&models.fix),
+            "{}: models.default (or both models.hunt and models.fix) must name a model when \
+             backend.llmProvider is anthropic: workers reach it through the auth gateway with \
+             --api-key, which omp accepts only together with --model",
+            cfg_path.display()
+        );
 
         let serve_host = match raw.serve.host.as_deref() {
             None => std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST),
@@ -516,6 +587,7 @@ impl Config {
             llm_provider,
             provider_hosts: raw.backend.provider_hosts,
             network_gate: raw.network.gate.unwrap_or(true),
+            auth_gateway,
             hunt_max_wall_s,
             hunt_max_findings: raw.hunt.max_findings.unwrap_or(8),
             hunt_rehunt_days: raw.hunt.rehunt_days.unwrap_or(90),

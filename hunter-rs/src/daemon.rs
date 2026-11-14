@@ -35,6 +35,15 @@
 //! pass since startup, and an engage that met a PR the forge has ended and
 //! the database has not. The job lane itself never waits for the sync.
 //!
+//! For an Anthropic daemon, two more processes run beside the lanes: the
+//! `omp auth-broker` and `omp auth-gateway` every worker reaches its
+//! provider through, with a token of its own per run
+//! ([`crate::backends::omp_scavenge::gateway`]). They are the daemon's
+//! children ([`AuthServices`]): started, with an empty clients file,
+//! before the first cycle, restarted when they exit, and stopped only
+//! after the job lane has finished its last cycle, whose worker needs
+//! them to the end.
+//!
 //! # Where the work queue is, and why there is no queue type
 //!
 //! There is no in-memory queue of work items, and no pool of workers that
@@ -112,6 +121,8 @@ use tokio::task::JoinHandle;
 
 use crate::activity::AdminStatus;
 use crate::backend::Backend;
+use crate::backends::omp_scavenge::LlmProvider;
+use crate::backends::omp_scavenge::gateway::{AuthGateway, AuthServices};
 use crate::config::Config;
 use crate::domain::JobState;
 use crate::recovery::AdminAuthority;
@@ -126,6 +137,10 @@ const USAGE_PROBE_TICK_S: u64 = 60;
 /// the unit's `TimeoutStopSec`, which would turn a graceful stop into a
 /// SIGKILL.
 const UI_DRAIN: Duration = Duration::from_secs(5);
+/// How long startup waits for the auth broker and gateway to answer
+/// before the job lane starts; past it, the lane holds its work until
+/// they do.
+const AUTH_STARTUP: Duration = Duration::from_secs(15);
 /// How often each admin duty runs when nothing wakes it sooner.
 pub const ADMIN_INTERVAL: Duration = Duration::from_mins(5);
 /// How long fetch-ahead leaves a clone alone after its last fetch,
@@ -817,6 +832,31 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         "unknown backend_type: {:?}",
         cfg.backend_type
     );
+    // Workers reach their provider through the daemon's auth gateway, one
+    // token per run (`backends::omp_scavenge::gateway`). Anthropic only:
+    // no gateway route is verified for the other providers, whose workers
+    // keep omp's local login. Started before the first cycle and stopped
+    // after the job lane's last one, so no worker outlives its gateway.
+    let (auth_gateway, auth_services) = match cfg.llm_provider {
+        LlmProvider::Anthropic => {
+            let gateway = Arc::new(AuthGateway::new(&cfg));
+            let (services, health) = {
+                let (cfg, gateway) = (cfg.clone(), gateway.clone());
+                tokio::task::spawn_blocking(move || {
+                    let services = AuthServices::start(&cfg, &gateway)?;
+                    anyhow::Ok((services, gateway.await_healthy(AUTH_STARTUP)))
+                })
+                .await??
+            };
+            match health {
+                None => tracing::info!("auth broker and gateway up"),
+                // Not fatal: the scheduler holds work until they answer.
+                Some(why) => tracing::warn!("{why}; jobs wait until it answers"),
+            }
+            (Some(gateway), Some(services))
+        }
+        LlmProvider::OpenAiCodex | LlmProvider::GitHubCopilot => (None, None),
+    };
     // The overdrive flag is the handle's, shared with the backend wrapper
     // that reads it on every decision.
     let scheduler = crate::server::SchedulerHandle::default();
@@ -827,6 +867,7 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
             ledger: store.clone() as Arc<dyn crate::backend::SpendLedger>,
             agent_db: crate::backends::omp_scavenge::default_agent_db(),
             prober: Arc::new(crate::backend::CmdProber),
+            gateway: auth_gateway,
         });
     let backend: Arc<dyn Backend> = Arc::new(crate::backend::OverdriveBackend::new(
         provider_backend,
@@ -1039,6 +1080,10 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         if let Err(e) = duty.await {
             tracing::error!("admin duty: {e}");
         }
+    }
+    // Only now that no worker runs: the last cycle's went through them.
+    if let Some(services) = auth_services {
+        let _ = tokio::task::spawn_blocking(move || drop(services)).await;
     }
     signal_handle.abort();
     prober_handle.abort();

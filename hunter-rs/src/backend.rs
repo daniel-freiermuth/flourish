@@ -140,6 +140,10 @@ impl Prober for CmdProber {
     }
 }
 
+/// `RunResult::killed_reason` of a run that spawned no worker because the
+/// worker could not get provider credentials ([`Backend::run`]).
+pub const AUTH_UNAVAILABLE: &str = "auth-unavailable";
+
 /// The backend facade — harness, accounting and budget policy behind one
 /// object, so the core never sees a provider's vocabulary.
 ///
@@ -171,13 +175,26 @@ pub trait Backend: Send + Sync {
     async fn first_unreachable(&self, hosts: &[String]) -> Option<String> {
         crate::reach::first_unreachable(hosts).await
     }
+    /// Why a worker cannot get provider credentials right now, if it
+    /// cannot: the scheduler holds every job that would run one while
+    /// this is `Some`, as it holds a job the budget denies. `None` = it
+    /// can, which is every backend whose workers use local credentials.
+    /// `omp_scavenge` asks its auth broker and gateway
+    /// ([`crate::backends::omp_scavenge::gateway`]).
+    async fn auth_unavailable(&self) -> Option<String> {
+        None
+    }
     /// Execute a worker job in its chain's workspace: the worker runs in
     /// `ws.tree` and its transcript goes to `ws.session`. `cap_tokens` is
     /// the token bound the ramp
     /// granted, `None` for a job that has none; `job_class` drives model
     /// selection. `resume_from` is the session file of an earlier attempt
     /// to continue instead of starting cold — `None` is a cold run, which
-    /// is what every job was before resume existed.
+    /// is what every job was before resume existed. A run whose worker
+    /// could not get credentials ends with `killed_reason`
+    /// [`AUTH_UNAVAILABLE`] and nothing spawned; the scheduler holds its
+    /// job like `auth_unavailable`, never counting it as the work's
+    /// failure.
     async fn run(
         &self,
         ws: &crate::workspace::Workspace,
@@ -232,6 +249,10 @@ impl Backend for OverdriveBackend {
 
     async fn first_unreachable(&self, hosts: &[String]) -> Option<String> {
         self.inner.first_unreachable(hosts).await
+    }
+
+    async fn auth_unavailable(&self) -> Option<String> {
+        self.inner.auth_unavailable().await
     }
 
     async fn run(

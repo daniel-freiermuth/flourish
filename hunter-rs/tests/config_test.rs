@@ -16,8 +16,21 @@ use hunter::config::{Config, HostAllowList};
 mod support;
 use support::TempDir;
 
-/// Write `config.json` under a scratch root and load it.
+/// Write `config.json` under a scratch root and load it. A config that
+/// names no `models` gets the test model, which an anthropic config needs
+/// (`models_are_required_for_anthropic` tests that rule itself).
 fn load(dir: &TempDir, json: &str) -> anyhow::Result<Config> {
+    let mut value: serde_json::Value = serde_json::from_str(json).expect("test config is JSON");
+    if let Some(object) = value.as_object_mut() {
+        object
+            .entry("models")
+            .or_insert_with(|| serde_json::json!({"default": "test-model"}));
+    }
+    load_raw(dir, &value.to_string())
+}
+
+/// Write `json` as `config.json` under a scratch root, as it is, and load it.
+fn load_raw(dir: &TempDir, json: &str) -> anyhow::Result<Config> {
     std::fs::write(dir.join("config.json"), json).expect("write config.json");
     Config::load(dir.path())
 }
@@ -175,13 +188,42 @@ fn test_stale_after_s_zero_accepted() {
 }
 
 #[test]
-fn test_defaults_load_without_config_file() {
+fn test_defaults_load_from_a_config_naming_only_the_model() {
     let dir = TempDir::new("cfg-defaults");
-    let cfg = Config::load(dir.path()).expect("missing config.json = all defaults");
+    let cfg = load(&dir, "{}").expect("everything but the model defaults");
     assert_eq!(cfg.hunt_max_wall_s, 1800);
     assert_eq!(cfg.fix_max_wall_s, 2700);
     assert_eq!(cfg.stale_after_s, 300.0);
     assert_eq!(cfg.root, Path::new(dir.path()));
+}
+
+/// Anthropic workers reach the provider through the auth gateway with
+/// `--api-key`, which omp accepts only with `--model`: a config whose hunt
+/// or fix workers would get no model is refused at load, naming the key.
+/// Other providers' workers keep omp's own default model.
+#[test]
+fn models_are_required_for_anthropic() {
+    let dir = TempDir::new("cfg-models");
+    for missing in [
+        "{}",
+        r#"{"models": {"smol": "haiku"}}"#,
+        r#"{"models": {"hunt": "opus"}}"#,
+        r#"{"models": {"fix": "opus"}}"#,
+        r#"{"backend": {"llmProvider": "anthropic"}, "models": {"default": null}}"#,
+    ] {
+        let e = format!("{:#}", load_raw(&dir, missing).expect_err(missing));
+        assert!(e.contains("models.default"), "{missing}: {e}");
+    }
+    std::fs::remove_file(dir.join("config.json")).unwrap();
+    assert!(Config::load(dir.path()).is_err(), "no config file at all");
+    for named in [
+        r#"{"models": {"default": "opus"}}"#,
+        r#"{"models": {"hunt": "opus", "fix": "sonnet"}}"#,
+        r#"{"backend": {"llmProvider": "openai-codex"}}"#,
+        r#"{"backend": {"llmProvider": "github-copilot"}}"#,
+    ] {
+        load_raw(&dir, named).expect(named);
+    }
 }
 
 /// Cadences are validated at the precision the scheduler uses.
@@ -211,13 +253,11 @@ fn cadences_that_round_to_no_interval_are_rejected() {
         ("scan", "1e300"),
     ] {
         let dir = TempDir::new("cfg-cadence");
-        std::fs::write(
-            dir.join("config.json"),
-            format!(r#"{{"{field}": {{"intervalDays": {value}}}}}"#),
+        let err = load(
+            &dir,
+            &format!(r#"{{"{field}": {{"intervalDays": {value}}}}}"#),
         )
-        .unwrap();
-        let err = Config::load(dir.path())
-            .expect_err(&format!("{field}.intervalDays = {value} was accepted"));
+        .expect_err(&format!("{field}.intervalDays = {value} was accepted"));
         assert!(
             format!("{err}").contains(&format!("{field}.intervalDays")),
             "error should name the field, got: {err}"
@@ -229,15 +269,14 @@ fn cadences_that_round_to_no_interval_are_rejected() {
 #[test]
 fn ordinary_cadences_load() {
     let dir = TempDir::new("cfg-cadence-ok");
-    std::fs::write(
-        dir.join("config.json"),
+    let cfg = load(
+        &dir,
         r#"{"scan": {"intervalDays": 0.5},
             "modernization": {"intervalDays": 30},
             "standards": {"intervalDays": 14},
             "simplification": {"intervalDays": 60}}"#,
     )
-    .unwrap();
-    let cfg = Config::load(dir.path()).expect("valid cadences");
+    .expect("valid cadences");
     // Half a day is meaningful for the scan scheduler: it keeps a
     // sub-day interval because that one is not truncated to whole days.
     assert!((cfg.scan_interval_days - 0.5).abs() < f64::EPSILON);
@@ -316,10 +355,40 @@ fn bad_serve_settings_are_refused() {
     }
 }
 
+/// The auth broker and gateway ports default to 8765 and 4000; a port 0
+/// (bind anywhere, so the daemon cannot reach it) or one port for both
+/// (the second cannot bind) is refused, naming the key.
+#[test]
+fn auth_gateway_ports_default_and_must_be_two_real_ports() {
+    let dir = TempDir::new("cfg-auth-gateway");
+    let cfg = load(&dir, "{}").unwrap();
+    assert_eq!(
+        (cfg.auth_gateway.broker_port, cfg.auth_gateway.gateway_port),
+        (8765, 4000)
+    );
+    let cfg = load(
+        &dir,
+        r#"{"authGateway": {"brokerPort": 9001, "gatewayPort": 9002}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        (cfg.auth_gateway.broker_port, cfg.auth_gateway.gateway_port),
+        (9001, 9002)
+    );
+    for bad in [
+        r#"{"brokerPort": 0}"#,
+        r#"{"gatewayPort": 0}"#,
+        r#"{"brokerPort": 4000}"#,
+    ] {
+        let e = err(&dir, &format!(r#"{{"authGateway": {bad}}}"#));
+        assert!(e.contains("authGateway.brokerPort"), "{bad}: {e}");
+    }
+}
+
 #[test]
 fn llm_provider_defaults_to_anthropic_and_accepts_supported_providers() {
     let default_dir = TempDir::new("cfg-provider-default");
-    let default = Config::load(default_dir.path()).expect("default configuration");
+    let default = load(&default_dir, "{}").expect("default configuration");
     assert_eq!(
         default.llm_provider,
         hunter::backends::omp_scavenge::LlmProvider::Anthropic

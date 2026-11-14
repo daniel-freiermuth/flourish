@@ -8,8 +8,10 @@
 //! showed that replacing `run_daemon` with `Ok(())`, or never entering its
 //! loop, left every test green. Everything the daemon could reach outside
 //! the root is redirected first: a fake `omp` on `PATH`, `HOME` pointed at
-//! scratch so omp's real usage database is never read, and a port nothing
-//! else uses.
+//! scratch so omp's real usage database is never read, a port nothing
+//! else uses, and an auth broker and gateway that are up
+//! (`support::healthy_auth`): the daemon holds every job while they are
+//! not.
 //!
 //! It also pins a bug found while rebasing the pause feature: the paused
 //! wait listened for a private `ctrl_c()`, which sees only SIGINT, so
@@ -27,6 +29,10 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use support::{FakeBins, TempDir};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// The worker model every config here names: an anthropic config needs
+/// one (`Config::load`).
+const MODELS: &str = r#""models": {"default": "test-model"}"#;
 
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
@@ -127,16 +133,17 @@ async fn wait_until<F, Fut>(
 #[tokio::test]
 async fn a_paused_daemon_reports_it_and_stops_on_sigterm() {
     let bins = FakeBins::acquire("daemon");
-    bins.script("omp", "exit 0");
+    bins.omp("exit 0");
     let root = TempDir::new("daemon-root");
     let _home = bins.env("HOME", root.path());
     let port = free_port();
     std::fs::write(
         root.join("config.json"),
-        format!(r#"{{"ompBin": "omp", "serve": {{"port": {port}}}}}"#),
+        format!(r#"{{"ompBin": "omp", {MODELS}, "serve": {{"port": {port}}}}}"#),
     )
     .unwrap();
-    let cfg = support::load_config(root.path());
+    let mut cfg = support::load_config(root.path());
+    support::healthy_auth(&mut cfg);
     // The API wants a session; the account goes in before the daemon opens
     // the database.
     let cookie = {
@@ -247,7 +254,7 @@ async fn seed_open_pr(store: &hunter::store::Store, repos: &std::path::Path) -> 
 #[tokio::test]
 async fn a_running_daemon_syncs_open_prs_on_its_admin_lane_even_paused() {
     let bins = FakeBins::acquire("daemon-admin");
-    bins.script("omp", "exit 0");
+    bins.omp("exit 0");
     bins.ok(
         "gh",
         r#"{"state":"OPEN","mergeable":"CONFLICTING","reviewDecision":"","comments":[],"reviews":[],"statusCheckRollup":[],"updatedAt":"2026-01-02T03:04:05Z","headRefName":"fix/some-bug","headRefOid":"deadbeef"}"#,
@@ -257,10 +264,11 @@ async fn a_running_daemon_syncs_open_prs_on_its_admin_lane_even_paused() {
     let port = free_port();
     std::fs::write(
         root.join("config.json"),
-        format!(r#"{{"ompBin": "omp", "serve": {{"port": {port}}}}}"#),
+        format!(r#"{{"ompBin": "omp", {MODELS}, "serve": {{"port": {port}}}}}"#),
     )
     .unwrap();
-    let cfg = support::load_config(root.path());
+    let mut cfg = support::load_config(root.path());
+    support::healthy_auth(&mut cfg);
     std::fs::create_dir_all(cfg.db_path.parent().unwrap()).unwrap();
     let store = hunter::store::Store::connect(&cfg.db_path).await.unwrap();
     let cookie = support::auth_cookie(&store).await;
@@ -341,7 +349,7 @@ async fn a_running_daemon_syncs_open_prs_on_its_admin_lane_even_paused() {
 #[tokio::test]
 async fn the_job_lane_runs_cycles_while_the_first_pr_sync_runs() {
     let bins = FakeBins::acquire("daemon-wait-sync");
-    bins.script("omp", "exit 0");
+    bins.omp("exit 0");
     let root = TempDir::new("daemon-wait-sync-root");
     let release = root.join("release-gh");
     // Bounded: a failing assertion below must not leave `gh` waiting.
@@ -357,10 +365,11 @@ async fn the_job_lane_runs_cycles_while_the_first_pr_sync_runs() {
     let port = free_port();
     std::fs::write(
         root.join("config.json"),
-        format!(r#"{{"ompBin": "omp", "serve": {{"port": {port}}}}}"#),
+        format!(r#"{{"ompBin": "omp", {MODELS}, "serve": {{"port": {port}}}}}"#),
     )
     .unwrap();
-    let cfg = support::load_config(root.path());
+    let mut cfg = support::load_config(root.path());
+    support::healthy_auth(&mut cfg);
     std::fs::create_dir_all(cfg.db_path.parent().unwrap()).unwrap();
     let store = hunter::store::Store::connect(&cfg.db_path).await.unwrap();
     let cookie = support::auth_cookie(&store).await;
@@ -475,7 +484,7 @@ impl EngageFixture {
         let port = free_port();
         std::fs::write(
             root.join("config.json"),
-            format!(r#"{{"ompBin": "omp", "serve": {{"port": {port}}}}}"#),
+            format!(r#"{{"ompBin": "omp", {MODELS}, "serve": {{"port": {port}}}}}"#),
         )
         .unwrap();
         std::fs::write(
@@ -483,7 +492,8 @@ impl EngageFixture {
             "test gaps in {{REPO_NAME}} -> {{OUT_PATH}}\n",
         )
         .unwrap();
-        let cfg = support::load_config(root.path());
+        let mut cfg = support::load_config(root.path());
+        support::healthy_auth(&mut cfg);
         std::fs::create_dir_all(cfg.db_path.parent().unwrap()).unwrap();
         let store = hunter::store::Store::connect(&cfg.db_path).await.unwrap();
         let repos = root.join("repos");
@@ -652,7 +662,7 @@ fn until_released(release: &std::path::Path) -> String {
 #[tokio::test]
 async fn the_job_lane_holds_engages_back_until_the_first_pr_sync_ends() {
     let bins = FakeBins::acquire("daemon-first-sync-engage");
-    bins.script("omp", "exit 0");
+    bins.omp("exit 0");
     gh_disagreeing(&bins, "");
     let f = EngageFixture::new(&bins, "daemon-first-sync-engage-root").await;
     let release = f.root.join("release-gh");
@@ -695,7 +705,7 @@ async fn the_job_lane_holds_engages_back_until_the_first_pr_sync_ends() {
 #[tokio::test]
 async fn an_engage_whose_pr_end_the_sync_never_records_is_held_without_a_hot_loop() {
     let bins = FakeBins::acquire("daemon-engage-unrecorded");
-    bins.script("omp", "exit 0");
+    bins.omp("exit 0");
     gh_disagreeing(&bins, "");
     let f = EngageFixture::new(&bins, "daemon-engage-unrecorded-root").await;
     // The first pass waits for the lane's first cycle, which it holds
@@ -764,16 +774,19 @@ async fn an_engage_whose_pr_end_the_sync_never_records_is_held_without_a_hot_loo
 #[tokio::test]
 async fn the_daemon_binds_the_configured_address() {
     let bins = FakeBins::acquire("daemon-bind");
-    bins.script("omp", "exit 0");
+    bins.omp("exit 0");
     let root = TempDir::new("daemon-bind-root");
     let _home = bins.env("HOME", root.path());
     let port = free_port();
     std::fs::write(
         root.join("config.json"),
-        format!(r#"{{"ompBin": "omp", "serve": {{"host": "127.0.0.2", "port": {port}}}}}"#),
+        format!(
+            r#"{{"ompBin": "omp", {MODELS}, "serve": {{"host": "127.0.0.2", "port": {port}}}}}"#
+        ),
     )
     .unwrap();
-    let cfg = support::load_config(root.path());
+    let mut cfg = support::load_config(root.path());
+    support::healthy_auth(&mut cfg);
     let daemon = std::thread::spawn(move || {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -827,13 +840,14 @@ async fn the_daemon_binds_the_configured_address() {
 async fn a_starting_daemon_reclaims_leftover_trees() {
     let dir = TempDir::new("daemon-sweep");
     let bins = FakeBins::acquire("daemon-sweep");
-    bins.fail("omp", 1, "fake omp: no usage data here");
+    bins.omp("echo 'fake omp: no usage data here' >&2\nexit 1");
     let _home = bins.env("HOME", dir.path());
     let mut cfg = support::load_config(dir.path());
     cfg.work_root = dir.subdir("work_root");
     cfg.db_path = support::db_copy(&dir, "hunter");
     cfg.serve_port = free_port();
     cfg.omp_bin = "omp".to_owned();
+    support::healthy_auth(&mut cfg);
     let leftover = cfg.work_root.join("wt").join("f57");
     std::fs::create_dir_all(leftover.join("src")).unwrap();
     std::fs::write(leftover.join("src").join("lib.rs"), "half removed\n").unwrap();
@@ -864,12 +878,13 @@ async fn a_starting_daemon_reclaims_leftover_trees() {
 async fn a_starting_daemon_turns_automatic_maintenance_off_in_its_clones() {
     let dir = TempDir::new("daemon-quiet");
     let bins = FakeBins::acquire("daemon-quiet");
-    bins.fail("omp", 1, "fake omp: no usage data here");
+    bins.omp("echo 'fake omp: no usage data here' >&2\nexit 1");
     let _home = bins.env("HOME", dir.path());
     let mut cfg = support::load_config(dir.path());
     cfg.work_root = dir.subdir("work_root");
     cfg.serve_port = free_port();
     cfg.omp_bin = "omp".to_owned();
+    support::healthy_auth(&mut cfg);
     let clone = cfg.work_root.join("repos").join("repo-1");
     std::fs::create_dir_all(&clone).unwrap();
     let git_config = |clone: &std::path::Path| {

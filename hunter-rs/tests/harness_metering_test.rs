@@ -96,7 +96,7 @@ impl Fixture {
 
     fn run(&self, cap_tokens: Option<i64>, max_wall_s: i64) -> RunResult {
         harness::run_worker(
-            &self.cfg, &self.ws, PROMPT, cap_tokens, max_wall_s, None, None,
+            &self.cfg, &self.ws, PROMPT, cap_tokens, max_wall_s, None, None, None,
         )
     }
 
@@ -120,6 +120,7 @@ impl Fixture {
             max_wall_s,
             None,
             Some(session_file),
+            None,
         )
     }
 }
@@ -225,6 +226,7 @@ fn metered_worker_sums_the_ledger_and_is_not_flagged() {
         Some(1_000_000),
         30,
         Some("test-model"),
+        None,
         None,
     );
 
@@ -610,7 +612,16 @@ fn worker_leaving_a_descendant_behind_does_not_hang_the_harness() {
     );
 
     let t0 = std::time::Instant::now();
-    let res = harness::run_worker(&fx.cfg, &fx.ws, PROMPT, Some(1_000_000), 30, None, None);
+    let res = harness::run_worker(
+        &fx.cfg,
+        &fx.ws,
+        PROMPT,
+        Some(1_000_000),
+        30,
+        None,
+        None,
+        None,
+    );
     let elapsed = t0.elapsed();
 
     assert!(
