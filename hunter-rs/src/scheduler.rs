@@ -7864,42 +7864,48 @@ async fn push_then_reply(
 ) -> Result<bool, String> {
     let (repo, worktree, head_ref) = (&start.repo, &start.ws.tree, &start.head_ref);
     let fg = forge::forge_for(repo.forge);
-    let wt = worktree.clone();
-    // The worker's own commits: those on top of the commit its tree was
-    // created at. Not `origin/<head_ref>..HEAD`: that ref moves under a
-    // running worker (fetch-ahead, a dependency scan's fetch), and after a
-    // rebase or force-push of the PR branch it would name the branch's old
-    // commits as the worker's, and push them into a lease that refuses.
-    let range = format!("{}..HEAD", start.pinned);
-    let (rc, commits) =
-        tokio::task::spawn_blocking(move || Unheld::Commits { range: &range }.run(&wt, 30))
-            .await
-            .unwrap_or((127, String::new()));
-    let has_commits = rc == 0 && !commits.trim().is_empty();
+    // The worker changed the branch: its `HEAD` moved off the commit its
+    // tree was created at, on the branch itself, to commits of its own (on
+    // top of it, or a rebase or squash), or back to drop the PR's last
+    // commits (`reset --hard HEAD~1`), with nothing of them left
+    // uncommitted: a `reset HEAD~1` or `--soft` that uncommitted them to
+    // rework is no rewind, and pushing it would lose their changes. A
+    // detached `HEAD` is a change only with the worker's own commits on top
+    // of the start; one checked out elsewhere (`HEAD~1` to show a test
+    // failing without the fix, `origin/<default>` to see whether the bug is
+    // still there) is an inspection, and pushing it would drop the PR's
+    // commits. Not compared with `origin/<head_ref>`: that ref moves under a
+    // running worker (fetch-ahead, a dependency scan's fetch).
+    let local = local_head(start).await;
+    let changed = match local.as_deref() {
+        Some(sha) if sha != start.pinned => {
+            if on_branch(start).await {
+                ancestor_rc(start, "HEAD", &start.pinned).await == 1 || tree_clean(start).await
+            } else {
+                ancestor_rc(start, &start.pinned, "HEAD").await == 0
+            }
+        }
+        _ => false,
+    };
     // Already pushed: this tree's `HEAD` is the PR's head, or, when the
     // forge would not say, is the commit this chain itself last pushed
     // ([`own_push`]), when an earlier attempt pushed it and was kept
     // because its reply was refused. Then its commits are on the PR, and
     // this attempt only has to reply: pushing them again would be a no-op
     // push recorded as a new one.
-    let remote = if has_commits {
+    let remote = if changed {
         remote_head(start).await
     } else {
         None
     };
-    let local = if has_commits {
-        local_head(start).await
-    } else {
-        None
-    };
-    let already = local.is_some()
+    let already = changed
         && match &remote {
             Some(r) => Some(r) == local.as_ref(),
             None => own_push(&start.ws.root) == local,
         };
     if already {
         *pushed_before = true;
-    } else if has_commits {
+    } else if changed {
         let push_url = repo.url.clone();
         let wt = worktree.clone();
         let refspec = format!("HEAD:{head_ref}");
@@ -8285,6 +8291,47 @@ async fn local_head(start: &EngageStart) -> Option<String> {
             .await
             .unwrap_or((127, String::new()));
     (rc == 0).then(|| out.trim().to_owned())
+}
+
+/// `merge-base --is-ancestor <ancestor> <rev>` in `start`'s tree: 0 when
+/// `rev` descends from `ancestor`, 1 when not, anything else when git
+/// cannot say.
+async fn ancestor_rc(start: &EngageStart, ancestor: &str, rev: &str) -> i32 {
+    let (tree, ancestor, rev) = (start.ws.tree.clone(), ancestor.to_owned(), rev.to_owned());
+    tokio::task::spawn_blocking(move || {
+        Unheld::IsAncestor {
+            ancestor: &ancestor,
+            rev: &rev,
+        }
+        .run(&tree, 30)
+        .0
+    })
+    .await
+    .unwrap_or(127)
+}
+
+/// Whether `start`'s tree holds nothing uncommitted but the worker's
+/// `PR-REPLY.md`: no change to a tracked file, and no other untracked one
+/// (a mixed `reset` leaves the files the dropped commits added untracked);
+/// `false` when git cannot say (its error is no such line).
+async fn tree_clean(start: &EngageStart) -> bool {
+    let tree = start.ws.tree.clone();
+    let (_, out) = tokio::task::spawn_blocking(move || Unheld::Status.run(&tree, 60))
+        .await
+        .unwrap_or((127, "spawn error".to_owned()));
+    out.lines()
+        .all(|line| line.is_empty() || line == "?? PR-REPLY.md")
+}
+
+/// Whether `start`'s tree has the PR branch checked out (`HEAD` is
+/// `refs/heads/<head_ref>`), as a `reset --hard` leaves it; a `checkout
+/// <rev>` detaches it, and `symbolic-ref --quiet` then prints nothing.
+async fn on_branch(start: &EngageStart) -> bool {
+    let tree = start.ws.tree.clone();
+    let (_, out) = tokio::task::spawn_blocking(move || Unheld::HeadRef.run(&tree, 30))
+        .await
+        .unwrap_or((127, String::new()));
+    out.trim() == format!("refs/heads/{}", start.head_ref)
 }
 
 /// Whether the PR branch on the forge is where this chain left it, or the
