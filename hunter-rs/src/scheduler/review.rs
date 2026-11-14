@@ -29,7 +29,7 @@ use crate::config::Config;
 use crate::domain::FinishedState;
 use crate::playbooks;
 use crate::recovery::CycleScope;
-use crate::store::Store;
+use crate::store::{ReportedIssue, Store};
 use crate::types::{JobPhase, RunResult};
 use crate::workspace::Workspace;
 
@@ -162,7 +162,7 @@ struct Progress {
     title: Option<String>,
     /// The follow-ups the rounds so far raised ([`merge_follow_ups`]).
     #[serde(default)]
-    follow_ups: Vec<serde_json::Value>,
+    follow_ups: Vec<ReportedIssue>,
     /// The part of the fix a suspended job still owes ([`Rounds::pause`]),
     /// which its resume carries out first; `None` when the resume goes on
     /// with the next review round.
@@ -182,7 +182,7 @@ struct Progress {
 #[serde(rename_all = "snake_case")]
 enum Owed {
     /// The fixer's answer to round [`Progress::rounds`]'s issues.
-    Answer(Vec<serde_json::Value>),
+    Answer(Vec<ReportedIssue>),
     /// The curation of a review that is through, its verdict saved for the
     /// tree ([`ENDING_FILE`]).
     Curation,
@@ -192,11 +192,12 @@ enum Owed {
 enum RoundVerdict {
     /// No issue to answer: none, or only follow-ups.
     Clean,
-    /// The reviewer's issues, verbatim, blocking ones first. `undone`: the
-    /// reviewer also changed the worktree, and that was undone ([`undo`]),
-    /// so the tree is the one it reviewed and its issues stand.
+    /// The reviewer's issues, as it reported them, blocking ones first.
+    /// `undone`: the reviewer also changed the worktree, and that was
+    /// undone ([`undo`]), so the tree is the one it reviewed and its issues
+    /// stand.
     Issues {
-        issues: Vec<serde_json::Value>,
+        issues: Vec<ReportedIssue>,
         undone: bool,
     },
     /// No usable review this round. `issues`: entries the reviewer wrote before it changed a tree that could not be put back;
@@ -208,7 +209,7 @@ enum RoundVerdict {
         /// attempt puts the tree back to before a worker runs
         /// ([`RESTORE_FILE`]).
         left: Option<ReviewedTree>,
-        issues: Vec<serde_json::Value>,
+        issues: Vec<ReportedIssue>,
     },
 }
 
@@ -250,8 +251,8 @@ impl Rounds<'_> {
     async fn stopped(
         &self,
         job: &mut Reviewed,
-        owed: (u32, &[serde_json::Value]),
-        follow_ups: &[serde_json::Value],
+        owed: (u32, &[ReportedIssue]),
+        follow_ups: &[ReportedIssue],
     ) -> bool {
         if !self.scope.stopping() {
             return false;
@@ -268,8 +269,8 @@ impl Rounds<'_> {
     async fn spent(
         &self,
         job: &mut Reviewed,
-        owed: (u32, &[serde_json::Value]),
-        follow_ups: &[serde_json::Value],
+        owed: (u32, &[ReportedIssue]),
+        follow_ups: &[ReportedIssue],
         why: &str,
     ) -> bool {
         let stop = format!("{why}; suspended to go on under a fresh grant");
@@ -287,8 +288,8 @@ impl Rounds<'_> {
     async fn suspend(
         &self,
         job: &mut Reviewed,
-        (reviewed, issues): (u32, &[serde_json::Value]),
-        follow_ups: &[serde_json::Value],
+        (reviewed, issues): (u32, &[ReportedIssue]),
+        follow_ups: &[ReportedIssue],
         (reason, stop): (&str, &str),
     ) -> bool {
         let progress = Progress {
@@ -343,7 +344,7 @@ impl Rounds<'_> {
         &self,
         job: &mut Reviewed,
         ending: &Ending,
-        follow_ups: &[serde_json::Value],
+        follow_ups: &[ReportedIssue],
         why: &str,
     ) -> bool {
         let reason = if self.scope.stopping() {
@@ -388,7 +389,7 @@ impl Rounds<'_> {
     /// the network's failure, handled as the fix's other offline failures
     /// are (`FixOutcome::Offline`). The progress is rewound so the retry
     /// reviews that round again, keeping the title and `follow_ups`.
-    async fn offline(&self, round: u32, follow_ups: &[serde_json::Value]) -> Option<String> {
+    async fn offline(&self, round: u32, follow_ups: &[ReportedIssue]) -> Option<String> {
         let start = self.start;
         let host = super::unreachable_now(self.cfg, &start.repo.url, self.backend).await?;
         let again = Progress {
@@ -417,8 +418,8 @@ impl Rounds<'_> {
     async fn failed_round(
         &self,
         round: u32,
-        (why, left, issues): (&str, Option<ReviewedTree>, &[serde_json::Value]),
-        follow_ups: &[serde_json::Value],
+        (why, left, issues): (&str, Option<ReviewedTree>, &[ReportedIssue]),
+        follow_ups: &[ReportedIssue],
         also: &str,
     ) -> Unanswered {
         let start = self.start;
@@ -460,9 +461,9 @@ impl Rounds<'_> {
     /// operator instead of shipping: any of them in the last round (a
     /// review still finding something after `review.maxRounds` rounds is
     /// not converging), else only a blocking one.
-    fn holds(&self, round: u32, issues: &[serde_json::Value]) -> bool {
+    fn holds(&self, round: u32, issues: &[ReportedIssue]) -> bool {
         let last = round >= self.cfg.review_max_rounds;
-        (last && !issues.is_empty()) || issues.iter().any(is_blocking)
+        (last && !issues.is_empty()) || issues.iter().any(|i| i.blocking)
     }
 
     /// Whether round `round`'s `issues` get no answer, and what then: none
@@ -479,8 +480,8 @@ impl Rounds<'_> {
         &self,
         job: &mut Reviewed,
         round: u32,
-        (issues, undone): (&[serde_json::Value], bool),
-        follow_ups: &[serde_json::Value],
+        (issues, undone): (&[ReportedIssue], bool),
+        follow_ups: &[ReportedIssue],
         raised: &str,
     ) -> Unanswered {
         let (start, max) = (self.start, self.cfg.review_max_rounds);
@@ -686,7 +687,7 @@ async fn ship_saved(
 enum Next {
     /// Its issues go back to the fixer; `raised` is their tally.
     Answer {
-        issues: Vec<serde_json::Value>,
+        issues: Vec<ReportedIssue>,
         raised: String,
     },
     /// The fix ships; `keep` saves the verdict for the tree.
@@ -705,7 +706,7 @@ async fn next_round(
     lane: &mut Lane,
     job: &mut Reviewed,
     round: u32,
-    follow_ups: &mut Vec<serde_json::Value>,
+    follow_ups: &mut Vec<ReportedIssue>,
 ) -> Next {
     let start = rounds.start;
     let before = (round - 1, &[][..]);
@@ -780,7 +781,7 @@ async fn finish(
     lane: &mut Lane,
     job: &mut Reviewed,
     ending: &mut Ending,
-    follow_ups: Vec<serde_json::Value>,
+    follow_ups: Vec<ReportedIssue>,
     keep: bool,
 ) -> bool {
     let start = rounds.start;
@@ -816,7 +817,7 @@ async fn curate(
     lane: &mut Lane,
     job: &mut Reviewed,
     ending: &mut Ending,
-    follow_ups: &[serde_json::Value],
+    follow_ups: &[ReportedIssue],
 ) -> Curated {
     if ending.head.is_some() {
         return Curated::Not;
@@ -875,7 +876,7 @@ async fn curated_head(
     rounds: &Rounds<'_>,
     lane: &mut Lane,
     job: &mut Reviewed,
-    (ending, follow_ups): (&mut Ending, &[serde_json::Value]),
+    (ending, follow_ups): (&mut Ending, &[ReportedIssue]),
     (commits, session): (usize, String),
 ) -> Curated {
     let (cfg, start) = (rounds.cfg, rounds.start);
@@ -1077,7 +1078,7 @@ async fn curated(
 }
 
 /// Append the follow-ups every round raised to `ending`'s PR body note.
-fn with_follow_ups(ending: &mut Ending, follow_ups: &[serde_json::Value]) {
+fn with_follow_ups(ending: &mut Ending, follow_ups: &[ReportedIssue]) {
     if follow_ups.is_empty() {
         return;
     }
@@ -1125,12 +1126,7 @@ async fn covering_verdict(ws: &Workspace) -> Option<Saved> {
 /// (an offline push retried after the fixer went on) is reviewed from
 /// round 1 again, under the same title and with them. `ending` is saved
 /// for the tree as it is when `keep` (a reviewer's own verdict).
-async fn end_loop(
-    start: &FixStart,
-    ending: &Ending,
-    follow_ups: Vec<serde_json::Value>,
-    keep: bool,
-) {
+async fn end_loop(start: &FixStart, ending: &Ending, follow_ups: Vec<ReportedIssue>, keep: bool) {
     let root = &start.ws.root;
     let progress = Progress {
         rounds: 0,
@@ -1216,7 +1212,7 @@ const HELD_FILE: &str = "review-held.json";
 /// review's hold and the fixer, but the issues are still the work left.
 #[derive(Debug, Serialize, Deserialize)]
 struct Held {
-    issues: Vec<serde_json::Value>,
+    issues: Vec<ReportedIssue>,
     /// A fixer has run on `issues`: later continues of the chain resume it
     /// as any other hold's do. Every file this daemon writes has it; one
     /// without it is a legacy file ([`Held::pending`]).
@@ -1258,7 +1254,7 @@ impl Held {
 fn hold(
     start: &FixStart,
     round: u32,
-    issues: &[serde_json::Value],
+    issues: &[ReportedIssue],
     (progress, stop, restoring): (&Progress, &str, Option<&str>),
 ) -> bool {
     let follow_ups = &progress.follow_ups;
@@ -1479,7 +1475,7 @@ async fn send_back(
     rounds: &Rounds<'_>,
     job: &mut Reviewed,
     progress: &Progress,
-    issues: &[serde_json::Value],
+    issues: &[ReportedIssue],
 ) -> Answered {
     let start = rounds.start;
     let (fid, round) = (start.finding.id, progress.rounds);
@@ -1534,14 +1530,14 @@ async fn send_back(
 async fn no_answer(
     rounds: &Rounds<'_>,
     progress: &Progress,
-    issues: &[serde_json::Value],
+    issues: &[ReportedIssue],
     why: &str,
 ) -> Answered {
     let (start, round) = (rounds.start, progress.rounds);
     if let Some(host) = rounds.offline(round, &progress.follow_ups).await {
         return Answered::Offline(host);
     }
-    if issues.iter().any(is_blocking) {
+    if issues.iter().any(|i| i.blocking) {
         let kept = Progress {
             rounds: 0,
             title: progress.title.clone(),
@@ -1671,7 +1667,7 @@ async fn review_round(
     round: u32,
     cap: Option<i64>,
     wall: i64,
-) -> (Option<RunResult>, RoundVerdict, Vec<serde_json::Value>) {
+) -> (Option<RunResult>, RoundVerdict, Vec<ReportedIssue>) {
     let (cfg, start) = (rounds.cfg, rounds.start);
     let _phase = crate::activity::job_phase(JobPhase::Reviewing);
     let fail = |why: String| RoundVerdict::Failed {
@@ -1744,7 +1740,8 @@ async fn review_round(
     // verdict is the rest's.
     let (mut written, follow_ups) = match parse_review(&out) {
         Ok((entries, dropped)) => {
-            let (follow_ups, rest): (Vec<_>, Vec<_>) = entries.into_iter().partition(is_follow_up);
+            let (follow_ups, rest): (Vec<_>, Vec<_>) =
+                entries.into_iter().partition(ReportedIssue::is_follow_up);
             // Entries that were not issues may have meant one: no clean
             // verdict rests on them.
             if dropped > 0 && rest.is_empty() {
@@ -1795,7 +1792,7 @@ async fn undo_reviewer(
     round: u32,
     shown: ReviewedTree,
     after: &TreeState,
-    written: &mut Result<Vec<serde_json::Value>, String>,
+    written: &mut Result<Vec<ReportedIssue>, String>,
 ) -> Option<RoundVerdict> {
     const CHANGED: &str = "the reviewer changed the worktree";
     let start = rounds.start;
@@ -2132,7 +2129,7 @@ fn unrestored(before: &TreeState, now: &TreeState) -> Option<String> {
 /// what is left of the job's grant after `job`.
 async fn answer_review(
     rounds: &Rounds<'_>,
-    issues: &[serde_json::Value],
+    issues: &[ReportedIssue],
     job: &RunResult,
 ) -> Result<RunResult, String> {
     let (cfg, start) = (rounds.cfg, rounds.start);
@@ -2218,12 +2215,12 @@ pub(super) async fn tree_state(tree: &Path) -> TreeState {
 /// string `summary` is an issue, one whose `blocking` is not a boolean is
 /// taken as blocking (a slip in severity must not let a defect ship), and
 /// anything else is counted and dropped, never taking the others with it.
-pub(super) fn parse_review(out: &Path) -> Result<(Vec<serde_json::Value>, usize), String> {
+pub(super) fn parse_review(out: &Path) -> Result<(Vec<ReportedIssue>, usize), String> {
     let bytes = std::fs::read(out).map_err(|e| format!("no review file: {e}"))?;
     let entries: Vec<serde_json::Value> = serde_json::from_slice(&bytes)
         .map_err(|e| format!("the review file is not an array: {e}"))?;
     let total = entries.len();
-    let mut issues: Vec<serde_json::Value> = entries
+    let mut issues: Vec<ReportedIssue> = entries
         .into_iter()
         .filter(|entry| {
             entry
@@ -2237,21 +2234,16 @@ pub(super) fn parse_review(out: &Path) -> Result<(Vec<serde_json::Value>, usize)
             {
                 issue["blocking"] = serde_json::Value::Bool(true);
             }
-            issue
+            ReportedIssue::from(issue)
         })
         .collect();
     let dropped = total - issues.len();
-    issues.sort_by_key(|entry| !is_blocking(entry));
+    issues.sort_by_key(|issue| !issue.blocking);
     Ok((issues, dropped))
 }
 
-/// Whether the reviewer marked `issue` blocking.
-fn is_blocking(issue: &serde_json::Value) -> bool {
-    issue.get("blocking").and_then(serde_json::Value::as_bool) == Some(true)
-}
-
 /// [`tally`], and whether the reviewer's changes to the tree were undone.
-fn raised(issues: &[serde_json::Value], undone: bool) -> String {
+fn raised(issues: &[ReportedIssue], undone: bool) -> String {
     if undone {
         format!(
             "{} (the reviewer changed the worktree; undone)",
@@ -2262,19 +2254,11 @@ fn raised(issues: &[serde_json::Value], undone: bool) -> String {
     }
 }
 
-/// Whether the reviewer judged `issue` outside the change's scope: a real
-/// defect it did not introduce or worsen, or a generalization beyond the
-/// finding. Reported to the human, never answered by the fixer.
-fn is_follow_up(issue: &serde_json::Value) -> bool {
-    issue.get("kind").and_then(serde_json::Value::as_str) == Some("follow-up")
-}
-
 /// Add a round's `raised` follow-ups to `all`: one per summary, the latest
 /// round's wording winning.
-fn merge_follow_ups(all: &mut Vec<serde_json::Value>, raised: Vec<serde_json::Value>) {
-    let summary = |v: &serde_json::Value| v.get("summary").cloned();
+fn merge_follow_ups(all: &mut Vec<ReportedIssue>, raised: Vec<ReportedIssue>) {
     for issue in raised {
-        all.retain(|kept| summary(kept) != summary(&issue));
+        all.retain(|kept| kept.summary != issue.summary);
         all.push(issue);
     }
 }
@@ -2289,8 +2273,8 @@ fn follow_up_tally(count: usize) -> String {
 }
 
 /// `"N issues (M blocking)"`, for events.
-fn tally(issues: &[serde_json::Value]) -> String {
-    let blocking = issues.iter().filter(|i| is_blocking(i)).count();
+fn tally(issues: &[ReportedIssue]) -> String {
+    let blocking = issues.iter().filter(|i| i.blocking).count();
     let s = if issues.len() == 1 { "" } else { "s" };
     format!("{} issue{s} ({blocking} blocking)", issues.len())
 }
@@ -2344,7 +2328,7 @@ async fn log_round(store: &Store, start: &FixStart, round: u32, outcome: &str) {
 
 /// A review that failed: the fix ships, and its PR says why it was not
 /// reviewed, followed by any `issues` the reviewer had written.
-fn failed(round: u32, why: &str, head: Option<String>, issues: &[serde_json::Value]) -> Ending {
+fn failed(round: u32, why: &str, head: Option<String>, issues: &[ReportedIssue]) -> Ending {
     let mut note = format!(
         "## Pre-PR review\n\nReview round {round} failed: {why}. This change ships \
          without a completed automated review."
@@ -2361,7 +2345,7 @@ fn failed(round: u32, why: &str, head: Option<String>, issues: &[serde_json::Val
 
 /// Ship round `round`'s `issues` unresolved, with why the fixer
 /// did not answer them when it was meant to.
-fn unresolved(round: u32, issues: &[serde_json::Value], unanswered: Option<&str>) -> Ending {
+fn unresolved(round: u32, issues: &[ReportedIssue], unanswered: Option<&str>) -> Ending {
     let mut note = unresolved_note(round, issues);
     if let Some(why) = unanswered {
         let _ = write!(note, "\n\nThe fixer could not answer them: {why}.");
@@ -2375,7 +2359,7 @@ fn unresolved(round: u32, issues: &[serde_json::Value], unanswered: Option<&str>
 
 /// The PR body section that hands a round's issues to the human, blocking
 /// ones first and marked so.
-fn unresolved_note(round: u32, issues: &[serde_json::Value]) -> String {
+fn unresolved_note(round: u32, issues: &[ReportedIssue]) -> String {
     let mut note = format!(
         "## Unresolved review issues\n\nAutomated pre-PR review round {round} raised these \
          issues, and the fix ships without resolving them:\n"
@@ -2385,7 +2369,7 @@ fn unresolved_note(round: u32, issues: &[serde_json::Value]) -> String {
 }
 
 /// The PR body section with the follow-ups every round raised.
-fn follow_ups_note(follow_ups: &[serde_json::Value]) -> String {
+fn follow_ups_note(follow_ups: &[ReportedIssue]) -> String {
     let mut note = "## Follow-ups from review\n\nThe automated pre-PR review found these \
                     defects outside this change's scope. They are not addressed here:\n"
         .to_owned();
@@ -2395,25 +2379,16 @@ fn follow_ups_note(follow_ups: &[serde_json::Value]) -> String {
 
 /// `issues` as a Markdown list on `note`: blocking ones marked, each with
 /// its place and detail.
-fn issue_list(note: &mut String, issues: &[serde_json::Value]) {
-    let field = |issue: &serde_json::Value, key: &str| match issue.get(key) {
-        Some(serde_json::Value::String(s)) => s.clone(),
-        Some(serde_json::Value::Null) | None => String::new(),
-        Some(other) => other.to_string(),
-    };
+fn issue_list(note: &mut String, issues: &[ReportedIssue]) {
     for issue in issues {
-        let place = match (field(issue, "file"), field(issue, "line")) {
-            (file, _) if file.is_empty() => String::new(),
-            (file, line) if line.is_empty() || line == "0" => format!(" (`{file}`)"),
-            (file, line) => format!(" (`{file}:{line}`)"),
+        let place = match (issue.file.as_deref(), issue.line) {
+            (None | Some(""), _) => String::new(),
+            (Some(file), None | Some(0)) => format!(" (`{file}`)"),
+            (Some(file), Some(line)) => format!(" (`{file}:{line}`)"),
         };
-        let mark = if is_blocking(issue) {
-            "[blocking] "
-        } else {
-            ""
-        };
-        let _ = write!(note, "\n- {mark}**{}**{place}", field(issue, "summary"));
-        for line in field(issue, "detail").lines() {
+        let mark = if issue.blocking { "[blocking] " } else { "" };
+        let _ = write!(note, "\n- {mark}**{}**{place}", issue.summary);
+        for line in issue.detail.lines() {
             note.push_str("\n  ");
             note.push_str(line);
         }

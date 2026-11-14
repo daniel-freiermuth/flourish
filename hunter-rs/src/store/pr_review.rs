@@ -42,7 +42,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use super::{ImmediateTx, Store};
+use super::{ImmediateTx, ReportedIssue, Store};
 use crate::domain::{ForgeName, PrReviewState};
 use crate::forge;
 use crate::types::{PrReviewIssueOut, PrReviewReplyOut, PrReviewRoundOut};
@@ -506,22 +506,6 @@ impl PrReviewRow {
         let doublings = u32::try_from((self.failures - 1).clamp(0, 16)).unwrap_or(0);
         Some(failed_at.saturating_add(PR_REVIEW_RETRY_MS.saturating_mul(1 << doublings)))
     }
-}
-
-/// An issue as the reviewer reported it, for [`PrReviewRound::Ok`].
-#[derive(Debug, Clone, Default)]
-pub struct ReportedIssue {
-    pub kind: String,
-    pub blocking: bool,
-    pub severity: Option<String>,
-    pub confidence: Option<f64>,
-    pub file: Option<String>,
-    pub line: Option<i64>,
-    /// `RIGHT` or `LEFT`, in any case; anything else is the reviewer not
-    /// saying.
-    pub side: Option<String>,
-    pub summary: String,
-    pub detail: String,
 }
 
 /// What a round said about one earlier issue (`pr_review_verdicts`).

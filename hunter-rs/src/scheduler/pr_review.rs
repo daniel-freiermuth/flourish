@@ -474,9 +474,7 @@ pub(super) async fn run_pr_review(
         // A reviewer stopped by its cap or the wall clock still verified
         // what it wrote: the playbook has it rewrite each file after every
         // entry, as the pre-PR reviewer's does.
-        (JobState::Done | JobState::Suspended, Ok((issues, _))) => {
-            Ok(issues.iter().map(issue_out).collect::<Vec<_>>())
-        }
+        (JobState::Done | JobState::Suspended, Ok((issues, _))) => Ok(issues),
         (JobState::Done, Err(why)) => Err(why),
         (state, _) => Err(format!("worker {state}")),
     };
@@ -628,28 +626,6 @@ pub(super) async fn run_pr_review(
         posts_approved,
         ..Default::default()
     })
-}
-
-/// A reviewer's issue entry as recorded: the playbook's schema, read
-/// leniently (a missing optional field is null, a missing kind is the
-/// reviewer's default `introduced`).
-fn issue_out(v: &serde_json::Value) -> ReportedIssue {
-    let s = |k: &str| {
-        v.get(k)
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-    };
-    ReportedIssue {
-        kind: s("kind").unwrap_or_else(|| "introduced".to_owned()),
-        blocking: v.get("blocking").and_then(serde_json::Value::as_bool) == Some(true),
-        severity: s("severity"),
-        confidence: v.get("confidence").and_then(serde_json::Value::as_f64),
-        file: s("file"),
-        line: v.get("line").and_then(serde_json::Value::as_i64),
-        side: s("side"),
-        summary: s("summary").unwrap_or_default(),
-        detail: s("detail").unwrap_or_default(),
-    }
 }
 
 /// The longest verdict note kept: one sentence of evidence, not an essay
