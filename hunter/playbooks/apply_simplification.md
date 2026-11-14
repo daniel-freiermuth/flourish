@@ -66,9 +66,8 @@ Commit ONLY a plan document under `docs/` (e.g. `docs/SIMPLIFICATION-<topic-slug
 - What exists and why it was built, the payers today, the simpler design, what would be
   deleted, what breaks and for whom, and the exact question the human must answer
 - This MUST be a real commit (a shipped PR always needs at least one)
-- Start the plan commit's subject with `[RFC]`. The PR title is taken from the commit
-  subject, not from PR-DESCRIPTION.md, so this is what marks the PR as a decision to make
-  rather than a change to merge
+- Start the PR title (the `Title:` line of PR-DESCRIPTION.md, see Deliverables) with `[RFC]`:
+  that is what marks the PR as a decision to make rather than a change to merge
 
 COMMIT PER STEP: you may be killed at any moment, and committed work survives while anything
 only in your head does not.
@@ -105,7 +104,9 @@ only.
 # Deliverables
 
 - **Commits on {{BRANCH}}** — at least one in either path
-- **PR-DESCRIPTION.md** at the worktree root, NOT COMMITTED (becomes the PR body):
+- **PR-DESCRIPTION.md** at the worktree root, NOT COMMITTED. Its first line is
+  `Title: <the PR title>`, starting with `[RFC]` if you chose (b); then a blank line; the rest
+  becomes the PR body:
   - Which of (a) / (b) you chose and why
   - Why the complexity existed, and the re-verified evidence that its reason is gone
   - (a) What was removed: lines added/removed in production code, with tests and docs

@@ -42,17 +42,17 @@ inside this worktree. NEVER push. NEVER run project-wide formatters.
    proof test may be committed alone as a checkpoint; once the fix makes it
    pass, amend the fix into that commit with a message that describes the
    fix (`git commit --amend -m "..."`), so no commit on the branch has a
-   failing test. The subject of your last commit becomes the PR title: it
-   must name the fix, not the test.
+   failing test.
 
 # Deliverables
 - Commits on {{BRANCH}}, each one building and passing the tests on its own:
   the proof test lands in the same commit as the fix it proves.
-- PR-DESCRIPTION.md at the worktree root, NOT COMMITTED (it becomes the PR
-  body): what breaks; why (code evidence); the INTENDED behavior and how you
-  know it is intended; evidence rung achieved and the proof itself (or where
-  it lives); verification performed with observed results; what you
-  deliberately did NOT change.
+- PR-DESCRIPTION.md at the worktree root, NOT COMMITTED. Its first line is
+  `Title: <the PR title>`, naming the fix, not the test; then a blank line;
+  the rest becomes the PR body: what breaks; why (code evidence); the
+  INTENDED behavior and how you know it is intended; evidence rung achieved
+  and the proof itself (or where it lives); verification performed with
+  observed results; what you deliberately did NOT change.
 - Missing proof is NOT a false finding. Write NOT-A-BUG.md only when evidence
   establishes that the finding is invalid; if you cannot reach at least rung
   3 with an airtight argument or cannot verify the affected change, write

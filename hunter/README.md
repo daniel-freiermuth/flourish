@@ -119,8 +119,13 @@ new ──recheck──> new / superseded / rejected
   hunt; other types can also be queued directly for `apply_*` playbooks).
 - **`queued` → `fixing` → `pr_open`** — a fix/apply worker verifies the
   finding and ships a draft PR, declines (`NOT-A-BUG.md`/`DECLINED.md`),
-  or pauses. A requeued checkpoint continues in its original worktree and
-  transcript instead of recreating the branch. A decline's first line
+  or pauses. The PR's title is the first line of the worker's
+  `PR-DESCRIPTION.md` (`Title: ...`), which it keeps current through the
+  pre-PR review, and the rest is the body; without exactly that line the
+  title is the shipped commit's subject, and the `ship` event in the log
+  says so. A requeued checkpoint continues in its
+  original worktree and transcript instead of recreating the branch. A
+  decline's first line
   classifies it with the closed-PR harvest's words and lands the same
   way: superseded / duplicate / obsolete → `superseded`, wrong →
   `rejected`, unwanted → `wontfix`; a decline that classifies nothing

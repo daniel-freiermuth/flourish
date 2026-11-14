@@ -33,7 +33,10 @@ in this list and not yours to fix here: they go to the PR body for later.
 # Deliverables
 - Commits for every issue you addressed.
 - PR-DESCRIPTION.md kept current (still NOT committed): it must describe the
-  change as it now stands. Append, or update if it already exists, a
+  change as it now stands. That includes its first line, `Title: <the PR
+  title>`: if your answers changed what the change is, change the title to
+  say so, and add the line if the file has none. Append, or update if it
+  already exists, a
   "## Review" section listing every issue above by its summary, either as
   addressed (and how, with the commit) or as rebutted (with the evidence).
   Keep the entries of earlier rounds. The next review round reads that

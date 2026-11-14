@@ -1869,8 +1869,10 @@ async fn fix(f: &Fixture, backend: &ScriptedBackend) -> hunter::scheduler::Cycle
 
 /// What a shipped fix hands the forge: the branch commit reaches origin,
 /// and the draft PR is opened from that branch onto the default branch,
-/// titled by the last commit and described by `PR-DESCRIPTION.md`. A
-/// shipped fix also ends any failure streak.
+/// described by `PR-DESCRIPTION.md`. A description without a `Title:` line
+/// (one written before the line was asked for) is the whole body, and the
+/// PR takes the shipped commit's subject. A shipped fix also ends any
+/// failure streak.
 #[tokio::test]
 async fn a_shipped_fix_reaches_origin_and_opens_its_pr_from_the_branch() {
     let bins = support::FakeBins::acquire("fix-ship-argv");
@@ -1914,9 +1916,77 @@ async fn a_shipped_fix_reaches_origin_and_opens_its_pr_from_the_branch() {
     assert_eq!(
         after_flag("--title"),
         "fix: the real bug",
-        "last commit subject"
+        "no Title line: the shipped commit's subject"
     );
     assert_eq!(after_flag("--body"), "the body");
+}
+
+/// The PR's title and body, and the ship event, for a fix whose worker
+/// wrote `description` and whose last commit is `test: pin the empty feed`.
+async fn shipped_as(label: &str, description: &'static str) -> (String, String, String) {
+    let bins = support::FakeBins::acquire(label);
+    bins.ok("gh", "https://github.com/acme/widget/pull/42");
+    let f = fixture(label).await;
+    route_push(&f, None);
+    let worker = ScriptedBackend::new(move |tree| {
+        std::fs::write(tree.join("FIX.md"), "fixed\n").unwrap();
+        git(tree, &["add", "-A"]);
+        git(tree, &["commit", "-m", "test: pin the empty feed"]);
+        std::fs::write(tree.join("PR-DESCRIPTION.md"), description).unwrap();
+        support::done()
+    });
+
+    let summary = fix(&f, &worker).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    let events = f.store.recent_events(20).await.unwrap();
+    let ship = events.iter().find(|e| e.kind == "ship").unwrap();
+    (pr_title(&bins), pr_body(&bins), ship.message.clone())
+}
+
+/// What the ship event says of a PR that took its commit's subject.
+const UNTITLED: &str = "titled by its commit's subject";
+
+/// The worker names its PR: the description's first line, `Title: ...`,
+/// is the title and is not repeated in the body. The last commit's
+/// subject is not the title, whatever it says.
+#[tokio::test]
+async fn the_descriptions_title_line_titles_the_pr_and_stays_out_of_the_body() {
+    let (title, body, event) = shipped_as(
+        "fix-title-line",
+        "Title:  fix(feed): an empty feed is not an error \n\n## What breaks\nthe body",
+    )
+    .await;
+
+    assert_eq!(title, "fix(feed): an empty feed is not an error");
+    assert_eq!(body, "## What breaks\nthe body");
+    assert!(!event.contains(UNTITLED), "{event}");
+}
+
+/// A `Title:` line that names nothing is no title: the PR falls back to
+/// the shipped commit's subject, not to an empty title, which the forge
+/// would replace with the branch name. The empty line does not reach the
+/// body, and the ship event says the PR was not titled by its worker.
+#[tokio::test]
+async fn an_empty_title_line_falls_back_to_the_commit_subject_and_is_reported() {
+    let (title, body, event) = shipped_as("fix-title-empty", "Title:   \n\nthe body").await;
+
+    assert_eq!(title, "test: pin the empty feed");
+    assert_eq!(body, "the body");
+    assert!(event.contains(UNTITLED), "{event}");
+}
+
+/// Only the exact line is a title. A description that spells it another
+/// way is not guessed at: it ships whole as the body, under the commit's
+/// subject, and the ship event says so, so the miss is seen.
+#[tokio::test]
+async fn a_title_spelled_another_way_is_not_guessed_at_and_is_reported() {
+    let description = "# Title: fix the feed\n\nthe body";
+    let (title, body, event) = shipped_as("fix-title-heading", description).await;
+
+    assert_eq!(title, "test: pin the empty feed");
+    assert_eq!(body, description);
+    assert!(event.contains(UNTITLED), "{event}");
 }
 
 /// A PR-create failure with no PR to recover requeues the finding and
@@ -2825,6 +2895,11 @@ fn reviewed_worker_stopping(
         result
     })
 }
+/// The title the reviewed fixer gives its PR ([`Act::Fix`]), and the one an
+/// answer to the review changes it to ([`Act::Answer`]). Neither is a
+/// commit subject.
+const TITLED: &str = "fix the real bug in the feed parser";
+const RETITLED: &str = "fix the real bug in both parsers";
 
 /// Run `act`, the `i`th run of a reviewed fix, against `run`'s tree.
 fn run_act(run: &support::Run, i: usize, act: Act) -> hunter::types::RunResult {
@@ -2836,7 +2911,11 @@ fn run_act(run: &support::Run, i: usize, act: Act) -> hunter::types::RunResult {
     };
     let fix = || {
         commit("FIX.md", "fix: the real bug");
-        std::fs::write(tree.join("PR-DESCRIPTION.md"), "the body").unwrap();
+        std::fs::write(
+            tree.join("PR-DESCRIPTION.md"),
+            format!("Title: {TITLED}\n\nthe body"),
+        )
+        .unwrap();
         support::done_with_transcript(tree)
     };
     let continued = || {
@@ -2899,10 +2978,13 @@ fn run_act(run: &support::Run, i: usize, act: Act) -> hunter::types::RunResult {
             std::fs::write(out_path(&run.prompt), CLEAN).unwrap();
             support::done()
         }
+        // The answer changes what the fix is, so it retitles the PR.
         Act::Answer => {
             commit(&format!("ANSWER-{i}.md"), "fix: the sibling parser too");
             let description = tree.join("PR-DESCRIPTION.md");
-            let body = std::fs::read_to_string(&description).unwrap();
+            let body = std::fs::read_to_string(&description)
+                .unwrap()
+                .replacen(TITLED, RETITLED, 1);
             std::fs::write(&description, format!("{body}\n\n## Review\naddressed")).unwrap();
             continued()
         }
@@ -3247,8 +3329,8 @@ async fn a_blocking_issue_resumes_the_fixer_and_the_answer_ships_once_clean() {
     assert_eq!(shipped_subject(&f), "fix: the sibling parser too");
     assert_eq!(
         pr_title(&bins),
-        "fix: the real bug",
-        "an answer to the review does not retitle the fix"
+        RETITLED,
+        "the title the answer left in the description, not the one before the review"
     );
     assert_eq!(pr_body(&bins), "the body\n\n## Review\naddressed");
     let events = f.store.recent_events(20).await.unwrap();
@@ -3414,8 +3496,8 @@ async fn a_continued_review_hold_answers_the_issues_and_is_reviewed_again() {
     );
     assert_eq!(
         pr_title(&bins),
-        "fix: the real bug",
-        "the hold keeps the title the fix had before round 1"
+        RETITLED,
+        "the title of the description as the answers left it"
     );
 }
 
@@ -3548,12 +3630,7 @@ async fn a_reviewer_that_moves_head_fails_its_review_and_its_commit_does_not_shi
         body.contains("Review round 1 failed: the reviewer changed the worktree"),
         "{body}"
     );
-    let title = bins.calls_to("gh")[0]
-        .iter()
-        .skip_while(|a| *a != "--title")
-        .nth(1)
-        .cloned();
-    assert_eq!(title.as_deref(), Some("fix: the real bug"));
+    assert_eq!(pr_title(&bins), TITLED);
 }
 
 /// A reviewer that rewrites or deletes the description, which becomes the
@@ -3745,7 +3822,7 @@ async fn a_suspended_review_keeps_its_title_and_follow_ups() {
     let summary = resume(&f, &plan, &resumed).await;
 
     assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
-    assert_eq!(pr_title(&bins), "fix: the real bug");
+    assert_eq!(pr_title(&bins), RETITLED);
     let body = pr_body(&bins);
     assert!(
         body.contains("the other feeds parse dates the same broken way"),
@@ -3823,7 +3900,7 @@ async fn an_owed_curation_keeps_the_title_and_follow_ups() {
             "{label}: {summary:?}"
         );
         assert_eq!(retry.runs().len(), 3, "{label}: reviewed and curated again");
-        assert_eq!(pr_title(&bins), "fix: the real bug", "{label}");
+        assert_eq!(pr_title(&bins), RETITLED, "{label}");
         let body = pr_body(&bins);
         assert!(
             body.contains("the other feeds parse dates the same broken way"),
@@ -4087,8 +4164,8 @@ async fn a_fixer_suspended_mid_answer_ships_nothing_and_its_resume_reviews_the_n
     assert_eq!(pr_body(&bins), "the body");
     assert_eq!(
         pr_title(&bins),
-        "fix: the real bug",
-        "titled by the fix, across attempts"
+        TITLED,
+        "titled by the description, not by the newer commit"
     );
 }
 
@@ -4140,8 +4217,8 @@ async fn work_after_an_unpublished_review_is_reviewed_again_and_ships_whole() {
     );
     assert_eq!(
         pr_title(&bins),
-        "fix: the real bug",
-        "titled by the fix it had before its first review, not the newer commit"
+        TITLED,
+        "titled by the description, not by the newer commit"
     );
 }
 
@@ -7305,7 +7382,7 @@ fn shipped_commits(f: &Fixture) -> Vec<String> {
 /// A review that ends in a ship hands the fixer its own session once more
 /// to curate the step-by-step history. A rewrite whose tree is exactly the
 /// reviewed one ships in place of the original commits, under the title
-/// the fix had before its first review.
+/// the description gives, which the rewritten commits do not change.
 #[tokio::test]
 async fn a_curated_history_of_the_reviewed_tree_ships() {
     let (f, worker, bins) = curated("fix-curate-ok", Curation::Squash).await;
@@ -7315,7 +7392,7 @@ async fn a_curated_history_of_the_reviewed_tree_ships() {
     let transcript = runs[0].session.join("session.jsonl");
     assert_eq!(runs[4].resume_from.as_deref(), Some(transcript.as_path()));
     assert_eq!(shipped_commits(&f), ["fix: the real bug, curated"]);
-    assert_eq!(pr_title(&bins), "fix: the real bug");
+    assert_eq!(pr_title(&bins), RETITLED);
     let events = f.store.recent_events(30).await.unwrap();
     assert!(
         events
@@ -7410,7 +7487,7 @@ async fn a_curation_the_grant_cut_short_is_had_by_the_resume() {
             ["fix: the real bug, curated"],
             "{case}"
         );
-        assert_eq!(pr_title(&bins), "fix: the real bug", "{case}");
+        assert_eq!(pr_title(&bins), RETITLED, "{case}");
         drop(bins);
     }
 }
