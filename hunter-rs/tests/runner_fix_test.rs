@@ -3568,7 +3568,7 @@ async fn a_legacy_review_hold_file_sends_its_issues_only_on_its_own_hold() {
     let legacy = |report: &str| {
         serde_json::json!({
             "report": report,
-            "issues": [{"title": "a legacy issue", "blocking": true}],
+            "issues": [{"summary": "a legacy issue", "blocking": true}],
         })
         .to_string()
     };
