@@ -391,11 +391,13 @@ pub struct ResumeChainStats {
     pub total: i64,
     /// How many attempts the chain contains, this one included, for the
     /// attempt arm of the give-up ceiling: not a stop the daemon's
-    /// shutdown or a spent grant made between a fix's review runs.
+    /// shutdown made between a fix's runs, nor a fix attempt that moved
+    /// its work on to another step.
     pub attempts: i64,
-    /// [`Self::attempts`] with the review's grant suspensions counted, for
-    /// the cost arm: a chain that keeps running out of grant in its review
-    /// is held there for its cost rather than resumed for ever.
+    /// [`Self::attempts`] with the attempts that made progress counted,
+    /// for the cost arm: a chain that keeps moving from step to step
+    /// without finishing, each attempt a whole grant, is held for its cost
+    /// rather than resumed for ever.
     pub runs: i64,
     /// The costliest single attempt in it. 0 when nothing in the chain
     /// has a metered cost yet.
@@ -676,6 +678,21 @@ pub struct JobOutcome<'a> {
     pub model: Option<&'a str>,
     pub usage_delta: Option<f64>,
     pub finished_at: i64,
+    /// A fix attempt's step record as it ended (`finding_work.step`, JSON):
+    /// its step is the job's `ended_step`, and a paused attempt's work
+    /// item continues from it. `None` for every other kind.
+    pub step: Option<&'a str>,
+    /// A fix attempt kept as its work item's checkpoint though it did not
+    /// pause, at `step`, as a paused one is: one that ends shipping, its
+    /// run finished, recorded before it ships, until shipping moves the
+    /// finding out of the fix tier, which drops both, so a daemon that dies
+    /// while it pushes or opens the PR leaves that step to resume (the
+    /// publish, or a review or curation whose changes are to be put back),
+    /// not the fix to redo; or one whose review failed short of a verdict
+    /// (it could not read which issues are open, or record the fixer's
+    /// answers), whose retry runs that step again in the same tree and
+    /// review. `false` for every other attempt.
+    pub kept: bool,
 }
 
 /// Allowed /api/repo update fields, post-coercion (WRITES contract §6).
@@ -877,6 +894,24 @@ async fn point_checkpoint(tx: &mut ImmediateTx, job_id: i64, paused: bool) -> sq
              checkpoint_job_id = excluded.checkpoint_job_id",
         job_id,
         paused
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Record `step`, a fix attempt's step record (`finding_work.step`), as
+/// where the work item continues from, when `job_id` is its checkpoint
+/// (moved there first, [`point_checkpoint`]). `None` writes nothing: any
+/// other kind keeps no step.
+async fn point_step(tx: &mut ImmediateTx, job_id: i64, step: Option<&str>) -> sqlx::Result<()> {
+    if step.is_none() {
+        return Ok(());
+    }
+    sqlx::query!(
+        "UPDATE finding_work SET step = ?2 WHERE checkpoint_job_id = ?1",
+        job_id,
+        step
     )
     .execute(&mut **tx)
     .await?;
@@ -1636,7 +1671,10 @@ impl Store {
     /// The verdict of a fix the worker declined, its classification's
     /// status ([`decline_status`]) with the anchor, applied only while the
     /// finding is still `fixing`; [`Moved::Conflict`] names where it is
-    /// instead, and nothing is written.
+    /// instead, and nothing is written. The fix's checkpoint (an attempt
+    /// kept at its step) is cleared first, in the same transaction: the
+    /// decline concludes the fix, so leaving the tier logs no drop for it,
+    /// as for [`Self::open_pr_from_fixing`].
     /// Takes an [`Owner`], which only `crate::recovery` makes, inside
     /// [`FixClaim::conclude`](crate::recovery::FixClaim::conclude): only the
     /// claim's holder moves a finding out of `fixing`.
@@ -1651,6 +1689,15 @@ impl Store {
         let (now, fixing) = (now_ms(), FindingStatus::Fixing);
         let status = FindingStatus::from(decline_status(class));
         let mut tx = ImmediateTx::begin(&self.pool).await?;
+        sqlx::query!(
+            "UPDATE finding_work SET checkpoint_job_id = NULL \
+             WHERE finding_id = ?1 AND kind = 'fix' \
+               AND EXISTS (SELECT 1 FROM findings WHERE id = ?1 AND status = ?2)",
+            finding_id,
+            fixing
+        )
+        .execute(&mut *tx)
+        .await?;
         let set = sqlx::query!(
             "UPDATE findings SET status = ?1, verdict_reason = ?2, updated_at = ?3 \
              WHERE id = ?4 AND status = ?5",
@@ -1813,7 +1860,10 @@ impl Store {
 
     /// `fixing` → `pr_open` with `pr_url`, only while the finding is still
     /// `fixing`; [`Moved::Conflict`] names where it is instead, and nothing
-    /// is written. Takes an [`Owner`], which only `crate::recovery` makes,
+    /// is written. The shipped fix's checkpoint (the attempt that
+    /// published, kept as one until now) is cleared first, in the same
+    /// transaction: the fix is done, not dropped, so leaving the tier
+    /// logs no drop for it. Takes an [`Owner`], which only `crate::recovery` makes,
     /// inside [`FixClaim::open_pr`](crate::recovery::FixClaim::open_pr).
     pub(crate) async fn open_pr_from_fixing(
         &self,
@@ -1823,6 +1873,15 @@ impl Store {
     ) -> sqlx::Result<Moved> {
         let (now, pr_open, fixing) = (now_ms(), FindingStatus::PrOpen, FindingStatus::Fixing);
         let mut tx = ImmediateTx::begin(&self.pool).await?;
+        sqlx::query!(
+            "UPDATE finding_work SET checkpoint_job_id = NULL \
+             WHERE finding_id = ?1 AND kind = 'fix' \
+               AND EXISTS (SELECT 1 FROM findings WHERE id = ?1 AND status = ?2)",
+            finding_id,
+            fixing
+        )
+        .execute(&mut *tx)
+        .await?;
         let set = sqlx::query!(
             "UPDATE findings SET status = ?1, pr_url = ?2, updated_at = ?3 \
              WHERE id = ?4 AND status = ?5",
@@ -2874,9 +2933,14 @@ impl Store {
     /// Make the finished attempt `job_id` its work item's checkpoint, when
     /// it has a transcript to continue: an attempt whose work is done but
     /// could not be published while the network was down (#95), which the
-    /// next cycle continues to publish instead of redoing the work. Without
-    /// a transcript the pointer is left as it is.
-    async fn keep_attempt_as_checkpoint(&self, job_id: i64) -> sqlx::Result<()> {
+    /// next cycle continues to publish instead of redoing the work. A fix
+    /// attempt's `step` record goes with it ([`point_step`]). Without a
+    /// transcript the pointer is left as it is.
+    async fn keep_attempt_as_checkpoint(
+        &self,
+        job_id: i64,
+        step: Option<&str>,
+    ) -> sqlx::Result<()> {
         let resumable = sqlx::query_scalar!(
             r#"SELECT session_file IS NOT NULL AS "resumable!: bool" FROM jobs WHERE id = ?1"#,
             job_id
@@ -2887,8 +2951,45 @@ impl Store {
         if resumable {
             let mut tx = ImmediateTx::begin(&self.pool).await?;
             point_checkpoint(&mut tx, job_id, true).await?;
+            point_step(&mut tx, job_id, step).await?;
             tx.commit().await?;
         }
+        Ok(())
+    }
+
+    /// The step record `finding_id`'s fix work continues from
+    /// (`finding_work.step`, JSON), if it has one: `None` starts cold.
+    pub async fn fix_step(&self, finding_id: i64) -> sqlx::Result<Option<String>> {
+        let fix = FindingJobKind::Fix;
+        Ok(sqlx::query_scalar!(
+            "SELECT step FROM finding_work WHERE finding_id = ?1 AND kind = ?2",
+            finding_id,
+            fix
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten())
+    }
+
+    /// Record `step`, the step record `finding_id`'s fix attempt moved to
+    /// between two of its runs, so an attempt cut off by a crash resumes
+    /// there. Only while the finding is in the fix tier: work that has left
+    /// it keeps no step. The job lane's alone, through [`JobStore`].
+    async fn set_fix_step(&self, finding_id: i64, step: &str) -> sqlx::Result<()> {
+        let fix = FindingJobKind::Fix;
+        sqlx::query!(
+            "INSERT INTO finding_work (finding_id, kind, step) \
+             SELECT ?1, ?2, ?3 \
+             WHERE EXISTS (SELECT 1 FROM findings f \
+                           JOIN work_tiers t ON t.status = f.status AND t.kind = ?2 \
+                           WHERE f.id = ?1) \
+             ON CONFLICT (finding_id, kind) DO UPDATE SET step = excluded.step",
+            finding_id,
+            fix,
+            step
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -3065,17 +3166,18 @@ impl Store {
     /// operator last released the work (WORK-MODEL.md §8).
     ///
     /// An attempt the daemon's own shutdown stopped between two worker
-    /// runs (`killed_reason = 'shutdown'`, a fix's pre-PR review) is not
-    /// counted as an attempt: a stop the daemon chose costs the work no
-    /// try, as a stop during a single run never did. Nor is one the review
-    /// suspended between its runs because its grant was spent
-    /// (`killed_reason = 'grant'`), or because its curator was refused its
-    /// credentials (`'auth-unavailable'`, a gateway outage): the work is
-    /// done up to that point, and the resume only carries on with it.
-    /// Each one's spend is real and counts like any other, in `total` and
-    /// `max_single`, and a grant or credentials suspension counts in
-    /// `runs`, which gates the cost arm of the ceiling, so that arm still
-    /// bounds a chain of them.
+    /// runs (`killed_reason = 'shutdown'`, a fix's pre-PR review) is
+    /// counted neither as an attempt nor as a run: a stop the daemon chose
+    /// costs the work no try, as a stop during a single run never did. Nor
+    /// is an attempt counted that made progress: a fix attempt that ended
+    /// at another step than the attempt it continued (`ended_step`), as one
+    /// whose review was suspended when its grant ran out after its fixer
+    /// finished. The work is done up to there, and the resume only carries
+    /// on with it. A chain stuck at one step counts every attempt there.
+    /// Every attempt's spend is real and counts like any other, in `total`
+    /// and `max_single`, and every one but a shutdown stop counts in
+    /// `runs`, which gates the cost arm of the ceiling, so that arm bounds
+    /// a chain whatever its progress.
     pub async fn resume_chain_stats(
         &self,
         job_id: i64,
@@ -3094,13 +3196,16 @@ impl Store {
                   AND (j.id = c.resumed_from OR j.resumed_from = c.id)
             )
             SELECT COALESCE(SUM(tokens_new), 0) AS "total!: i64",
-                   COALESCE(SUM(killed_reason IS NOT 'shutdown' AND killed_reason IS NOT 'grant'
-                                AND killed_reason IS NOT 'auth-unavailable'
-                                AND (resumed_from IS NULL OR killed_reason = 'cap'
-                                     OR COALESCE(tokens_new, 0) > 0)), 0) AS "attempts!: i64",
                    COALESCE(SUM(killed_reason IS NOT 'shutdown'
-                                AND (resumed_from IS NULL
-                                     OR killed_reason IN ('cap', 'grant', 'auth-unavailable')
+                                AND (resumed_from IS NULL OR killed_reason = 'cap'
+                                     OR COALESCE(tokens_new, 0) > 0)
+                                AND NOT (resumed_from IS NOT NULL AND ended_step IS NOT NULL
+                                         AND ended_step IS NOT
+                                             (SELECT p.ended_step FROM jobs p
+                                              WHERE p.id = jobs.resumed_from))), 0)
+                       AS "attempts!: i64",
+                   COALESCE(SUM(killed_reason IS NOT 'shutdown'
+                                AND (resumed_from IS NULL OR killed_reason = 'cap'
                                      OR COALESCE(tokens_new, 0) > 0)), 0) AS "runs!: i64",
                    COALESCE(MAX(tokens_new), 0) AS "max_single!: i64"
             FROM jobs WHERE id IN (SELECT id FROM chain)
@@ -3935,8 +4040,13 @@ impl Store {
     /// Record a completed job (all outcome fields set at once).
     ///
     /// This also moves its work item's checkpoint, in
-    /// the same transaction: to this attempt when it ended paused, and off
-    /// whatever it was when it did not ([`point_checkpoint`]). Takes an
+    /// the same transaction: to this attempt when it ended paused or kept
+    /// ([`JobOutcome::kept`]), and off whatever it was
+    /// when it did not ([`point_checkpoint`]). A fix attempt's step record
+    /// ([`JobOutcome::step`]) goes with it: the step the attempt ended at is
+    /// the job's `ended_step`, and a kept one's record is where its work
+    /// item continues from ([`point_step`]); one that was not kept leaves
+    /// none (migration 041's trigger). Takes an
     /// [`Owner`], which only `crate::recovery` makes, inside
     /// [`RunningJob::complete`](crate::recovery::RunningJob::complete): only
     /// the job's owner records how it ended.
@@ -3957,14 +4067,17 @@ impl Store {
             model,
             usage_delta,
             finished_at,
+            step,
+            kept,
         } = *outcome;
-        let suspended = state == FinishedState::Suspended;
+        let kept = state == FinishedState::Suspended || kept;
         let state = JobState::from(state);
         let mut tx = ImmediateTx::begin(&self.pool).await?;
         sqlx::query!(
             "UPDATE jobs SET state = ?1, pid = NULL, tokens_new = ?2, calls = ?3, \
              exit_code = ?4, killed_reason = ?5, session_file = ?6, notes = ?7, \
-             model = ?8, usage_delta = ?9, finished_at = ?10 \
+             model = ?8, usage_delta = ?9, finished_at = ?10, \
+             ended_step = json_extract(?12, '$.step') \
              WHERE id = ?11",
             state,
             tokens_new,
@@ -3976,11 +4089,15 @@ impl Store {
             model,
             usage_delta,
             finished_at,
-            job_id
+            job_id,
+            step
         )
         .execute(&mut *tx)
         .await?;
-        point_checkpoint(&mut tx, job_id, suspended).await?;
+        point_checkpoint(&mut tx, job_id, kept).await?;
+        if kept {
+            point_step(&mut tx, job_id, step).await?;
+        }
         tx.commit().await
     }
 
@@ -3988,7 +4105,9 @@ impl Store {
     /// died while its worker had done metered work, and the transcript is
     /// on disk for the resume tier to continue. `killed_reason` stays
     /// `orphaned` so the row still says how the attempt ended. Its work
-    /// item now continues from it. Only for a job nothing will finish
+    /// item now continues from it, at the step the attempt last recorded
+    /// (`finding_work.step`, left as it is), which is also the step it
+    /// ended at (`ended_step`). Only for a job nothing will finish
     /// ([`StrandedJob`], which only `crate::recovery` makes), and only
     /// while it is still `running`: `false`, and nothing written, when it
     /// no longer is.
@@ -4005,7 +4124,11 @@ impl Store {
         let mut tx = ImmediateTx::begin(&self.pool).await?;
         let updated = sqlx::query!(
             "UPDATE jobs SET state = ?1, pid = NULL, killed_reason = 'orphaned', \
-             session_file = ?2, tokens_new = ?3, notes = ?4, finished_at = ?5 \
+             session_file = ?2, tokens_new = ?3, notes = ?4, finished_at = ?5, \
+             ended_step = (SELECT CASE WHEN json_valid(w.step) \
+                                  THEN json_extract(w.step, '$.step') END \
+                           FROM finding_work w \
+                           WHERE w.finding_id = jobs.finding_id AND w.kind = jobs.kind) \
              WHERE id = ?6 AND state = ?7",
             suspended,
             session_file,
@@ -4026,10 +4149,11 @@ impl Store {
         Ok(true)
     }
 
-    /// Mark an orphaned running job as killed. Only for a job nothing will
-    /// finish ([`StrandedJob`], which only `crate::recovery` makes), and
-    /// only while it is still `running`: `false`, and nothing written,
-    /// when it no longer is.
+    /// Mark an orphaned running job as killed, at the step its work item
+    /// last recorded (`ended_step`, as [`Self::suspend_orphan`]). Only for a
+    /// job nothing will finish ([`StrandedJob`], which only
+    /// `crate::recovery` makes), and only while it is still `running`:
+    /// `false`, and nothing written, when it no longer is.
     pub async fn orphan_job(
         &self,
         job: &StrandedJob,
@@ -4040,7 +4164,12 @@ impl Store {
         let (killed, running) = (JobState::Killed, JobState::Running);
         let updated = sqlx::query!(
             "UPDATE jobs SET state = ?1, pid = NULL, killed_reason = 'orphaned', \
-             notes = ?2, finished_at = ?3 WHERE id = ?4 AND state = ?5",
+             notes = ?2, finished_at = ?3, \
+             ended_step = (SELECT CASE WHEN json_valid(w.step) \
+                                  THEN json_extract(w.step, '$.step') END \
+                           FROM finding_work w \
+                           WHERE w.finding_id = jobs.finding_id AND w.kind = jobs.kind) \
+             WHERE id = ?4 AND state = ?5",
             killed,
             notes,
             finished_at,
@@ -5105,7 +5234,9 @@ impl Store {
     /// transcript). Without one (no job, or a tree never made, G9) the
     /// checkpoint the work item already had stays: the work done before it
     /// is still there to continue, and with none the operator can only
-    /// restart.
+    /// restart. A fix's `step` record, given one, is where the `continue`
+    /// resumes it (`finding_work.step`); without one the step stays as it
+    /// is.
     ///
     /// Only while the finding is in that kind's tier (invariant 2): work
     /// that has left it is over, and `false` says nothing was held. `false`
@@ -5115,9 +5246,9 @@ impl Store {
         &self,
         finding_id: i64,
         kind: FindingJobKind,
-        reason: HoldReason,
-        detail: &str,
+        (reason, detail): (HoldReason, &str),
         job: Option<i64>,
+        step: Option<&str>,
     ) -> sqlx::Result<bool> {
         let now = now_ms();
         let harvest = FindingJobKind::Harvest;
@@ -5146,16 +5277,19 @@ impl Store {
             return Ok(false);
         }
         sqlx::query!(
-            "INSERT INTO finding_work (finding_id, kind, streak, last_failure, checkpoint_job_id) \
+            "INSERT INTO finding_work \
+                 (finding_id, kind, streak, last_failure, checkpoint_job_id, step) \
              VALUES (?1, ?2, 0, NULL, \
-                     (SELECT id FROM jobs WHERE id = ?3 AND session_file IS NOT NULL)) \
+                     (SELECT id FROM jobs WHERE id = ?3 AND session_file IS NOT NULL), ?4) \
              ON CONFLICT (finding_id, kind) DO UPDATE SET \
                  streak = 0, last_failure = NULL, \
                  checkpoint_job_id = COALESCE(excluded.checkpoint_job_id, \
-                                              finding_work.checkpoint_job_id)",
+                                              finding_work.checkpoint_job_id), \
+                 step = COALESCE(excluded.step, finding_work.step)",
             finding_id,
             kind,
-            job
+            job,
+            step
         )
         .execute(&mut *tx)
         .await?;
@@ -5892,7 +6026,7 @@ impl JobStore {
 
     /// Hold `finding_id`'s `kind` work for the operator (WORK-MODEL.md
     /// §9); `false` when the finding has left the kind's tier or the work
-    /// is already held.
+    /// is already held. A fix's step record stays as it is.
     pub async fn hold_work(
         &self,
         finding_id: i64,
@@ -5902,8 +6036,35 @@ impl JobStore {
         job: Option<i64>,
     ) -> sqlx::Result<bool> {
         self.0
-            .hold_work(finding_id, kind, reason, detail, job)
+            .hold_work(finding_id, kind, (reason, detail), job, None)
             .await
+    }
+
+    /// Hold `finding_id`'s fix for the operator as [`Self::hold_work`]
+    /// does, with `step` as the step record its `continue` resumes at, in
+    /// the hold's transaction.
+    pub async fn hold_fix_at(
+        &self,
+        finding_id: i64,
+        (reason, detail): (HoldReason, &str),
+        job: Option<i64>,
+        step: &str,
+    ) -> sqlx::Result<bool> {
+        self.0
+            .hold_work(
+                finding_id,
+                FindingJobKind::Fix,
+                (reason, detail),
+                job,
+                Some(step),
+            )
+            .await
+    }
+
+    /// Record the step `finding_id`'s fix attempt moved to between its
+    /// runs. See the private `Store` method of the same name.
+    pub async fn set_fix_step(&self, finding_id: i64, step: &str) -> sqlx::Result<()> {
+        self.0.set_fix_step(finding_id, step).await
     }
 
     /// Spend `finding_id`'s one-shot budget override, only while it is
@@ -5943,9 +6104,13 @@ impl JobStore {
         self.0.reconfirm_anchor(finding_id, sha, holds_while).await
     }
 
-    /// Make the finished attempt `job_id` its work item's checkpoint, when it has a transcript to continue. See the private `Store` method of the same name.
-    pub async fn keep_attempt_as_checkpoint(&self, job_id: i64) -> sqlx::Result<()> {
-        self.0.keep_attempt_as_checkpoint(job_id).await
+    /// Make the finished attempt `job_id` its work item's checkpoint, when it has a transcript to continue, with a fix attempt's `step` record. See the private `Store` method of the same name.
+    pub async fn keep_attempt_as_checkpoint(
+        &self,
+        job_id: i64,
+        step: Option<&str>,
+    ) -> sqlx::Result<()> {
+        self.0.keep_attempt_as_checkpoint(job_id, step).await
     }
 
     /// Record the commit a cold job's working tree was created at. See the private `Store` method of the same name.

@@ -104,9 +104,13 @@ impl Workspace {
     }
 
     /// The session directory of fix job `job`'s pre-PR reviewer in round
-    /// `round`, beside `session/` (WORK-MODEL.md §5.7). One per job and
-    /// round, and never removed while the chain lives, so a reviewer
-    /// never continues an old transcript, and the chain's metered spend
+    /// `round` of the chain's review (as people are shown it: a second
+    /// pass in the same job goes on counting), beside `session/`
+    /// (WORK-MODEL.md §5.7). One per job and round, and never removed while
+    /// the chain lives, so a reviewer never continues an old transcript (omp
+    /// resumes the session a reused directory holds). A job never runs a
+    /// round twice: a failed round, which the chain does not count, ends the
+    /// attempt, and its retry is a new job. The chain's metered spend
     /// is `session/` plus all of them ([`Self::review_sessions`]).
     pub fn review_session(&self, job: i64, round: u32) -> PathBuf {
         self.root.join(format!("{REVIEW_PREFIX}{job}-{round}"))

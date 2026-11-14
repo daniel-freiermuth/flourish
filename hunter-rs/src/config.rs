@@ -278,7 +278,8 @@ pub struct Config {
     /// review.maxRounds — how many times a finished fix is reviewed by a
     /// fresh reviewer before it ships (`scheduler::review_fix`); the
     /// fixer answers every round but the last, whose issues hold the fix
-    /// for the operator. 0 ships unreviewed.
+    /// for the operator. 0 ships unreviewed: a review already under way
+    /// runs no more reviewer, but an answer it owes is still had first.
     pub review_max_rounds: u32,
     /// review.curate — once a review ends in a ship with more than one
     /// commit, the fixer rewrites them into a few logical ones of the same
