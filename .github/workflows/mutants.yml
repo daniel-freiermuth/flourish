@@ -148,9 +148,8 @@ jobs:
         #          outside hunter-rs/, which cargo-mutants does not copy;
         #          exclude it in .cargo/mutants.toml)
         #
-        # --minimum-test-timeout guards the timeout case against load: the
-        # auto timeout is derived from one baseline run, and at -j 2 a
-        # caught mutant has been seen to overrun it.
+        # The timeout floor (minimum_test_timeout) lives in
+        # .cargo/mutants.toml, so a local run uses the same one.
         env:
           BASE_REF: ${{ github.base_ref }}
           SHARD: ${{ matrix.shard }}
@@ -160,7 +159,6 @@ jobs:
           set +e
           timeout 35m cargo mutants --test-tool nextest \
             --in-diff /tmp/pr.diff -j 2 --colors never \
-            --minimum-test-timeout 120 \
             --shard "$SHARD/$SHARDS"
           rc=$?
           set -e

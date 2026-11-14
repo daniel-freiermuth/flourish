@@ -43,8 +43,8 @@
 # excluding them costs no mutation signal.
 #
 # Adding a test that reads a sibling directory means adding it here too.
-# That is not a rule anything enforces: mutants is a separate advisory
-# workflow, so CI stays green and only the mutants run goes red.
+# That is not a rule anything enforces: CI stays green, and only the
+# mutants gate goes red.
 # Named here, not only on the command line: `-E` below is a nextest
 # filter expression, so a plain `cargo mutants` would hand it to
 # `cargo test`, which does not understand it -- the baseline fails and
@@ -58,7 +58,11 @@ additional_cargo_test_args = [
 ]
 
 timeout_multiplier = 3.0
-minimum_test_timeout = 20
+# The auto timeout comes from one baseline run, and under load (CI's
+# -j 2, or a busy laptop) a caught mutant has been seen to overrun it and
+# be reported as TIMEOUT. Here rather than on the workflow's command
+# line, so a local run uses the same floor as CI.
+minimum_test_timeout = 120
 
 # Excluded because mutating them produces noise rather than signal:
 exclude_globs = [
