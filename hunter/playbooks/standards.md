@@ -16,6 +16,15 @@ handling pattern, missing type safety, unchecked SQL, stringly-typed
 enums, unsafe code, panicking code paths) rather than style nits
 (formatting, naming — those are caught by linters).
 
+Check an existing mutation-testing setup too (its CI job,
+`.cargo/mutants.toml`) against "Testing / Mutation testing": a gate that
+passes having tested nothing, or an exclusion without a reason, is a
+violation like any in the code. A MISSING gate or CI job is not filed
+here: that is modernization's `ci-cd-gap`, and this scan cannot see its
+findings. `cargo mutants --list` (no build, no tests) is allowed, to check
+whether an `exclude_re` pattern matches any mutant; never run mutants
+themselves — a whole-tree run takes hours.
+
 # What counts as a standards violation
 A deviation from the coding standards document above that:
 1. Creates a condition for future bugs (e.g. positional Option<&str>

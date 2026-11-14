@@ -332,6 +332,50 @@ question is *"what input class did the author not consider?"* — not
 class, so run it deliberately rather than waiting for it to arrive
 from outside.
 
+### Mutation testing
+
+Coverage says a line ran; a mutant says whether any test would notice
+it changing. Every Rust project with a test suite gates its pull
+requests on `cargo-mutants`, set up the way that has held up here
+(`.github/workflows/mutants.yml`, `hunter-rs/.cargo/mutants.toml`).
+Frontends are not required to.
+
+- **The diff, not the tree.** `cargo mutants --in-diff` against the
+  PR's base. A whole-tree run is hours (~1900 mutants in hunter-rs): per
+  push it never finishes, gets demoted to advisory, and is ignored.
+  Whole-tree is a manual audit, one module at a time (`--file`).
+- **A gate, not a report.** A surviving mutant fails the PR. Answer it
+  with the test that tells the code from its mutant, or by deleting the
+  code nothing depends on; an equivalent mutant usually marks redundant
+  code.
+- **Testing nothing must fail, not pass.** Each of these reads exactly
+  like a clean run:
+  - diff paths not relative to the package (`git diff --relative` when
+    the crate is in a subdirectory) filter out every mutant;
+  - a failed `--list` looks like an empty one, so check its exit status;
+  - a red baseline mutates nothing. Classify the exit code: 0 passes;
+    2 (survivors), 3 (timeouts), 4 (baseline failed) and anything else
+    fail.
+- **Every mutant of the diff runs.** Split a large diff into shards
+  (`--shard k/n`) small enough to finish under the step's time cap,
+  behind one stable required check. Hitting the cap fails: part of the
+  diff went untested. Set `--minimum-test-timeout`, or a caught mutant
+  under CI load is reported as a timeout.
+- **Its own workflow and concurrency group.** In CI's group every push
+  cancels it, and it never finishes.
+- **Configured in `.cargo/mutants.toml`**, so a local `cargo mutants`
+  runs what CI runs: the test tool (with any nextest `-E` filter beside
+  it — `cargo test` rejects one, failing the baseline), and the tests
+  excluded for reading files outside the package, which cargo-mutants
+  does not copy.
+- **Exclusions are narrow and argued.** One mutant or one function per
+  `exclude_re` entry, each with the reason the mutant is untestable or
+  equivalent, checked against `cargo mutants --list` (a pattern that
+  matches no mutant is silently inert). A whole file only when the
+  reason holds for every mutant in it (generated code, a binary's argv
+  parsing). Never exclude to turn a gate green.
+- **Pinned tool version**, as for every CI tool.
+
 ---
 
 ## Dependencies
@@ -367,6 +411,8 @@ Every project enforces at minimum:
 3. `cargo nextest run --profile ci` — the command CI runs. Plain
    `cargo test` is not an equivalent here: `require_process_isolation`
    fails every test under it (see *nextest-only*, above).
+4. The `cargo-mutants` gate on the PR's diff (see *Mutation testing*,
+   above).
 
 Additional per project type:
 - **Frontend:** `npm run check`, `eslint` (strict), `vitest`
