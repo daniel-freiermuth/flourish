@@ -187,6 +187,15 @@ new ──recheck──> new / superseded / rejected
   short (a grant that runs out before or during it, a restart, a rewrite
   that had to be put back) is owed: the next attempt runs no fixer and
   curates before it ships, as for any other part of the fix.
+- **Pre-push review** — an engage's commits get the same review before
+  they are pushed to its PR (`playbooks/review_engage.md`, answered
+  through `playbooks/review_engage_followup.md` in the engage's own
+  session, with a `## Review` section in its `PR-REPLY.md`): its own
+  commits on top of the PR head, or the whole PR from where it forks
+  from the default branch when it rewrote the branch or merged the
+  default branch in, worked out again for every round. A reply-only
+  engage is not reviewed. Issues left after the last round hold the
+  engage unpushed; a failed review pushes with a note after the reply.
 - **Held work** is not a status. When a worker writes `BLOCKED.md`
   (a verification prerequisite, dependency, or human decision is
   missing; every finding kind's playbook says when: a recheck that cannot
@@ -1130,8 +1139,9 @@ quota source for one installation.
   `fix` override per job family; `null` inherits `default`. The pre-PR
   reviewer runs with the `fix` model.
 - `review.maxRounds` (default 7) — how many times a finished fix is
-  reviewed before it ships; issues still open after the last round hold
-  the fix for you (§ Finding lifecycle). `0` ships unreviewed.
+  reviewed before it ships, and an engage's commits before they are
+  pushed; issues still open after the last round hold the work for you
+  (§ Finding lifecycle). `0` ships unreviewed.
 - `review.curate` (default true) — once a review ends in a ship with more
   than one commit, the fixer rewrites them into a few logical commits of
   the same tree (`playbooks/curate.md`); a rewrite that changes the tree

@@ -583,6 +583,8 @@ pub enum Unheld<'a> {
     /// `merge-base --is-ancestor <ancestor> <rev>`: rc 0 when `rev`
     /// descends from `ancestor` (or is it), 1 when not.
     IsAncestor { ancestor: &'a str, rev: &'a str },
+    /// `merge-base <a> <b>`: the best common ancestor of the two commits.
+    MergeBase { a: &'a str, b: &'a str },
     /// `--no-optional-locks status --porcelain`: the tree's uncommitted
     /// changes and untracked files, one per line; empty when it is clean.
     /// Without the flag `status` refreshes and rewrites the tree's index.
@@ -643,6 +645,7 @@ impl Unheld<'_> {
             Self::IsAncestor { ancestor, rev } => {
                 args.extend(["merge-base", "--is-ancestor", ancestor, rev]);
             }
+            Self::MergeBase { a, b } => args.extend(["merge-base", a, b]),
             Self::Status => args.extend(["--no-optional-locks", "status", "--porcelain"]),
             Self::Push {
                 force,

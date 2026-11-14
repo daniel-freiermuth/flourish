@@ -979,21 +979,25 @@ fn resume_prompt(kind: JobKind, plan: &ResumePlan) -> String {
 ///   hands straight on into the closed PR's harvest, which is gated and
 ///   reserved for as a resume, so the withdrawal is too, and runs only
 ///   when that warm handoff can, instead of losing it to a cold harvest;
-/// - it is a fix whose `ws` holds no verdict covering its tree. One whose
-///   verdict pinned a commit (a reviewer's change or a curation that
-///   could not be undone) has none, so its retry is reviewed afresh,
-///   which may send it back to the fixer or curate it, and is reserved
-///   for as any resume is. With the review off, a kept fix's (empty)
-///   verdict is saved all the same;
+/// - it is a fix or an engage whose `ws` holds no verdict covering its
+///   tree. One whose verdict pinned a commit (a reviewer's change or a
+///   curation that could not be undone) has none, so its retry is reviewed
+///   afresh, which may send it back to the worker or curate it, and is
+///   reserved for as any resume is. With the review off, or nothing for
+///   an engage's review to review, a kept attempt's (empty) verdict is
+///   saved all the same;
 /// - it is a fix whose next attempt will curate ([`review::curation_pending`]):
 ///   a curation owed, or one the daemon died in or whose changes are to be
 ///   put back, which owes it once recovered. The curator is a model run,
 ///   capped and reserved for as any resume is.
 async fn publishes_for_free(job: &Job, ws: &Workspace, as_kept: bool) -> bool {
-    let fix = job.kind == JobKind::Finding(FindingJobKind::Fix);
+    let reviewed = matches!(
+        job.kind,
+        JobKind::Finding(FindingJobKind::Fix | FindingJobKind::Engage)
+    );
     as_kept
         && !ws.tree.join("WITHDRAW.md").exists()
-        && (!fix || (review::has_kept_verdict(ws).await && !review::curation_pending(ws)))
+        && (!reviewed || (review::has_kept_verdict(ws).await && !review::curation_pending(ws)))
 }
 
 /// What to reserve for a resumed attempt.
@@ -1540,42 +1544,45 @@ async fn give_up_chain<'s>(
     }
 }
 
-/// The first line of a fix held because its chain went far past its
-/// budget ([`hold_over_budget`]).
+/// The first line of a fix or engage held because its chain went far past
+/// its budget ([`hold_over_budget`]).
 const CHAIN_OVER_BUDGET: &str = "resume chain over budget";
 
-/// Hold fix `fid` for the operator as `gave_up`, `job`'s chain as its
-/// checkpoint, when the give-up ceiling's cost arm ends that chain: the
-/// chain's branch and transcript are kept for a `continue`, where
-/// dropping the checkpoint would start the fix over and pay again for
-/// work that already cost several times its kind's typical.
+/// Hold finding `fid`'s `kind` work (a fix or an engage) for the operator
+/// as `gave_up`, `job`'s chain as its checkpoint, when the give-up
+/// ceiling's cost arm ends that chain: the chain's branch and transcript
+/// are kept for a `continue`, where dropping the checkpoint would start
+/// the work over and pay again for work that already cost several times
+/// its kind's typical.
 ///
 /// Never drops the checkpoint. A hold that did not land is skipped: a
 /// failed write is tried again by the next selection, and `false` from
-/// [`Store::hold_work`] means the fix is held already (by this same
+/// [`Store::hold_work`] means the work is held already (by this same
 /// selection, through another tier, before its snapshot of held work was
 /// taken) or has left its tier, which clears the pointer itself. A
 /// preview writes nothing and skips it, as the cycle would.
-async fn hold_over_budget<'s>(mode: Pick<'s>, job: &Job, fid: i64, detail: &str) -> Resumable<'s> {
+async fn hold_over_budget<'s>(
+    mode: Pick<'s>,
+    job: &Job,
+    (kind, fid): (FindingJobKind, i64),
+    (total, cost): (i64, &str),
+) -> Resumable<'s> {
     let Pick::Run(scope) = mode else {
         return Resumable::Held { landed: false };
     };
+    let detail = format!("{CHAIN_OVER_BUDGET}: {total} tok across the chain ({cost})");
     let store = scope.store();
     let held = store
-        .hold_work(
-            fid,
-            FindingJobKind::Fix,
-            HoldReason::GaveUp,
-            detail,
-            Some(job.id),
-        )
+        .hold_work(fid, kind, HoldReason::GaveUp, &detail, Some(job.id))
         .await;
     let message = match &held {
         Ok(true) => format!("#{fid} held: {detail}; checkpoint retained"),
         Ok(false) => return Resumable::Held { landed: false },
         Err(e) => format!("#{fid} {detail}, but holding it failed: {e}; will retry"),
     };
-    let _ = fix_event(store, "fix", fid, job.id, message).await;
+    let _ = store
+        .log_event(kind.as_str(), &message, Some(job.id), Some(fid))
+        .await;
     Resumable::Held {
         landed: held.is_ok(),
     }
@@ -1720,20 +1727,20 @@ async fn resume_plan<'s>(
     if (too_many || too_costly || publish_only) && !spared {
         let cost =
             format!("{excess} tok outside its largest attempt > {GIVE_UP_MULTIPLE}x {z} typical");
-        // A fix this far over its budget is held rather than dropped: its
-        // tree holds a branch the chain paid for, and starting over would
-        // pay for it again with no reason to expect a cheaper ending. Not
-        // one kept only to publish: its spare's end is what retires it,
+        // A fix or an engage this far over its budget is held rather than
+        // dropped: its tree holds a branch the chain paid for (a fix's, or
+        // an engage's reviewed and unpushed commits), and starting over
+        // would pay for it again with no reason to expect a cheaper ending.
+        // Not one kept only to publish: its spare's end is what retires it,
         // the cost having bought finished work, not a stuck chain.
         if too_costly
             && !publish_only
-            && let (JobKind::Finding(FindingJobKind::Fix), Some(fid)) = (job.kind, job.finding_id)
+            && let (
+                JobKind::Finding(kind @ (FindingJobKind::Fix | FindingJobKind::Engage)),
+                Some(fid),
+            ) = (job.kind, job.finding_id)
         {
-            let detail = format!(
-                "{CHAIN_OVER_BUDGET}: {} tok across the chain ({cost})",
-                own.total
-            );
-            return Ok(hold_over_budget(mode, &job, fid, &detail).await);
+            return Ok(hold_over_budget(mode, &job, (kind, fid), (own.total, &cost)).await);
         }
         let why = if too_many {
             format!("{} attempts, the limit", own.attempts)
@@ -2017,10 +2024,10 @@ const MAX_CONSECUTIVE_SAME_FAILURE: i64 = 3;
 /// `resume-unavailable` is `Failed` rather than `Killed` because nothing
 /// was spawned — there was no run to kill, the attempt could not start.
 ///
-/// `shutdown` and `grant` are no run's end: a fix job the daemon's
-/// shutdown, or a spent grant, stopped between its worker runs (the
-/// pre-PR review, [`review::review_fix`]), with the fixer's transcript to
-/// continue. Each is a pause, as a cap is.
+/// `shutdown` and `grant` are no run's end: a fix or engage job the
+/// daemon's shutdown, or a spent grant, stopped between its worker runs
+/// (the review, [`review::review_change`]), with the worker's transcript
+/// to continue. Each is a pause, as a cap is.
 fn job_state(rr: &RunResult) -> FinishedState {
     match rr.killed_reason.as_deref() {
         Some("cap" | review::STOPPED | review::GRANT) if rr.session_file.is_some() => {
@@ -5159,6 +5166,23 @@ struct FixStart {
     cap: Option<i64>,
 }
 
+impl FixStart {
+    /// The fix as the review loop sees it ([`review::Subject`]).
+    fn subject(&self) -> review::Subject<'_> {
+        review::Subject {
+            finding: &self.finding,
+            repo: &self.repo,
+            job: self.job,
+            ws: &self.ws,
+            pinned: &self.pinned,
+            branch: &self.branch,
+            cap: self.cap,
+            change: review::Change::Fix,
+            pr: None,
+        }
+    }
+}
+
 /// Put the claimed finding back to `queued` ([`FixClaim::release`]). A
 /// release that fails is logged; the claim is then owed, and the cycle's
 /// settle retries it.
@@ -5428,7 +5452,7 @@ fn fix_prompt(
         return Ok((publish_only_prompt(detail), false));
     }
     if let Some((_, detail)) = resume.and_then(ResumePlan::after_hold)
-        && let Some(held) = review::held_resume_prompt(cfg, start, detail)
+        && let Some(held) = review::held_resume_prompt(cfg, &start.subject(), &start.pinned, detail)
     {
         return held.map(|prompt| (prompt, true));
     }
@@ -5614,7 +5638,7 @@ fn decline_report(kind: FindingType) -> &'static str {
 
 /// Read the worker's result and decide the attempt's outcome. Shipping is
 /// part of deciding (a push or a PR that fails is a failed attempt), with
-/// what the review loop left ([`review::review_fix`]). An error leaves the
+/// what the review loop left ([`review::review_change`]). An error leaves the
 /// claim to the caller, which releases it.
 async fn conclude_fix(
     (cfg, backend): (&Config, &dyn Backend),
@@ -5643,7 +5667,7 @@ async fn conclude_fix(
         Err(e) => anyhow::bail!("fix #{fid}: cannot read the worker's report: {e}"),
     };
     if report.is_some() {
-        review::restart_rounds(start);
+        review::restart_rounds(&start.subject());
     }
     if declined {
         return Ok(FixOutcome::Declined(parse_decline(
@@ -5670,7 +5694,7 @@ async fn conclude_fix(
         Some(ending) => ending.clone(),
         None if state == JobState::Done => {
             return Ok(FixOutcome::Failed {
-                failure: review::unshippable(start).await,
+                failure: review::unshippable(&start.subject()).await,
             });
         }
         None if state == JobState::Suspended => return Ok(FixOutcome::Suspended),
@@ -5711,7 +5735,7 @@ async fn conclude_fix(
         // Kept to publish, refused or offline: the retry ships this same
         // verdict on this same tree however its own run ends, without
         // reviewing it again.
-        review::keep_for_publish(start, &ending).await;
+        review::keep_for_publish(&start.subject(), &ending).await;
     }
     if let Some(host) = forge_unreachable_now(cfg, &start.repo.url, backend).await {
         return Ok(FixOutcome::Offline {
@@ -6518,12 +6542,12 @@ pub async fn run_fix(
     // records the abandoned job.
     // A curation the daemon died in is undone before anything reads the
     // tree, and owed again.
-    review::recover_curation(lane, store, &start).await;
+    review::recover_curation(lane, store, &start.subject()).await;
     // A review round's reviewer or a curator whose changes could not be
     // undone left the tree as it changed it, however the attempt then ended
     // (a hold, offline, a pinned commit whose publish failed): it is put
     // back to the reviewed commit before any worker runs in it, or none does.
-    if let Err(why) = review::restore_reviewed(lane, store, &start).await {
+    if let Err(why) = review::restore_reviewed(lane, store, &start.subject()).await {
         return Ok(count_unrestored_tree(lane, store, (start, running, claim), &why).await);
     }
     // A fix owing only its curation runs no fixer, whatever hold an
@@ -6532,9 +6556,9 @@ pub async fn run_fix(
     // straight back to the review, its fixer having finished; unless an
     // operator released a hold since, whose prompt the fixer has to act on.
     let paused = resume.is_some_and(|r| {
-        review::owes_curation(&start)
+        review::owes_curation(&start.subject())
             || (r.after_hold().is_none()
-                && review::suspended_between_runs(&start, r.predecessor_id()))
+                && review::suspended_between_runs(&start.subject(), r.predecessor_id()))
     });
     let (prompt, answers_held) = match fix_prompt(cfg, resume, &start) {
         Ok(prompted) => prompted,
@@ -6575,12 +6599,12 @@ pub async fn run_fix(
     // The fixer ran on a review hold's pending issues: no later `continue`
     // sends them again. Before the review, which may hold on new ones.
     if answers_held {
-        review::mark_held_sent(&start);
+        review::mark_held_sent(&start.subject());
     }
     // A finished fix is reviewed before it ships, all within this job: the
     // reviewer and the fixer's answers run under the same grant, and the
     // row records what all of them spent.
-    let reviewed = review::review_fix(scope, lane, cfg, backend, &start, rr).await;
+    let reviewed = review::review_change(scope, lane, cfg, backend, &start.subject(), rr).await;
     let rr = &reviewed.rr;
     let recorded = log_write_failure(
         record_job(store, running, rr, model, resume).await,
@@ -7196,6 +7220,26 @@ struct EngageStart {
     shown_ps: bool,
 }
 
+impl EngageStart {
+    /// The engage's commits as the review loop sees them
+    /// ([`review::Subject`]): reviewed against a base worked out from the
+    /// PR head its tree was created at, as the tree stands at each round
+    /// ([`review::engage_base`]).
+    fn subject<'a>(&'a self, finding: &'a Finding) -> review::Subject<'a> {
+        review::Subject {
+            finding,
+            repo: &self.repo,
+            job: self.job,
+            ws: &self.ws,
+            pinned: &self.pinned,
+            branch: &self.head_ref,
+            cap: self.cap,
+            change: review::Change::Engage,
+            pr: Some(&self.pr_ref),
+        }
+    }
+}
+
 /// The PR as the forge shows it, for a fresh engage's playbook. A failed
 /// view is a failed engage ([`engage_prefetch_failed`]), or the
 /// network's, which ends the cycle denied (`Ok(Err(summary))`).
@@ -7711,19 +7755,24 @@ struct Published {
     finished: bool,
 }
 
-/// Push the worker's commits to the PR branch and post its `PR-REPLY.md`.
-/// Only a finished tree is published: the worker's run ended `Done`, or
-/// it continued an attempt kept only to publish ([`kept_to_publish`]) and
-/// did no metered work, which leaves the tree as that attempt finished it
-/// (a retry whose run failed before its first token, a rate limit).
-async fn push_and_reply(start: &EngageStart, state: JobState, publish_only: bool) -> Published {
+/// Push the worker's commits to the PR branch and post its `PR-REPLY.md`,
+/// followed by the note the review left to say, when the review lets the
+/// tree out (`reviewed`, [`reviewed_publish`]). Only a finished tree is
+/// published (`finished`): the worker's run ended `Done`, or it continued
+/// an attempt kept only to publish ([`kept_to_publish`]) and did no metered
+/// work, which leaves the tree as that attempt finished it (a retry whose
+/// run failed before its first token, a rate limit). `state` is the run's.
+async fn push_and_reply(
+    start: &EngageStart,
+    (state, finished): (JobState, bool),
+    reviewed: Result<Option<&str>, String>,
+) -> Published {
     let _phase = crate::activity::job_phase(JobPhase::Publishing);
-    let finished = state == JobState::Done || (publish_only && state != JobState::Suspended);
     let (mut pushed, mut pushed_before) = (false, false);
-    let replied = if finished {
-        push_then_reply(start, (&mut pushed, &mut pushed_before)).await
-    } else {
-        Err(format!("worker {state}"))
+    let replied = match reviewed {
+        _ if !finished => Err(format!("worker {state}")),
+        Err(fail) => Err(fail),
+        Ok(note) => push_then_reply(start, (&mut pushed, &mut pushed_before), note).await,
     };
     Published {
         pushed,
@@ -7739,6 +7788,7 @@ async fn push_and_reply(start: &EngageStart, state: JobState, publish_only: bool
 async fn push_then_reply(
     start: &EngageStart,
     (pushed, pushed_before): (&mut bool, &mut bool),
+    note: Option<&str>,
 ) -> Result<bool, String> {
     let (repo, worktree, head_ref) = (&start.repo, &start.ws.tree, &start.head_ref);
     let fg = forge::forge_for(repo.forge);
@@ -7821,10 +7871,13 @@ async fn push_then_reply(
             record_own_push(&start.ws.root, &sha);
         }
     }
-    let reply = worktree.join("PR-REPLY.md");
+    let reply = std::fs::read_to_string(worktree.join("PR-REPLY.md")).ok();
+    let body = match (reply, note) {
+        (Some(reply), Some(note)) => Some(format!("{}\n\n{note}", reply.trim_end())),
+        (reply, note) => reply.or_else(|| note.map(str::to_owned)),
+    };
     let mut replied = false;
-    if reply.exists() {
-        let body = std::fs::read_to_string(&reply).unwrap_or_default();
+    if let Some(body) = body {
         post_once(fg.as_ref(), start, &body, "reply").map_err(|e| {
             format!(
                 "PR comment failed: {}",
@@ -8363,21 +8416,33 @@ async fn engage_prefetch_failed(
 
 /// The engage worker's prompt: the playbook for a fresh engage, the short
 /// resume prompt for a continued one (whose transcript holds the playbook,
-/// and which read no PR to build one from).
+/// and which read no PR to build one from); and whether it resumes the
+/// worker on a review hold's pending issues ([`review::held_resume_prompt`]),
+/// which any operator's `continue` does while they are pending.
 fn engage_prompt(
     cfg: &Config,
     attempt: Attempt<'_, kind::Engage>,
     start: &EngageStart,
-) -> anyhow::Result<String> {
+    (subject, base): (&review::Subject<'_>, &str),
+) -> anyhow::Result<(String, bool)> {
     let (finding, resume) = (attempt.subject(), attempt.plan());
     let Some(pr) = &start.pr else {
-        return Ok(resume.map_or_else(
-            || RESUME_PROMPT.to_owned(),
-            |plan| resume_prompt(FindingJobKind::Engage.into(), plan),
+        if let Some(plan) = resume.filter(|r| !r.publish_only())
+            && let Some((_, detail)) = plan.after_hold()
+            && let Some(held) = review::held_resume_prompt(cfg, subject, base, detail)
+        {
+            return held.map(|prompt| (prompt, true));
+        }
+        return Ok((
+            resume.map_or_else(
+                || RESUME_PROMPT.to_owned(),
+                |plan| resume_prompt(FindingJobKind::Engage.into(), plan),
+            ),
+            false,
         ));
     };
     let repo_notes = Store::repo_notes(&cfg.work_root, start.repo.id);
-    playbooks::build_engage_prompt(
+    let prompt = playbooks::build_engage_prompt(
         &cfg.root,
         finding,
         &start.ws.tree,
@@ -8386,12 +8451,67 @@ fn engage_prompt(
         pr,
         &start.ps,
         &repo_notes,
-    )
+    )?;
+    Ok((prompt, false))
+}
+
+/// Count an engage whose tree could not be put back to the one a failed
+/// review round's reviewer was shown ([`review::restore_reviewed`]) as a
+/// failed attempt under [`review::TREE_NOT_RESTORED`], and end it, as
+/// [`count_unrestored_tree`] does a fix's: no worker ran, so the job fails
+/// unstarted, the kept checkpoint stays for the next attempt, and the
+/// streak holds the engage `stuck` at its limit, with `why` in the report.
+async fn count_unrestored_engage(
+    lane: &mut Lane,
+    store: &JobStore,
+    (fid, start, running): (i64, EngageStart, RunningJob),
+    why: &str,
+) -> CycleSummary {
+    let job = start.job;
+    let note = format!("{}: {why}", review::TREE_NOT_RESTORED);
+    log_write_failure(
+        running.fail_unstarted(&note).await,
+        format_args!("job {job}: failing unstarted"),
+    );
+    let key = review::TREE_NOT_RESTORED;
+    let held = record_engage_failure(store, fid, Some(job), key, why, HoldReason::Stuck).await;
+    close_workspace(lane, start.ws).await;
+    CycleSummary {
+        kind: Some(FindingJobKind::Engage.into()),
+        finding_id: Some(fid),
+        job_id: Some(job),
+        state: Some(JobState::Failed),
+        pr_number: Some(start.pr_ref.number()),
+        outcome: Some(if held { "held" } else { "retry" }.into()),
+        failure: Some(note),
+        ..Default::default()
+    }
+}
+
+/// Why an engage that finished may not publish what its review left
+/// ([`review::review_change`]), or the note its reply goes out with: the
+/// review's unresolved issues or why it failed. Nothing unreviewed is
+/// pushed while the review is on.
+fn reviewed_publish(reviewed: &review::Reviewed) -> Result<Option<&str>, String> {
+    match &reviewed.ending {
+        None => Err("not reviewed: the review could not list the engage's commits".to_owned()),
+        Some(ending) if ending.head.is_some() => Err(format!(
+            "not reviewed: a reviewer's changes to the tree could not be undone ({})",
+            review::TREE_NOT_RESTORED
+        )),
+        Some(ending) => Ok(ending.note.as_deref()),
+    }
 }
 
 /// Run engage job (`scheduler.run_engage`): start it ([`start_engage`]),
-/// run the worker, then withdraw the PR ([`withdraw_pr`]) or publish its
-/// work ([`push_and_reply`]) and record that ([`record_engage`]).
+/// run the worker, have its commits reviewed before they are pushed
+/// ([`review::review_change`]), then withdraw the PR ([`withdraw_pr`]) or
+/// publish its work ([`push_and_reply`]) and record that
+/// ([`record_engage`]).
+#[allow(
+    clippy::too_many_lines,
+    reason = "the attempt's steps in the order they must run, each with its own early end"
+)]
 pub async fn run_engage(
     scope: &CycleScope<'_>,
     lane: &mut Lane,
@@ -8407,13 +8527,28 @@ pub async fn run_engage(
         Ok(started) => started,
         Err(ended) => return Ok(ended),
     };
-    let prompt = engage_prompt(cfg, attempt, &start)?;
+    // A review round whose reviewer's changes could not be undone left the
+    // tree as that reviewer changed it: it is put back before any worker
+    // runs in it, or none does.
+    let subject = start.subject(finding);
+    if let Err(why) = review::restore_reviewed(lane, store, &subject).await {
+        let ran = (fid, start, running);
+        return Ok(count_unrestored_engage(lane, store, ran, &why).await);
+    }
+    // An engage the review suspended between its runs goes straight back
+    // to the review, its worker having finished; unless an operator
+    // released a hold since, whose prompt the worker has to act on.
+    let paused = resume.is_some_and(|r| {
+        r.after_hold().is_none() && review::suspended_between_runs(&subject, r.predecessor_id())
+    });
+    let base = subject.base().await;
+    let (prompt, answers_held) = engage_prompt(cfg, attempt, &start, (&subject, &base))?;
     let model = cfg.model_for("fix");
     let rr = match worker_run(
         backend,
         &start.ws,
         (&prompt, start.cap, cfg.fix_max_wall_s),
-        (resume, false),
+        (resume, paused),
     )
     .await
     {
@@ -8433,8 +8568,15 @@ pub async fn run_engage(
             return Ok(denied);
         }
     };
+    if answers_held {
+        review::mark_held_sent(&subject);
+    }
+    // The worker's commits are reviewed before they are pushed, all within
+    // this job, as a fix's are before its PR opens.
+    let reviewed = review::review_change(scope, lane, cfg, backend, &subject, rr).await;
+    let rr = &reviewed.rr;
     let recorded = log_write_failure(
-        record_job(store, running, &rr, model, resume).await,
+        record_job(store, running, rr, model, resume).await,
         format_args!("job {}: recording outcome", start.job),
     );
     let state = recorded.map_or(JobState::Failed, |r| r.state());
@@ -8466,6 +8608,8 @@ pub async fn run_engage(
         let (net, subject) = ((cfg, backend), (finding, recorded));
         withdraw_pr(store, net, &start, subject, &reason, &mut summary).await
     } else if let Some(report) = blocked_report(&start.ws.tree)? {
+        // A report starts any later review of the chain from round 1.
+        review::restart_rounds(&subject);
         if let Err(e) = engage_blocked(store, fid, &start, &report, &mut summary).await {
             close_workspace(lane, start.ws).await;
             return Err(e);
@@ -8474,10 +8618,39 @@ pub async fn run_engage(
     } else if let Some(now) = ended {
         engage_unpublished(store, finding, &start, &now, &mut summary).await;
         false
+    } else if let Some(host) = reviewed.offline.clone() {
+        // The review was cut off while a host it needs was unreachable:
+        // the network's failure, as for a fix (`FixOutcome::Offline`).
+        // Nothing is counted or published, and the attempt is kept as the
+        // checkpoint, not as kept only to publish: its review is not done,
+        // and the retry reviews that round again.
+        log_write_failure(
+            store.keep_attempt_as_checkpoint(start.job).await,
+            format_args!(
+                "job {}: keeping the unreviewed attempt as the checkpoint",
+                start.job
+            ),
+        );
+        summary = offline_denial(
+            store,
+            FindingJobKind::Engage.into(),
+            Some(fid),
+            Some(start.job),
+            host,
+        )
+        .await;
+        false
     } else {
         // Its tree is still the kept attempt's ([`push_and_reply`]).
         let publish_only = resume.is_some_and(ResumePlan::publish_only) && rr.tokens_new == 0;
-        let published = push_and_reply(&start, state, publish_only).await;
+        let finished = state == JobState::Done || (publish_only && state != JobState::Suspended);
+        // The retry of an attempt kept to publish publishes this same
+        // verdict, without reviewing the tree again.
+        if let Some(ending) = reviewed.ending.as_ref().filter(|_| finished) {
+            review::keep_for_publish(&subject, ending).await;
+        }
+        let published =
+            push_and_reply(&start, (state, finished), reviewed_publish(&reviewed)).await;
         record_engage(
             store,
             ((cfg, backend), finding),
@@ -8513,7 +8686,7 @@ pub async fn run_engage(
 /// open PR: its status now, or that it has another PR. `None` while it
 /// still is, and when the finding cannot be read, which leaves the engage
 /// to publish as it did before this check.
-async fn pr_ended(store: &Store, fid: i64, pr: &PrRef) -> Option<String> {
+pub(super) async fn pr_ended(store: &Store, fid: i64, pr: &PrRef) -> Option<String> {
     match store.get_finding(fid).await {
         Ok(Some(f)) if f.status == FindingStatus::PrOpen => {
             (f.pr_url.as_deref() != Some(pr.url())).then(|| "on another PR".to_owned())

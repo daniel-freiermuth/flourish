@@ -5395,3 +5395,891 @@ async fn continue_held(f: &Fixture) -> String {
     .unwrap();
     resumed.runs()[0].prompt.clone()
 }
+
+// ---------------------------------------------------------------------------
+// The review of an engage's commits before they are pushed (WORK-MODEL.md
+// §5.7)
+// ---------------------------------------------------------------------------
+
+/// A review with one blocking issue.
+const ENGAGE_ISSUE: &str = r#"[
+  {"kind": "introduced", "blocking": true, "file": "src/lib.rs", "line": 3,
+   "severity": "high", "confidence": 0.9,
+   "summary": "the merge dropped the bounds check",
+   "detail": "parse() lost its len check"}
+]"#;
+
+/// One run of a reviewed engage, in call order.
+#[derive(Clone, Copy)]
+enum Step {
+    /// The worker commits an answer to the feedback, replies, and leaves a
+    /// transcript.
+    Engage,
+    /// The worker rewrites the PR's head commit (`commit --amend`),
+    /// replies, and leaves a transcript.
+    Amend,
+    /// The worker only replies, and leaves a transcript.
+    Reply,
+    /// The worker answering a review by dropping its commits (`reset
+    /// --hard` to the PR head), and saying so in its reply.
+    Retract,
+    /// The worker bringing the branch up to date by merging the default
+    /// branch (`git fetch` and `git merge origin/<default>`), committing an
+    /// answer of its own, and replying; as an answer to a review when
+    /// `.0`, continuing its transcript, else as its first run.
+    Merge(bool),
+    /// The worker continuing its transcript, with nothing left to do.
+    Continue,
+    /// A reviewer that commits in the tree and keeps its index locked, so
+    /// its changes cannot be undone, having written `.0`.
+    LockingReview(&'static str),
+    /// A reviewer writing `.0` as its review.
+    Review(&'static str),
+    /// The worker's answer to a review, failing before any metered work.
+    AnswerFails,
+    /// A reviewer that writes `.0`, then is killed at its cap.
+    ReviewCapped(&'static str),
+    /// The worker answering a review: one more commit, and a Review section
+    /// in its reply.
+    Answer,
+}
+
+/// A backend that runs `steps`, one per run, against the tree.
+fn reviewed_engage(steps: Vec<Step>) -> ScriptedBackend {
+    reviewed_engage_then(steps, |_| {})
+}
+
+/// [`reviewed_engage`], calling `after` with each run's index once its
+/// step is done.
+fn reviewed_engage_then(
+    steps: Vec<Step>,
+    after: impl Fn(usize) + Send + Sync + 'static,
+) -> ScriptedBackend {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    ScriptedBackend::seeing(move |run| {
+        let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let result = engage_step(run, steps[i]);
+        after(i);
+        result
+    })
+}
+
+/// Run `step` as a run of a reviewed engage.
+fn engage_step(run: &support::Run, step: Step) -> RunResult {
+    {
+        let tree = run.tree.as_path();
+        let commit = |name: &str, message: &str| {
+            std::fs::write(tree.join(name), format!("{message}\n")).unwrap();
+            git(tree, &["add", name]);
+            git(tree, &["commit", "-m", message]);
+        };
+        let review = |text: &str| {
+            let out = run.prompt.trim_end().split(" into ").nth(1).unwrap();
+            std::fs::write(out, text).unwrap();
+            done()
+        };
+        // A run continuing the worker's own transcript.
+        let continued = || RunResult {
+            session_file: run
+                .resume_from
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            ..done()
+        };
+        match step {
+            Step::Engage => {
+                commit("review.txt", "address review");
+                std::fs::write(tree.join("PR-REPLY.md"), "done, see the new commit").unwrap();
+                support::done_with_transcript(tree)
+            }
+            Step::Amend => {
+                git(tree, &["commit", "--amend", "-m", "the fix, squashed"]);
+                std::fs::write(tree.join("PR-REPLY.md"), "squashed as asked").unwrap();
+                support::done_with_transcript(tree)
+            }
+            Step::Reply => {
+                std::fs::write(tree.join("PR-REPLY.md"), "answered, nothing to change").unwrap();
+                support::done_with_transcript(tree)
+            }
+            Step::Retract => {
+                git(tree, &["reset", "--hard", "HEAD~1"]);
+                std::fs::write(tree.join("PR-REPLY.md"), "dropped the change").unwrap();
+                continued()
+            }
+            Step::Merge(answering) => {
+                git(tree, &["fetch", "-q", "origin"]);
+                let default = git(
+                    tree,
+                    &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+                );
+                git(tree, &["merge", "--no-edit", "-q", default.trim()]);
+                commit("merged.txt", "follow the default branch");
+                std::fs::write(tree.join("PR-REPLY.md"), "merged the default branch").unwrap();
+                if answering {
+                    continued()
+                } else {
+                    support::done_with_transcript(tree)
+                }
+            }
+            Step::Continue => continued(),
+            Step::LockingReview(text) => {
+                commit("REVIEWER.md", "review: a commit of the reviewer's");
+                std::fs::write(index_lock(tree), "").unwrap();
+                review(text)
+            }
+            Step::AnswerFails => RunResult {
+                exit_code: Some(1),
+                tokens_new: 0,
+                ..continued()
+            },
+            Step::Review(text) => review(text),
+            Step::ReviewCapped(text) => RunResult {
+                exit_code: None,
+                killed_reason: Some("cap".to_owned()),
+                tokens_new: run.cap_tokens.expect("a cap to be killed at"),
+                ..review(text)
+            },
+            Step::Answer => {
+                commit("bounds.txt", "keep the bounds check");
+                let reply = tree.join("PR-REPLY.md");
+                let body = std::fs::read_to_string(&reply).unwrap();
+                std::fs::write(&reply, format!("{body}\n\n## Review\naddressed")).unwrap();
+                continued()
+            }
+        }
+    }
+}
+
+/// Turn the review on for `rounds` rounds, with stub reviewer playbooks.
+fn engage_review_on(f: &mut Fixture, rounds: u32) {
+    f.cfg.review_max_rounds = rounds;
+    let playbooks = f.cfg.root.join("playbooks");
+    std::fs::write(
+        playbooks.join("review_engage.md"),
+        "review {{BASE}} into {{OUT_PATH}}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        playbooks.join("review_engage_followup.md"),
+        "answer {{ISSUES}}\n",
+    )
+    .unwrap();
+}
+
+/// The bodies of every comment `gh` was asked to post.
+fn posted(bins: &FakeBins) -> Vec<String> {
+    bins.calls_to("gh")
+        .into_iter()
+        .filter(|call| call.iter().any(|a| a == "comment"))
+        .filter_map(|call| call.into_iter().skip_while(|a| a != "--body").nth(1))
+        .collect()
+}
+
+/// An engage's commits are reviewed before they are pushed, against the PR
+/// head its tree was created at. The worker answers the reviewer's issues
+/// in its own session, the change is reviewed again, and only then are the
+/// commits pushed and the reply, with its Review section, posted.
+#[tokio::test]
+async fn an_engage_s_commits_are_reviewed_and_answered_before_they_are_pushed() {
+    let mut f = fixture("engage-reviewed").await;
+    engage_review_on(&mut f, 3);
+    let bins = FakeBins::acquire("engage-reviewed");
+    bins.ok("gh", PR_VIEW_JSON);
+    let origin = push_to(&f, None).await;
+    let head = git(&origin, &["rev-parse", BRANCH]).trim().to_owned();
+    let backend = reviewed_engage(vec![
+        Step::Engage,
+        Step::Review(ENGAGE_ISSUE),
+        Step::Answer,
+        Step::Review("[]"),
+    ]);
+
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Cold(&finding),
+        &backend,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
+    let runs = backend.runs();
+    assert_eq!(runs.len(), 4, "engage, review, answer, review");
+    assert!(
+        runs[1].prompt.starts_with(&format!("review {head} into")),
+        "{}",
+        runs[1].prompt
+    );
+    assert!(
+        runs[2].prompt.starts_with("answer")
+            && runs[2]
+                .prompt
+                .contains("the merge dropped the bounds check"),
+        "{}",
+        runs[2].prompt
+    );
+    assert!(
+        runs[2].resume_from.is_some(),
+        "the answer continues the worker"
+    );
+    let pushed = git(
+        &origin,
+        &["log", "--format=%s", &format!("{head}..{BRANCH}")],
+    );
+    assert_eq!(pushed.trim(), "keep the bounds check\naddress review");
+    let replies = posted(&bins);
+    assert_eq!(replies.len(), 1, "{replies:?}");
+    assert!(replies[0].contains("## Review\naddressed"), "{replies:?}");
+}
+
+/// An engage that only replies changed nothing to review: no reviewer runs,
+/// and its reply is posted as it is.
+#[tokio::test]
+async fn a_reply_only_engage_is_not_reviewed() {
+    let mut f = fixture("engage-reviewed-reply").await;
+    engage_review_on(&mut f, 3);
+    let bins = FakeBins::acquire("engage-reviewed-reply");
+    bins.ok("gh", PR_VIEW_JSON);
+    push_to(&f, None).await;
+    let backend = reviewed_engage(vec![Step::Reply]);
+
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Cold(&finding),
+        &backend,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
+    assert_eq!(backend.runs().len(), 1, "no reviewer");
+    let replies = posted(&bins);
+    assert_eq!(replies.len(), 1, "{replies:?}");
+    assert!(
+        replies[0].starts_with("answered, nothing to change\n\n<!--"),
+        "{replies:?}"
+    );
+}
+
+/// Issues the last review round leaves hold the engage for the operator:
+/// nothing is pushed or posted. The operator's `continue` resumes the
+/// worker on those issues, and the answer is reviewed before it is pushed.
+#[tokio::test]
+async fn issues_left_by_the_last_round_hold_the_engage_until_continued() {
+    let mut f = fixture("engage-reviewed-held").await;
+    engage_review_on(&mut f, 1);
+    let bins = FakeBins::acquire("engage-reviewed-held");
+    bins.ok("gh", PR_VIEW_JSON);
+    let origin = push_to(&f, None).await;
+    let head = git(&origin, &["rev-parse", BRANCH]).trim().to_owned();
+    let backend = reviewed_engage(vec![Step::Engage, Step::Review(ENGAGE_ISSUE)]);
+
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Cold(&finding),
+        &backend,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("held"), "{summary:?}");
+    assert_eq!(
+        git(&origin, &["rev-parse", BRANCH]).trim(),
+        head,
+        "nothing pushed"
+    );
+    assert!(posted(&bins).is_empty(), "nothing posted");
+    let hold = support::hold_of(&f.store, f.fid, hunter::domain::FindingJobKind::Engage)
+        .await
+        .expect("held");
+    assert!(
+        hold.detail.contains("Held by the pre-push review")
+            && hold.detail.contains("the merge dropped the bounds check"),
+        "{}",
+        hold.detail
+    );
+    support::release(
+        &f.store,
+        f.fid,
+        hunter::domain::FindingJobKind::Engage,
+        hunter::domain::ReleaseAction::Continue,
+    )
+    .await;
+    let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
+        hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
+            .await
+            .unwrap()
+    else {
+        panic!("a continued hold resumes its checkpoint");
+    };
+    let resumed = reviewed_engage(vec![Step::Answer, Step::Review("[]")]);
+
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
+        &resumed,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
+    let runs = resumed.runs();
+    assert_eq!(runs.len(), 2, "the answer, then a review");
+    assert!(
+        runs[0]
+            .prompt
+            .starts_with("An operator released this engage")
+            && runs[0]
+                .prompt
+                .contains("the merge dropped the bounds check"),
+        "{}",
+        runs[0].prompt
+    );
+    let pushed = git(
+        &origin,
+        &["log", "--format=%s", &format!("{head}..{BRANCH}")],
+    );
+    assert_eq!(pushed.trim(), "keep the bounds check\naddress review");
+}
+
+/// Land a commit on the origin's default branch, as someone else's merge
+/// would: what an engage that merges the default branch brings in. Its
+/// sha.
+fn upstream_commit(origin: &Path) -> String {
+    let dir = TempDir::new("engage-upstream");
+    let clone = dir.path().join("clone");
+    git(
+        dir.path(),
+        &["clone", "-q", &origin.to_string_lossy(), "clone"],
+    );
+    std::fs::write(clone.join("UPSTREAM.md"), "someone else's work\n").unwrap();
+    git(&clone, &["add", "UPSTREAM.md"]);
+    git(
+        &clone,
+        &["commit", "-q", "-m", "upstream: someone else's work"],
+    );
+    git(&clone, &["push", "-q", "origin", "HEAD"]);
+    git(&clone, &["rev-parse", "HEAD"]).trim().to_owned()
+}
+
+/// An engage that merges the default branch into the PR, in its first run
+/// or in an answer, is reviewed from where the PR now forks from it: the
+/// upstream commits the merge brought in are not the worker's change, and
+/// the reviewer is not handed them. Until the merge, a round reviews the
+/// worker's own commits on top of the PR head, as before.
+#[tokio::test]
+async fn a_merge_of_the_default_branch_is_reviewed_from_the_new_fork() {
+    for answering in [false, true] {
+        let mut f = fixture("engage-reviewed-merge").await;
+        engage_review_on(&mut f, 3);
+        let bins = FakeBins::acquire("engage-reviewed-merge");
+        bins.ok("gh", PR_VIEW_JSON);
+        let origin = push_to(&f, None).await;
+        let head = git(&origin, &["rev-parse", BRANCH]).trim().to_owned();
+        let upstream = upstream_commit(&origin);
+        let steps = if answering {
+            vec![
+                Step::Engage,
+                Step::Review(ENGAGE_ISSUE),
+                Step::Merge(true),
+                Step::Review("[]"),
+            ]
+        } else {
+            vec![Step::Merge(false), Step::Review("[]")]
+        };
+        let backend = reviewed_engage(steps);
+
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        let summary = hunter::scheduler::run_engage(
+            &support::scope(&f.store),
+            f.store.test_lane(),
+            &f.cfg,
+            Attempt::Cold(&finding),
+            &backend,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
+        let reviews: Vec<_> = backend
+            .runs()
+            .into_iter()
+            .filter(|r| r.prompt.starts_with("review"))
+            .map(|r| r.prompt)
+            .collect();
+        let last = reviews.last().unwrap();
+        assert!(
+            last.starts_with(&format!("review {upstream} into")),
+            "answering {answering}: {last}"
+        );
+        if answering {
+            assert!(
+                reviews[0].starts_with(&format!("review {head} into")),
+                "{}",
+                reviews[0]
+            );
+        }
+        drop(bins);
+    }
+}
+
+/// An engage that rewrote the PR's history (here, amending its head) is
+/// reviewed as the whole PR now stands, from where it forks from the
+/// default branch: its own commits are no longer on top of the head its
+/// tree was created at.
+#[tokio::test]
+async fn a_rewritten_pr_is_reviewed_from_where_it_forks() {
+    let mut f = fixture("engage-reviewed-rewrite").await;
+    engage_review_on(&mut f, 3);
+    let bins = FakeBins::acquire("engage-reviewed-rewrite");
+    bins.ok("gh", PR_VIEW_JSON);
+    let origin = push_to(&f, None).await;
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let repo = f
+        .store
+        .get_repo_by_id(finding.repo_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let fork = git(&origin, &["merge-base", BRANCH, &repo.default_branch])
+        .trim()
+        .to_owned();
+    let backend = reviewed_engage(vec![Step::Amend, Step::Review("[]")]);
+
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Cold(&finding),
+        &backend,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
+    let runs = backend.runs();
+    assert!(
+        runs[1].prompt.starts_with(&format!("review {fork} into")),
+        "{}",
+        runs[1].prompt
+    );
+    assert_eq!(
+        git(&origin, &["log", "-1", "--format=%s", BRANCH]).trim(),
+        "the fix, squashed"
+    );
+}
+
+/// A review round that fails (here, a reviewer that wrote no review) never
+/// holds the commits hostage: they are pushed, and the reply says why they
+/// were not reviewed.
+#[tokio::test]
+async fn a_failed_review_pushes_and_says_so_in_the_reply() {
+    let mut f = fixture("engage-reviewed-failed").await;
+    engage_review_on(&mut f, 3);
+    let bins = FakeBins::acquire("engage-reviewed-failed");
+    bins.ok("gh", PR_VIEW_JSON);
+    let origin = push_to(&f, None).await;
+    let backend = reviewed_engage(vec![Step::Engage, Step::Review("not a review")]);
+
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Cold(&finding),
+        &backend,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
+    assert_eq!(
+        git(&origin, &["log", "-1", "--format=%s", BRANCH]).trim(),
+        "address review"
+    );
+    let replies = posted(&bins);
+    assert_eq!(replies.len(), 1, "{replies:?}");
+    assert!(
+        replies[0].starts_with("done, see the new commit\n\n")
+            && replies[0].contains("Review round 1 failed"),
+        "{replies:?}"
+    );
+}
+
+/// A worker that answers a review by taking back every commit leaves
+/// nothing to review again: nothing is pushed, and its reply is posted.
+#[tokio::test]
+async fn an_answer_that_takes_back_every_commit_only_replies() {
+    let mut f = fixture("engage-reviewed-retract").await;
+    engage_review_on(&mut f, 3);
+    let bins = FakeBins::acquire("engage-reviewed-retract");
+    bins.ok("gh", PR_VIEW_JSON);
+    let origin = push_to(&f, None).await;
+    let head = git(&origin, &["rev-parse", BRANCH]).trim().to_owned();
+    let backend = reviewed_engage(vec![
+        Step::Engage,
+        Step::Review(ENGAGE_ISSUE),
+        Step::Retract,
+    ]);
+
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Cold(&finding),
+        &backend,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
+    assert_eq!(
+        backend.runs().len(),
+        3,
+        "engage, review, answer: no review after"
+    );
+    assert_eq!(git(&origin, &["rev-parse", BRANCH]).trim(), head);
+    let replies = posted(&bins);
+    assert_eq!(replies.len(), 1, "{replies:?}");
+    assert!(replies[0].starts_with("dropped the change"), "{replies:?}");
+}
+
+/// An answer cut off by an unreachable model provider, the forge still
+/// reachable, is the network's failure, as a fix's is: nothing is pushed,
+/// posted or counted, and the attempt is kept, not as kept only to
+/// publish, since its review is not done. The retry reviews that round
+/// again before anything is pushed.
+#[tokio::test]
+async fn an_answer_cut_off_by_an_unreachable_provider_is_kept_and_reviewed_again() {
+    let mut f = fixture("engage-reviewed-offline").await;
+    engage_review_on(&mut f, 3);
+    f.cfg.network_gate = true;
+    let bins = FakeBins::acquire("engage-reviewed-offline");
+    bins.ok("gh", PR_VIEW_JSON);
+    let origin = push_to(&f, None).await;
+    let head = git(&origin, &["rev-parse", BRANCH]).trim().to_owned();
+    let provider = "api.provider.test";
+    let first = reviewed_engage(vec![
+        Step::Engage,
+        Step::Review(ENGAGE_ISSUE),
+        Step::AnswerFails,
+    ])
+    .needing(&[provider])
+    .offline_once_dispatched(&[provider]);
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Cold(&finding),
+        &first,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        summary.unreachable.as_deref(),
+        Some(provider),
+        "{summary:?}"
+    );
+    assert_eq!(
+        git(&origin, &["rev-parse", BRANCH]).trim(),
+        head,
+        "nothing pushed"
+    );
+    assert!(posted(&bins).is_empty(), "nothing posted");
+    let streak = f
+        .store
+        .work_streak(f.fid, hunter::domain::FindingJobKind::Engage)
+        .await
+        .unwrap()
+        .streak;
+    assert_eq!(streak, 0, "nothing is counted");
+    f.cfg.network_gate = false;
+    let plan = match hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
+        .await
+        .unwrap()
+    {
+        Some(hunter::scheduler::Candidate::Resume { plan, .. }) => *plan,
+        other => panic!("expected the kept engage to be resumed, got {other:?}"),
+    };
+    assert!(!plan.publish_only(), "its review is not done");
+    let resumed = reviewed_engage(vec![
+        Step::Continue,
+        Step::Review(ENGAGE_ISSUE),
+        Step::Answer,
+        Step::Review("[]"),
+    ]);
+
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
+        &resumed,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
+    assert_eq!(
+        resumed.runs().len(),
+        4,
+        "the resume, the round again, its answer, a review"
+    );
+    let pushed = git(
+        &origin,
+        &["log", "--format=%s", &format!("{head}..{BRANCH}")],
+    );
+    assert_eq!(pushed.trim(), "keep the bounds check\naddress review");
+}
+
+/// The index lock of the worktree `tree`.
+fn index_lock(tree: &Path) -> PathBuf {
+    tree.join(git(tree, &["rev-parse", "--git-path", "index.lock"]).trim())
+}
+
+/// A reviewer whose changes could not be undone leaves no verdict to
+/// publish: nothing is pushed or posted, and the attempt is kept. The next
+/// attempt puts the tree back to the commit the reviewer was shown before
+/// its worker runs; while that fails, no worker runs and the attempt fails
+/// as `reviewed tree not restored`. Once it succeeds, the reviewer's commit
+/// is gone, and what is pushed is the worker's own, reviewed again.
+#[tokio::test]
+async fn a_tree_a_reviewer_left_is_put_back_before_the_engage_runs_again() {
+    let mut f = fixture("engage-reviewed-locked").await;
+    engage_review_on(&mut f, 3);
+    let bins = FakeBins::acquire("engage-reviewed-locked");
+    bins.ok("gh", PR_VIEW_JSON);
+    let origin = push_to(&f, None).await;
+    let head = git(&origin, &["rev-parse", BRANCH]).trim().to_owned();
+    let first = reviewed_engage(vec![Step::Engage, Step::LockingReview("[]")]);
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let run = |attempt, backend| {
+        let f = &f;
+        async move {
+            hunter::scheduler::run_engage(
+                &support::scope(&f.store),
+                f.store.test_lane(),
+                &f.cfg,
+                attempt,
+                backend,
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let next = || async {
+        match hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
+            .await
+            .unwrap()
+        {
+            Some(hunter::scheduler::Candidate::Resume { plan, .. }) => *plan,
+            other => panic!("expected the kept engage to be resumed, got {other:?}"),
+        }
+    };
+
+    let summary = run(Attempt::Cold(&finding), &first).await;
+
+    let failure = summary.failure.clone().unwrap_or_default();
+    assert!(failure.starts_with("not reviewed"), "{summary:?}");
+    assert_eq!(
+        git(&origin, &["rev-parse", BRANCH]).trim(),
+        head,
+        "nothing pushed"
+    );
+    assert!(posted(&bins).is_empty(), "nothing posted");
+    let tree = first.runs()[0].tree.clone();
+    let kept = next().await;
+    let plan = Resumed::load(&f.store, &kept).await.unwrap();
+    let stuck = reviewed_engage(Vec::new());
+
+    let summary = run(Attempt::Resume(&plan), &stuck).await;
+
+    let failure = summary.failure.clone().unwrap_or_default();
+    assert!(
+        failure.starts_with("reviewed tree not restored"),
+        "{summary:?}"
+    );
+    assert_eq!(
+        (
+            summary.kind,
+            summary.finding_id,
+            summary.state,
+            summary.pr_number,
+            summary.outcome.as_deref(),
+        ),
+        (
+            Some(hunter::domain::FindingJobKind::Engage.into()),
+            Some(f.fid),
+            Some(hunter::domain::JobState::Failed),
+            Some(7),
+            Some("retry"),
+        ),
+        "{summary:?}"
+    );
+    assert!(
+        summary
+            .job_id
+            .is_some_and(|job| job > kept.predecessor_id()),
+        "the new attempt's job: {summary:?}"
+    );
+    assert!(
+        stuck.runs().is_empty(),
+        "no worker runs on a tree not put back"
+    );
+    std::fs::remove_file(index_lock(&tree)).unwrap();
+    let kept = next().await;
+    let plan = Resumed::load(&f.store, &kept).await.unwrap();
+    let resumed = reviewed_engage(vec![Step::Continue, Step::Review("[]")]);
+
+    let summary = run(Attempt::Resume(&plan), &resumed).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
+    assert_eq!(resumed.runs().len(), 2, "the worker, then a review");
+    let pushed = git(
+        &origin,
+        &["log", "--format=%s", &format!("{head}..{BRANCH}")],
+    );
+    assert_eq!(pushed.trim(), "address review");
+}
+
+/// A PR merged while its engage's review runs stops the review before its
+/// next run: the worker is not sent the round's issues, nothing is pushed
+/// or posted, and nothing is counted against the engage, as for a PR that
+/// ended while the worker ran.
+#[tokio::test]
+async fn a_pr_merged_during_the_review_stops_it() {
+    let mut f = fixture("engage-reviewed-merged").await;
+    engage_review_on(&mut f, 3);
+    let bins = FakeBins::acquire("engage-reviewed-merged");
+    bins.ok("gh", PR_VIEW_JSON);
+    let origin = push_to(&f, None).await;
+    let before = git(&origin, &["rev-parse", BRANCH]);
+    let (db, fid) = (f.db.clone(), f.fid);
+    // The PR is merged while the round's reviewer runs.
+    let backend = reviewed_engage_then(
+        vec![Step::Engage, Step::Review(ENGAGE_ISSUE), Step::Answer],
+        move |i| {
+            if i == 1 {
+                merge_finding_from_worker(&db, fid);
+            }
+        },
+    );
+
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Cold(&finding),
+        &backend,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        backend.runs().len(),
+        2,
+        "the worker and one reviewer, no answer"
+    );
+    assert_eq!(
+        git(&origin, &["rev-parse", BRANCH]),
+        before,
+        "nothing pushed"
+    );
+    assert!(posted(&bins).is_empty(), "nothing posted");
+    assert_eq!(
+        f.store
+            .work_streak(f.fid, hunter::domain::FindingJobKind::Engage)
+            .await
+            .unwrap()
+            .streak,
+        0
+    );
+    let events = f.store.recent_events(30).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.message.contains("the PR ended ('merged'); stopped")),
+        "{events:?}"
+    );
+}
+
+/// A grant spent mid-review suspends the engage with nothing pushed. Its
+/// resume runs no worker continuation: the worker answers the issues the
+/// capped reviewer wrote, the change is reviewed again, and only then is it
+/// pushed.
+#[tokio::test]
+async fn a_spent_grant_suspends_the_engage_review_and_the_resume_finishes_it() {
+    let mut f = fixture("engage-reviewed-spent").await;
+    engage_review_on(&mut f, 3);
+    let bins = FakeBins::acquire("engage-reviewed-spent");
+    bins.ok("gh", PR_VIEW_JSON);
+    let origin = push_to(&f, None).await;
+    let head = git(&origin, &["rev-parse", BRANCH]).trim().to_owned();
+    let first = reviewed_engage(vec![Step::Engage, Step::ReviewCapped(ENGAGE_ISSUE)])
+        .granting(Some(10_000));
+
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Cold(&finding),
+        &first,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("suspended"), "{summary:?}");
+    assert_eq!(git(&origin, &["rev-parse", BRANCH]).trim(), head);
+    assert!(posted(&bins).is_empty(), "nothing posted");
+    let plan = match hunter::scheduler::pick_next(&support::scope(&f.store), &f.cfg, None)
+        .await
+        .unwrap()
+    {
+        Some(hunter::scheduler::Candidate::Resume { plan, .. }) => *plan,
+        other => panic!("expected the suspended engage to be resumed, got {other:?}"),
+    };
+    let resumed = reviewed_engage(vec![Step::Answer, Step::Review("[]")]);
+
+    let summary = hunter::scheduler::run_engage(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Resume(&Resumed::load(&f.store, &plan).await.unwrap()),
+        &resumed,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
+    let runs = resumed.runs();
+    assert_eq!(runs.len(), 2, "the answer, then a review");
+    assert!(
+        runs[0]
+            .prompt
+            .contains("the merge dropped the bounds check"),
+        "{}",
+        runs[0].prompt
+    );
+    let pushed = git(
+        &origin,
+        &["log", "--format=%s", &format!("{head}..{BRANCH}")],
+    );
+    assert_eq!(pushed.trim(), "keep the bounds check\naddress review");
+}

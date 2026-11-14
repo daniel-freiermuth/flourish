@@ -510,8 +510,8 @@ pub enum JobPhase {
     Fetching,
     /// Adding the job's worktree.
     PreparingTree,
-    /// A fresh reviewer reading a finished fix before it ships
-    /// (`scheduler::review_fix`).
+    /// A fresh reviewer reading a finished fix before it ships, or an
+    /// engage's commits before they are pushed (`scheduler::review`).
     Reviewing,
     /// Pushing and opening or answering a PR, or withdrawing one.
     Publishing,

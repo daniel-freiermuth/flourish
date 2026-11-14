@@ -514,11 +514,15 @@ pub fn build_apply_simplification_prompt(
     )
 }
 
-/// The pre-PR reviewer's prompt (`review.md`): a fresh session that reviews
-/// `<base>..HEAD` in `worktree` against the finding and the author's PR
-/// description, and writes its issues to `out_path`, outside the tree.
+/// The reviewer's prompt (`template`: `review.md` for a fix before its PR
+/// opens, `review_engage.md` for an engage's commits before they are
+/// pushed): a fresh session that reviews `<base>..HEAD` in `worktree`
+/// against the finding and the author's description (a fix's PR
+/// description, an engage's reply), and writes its issues to `out_path`,
+/// outside the tree.
 pub fn build_review_prompt(
     root: &Path,
+    template: &str,
     finding: &Finding,
     worktree: &Path,
     base: &str,
@@ -528,7 +532,7 @@ pub fn build_review_prompt(
     repo_notes: &str,
 ) -> Result<String> {
     let notes = notes_or_default(repo_notes, "(No notes yet)");
-    let template = read_template(root, "review.md")?;
+    let template = read_template(root, template)?;
     let mut slots = HashMap::new();
     slots.insert("WORKTREE", worktree.display().to_string());
     slots.insert("BASE", base.to_owned());
@@ -623,18 +627,21 @@ pub fn build_pr_review_prompt(
     render(&template, &slots)
 }
 
-/// What a resumed fixer is told after a review round raised blocking
-/// issues (`review_followup.md`). `issues` is the reviewer's blocking
-/// entries as JSON, verbatim; `decline_file` is the file the fixer's own
-/// playbook declines with (`NOT-A-BUG.md` or `DECLINED.md`).
+/// What a resumed author is told after a review round raised issues
+/// (`template`: `review_followup.md` for a fixer, `review_engage_followup.md`
+/// for an engage's worker). `issues` is the reviewer's entries as JSON,
+/// verbatim; `decline_file` is the file the author's own playbook refuses
+/// the change with (`NOT-A-BUG.md` or `DECLINED.md`, an engage's
+/// `WITHDRAW.md`).
 pub fn build_review_followup_prompt(
     root: &Path,
+    template: &str,
     worktree: &Path,
     base: &str,
     issues: &str,
     decline_file: &str,
 ) -> Result<String> {
-    let template = read_template(root, "review_followup.md")?;
+    let template = read_template(root, template)?;
     let mut slots = HashMap::new();
     slots.insert("WORKTREE", worktree.display().to_string());
     slots.insert("BASE", base.to_owned());
