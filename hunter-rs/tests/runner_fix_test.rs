@@ -3262,6 +3262,160 @@ async fn a_blocking_issue_resumes_the_fixer_and_the_answer_ships_once_clean() {
     );
 }
 
+/// The commits the fix branch has on origin beyond `main`, newest first,
+/// and `main`'s: what each review round was shown, and what every round
+/// reviews from.
+fn shipped_range(f: &Fixture) -> (Vec<String>, String) {
+    let origin = git(&f.repo_dir, &["remote", "get-url", "origin"]);
+    let origin = std::path::Path::new(origin.trim());
+    let heads = git(origin, &["rev-list", &format!("main..{BRANCH}")]);
+    let base = git(origin, &["rev-parse", "main"]);
+    (
+        heads.lines().map(str::to_owned).collect(),
+        base.trim().to_owned(),
+    )
+}
+
+/// Each issue of a recorded round: its kind, whether it blocks, and its
+/// summary.
+fn recorded_issues(round: &hunter::types::FixReviewRoundOut) -> Vec<(&str, bool, &str)> {
+    round
+        .issues
+        .iter()
+        .map(|i| (i.kind.as_str(), i.blocking, i.summary.as_str()))
+        .collect()
+}
+
+/// Every round of a fix's review is recorded for the finding: the commit
+/// the reviewer was shown, by the attempt it ran in, with its reviewer's
+/// spend and the issues it reported, blocking ones first and its
+/// follow-ups among them. A round that raised only follow-ups is clean.
+#[tokio::test]
+async fn a_fixs_review_rounds_are_recorded_with_their_issues() {
+    let bins = support::FakeBins::acquire("fix-review-recorded");
+    bins.ok("gh", "https://github.com/acme/widget/pull/42");
+    let f = reviewed_fixture("fix-review-recorded", 3).await;
+    let worker = reviewed_worker(vec![
+        Act::Fix,
+        Act::Review(BLOCKING),
+        Act::Answer,
+        Act::Review(FOLLOW_UP_ONLY),
+    ]);
+
+    let summary = fix(&f, &worker).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    let job = summary.job_id.unwrap();
+    let (heads, base) = shipped_range(&f);
+    let rounds = f.store.fix_review_rounds(f.fid).await.unwrap();
+    assert_eq!(rounds.len(), 2, "{rounds:?}");
+    let (clean, answered) = (&rounds[0], &rounds[1]);
+    for (round, head) in [(clean, &heads[0]), (answered, &heads[1])] {
+        assert_eq!(round.verdict, "ok", "{round:?}");
+        assert_eq!(round.failure, None, "{round:?}");
+        assert_eq!((round.origin_job_id, round.job_id), (job, Some(job)));
+        assert_eq!((&round.base_sha, &round.head_sha), (&base, head));
+        assert_eq!(round.tokens_new, Some(1_000), "the reviewer's own spend");
+    }
+    assert_eq!(
+        recorded_issues(answered),
+        [
+            ("incomplete", true, "the sibling parser still breaks"),
+            ("introduced", false, "a minor edge case"),
+        ]
+    );
+    assert_eq!(
+        recorded_issues(clean),
+        [(
+            "follow-up",
+            false,
+            "the other feeds parse dates the same broken way"
+        )]
+    );
+}
+
+/// A reviewer killed at its cap after it wrote issues records a partial
+/// round with them, which the fix goes on with. The resume's rounds are
+/// the same review's: one review per fix chain, its rounds by the attempt
+/// each ran in.
+#[tokio::test]
+async fn a_cut_short_round_is_partial_and_the_resume_reviews_on_in_the_same_review() {
+    let bins = support::FakeBins::acquire("fix-review-recorded-partial");
+    bins.ok("gh", "https://github.com/acme/widget/pull/42");
+    let f = reviewed_fixture("fix-review-recorded-partial", 3).await;
+    let worker =
+        reviewed_worker(vec![Act::Fix, Act::ReviewKilled(BLOCKING)]).granting(Some(10_000));
+    let summary = fix(&f, &worker).await;
+    assert_eq!(summary.outcome.as_deref(), Some("suspended"), "{summary:?}");
+    let first = summary.job_id.unwrap();
+    let rounds = f.store.fix_review_rounds(f.fid).await.unwrap();
+    assert_eq!(rounds.len(), 1, "{rounds:?}");
+    let partial = &rounds[0];
+    assert_eq!(partial.verdict, "partial");
+    assert_eq!(
+        partial.failure.as_deref(),
+        Some("the reviewer was killed (cap)")
+    );
+    assert_eq!(partial.tokens_new, worker.runs()[1].cap_tokens);
+    assert_eq!(
+        recorded_issues(partial),
+        [
+            ("incomplete", true, "the sibling parser still breaks"),
+            ("introduced", false, "a minor edge case"),
+        ]
+    );
+    let plan = pending_resume(&f).await;
+    let resumed = reviewed_worker(vec![Act::Answer, Act::Review(CLEAN)]);
+
+    let summary = resume(&f, &plan, &resumed).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    let second = summary.job_id.unwrap();
+    assert_ne!(second, first);
+    let rounds = f.store.fix_review_rounds(f.fid).await.unwrap();
+    let recorded: Vec<_> = rounds
+        .iter()
+        .map(|r| (r.origin_job_id, r.job_id, r.verdict.as_str()))
+        .collect();
+    assert_eq!(
+        recorded,
+        [(first, Some(second), "ok"), (first, Some(first), "partial")]
+    );
+    assert!(rounds[0].issues.is_empty(), "{rounds:?}");
+}
+
+/// A round that had no review records it failed, saying why, with no
+/// issues; the fix ships as before.
+#[tokio::test]
+async fn a_round_without_a_review_is_recorded_as_failed() {
+    for (reviewer, why, spent) in [
+        (
+            Act::ReviewSilent,
+            "no review file: No such file or directory (os error 2)",
+            1_000,
+        ),
+        (Act::ReviewUnreached, "the reviewer exited 1", 0),
+    ] {
+        let bins = support::FakeBins::acquire("fix-review-recorded-failed");
+        bins.ok("gh", "https://github.com/acme/widget/pull/42");
+        let f = reviewed_fixture("fix-review-recorded-failed", 7).await;
+        let worker = reviewed_worker(vec![Act::Fix, reviewer]);
+
+        let summary = fix(&f, &worker).await;
+
+        assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{why}");
+        let rounds = f.store.fix_review_rounds(f.fid).await.unwrap();
+        assert_eq!(rounds.len(), 1, "{why}: {rounds:?}");
+        let failed = &rounds[0];
+        assert_eq!(failed.verdict, "failed", "{why}");
+        assert_eq!(failed.failure.as_deref(), Some(why));
+        assert_eq!(failed.job_id, summary.job_id, "{why}");
+        assert_eq!(failed.tokens_new, Some(spent), "{why}");
+        assert!(failed.issues.is_empty(), "{why}: {failed:?}");
+        drop(bins);
+    }
+}
+
 /// Non-blocking issues left after the last round hold the fix as a
 /// blocking one does: a review still finding something after its last
 /// round is not converging, so nothing ships on the hope the rest is

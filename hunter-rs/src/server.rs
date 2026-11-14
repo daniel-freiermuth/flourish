@@ -680,6 +680,7 @@ async fn finding_detail(
             .get_pr_state(fid)
             .await?
             .map(crate::store::RecordedPrState::into_inner),
+        fix_review_rounds: store.fix_review_rounds(fid).await?,
     }))
 }
 

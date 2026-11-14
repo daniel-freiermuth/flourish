@@ -14,7 +14,9 @@
 //! All of it runs inside the fix job: the finding stays `fixing` under the
 //! same claim, and the job row records every run's spend under the one
 //! budget grant. The reviewer never holds the fix hostage: a review that
-//! cannot be had ships the fix as before, saying so in the PR body.
+//! cannot be had ships the fix as before, saying so in the PR body. Every
+//! round is recorded in the chain's `fix` review ([`record_round`]), which
+//! the finding's detail shows; the loop itself goes by its files.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -22,14 +24,14 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{BLOCKED_REPORT, FixStart, decline_report, fix_event, job_state};
+use super::{BLOCKED_REPORT, FixStart, decline_report, fix_event, job_state, log_write_failure};
 use crate::backend::{Backend, JobClass};
 use crate::clones::{Lane, Unheld};
 use crate::config::Config;
 use crate::domain::FinishedState;
 use crate::playbooks;
 use crate::recovery::CycleScope;
-use crate::store::{ReportedIssue, Store};
+use crate::store::{FixReviewRound, ReportedIssue, Store};
 use crate::types::{JobPhase, RunResult};
 use crate::workspace::Workspace;
 
@@ -723,7 +725,16 @@ async fn next_round(
             return Next::Ship(failed(round, &why, None, &[]), false);
         }
     };
-    let (run, verdict, raised_follow_ups) = review_round(rounds, lane, round, cap, wall).await;
+    let (run, head, verdict, raised_follow_ups) =
+        review_round(rounds, lane, round, cap, wall).await;
+    record_round(
+        rounds,
+        round,
+        (run.as_ref(), head.as_deref()),
+        &verdict,
+        &raised_follow_ups,
+    )
+    .await;
     let capped = run
         .as_ref()
         .is_some_and(|run| run.killed_reason.as_deref() == Some("cap"));
@@ -767,6 +778,63 @@ async fn next_round(
         Unanswered::Held | Unanswered::Offline(_) | Unanswered::Suspended => Next::End,
         Unanswered::Ship(ending, keep) => Next::Ship(ending, keep),
     }
+}
+
+/// Record review round `round` ([`crate::store::JobStore::record_fix_review_round`]):
+/// over `<pinned>..head`, the commit the reviewer was shown, by this
+/// attempt's job, with the spend of its reviewer's `run`, the issues it
+/// wrote and the `follow_ups` it raised. A round whose reviewer finished
+/// is `ok`, whatever its `verdict`'s issues; one whose reviewer was
+/// stopped, or whose round failed, after it wrote issues the fix goes on
+/// with is `partial`; any other is `failed`. The loop goes by its files,
+/// not by this record: a failure to write it is logged and changes
+/// nothing of the fix, and a round whose commit git could not say is not
+/// recorded.
+async fn record_round(
+    rounds: &Rounds<'_>,
+    round: u32,
+    (run, head): (Option<&RunResult>, Option<&str>),
+    verdict: &RoundVerdict,
+    follow_ups: &[ReportedIssue],
+) {
+    let start = rounds.start;
+    let fid = start.finding.id;
+    let Some(head) = head else {
+        tracing::warn!("#{fid} review round {round}: not recorded, its commit is unknown");
+        return;
+    };
+    let stopped = run
+        .filter(|rr| rr.killed_reason.is_some() || rr.exit_code != Some(0))
+        .map(|rr| format!("the reviewer {}", run_failure(rr)));
+    let (written, failure) = match verdict {
+        RoundVerdict::Clean => (&[][..], None),
+        RoundVerdict::Issues { issues, .. } => (issues.as_slice(), stopped.as_deref()),
+        RoundVerdict::Failed { why, issues, .. } => (issues.as_slice(), Some(why.as_str())),
+    };
+    let issues: Vec<ReportedIssue> = written.iter().chain(follow_ups).cloned().collect();
+    let recorded = match failure {
+        None => FixReviewRound::Ok(&issues),
+        Some(why) if !issues.is_empty() => FixReviewRound::Partial {
+            why,
+            issues: &issues,
+        },
+        Some(why) => FixReviewRound::Failed(why),
+    };
+    let written = rounds
+        .scope
+        .store()
+        .record_fix_review_round(
+            (fid, start.ws.origin_id),
+            start.job,
+            (&start.pinned, head),
+            run.map(|rr| rr.tokens_new),
+            recorded,
+        )
+        .await;
+    log_write_failure(
+        written,
+        format_args!("#{fid}: recording review round {round}"),
+    );
 }
 
 /// End a loop that ships: the follow-ups go into the PR body, the loop's
@@ -1651,7 +1719,8 @@ async fn head_subject(tree: &Path) -> Option<String> {
 /// `wall` seconds: a fresh session in a directory of its own
 /// ([`Workspace::review_session`], one per job and round, so it is never a
 /// transcript to continue and is metered apart from the fixer's), writing
-/// its issues outside the tree. The run, if one happened, and its verdict.
+/// its issues outside the tree. The run, if one happened, the commit the
+/// reviewer was shown, if git could say, its verdict and its follow-ups.
 ///
 /// The tree is cleaned first ([`clean_tree`]): the reviewer is shown the
 /// commits alone, and its verdict is about them. One that changed the tree
@@ -1667,7 +1736,12 @@ async fn review_round(
     round: u32,
     cap: Option<i64>,
     wall: i64,
-) -> (Option<RunResult>, RoundVerdict, Vec<ReportedIssue>) {
+) -> (
+    Option<RunResult>,
+    Option<String>,
+    RoundVerdict,
+    Vec<ReportedIssue>,
+) {
     let (cfg, start) = (rounds.cfg, rounds.start);
     let _phase = crate::activity::job_phase(JobPhase::Reviewing);
     let fail = |why: String| RoundVerdict::Failed {
@@ -1691,7 +1765,11 @@ async fn review_round(
         &Store::repo_notes(&cfg.work_root, start.repo.id),
     ) {
         Ok(prompt) => prompt,
-        Err(e) => return (None, fail(format!("no reviewer prompt: {e}")), Vec::new()),
+        Err(e) => {
+            let head = tree_state(&start.ws.tree).await.head;
+            let why = format!("no reviewer prompt: {e}");
+            return (None, head, fail(why), Vec::new());
+        }
     };
     // The change is the commits: the reviewer is shown them alone, and
     // whatever it leaves besides is its own. What the clean cannot remove
@@ -1717,8 +1795,9 @@ async fn review_round(
     if !before.readable() {
         // Nothing to hold the reviewer's tree against, or to put back to:
         // no review this round.
-        return (None, fail(UNREADABLE.to_owned()), Vec::new());
+        return (None, before.head, fail(UNREADABLE.to_owned()), Vec::new());
     }
+    let head = before.head.clone();
     let ws = Workspace {
         session,
         ..(*start.ws).clone()
@@ -1732,7 +1811,7 @@ async fn review_round(
         Ok(rr) => rr,
         Err(e) => {
             let why = format!("the reviewer could not run: {e}");
-            return (None, fail(why), Vec::new());
+            return (None, head, fail(why), Vec::new());
         }
     };
     let finished = rr.killed_reason.is_none() && rr.exit_code == Some(0);
@@ -1760,7 +1839,7 @@ async fn review_round(
         };
         if let Some(verdict) = undo_reviewer(rounds, lane, round, shown, &after, &mut written).await
         {
-            return (Some(rr), verdict, follow_ups);
+            return (Some(rr), head, verdict, follow_ups);
         }
     }
     let verdict = match written {
@@ -1775,7 +1854,7 @@ async fn review_round(
         // Ended early with no issue written: no verdict.
         Ok(_) | Err(_) => fail(format!("the reviewer {}", run_failure(&rr))),
     };
-    (Some(rr), verdict, follow_ups)
+    (Some(rr), head, verdict, follow_ups)
 }
 
 /// Undo the changes of round `round`'s reviewer, which left `after` of the

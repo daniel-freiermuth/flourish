@@ -59,7 +59,7 @@ pub use pr_review::{
     ThreadSteps, ThreadToSettle, ThreadsRead, Trust, Verdict,
 };
 pub use pr_state::{PrRead, PrSyncPass};
-pub use review::ReportedIssue;
+pub use review::{FixReviewRound, ReportedIssue};
 
 /// A `pr_state` row as the store read it ([`Store::get_pr_state`]).
 ///
@@ -6131,6 +6131,22 @@ impl JobStore {
         read_at: i64,
     ) -> sqlx::Result<u64> {
         self.0.observe_pr_review_threads(read, read_at).await
+    }
+
+    /// Record one round of the review of `finding_id`'s fix chain that
+    /// job `origin_job_id` began, run by job `job_id`, with its issues.
+    /// See the private `Store` method of the same name.
+    pub async fn record_fix_review_round(
+        &self,
+        chain: (i64, i64),
+        job_id: i64,
+        range: (&str, &str),
+        tokens_new: Option<i64>,
+        round: FixReviewRound<'_>,
+    ) -> sqlx::Result<i64> {
+        self.0
+            .record_fix_review_round(chain, job_id, range, tokens_new, round)
+            .await
     }
 }
 
