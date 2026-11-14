@@ -51,6 +51,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+use super::review::{IssueVerdict, Verdict};
 use super::{ImmediateTx, ReportedIssue, Store, review};
 use crate::domain::{ForgeName, PrReviewState};
 use crate::forge;
@@ -515,59 +516,6 @@ impl PrReviewRow {
         let doublings = u32::try_from((self.failures - 1).clamp(0, 16)).unwrap_or(0);
         Some(failed_at.saturating_add(PR_REVIEW_RETRY_MS.saturating_mul(1 << doublings)))
     }
-}
-
-/// What a round said about one earlier issue (`review_verdicts`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IssueVerdict {
-    /// The new commits fix it.
-    Addressed,
-    /// A reply argued it is no issue, and the round checked the argument
-    /// against the code.
-    RebuttalAccepted,
-    /// It still stands.
-    Open,
-}
-
-impl IssueVerdict {
-    /// The word the reviewer writes and the table keeps.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Addressed => "addressed",
-            Self::RebuttalAccepted => "rebuttal-accepted",
-            Self::Open => "open",
-        }
-    }
-
-    pub fn parse(word: &str) -> Option<Self> {
-        match word {
-            "addressed" => Some(Self::Addressed),
-            "rebuttal-accepted" => Some(Self::RebuttalAccepted),
-            "open" => Some(Self::Open),
-            _ => None,
-        }
-    }
-}
-
-/// A round's verdict on earlier issue `issue_id`, with its evidence.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Verdict {
-    pub issue_id: i64,
-    pub verdict: IssueVerdict,
-    pub note: String,
-    /// The reply the issue's thread ended in as the round was shown it,
-    /// somebody's other than hunter's (epoch ms): the verdict is posted
-    /// there as hunter's answer to it, even when it changes nothing.
-    pub answers_reply_at: Option<i64>,
-    /// The issue's `reopened_at` as the round read it
-    /// ([`EarlierIssue::reopened_at`]): the verdict counts only while no
-    /// later reopen is recorded.
-    pub seen_reopened_at: Option<i64>,
-    /// The newest reply by somebody other than hunter in the thread as the
-    /// round was shown it ([`EarlierIssue::newest_reply_at`], epoch ms): a
-    /// newer one leaves the issue awaiting judgment, and its thread is not
-    /// answered or resolved with this verdict.
-    pub seen_reply_at: Option<i64>,
 }
 
 /// How a round ended, as [`JobStore::record_pr_review_round`] records it.
@@ -2350,37 +2298,30 @@ async fn mark_gone(tx: &mut sqlx::SqliteConnection, gone: &[i64]) -> sqlx::Resul
     Ok(())
 }
 
-/// Record round `round_id`'s `verdicts` on earlier issues of its review.
-/// A verdict on an issue of another review or another binding, or of this
-/// very round, is dropped: the reviewer was never shown it.
+/// Record round `round_id`'s `verdicts` on earlier issues of its review
+/// ([`review::insert_verdict`]). A verdict on an issue of another binding
+/// is dropped as well: the reviewer was never shown it.
 async fn record_verdicts(
     tx: &mut sqlx::SqliteConnection,
     round_id: i64,
     verdicts: &[Verdict],
 ) -> sqlx::Result<()> {
     for v in verdicts {
-        let word = v.verdict.as_str();
-        sqlx::query!(
-            "INSERT INTO review_verdicts \
-                 (round_id, issue_id, verdict, note, answers_reply_at, seen_reopened_at, \
-                  seen_reply_at) \
-             SELECT ?1, i.id, ?3, ?4, ?5, ?6, ?7 FROM review_issues i \
-             JOIN review_rounds r ON r.id = i.round_id \
-             JOIN pr_review_posts o ON o.round_id = r.id \
-             WHERE i.id = ?2 AND r.id != ?1 \
-               AND r.review_id = (SELECT review_id FROM review_rounds WHERE id = ?1) \
-               AND o.binding = (SELECT binding FROM pr_review_posts WHERE round_id = ?1) \
-             ON CONFLICT DO NOTHING",
+        let bound = sqlx::query_scalar!(
+            r#"SELECT EXISTS (
+                   SELECT 1 FROM review_issues i
+                   JOIN pr_review_posts o ON o.round_id = i.round_id
+                   WHERE i.id = ?2
+                     AND o.binding = (SELECT binding FROM pr_review_posts WHERE round_id = ?1)
+               ) AS "bound!: bool""#,
             round_id,
-            v.issue_id,
-            word,
-            v.note,
-            v.answers_reply_at,
-            v.seen_reopened_at,
-            v.seen_reply_at
+            v.issue_id
         )
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await?;
+        if bound {
+            review::insert_verdict(tx, round_id, v).await?;
+        }
     }
     Ok(())
 }
