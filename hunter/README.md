@@ -152,10 +152,9 @@ new ──recheck──> new / superseded / rejected
   converging. `continue` resumes the fixer on the issues still open and
   the review runs again. When the grant is spent before
   the review is through (before a round, by a reviewer killed at its cap,
-  or before the fixer can answer a round), the job is suspended, and its
-  resume, under a fresh grant, answers the issues left or has the
-  cut-off round again, without first resuming the finished fixer: a
-  review cut short never ships as one. When the fixer's answer fails
+  or before the fixer can answer a round), the job is suspended at that
+  step, and its resume, under a fresh grant, answers the issues left or
+  has the cut-off round again: a review cut short never ships as one. When the fixer's answer fails
   without doing work while the forge is reachable (offline, the attempt
   is kept and retried), a blocking issue holds the fix the same way and
   non-blocking ones ship in an "Unresolved review issues" section of the
@@ -186,14 +185,21 @@ new ──recheck──> new / superseded / rejected
   `stuck`. Until a fixer has run on the review's issues, any `continue`
   resumes it on them, whichever hold it released. A fixer
   that did not finish ships nothing while the review is on. Every run is
-  metered into the one fix job, under its one budget grant. Details:
-  `hunter-rs/WORK-MODEL.md` §5.7. Before the push, a multi-commit fix is
-  curated into a few logical commits of the same tree (`review.curate`); a
-  curation whose changes cannot be undone is put back the same way as
-  a reviewer's before any later attempt runs a worker. A curation cut
-  short (a grant that runs out before or during it, a restart, a rewrite
-  that had to be put back) is owed: the next attempt runs no fixer and
-  curates before it ships, as for any other part of the fix.
+  metered into the one fix job, under its one budget grant. Before the
+  push, a multi-commit fix is curated into a few logical commits of the
+  same tree (`review.curate`); a curation whose changes cannot be undone
+  is put back the same way as a reviewer's before any later attempt runs
+  a worker. The fix job moves through steps (implement, review N,
+  answer N, curate, publish), recorded on the finding's fix work item
+  (`finding_work.step`) as each one completes and with the attempt's end:
+  whatever stops an attempt (a grant that runs out, a cap, a shutdown, a
+  restart, a host out of reach), the next one runs the step it stopped
+  at, a reviewer, the fixer's answer, the curator or just the publish,
+  without first resuming the finished fixer. A resume that moved the fix
+  on to another step is not counted toward the give-up ceiling's
+  attempts; a chain stuck at one step past its implementation is held
+  for you with its work instead of being given up and fixed again.
+  Details: `hunter-rs/WORK-MODEL.md` §5.7.
 - **Held work** is not a status. When a worker writes `BLOCKED.md`
   (a verification prerequisite, dependency, or human decision is
   missing; every finding kind's playbook says when: a recheck that cannot
@@ -1079,11 +1085,16 @@ for the schema — most columns carry comments explaining *why*, not just *what*
 - **`findings`** — one row per finding across all five types (type
   discriminator column), status, common fields, plus per-type nullable
   columns (bug\_class, dep\_update ecosystem/package/versions, test\_gap
-  missing\_tests, refactor smell\_type, modernization\_class), and retry
-  streak tracking (fix/recheck) for the give-up mechanism.
+  missing\_tests, refactor smell\_type, modernization\_class).
+- **`finding_work`** — one row per (finding, kind) of work (recheck, fix,
+  engage, harvest): its failure streak, its checkpoint (the attempt it
+  continues from), and for a fix the step record (`step`: the step its
+  next attempt runs, the PR title, the review's follow-ups and verdict, a
+  tree to put back), cleared with the checkpoint. **`work_holds`** — the
+  holds on that work and how each was released.
 - **`jobs`** — one row per worker invocation: kind, cap/actual tokens,
-  exit/kill reason, timing, and `resumed_from` (the suspended attempt this
-  one continues). States are `running | done | failed | killed | suspended |
+  exit/kill reason, timing, `resumed_from` (the suspended attempt this
+  one continues), and for a fix the step it ended at (`ended_step`). States are `running | done | failed | killed | suspended |
   denied`; `suspended` is a pause with a session file to
   continue, everything else killed is terminal. The audit trail for "what
   did hunter actually spend, and on what."
