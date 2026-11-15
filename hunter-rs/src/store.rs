@@ -4021,14 +4021,23 @@ impl Store {
     /// finish ([`StrandedJob`], which only `crate::recovery` makes), and
     /// only while it is still `running`: `false`, and nothing written,
     /// when it no longer is.
+    ///
+    /// When `ends_chain` (its worker still runs in its chain's tree), its
+    /// work item's checkpoint is moved off in the same transaction, as
+    /// [`Self::complete_job`] moves it for an attempt that did not pause.
+    /// A resume never moves the pointer off the attempt it continues, so
+    /// that attempt would otherwise be resumed in the tree the worker is
+    /// still in.
     pub async fn orphan_job(
         &self,
         job: &StrandedJob,
         notes: &str,
+        ends_chain: bool,
         finished_at: i64,
     ) -> sqlx::Result<bool> {
         let job_id = job.id();
         let (killed, running) = (JobState::Killed, JobState::Running);
+        let mut tx = ImmediateTx::begin(&self.pool).await?;
         let updated = sqlx::query!(
             "UPDATE jobs SET state = ?1, pid = NULL, killed_reason = 'orphaned', \
              notes = ?2, finished_at = ?3 WHERE id = ?4 AND state = ?5",
@@ -4038,10 +4047,17 @@ impl Store {
             job_id,
             running
         )
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
-        Ok(updated > 0)
+        if updated == 0 {
+            return Ok(false);
+        }
+        if ends_chain {
+            point_checkpoint(&mut tx, job_id, false).await?;
+        }
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// Downgrade an already-recorded job to failed (e.g. post-run push

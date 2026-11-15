@@ -1370,6 +1370,70 @@ async fn reconcile_does_not_suspend_an_orphan_whose_worker_is_still_running() {
     assert_eq!(jobs[0].job.state, hunter::domain::JobState::Killed);
 }
 
+/// The same for a resume: its worker still runs in the chain's tree, so
+/// the chain is over. The checkpoint it continued is dropped with it, or
+/// the next cycle resumes that predecessor, putting a second worker in
+/// the tree and transcript the first is still writing.
+#[tokio::test]
+async fn reconcile_drops_the_checkpoint_of_a_resume_whose_worker_is_still_running() {
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo(&pool).await;
+    seed_findings(&pool).await;
+    let work_root = dir.subdir("work_root");
+    let chain = work_root.join("jobs").join("10");
+    let transcript = chain.join("session").join("s.jsonl");
+    std::fs::create_dir_all(chain.join("session")).unwrap();
+    std::fs::create_dir_all(chain.join("tree")).unwrap();
+    // Job 10's call, then job 11's: 11 did work of its own.
+    std::fs::write(&transcript, format!("{CALL_1600}\n{CALL_1600}\n")).unwrap();
+    // Finding 3 is `fixing`: job 10 suspended its fix, job 11 resumes it.
+    sqlx::query(
+        "INSERT INTO jobs (id, kind, repo_id, finding_id, state, session_file, tokens_new, \
+                           started_at, finished_at) \
+         VALUES (10, 'fix', 1, 3, 'suspended', ?1, 1600, 1000, 2000)",
+    )
+    .bind(transcript.to_str().unwrap())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql(
+        "INSERT INTO jobs (id, kind, repo_id, finding_id, state, started_at, resumed_from) \
+         VALUES (11, 'fix', 1, 3, 'running', 3000, 10); \
+         INSERT INTO finding_work (finding_id, kind, checkpoint_job_id) VALUES (3, 'fix', 10);",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let store = rw_store(&path).await;
+    let mut worker = std::process::Command::new("sleep")
+        .arg("30")
+        .current_dir(chain.join("tree"))
+        .spawn()
+        .unwrap();
+
+    let result =
+        hunter::recovery::reconcile_and_log(store.take_unreconciled().unwrap(), &work_root).await;
+    worker.kill().unwrap();
+    worker.wait().unwrap();
+    result.unwrap();
+
+    let jobs = store.list_jobs(10).await.unwrap();
+    let resume = &jobs.iter().find(|j| j.job.id == 11).unwrap().job;
+    assert_eq!(resume.state, hunter::domain::JobState::Killed);
+    let finding = store.get_finding(3).await.unwrap().unwrap();
+    assert_eq!(finding.status, hunter::domain::FindingStatus::Queued);
+    assert_eq!(
+        store
+            .checkpoint_job(3, FindingJobKind::Fix)
+            .await
+            .unwrap()
+            .map(|j| j.id),
+        None,
+        "the chain whose tree is in use must not be continued"
+    );
+    assert!(store.list_resumable_jobs().await.unwrap().is_empty());
+}
+
 /// A suspension ends a job like a kill or a failure does: the cycle did
 /// work, so with fixes queued the daemon drains at once rather than
 /// sleeping the 15-minute idle interval, and `scheduler_state` names the

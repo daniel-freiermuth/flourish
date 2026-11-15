@@ -144,6 +144,13 @@ pub fn jobs_root(work_root: &Path) -> PathBuf {
 /// put a second worker in the same tree and transcript, so the caller
 /// treats a tree in use as not resumable. Processes whose cwd cannot be
 /// read (another user's) are not ours and are skipped.
+///
+/// Any process counts, not only a worker: no worker pid is recorded to
+/// tell them apart. An operator's shell or editor left inside a running
+/// chain's tree across a restart is taken for a surviving worker, and the
+/// startup reconcile ends that chain (`recovery::orphan_work`): its
+/// checkpoint is dropped, so the work it kept is lost, and the startup
+/// sweep releases the tree, removing the directory the shell sits in.
 pub fn tree_in_use(tree: &Path) -> bool {
     let Ok(tree) = tree.canonicalize() else {
         return false;

@@ -900,7 +900,8 @@ async fn settle_jobs(
     for j in jobs {
         let now = crate::util::now_ms();
         let stranded = StrandedJob(j.id);
-        if let Some((session_file, tokens)) = orphan_work(store, work_root, j).await? {
+        let work = orphan_work(store, work_root, j).await?;
+        if let Orphan::Worked(session_file, tokens) = work {
             let note = format!("{label} -- {cause}; transcript kept for the resume");
             if !store
                 .suspend_orphan(&stranded, &session_file, tokens, &note, now)
@@ -920,8 +921,12 @@ async fn settle_jobs(
                 )
                 .await;
         } else {
+            // A worker still in the tree ends its chain: the checkpoint the
+            // job continued goes with it, or the next cycle resumes that
+            // beside the worker.
+            let ends_chain = matches!(work, Orphan::InUse);
             if !store
-                .orphan_job(&stranded, &format!("{label} -- {cause}"), now)
+                .orphan_job(&stranded, &format!("{label} -- {cause}"), ends_chain, now)
                 .await?
             {
                 continue;
@@ -964,8 +969,19 @@ async fn chain_workspace(store: &Store, work_root: &Path, j: &Job) -> anyhow::Re
     Ok(Workspace::for_chain(work_root, Path::new(""), origin))
 }
 
-/// `(session_file, tokens)` of the work orphaned job `j` did itself,
-/// when it did any and nothing is still running in its tree.
+/// What orphaned job `j` left ([`orphan_work`]).
+enum Orphan {
+    /// `(session_file, tokens)` of the work it did itself: it is suspended.
+    Worked(String, i64),
+    /// No work of its own, or none that can be metered: it is killed.
+    Idle,
+    /// A live process still works in its chain's tree: it is killed, and
+    /// its chain ends with it.
+    InUse,
+}
+
+/// What orphaned job `j` left: the work it did itself, when it did any
+/// and nothing is still running in its tree.
 ///
 /// The chain's session directory is shared by every attempt, so the
 /// ledger there also holds what earlier attempts already recorded --
@@ -980,13 +996,12 @@ async fn chain_workspace(store: &Store, work_root: &Path, j: &Job) -> anyhow::Re
 /// A ledger that cannot be metered gives no spend to record a
 /// suspension against, so the job is treated as having kept no work
 /// (killed) rather than suspended at a made-up figure.
-async fn orphan_work(
-    store: &Store,
-    work_root: &Path,
-    j: &Job,
-) -> anyhow::Result<Option<(String, i64)>> {
+async fn orphan_work(store: &Store, work_root: &Path, j: &Job) -> anyhow::Result<Orphan> {
     use crate::backends::omp_scavenge::harness::ledger_dir_usage;
     let ws = chain_workspace(store, work_root, j).await?;
+    if tree_in_use(&ws.tree) {
+        return Ok(Orphan::InUse);
+    }
     let metered = ledger_dir_usage(&ws.session).and_then(|own| {
         let Some((file, tokens, _)) = own else {
             return Ok(None);
@@ -1001,17 +1016,17 @@ async fn orphan_work(
     });
     let (file, tokens) = match metered {
         Ok(Some(found)) => found,
-        Ok(None) => return Ok(None),
+        Ok(None) => return Ok(Orphan::Idle),
         Err(e) => {
             tracing::warn!("recovery: job #{} transcript unmeterable: {e:#}", j.id);
-            return Ok(None);
+            return Ok(Orphan::Idle);
         }
     };
     let own = tokens - store.ancestor_tokens(j.id).await?;
-    if own <= 0 || tree_in_use(&ws.tree) {
-        return Ok(None);
+    if own <= 0 {
+        return Ok(Orphan::Idle);
     }
-    Ok(Some((file.to_string_lossy().into_owned(), own)))
+    Ok(Orphan::Worked(file.to_string_lossy().into_owned(), own))
 }
 
 #[cfg(test)]
