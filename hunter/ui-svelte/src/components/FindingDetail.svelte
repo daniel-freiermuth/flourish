@@ -1,7 +1,7 @@
 <script lang="ts">
   import { store } from "../lib/api.svelte";
   import type { FindingDetail } from "../lib/types";
-  import { ktok, dur, datetime } from "../lib/format";
+  import { ktok, dur, datetime, checksTone } from "../lib/format";
 
   let { findingId }: { findingId: number } = $props();
 
@@ -108,7 +108,7 @@
         <span class="pr-value" class:ok={pr.mergeable === "MERGEABLE"} class:bad={pr.mergeable === "CONFLICTING"} class:dim={pr.mergeable !== "MERGEABLE" && pr.mergeable !== "CONFLICTING"}>{pr.mergeable ?? "–"}</span>
 
         <span class="pr-label">Checks</span>
-        <span class="pr-value" class:ok={pr.checks === "SUCCESS"} class:bad={pr.checks === "FAILURE"} class:dim={pr.checks !== "SUCCESS" && pr.checks !== "FAILURE"}>{pr.checks ?? "–"}</span>
+        <span class="pr-value" class:ok={checksTone(pr.checks) === "ok"} class:bad={checksTone(pr.checks) === "bad"} class:dim={checksTone(pr.checks) === "dim"}>{pr.checks ?? "–"}</span>
 
         <span class="pr-label">Branch</span>
         <span class="mono">{pr.head_ref ?? "–"}</span>
