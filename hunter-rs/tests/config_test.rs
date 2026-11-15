@@ -394,6 +394,27 @@ fn provider_hosts_and_the_gate_switch_load() {
     );
 }
 
+/// IPv6 literals, bare or bracketed, with a port or a numeric scope, are
+/// what the gate's `host[:port]` split hands to a TCP connect as an address.
+#[test]
+fn provider_hosts_that_are_ipv6_literals_load() {
+    let dir = TempDir::new("cfg-provider-hosts-ipv6");
+    for good in [
+        "::1",
+        "[::1]",
+        "[::1]:8443",
+        "fe80::1%2",
+        "[fe80::1%2]:8443",
+    ] {
+        let cfg = load(
+            &dir,
+            &format!(r#"{{"backend": {{"providerHosts": ["{good}"]}}}}"#),
+        )
+        .unwrap_or_else(|e| panic!("{good}: {e:#}"));
+        assert_eq!(cfg.provider_hosts, Some(vec![good.to_owned()]));
+    }
+}
+
 /// An entry goes to a TCP connect as `host[:port]`: a URL or a blank
 /// resolves nowhere, and would hold every cycle as offline.
 #[test]
@@ -403,6 +424,16 @@ fn provider_hosts_that_are_not_host_names_are_rejected() {
         r#"["https://api.anthropic.com"]"#,
         r#"[""]"#,
         r#"["api anthropic.com"]"#,
+        r#"["gw.corp:"]"#,
+        r#"["gw.corp:https"]"#,
+        r#"["gw.corp:84433"]"#,
+        r#"["[::1"]"#,
+        r#"["gw.corp:0"]"#,
+        r#"["[::1]:0"]"#,
+        r#"["[gw.corp]"]"#,
+        r#"["[127.0.0.1]:8443"]"#,
+        r#"["gw.corp::443"]"#,
+        r#"["gw.corp:443:"]"#,
     ] {
         let msg = err(
             &dir,

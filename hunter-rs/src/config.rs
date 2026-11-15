@@ -428,12 +428,34 @@ impl Config {
             cfg_path.display()
         );
         let review_bots = ReviewBots::new(&raw_bots);
-        // An entry is handed to a TCP connect as `host[:port]`, so a URL
-        // or a blank would probe nothing and deny every cycle.
+        // An entry is handed to a TCP connect as `host[:port]`, so a URL,
+        // a blank, a port no connect can use, or brackets or extra colons
+        // around anything but an IPv6 address would probe nothing and deny
+        // every cycle. The split mirrors `reach::socket_target`.
         if let Some(hosts) = &raw.backend.provider_hosts {
+            let port_ok = |p: &str| p.parse::<u16>().is_ok_and(|n| n != 0);
+            // As `[addr]:port` parses, so a numeric `%scope` is kept.
+            let ipv6_ok = |a: &str| format!("[{a}]:1").parse::<std::net::SocketAddrV6>().is_ok();
             anyhow::ensure!(
                 hosts.iter().all(|h| {
-                    !h.is_empty() && !h.contains(|c: char| c.is_whitespace() || c == '/')
+                    !h.is_empty()
+                        && !h.contains(|c: char| c.is_whitespace() || c == '/')
+                        && match h.strip_prefix('[') {
+                            Some(rest) => match rest.split_once(']') {
+                                Some((addr, "")) => ipv6_ok(addr),
+                                Some((addr, tail)) => {
+                                    ipv6_ok(addr) && tail.strip_prefix(':').is_some_and(port_ok)
+                                }
+                                None => false,
+                            },
+                            None => match h.matches(':').count() {
+                                0 => true,
+                                1 => h
+                                    .split_once(':')
+                                    .is_some_and(|(host, p)| !host.is_empty() && port_ok(p)),
+                                _ => ipv6_ok(h),
+                            },
+                        }
                 }),
                 "{}: backend.providerHosts entries must be host names such as \
                  \"api.anthropic.com\", optionally with a :port (got {hosts:?})",
