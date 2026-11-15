@@ -1631,6 +1631,98 @@ async fn a_hold_that_cannot_be_recorded_returns_the_finding_to_queued() {
     assert_eq!(finding.status.as_str(), "queued");
 }
 
+/// A decline whose verdict cannot be written (a busy database) goes back
+/// to `queued`, to run again: neither the event log nor the summary may
+/// report the verdict the finding never got.
+#[tokio::test]
+async fn a_decline_that_cannot_be_recorded_reports_no_verdict() {
+    let f = fixture("fix-decline-not-recorded").await;
+    let pool = support::open_pool(&f.db).await;
+    sqlx::raw_sql(
+        "CREATE TRIGGER refuse_verdict BEFORE UPDATE OF status ON findings \
+         WHEN OLD.status = 'fixing' AND NEW.status != 'queued' \
+         BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let backend =
+        ScriptedBackend::writing("NOT-A-BUG.md", "Classification: wrong\nmisread the code");
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let summary = hunter::scheduler::run_fix(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Cold(&finding),
+        &backend,
+    )
+    .await
+    .unwrap();
+
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(finding.status.as_str(), "queued");
+    assert_eq!(summary.outcome, None, "{summary:?}");
+    let events = f.store.recent_events(20).await.unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.kind == "fix" && e.message.contains("declined by worker")),
+        "{events:?}"
+    );
+}
+
+/// A shipped fix whose `pr_open` cannot be written goes back to `queued`:
+/// the PR exists, but the cycle's outcome is not `pr_open`.
+#[tokio::test]
+async fn a_shipped_fix_whose_pr_open_cannot_be_recorded_reports_no_pr_open() {
+    const URL: &str = "https://github.com/acme/widget/pull/42";
+    let bins = support::FakeBins::acquire("fix-ship-not-recorded");
+    let f = fixture("fix-ship-not-recorded").await;
+    git(&f.repo_dir, &["checkout", "--detach"]);
+    git(&f.repo_dir, &["branch", "-D", "main"]);
+    let origin = git(&f.repo_dir, &["remote", "get-url", "origin"]);
+    git(
+        &f.repo_dir,
+        &[
+            "config",
+            &format!("url.{}.insteadOf", origin.trim()),
+            REPO_URL,
+        ],
+    );
+    bins.ok("gh", URL);
+    let pool = support::open_pool(&f.db).await;
+    sqlx::raw_sql(
+        "CREATE TRIGGER refuse_pr_open BEFORE UPDATE OF status ON findings \
+         WHEN NEW.status = 'pr_open' \
+         BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let worker = ScriptedBackend::new(|tree| {
+        std::fs::write(tree.join("fix.txt"), "fixed\n").unwrap();
+        git(tree, &["add", "fix.txt"]);
+        git(tree, &["commit", "-m", "fix it"]);
+        std::fs::write(tree.join("PR-DESCRIPTION.md"), "the fix").unwrap();
+        support::done()
+    });
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let summary = hunter::scheduler::run_fix(
+        &support::scope(&f.store),
+        f.store.test_lane(),
+        &f.cfg,
+        Attempt::Cold(&finding),
+        &worker,
+    )
+    .await
+    .unwrap();
+
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(finding.status.as_str(), "queued");
+    assert_ne!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    drop(bins);
+}
+
 /// Each kind gets its own branch prefix and playbook, and every one of
 /// them hands the worker the decline classification the scheduler parses:
 /// a playbook without it leaves every decline unclassified, back at `new`.
