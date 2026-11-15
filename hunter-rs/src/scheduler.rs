@@ -6563,10 +6563,12 @@ async fn record_declined_fix(
             log_not_moved(store, fid, Some(job), "fix", edge, now).await;
             return;
         }
-        // A claim whose verdict could not be written goes back to `queued`.
+        // A claim whose verdict could not be written goes back to `queued`,
+        // to run again: it got no verdict to report.
         Err((claim, e)) => {
             log_write_failure(Err::<(), _>(e), format_args!("#{fid}: verdict -> {status}"));
             release_claim(claim).await;
+            return;
         }
     }
     let first_line: String = reason
@@ -6634,7 +6636,7 @@ async fn record_fix_outcome(
             titled,
         } => {
             // A claim whose `pr_open` could not be written goes back to
-            // `queued`.
+            // `queued`, so its outcome is not `pr_open` either.
             let (lost, unopened) = match claim.open_pr(&pr_url).await {
                 Ok(Moved::Applied) => (false, None),
                 // The PR exists, but something moved the finding off its
@@ -6650,7 +6652,7 @@ async fn record_fix_outcome(
                         Err::<(), _>(e),
                         format_args!("#{fid}: status -> pr_open ({pr_url})"),
                     );
-                    (false, Some(claim))
+                    (true, Some(claim))
                 }
             };
             let message = shipped_message(fid, &pr_url, recovered, titled);
