@@ -1,7 +1,7 @@
 //! What each scheduler lane is doing right now, for the status page.
 //!
 //! The job lane does one thing at a time: its current phase is set only
-//! through a guard ([`ActivityGuard`]) that puts back what was there before
+//! through a guard ([`JobPhaseGuard`]) that puts back what was there before
 //! when it drops, so the status never names work that has ended, however
 //! that work returned, and a phase begun inside another (a fetch inside a
 //! tree's preparation) hands the status back to the outer one.
@@ -22,56 +22,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::types::{AdminActivity, AdminTask, JobActivity, JobPhase};
-
-/// One lane's current activity, shared with the status page.
-pub struct LaneStatus<T>(Arc<Mutex<Option<T>>>);
-
-impl<T> Default for LaneStatus<T> {
-    fn default() -> Self {
-        Self(Arc::default())
-    }
-}
-
-impl<T> Clone for LaneStatus<T> {
-    fn clone(&self) -> Self {
-        Self(Arc::clone(&self.0))
-    }
-}
-
-impl<T: Copy> LaneStatus<T> {
-    /// The activity running now, if any.
-    pub fn current(&self) -> Option<T> {
-        *self.cell()
-    }
-
-    /// Show `activity` until the guard drops, then what was shown before.
-    fn show(&self, activity: T) -> ActivityGuard<T> {
-        let previous = self.cell().replace(activity);
-        ActivityGuard {
-            status: self.clone(),
-            previous,
-        }
-    }
-
-    /// Never held across an await, so a poisoned lock only means a panic
-    /// between two plain assignments: the value is intact.
-    fn cell(&self) -> MutexGuard<'_, Option<T>> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
-/// An activity in progress; dropped, the lane shows what it showed before.
-#[must_use = "the activity shows only while its guard is held"]
-pub struct ActivityGuard<T: Copy> {
-    status: LaneStatus<T>,
-    previous: Option<T>,
-}
-
-impl<T: Copy> Drop for ActivityGuard<T> {
-    fn drop(&mut self) {
-        *self.status.cell() = self.previous;
-    }
-}
 
 /// The admin lane's duties running now (`crate::daemon`), each from its
 /// [`Self::begin`] until its guard drops.
@@ -131,19 +81,50 @@ impl Drop for AdminTaskGuard {
     }
 }
 
-/// The job lane's current phase: what a cycle does outside its worker.
-pub type JobStatus = LaneStatus<JobActivity>;
+/// The job lane's current phase: what a cycle does outside its worker,
+/// shared with the status page.
+#[derive(Clone, Default)]
+pub struct JobStatus(Arc<Mutex<Option<JobActivity>>>);
 
 impl JobStatus {
-    /// Record `phase` as running from now until the guard is dropped.
+    /// The phase running now, if any.
+    pub fn current(&self) -> Option<JobActivity> {
+        *self.cell()
+    }
+
+    /// Record `phase` as running from now until the guard is dropped, then
+    /// show what was shown before.
     /// Crate-private: the job lane's phases are set inside the cycle
     /// `run_cycle` runs under [`reporting_job_phases`] ([`job_phase`]), so
     /// no handler or admin duty can show a job phase.
-    pub(crate) fn begin(&self, phase: JobPhase) -> ActivityGuard<JobActivity> {
-        self.show(JobActivity {
+    pub(crate) fn begin(&self, phase: JobPhase) -> JobPhaseGuard {
+        let previous = self.cell().replace(JobActivity {
             phase,
             started_at: crate::util::now_ms(),
-        })
+        });
+        JobPhaseGuard {
+            status: self.clone(),
+            previous,
+        }
+    }
+
+    /// Never held across an await, so a poisoned lock only means a panic
+    /// between two plain assignments: the value is intact.
+    fn cell(&self) -> MutexGuard<'_, Option<JobActivity>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// A phase in progress; dropped, the job lane shows what it showed before.
+#[must_use = "the phase shows only while its guard is held"]
+pub struct JobPhaseGuard {
+    status: JobStatus,
+    previous: Option<JobActivity>,
+}
+
+impl Drop for JobPhaseGuard {
+    fn drop(&mut self) {
+        *self.status.cell() = self.previous;
     }
 }
 
@@ -159,7 +140,7 @@ pub(crate) async fn reporting_job_phases<F: Future>(status: JobStatus, cycle: F)
 
 /// Report `phase` for the job lane until the guard drops; `None`, and
 /// nothing reported, outside the job lane's cycle.
-pub fn job_phase(phase: JobPhase) -> Option<ActivityGuard<JobActivity>> {
+pub fn job_phase(phase: JobPhase) -> Option<JobPhaseGuard> {
     JOB_STATUS.try_with(|status| status.begin(phase)).ok()
 }
 
