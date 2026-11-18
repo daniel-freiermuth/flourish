@@ -189,13 +189,19 @@ async fn next_signal(sig: Option<Signal>) {
     }
 }
 
-/// Release finished chains' trees and reclaim old workspaces and the
-/// previous layout's leftovers (`workspace::sweep`). Safe beside a running
-/// job: the sweep releases no tree a live job or a runner's lease keeps,
-/// and changes a clone only under its permit. Best effort, since a failed
-/// run is retried on the next.
-async fn sweep_workspaces(admin: &AdminAuthority, work_root: &Path) {
-    let swept = crate::workspace::sweep(admin, work_root, crate::util::now_ms()).await;
+/// Release finished chains' trees, reclaim old workspaces and the
+/// previous layout's leftovers, and, given `caches`, clear clones' build
+/// caches over their cap (`workspace::sweep`). Safe beside a running job:
+/// the sweep releases no tree a live job or a runner's lease keeps,
+/// clears no cache of a repo a runner leases a tree of, and changes a
+/// clone only under its permit. Best effort, since a failed run is
+/// retried on the next.
+async fn sweep_workspaces(
+    admin: &AdminAuthority,
+    work_root: &Path,
+    caches: Option<crate::workspace::CacheCap<'_>>,
+) {
+    let swept = crate::workspace::sweep(admin, work_root, crate::util::now_ms(), caches).await;
     match swept {
         Ok(r) if r != crate::workspace::SweepReport::default() => {
             tracing::info!("workspace sweep: {r:?}");
@@ -241,9 +247,10 @@ impl DutyRun {
 /// authority, which this does not have.
 ///
 /// Once `shutdown` is set, a sync and the PR reviews stop at the next PR,
-/// and fetch-ahead and the dependency scans at the next repo: the daemon
-/// waits for every duty's run in progress, and a run over many PRs or
-/// repos is many round trips.
+/// fetch-ahead and the dependency scans at the next repo, and the sweep's
+/// cache cap at the next clone: the daemon waits for every duty's run in
+/// progress, and a run over many PRs or repos is many round trips, or
+/// many clones' caches to measure and clear.
 pub async fn admin_duty(
     admin: &AdminAuthority,
     cfg: &Config,
@@ -268,7 +275,11 @@ pub async fn admin_duty(
             DutyRun::Scanned(crate::scheduler::dependency_scans(admin, cfg, shutdown).await)
         }
         AdminTask::Sweep => {
-            sweep_workspaces(admin, &cfg.work_root).await;
+            let caches = crate::workspace::CacheCap {
+                bytes: cfg.repo_cache_cap_bytes,
+                shutdown,
+            };
+            sweep_workspaces(admin, &cfg.work_root, Some(caches)).await;
             DutyRun::Swept
         }
     }
@@ -898,7 +909,10 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         tracing::info!("reclaimed {reaped} repo director(ies) left by earlier deletions");
     }
     quiet_clones(&store, &cfg.work_root).await;
-    sweep_workspaces(&admin, &cfg.work_root).await;
+    // Without the cache cap: measuring every clone and clearing tens of
+    // gigabytes would hold up the start, and the admin lane's own sweep
+    // runs it beside the lanes once they are up (`workspace::sweep` f).
+    sweep_workspaces(&admin, &cfg.work_root, None).await;
     anyhow::ensure!(
         cfg.backend_type == "omp-scavenge",
         "unknown backend_type: {:?}",

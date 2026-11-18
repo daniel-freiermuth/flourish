@@ -285,6 +285,30 @@ fn ordinary_cadences_load() {
     assert_eq!(cfg.simplification_interval_days, 60);
 }
 
+/// A clone's build caches are capped at 10 GiB unless the operator says
+/// otherwise, in GiB, fractions included.
+#[test]
+fn the_repo_cache_cap_is_ten_gib_unless_configured() {
+    let dir = TempDir::new("cfg-cache-cap-default");
+    let cfg = load(&dir, "{}").unwrap();
+    assert_eq!(cfg.repo_cache_cap_bytes, 10 << 30);
+
+    let dir = TempDir::new("cfg-cache-cap");
+    let cfg = load(&dir, r#"{"repoCacheCapGiB": 2.5}"#).unwrap();
+    assert_eq!(cfg.repo_cache_cap_bytes, 5 << 29);
+}
+
+/// A cap of nothing would clear every clone's caches on every sweep, so
+/// every build would start cold: refused rather than read as "no cache".
+#[test]
+fn a_repo_cache_cap_of_nothing_is_rejected() {
+    for value in ["0", "-1"] {
+        let dir = TempDir::new("cfg-cache-cap-bad");
+        let e = err(&dir, &format!(r#"{{"repoCacheCapGiB": {value}}}"#));
+        assert!(e.contains("repoCacheCapGiB"), "{e}");
+    }
+}
+
 // -- serve.host / serve.allowedHosts ------------------------------------------
 
 /// No config means today's behaviour exactly: loopback bind, loopback names.

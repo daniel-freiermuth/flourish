@@ -1721,9 +1721,14 @@ async fn a_sweep_during_the_handoff_keeps_the_tree_for_the_harvest() {
         move || {
             let (store, root, sweeps) = (store.clone(), root.clone(), sweeps.clone());
             async move {
-                hunter::workspace::sweep(&support::admin(&store), &root, hunter::util::now_ms())
-                    .await
-                    .unwrap();
+                hunter::workspace::sweep(
+                    &support::admin(&store),
+                    &root,
+                    hunter::util::now_ms(),
+                    None,
+                )
+                .await
+                .unwrap();
                 sweeps.fetch_add(1, Ordering::SeqCst);
             }
         }

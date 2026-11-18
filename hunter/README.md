@@ -1219,6 +1219,16 @@ quota source for one installation.
 - `--root` may be relative. The loader resolves it to an absolute path
   before resolving `workRoot`, `dbPath`, playbooks, and UI paths, so Git's
   clone-relative working directory cannot relocate worker worktrees.
+- `repoCacheCapGiB` (default 10) — how much disk each repo clone's
+  untracked files may take (`<workRoot>/repos/repo-<id>`). Workers build
+  in the clone's shared caches (cargo's `target/` via `CARGO_TARGET_DIR`,
+  and whatever else a build leaves there, like Gradle's `build/`), which
+  nothing else trims. Everything git does not track in a clone counts as
+  cache: once it passes the cap, the workspace sweep that runs every five
+  minutes removes all of it (`git clean -ffdx`; tracked files stay) unless
+  a job of that repo is running there, and the next build starts cold.
+  The sweep at startup leaves caches alone, so it never holds up a start.
+  A repo whose path is your own checkout is never cleaned.
 - `hunt`/`fix` settings apply to their whole job family (hunt also covers
   test\_gap/dep\_update/refactor/modernization/recheck; fix also covers
   engage/harvest/apply\_\*).

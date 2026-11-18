@@ -958,6 +958,89 @@ async fn a_starting_daemon_turns_automatic_maintenance_off_in_its_clones() {
     daemon.abort();
 }
 
+/// The startup sweep, which the daemon awaits before it serves, leaves the
+/// clones' build caches alone: measuring every clone and clearing tens of
+/// GiB there would hold up every start. The admin lane's sweep, beside the
+/// lanes, clears them. Here measuring a clone's caches (`git ls-files
+/// --others`) waits until the test releases it, which it does only once
+/// the daemon serves: a startup sweep that measured would never let it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_starting_daemon_serves_before_its_sweep_caps_build_caches() {
+    let dir = TempDir::new("daemon-cache-cap");
+    let bins = daemon_bins("daemon-cache-cap");
+    bins.omp("echo 'fake omp: no usage data here' >&2\nexit 1");
+    let _home = bins.env("HOME", dir.path());
+    let real_git = std::process::Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    let real_git = String::from_utf8(real_git.stdout).unwrap();
+    let release = dir.join("release-git");
+    // Bounded, so a failing test's daemon does not wait on forever.
+    bins.script(
+        "git",
+        &format!(
+            "case \" $* \" in *' --others '*) for _ in $(seq 1 900); do [ -f '{}' ] && break; sleep 0.05; done ;; esac\nexec '{}' \"$@\"",
+            release.display(),
+            real_git.trim()
+        ),
+    );
+    let mut cfg = support::load_config(dir.path());
+    cfg.work_root = dir.subdir("work_root");
+    cfg.serve_port = free_port();
+    cfg.omp_bin = "omp".to_owned();
+    cfg.repo_cache_cap_bytes = 1;
+    support::healthy_auth(&mut cfg);
+    let clone = cfg.work_root.join("repos").join("repo-1");
+    std::fs::create_dir_all(&clone).unwrap();
+    support::git(&clone, &["init", "-q"]);
+    let cache = clone.join("target").join("app");
+    std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+    std::fs::write(&cache, vec![7u8; 64 << 10]).unwrap();
+    let (db, pool) = support::fresh_pool(&dir, "hunter").await;
+    sqlx::query(
+        "INSERT INTO repos (id, name, url, path, forge, default_branch, enabled, added_at) \
+         VALUES (1, 'alpha', 'https://example.com/r.git', ?1, 'github', 'main', 0, 1000)",
+    )
+    .bind(clone.to_string_lossy().to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    cfg.db_path = db;
+    let port = cfg.serve_port;
+
+    let daemon = tokio::spawn(hunter::daemon::run_daemon(cfg));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while http(port, "GET", "/api/summary", "", "").await.is_none() {
+        assert!(
+            !daemon.is_finished(),
+            "the daemon exited instead of running: {:?}",
+            daemon.await
+        );
+        assert!(
+            Instant::now() < deadline,
+            "the daemon did not serve while measuring build caches waited"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        cache.exists(),
+        "the caches were cleared before the daemon served"
+    );
+
+    std::fs::write(&release, "").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while cache.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the admin lane's sweep never cleared the caches over the cap"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    daemon.abort();
+}
+
 /// A skipped cycle did no work: its pick was stale (the finding left
 /// `queued`), so the next cycle starts at once rather than idling the
 /// queue for the 15-minute default.

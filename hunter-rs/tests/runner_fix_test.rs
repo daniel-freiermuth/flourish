@@ -719,6 +719,7 @@ async fn a_blocked_report_holds_the_fix_and_keeps_its_checkpoint() {
         &support::admin(&f.store),
         &f.cfg.work_root,
         hunter::util::now_ms(),
+        None,
     )
     .await
     .unwrap();
@@ -1294,6 +1295,7 @@ async fn rejecting_a_held_fix_lets_the_sweep_release_its_checkpoint() {
         &support::admin(&f.store),
         &f.cfg.work_root,
         hunter::util::now_ms(),
+        None,
     )
     .await
     .unwrap();
@@ -1322,6 +1324,7 @@ async fn rejecting_a_held_fix_lets_the_sweep_release_its_checkpoint() {
         &support::admin(&f.store),
         &f.cfg.work_root,
         hunter::util::now_ms(),
+        None,
     )
     .await
     .unwrap();

@@ -8,8 +8,9 @@
 //! removes the tree of a running or suspended chain; a hunt's watermark is
 //! the commit its chain was pinned at; a fresh fix can take over a
 //! suspended fix's branch; the previous layout's leftovers go unless a
-//! live job still uses them; and a cold job whose tree cannot be made
-//! fails without leaving anything behind.
+//! live job still uses them; a clone's untracked build caches go only
+//! over the cap, while no runner leases a tree of it; and a cold job whose
+//! tree cannot be made fails without leaving anything behind.
 
 mod support;
 
@@ -465,7 +466,7 @@ async fn the_sweep_releases_only_finished_chains_and_ages_out_their_sessions() {
     let ws = made_workspace(&f, 10, "suspended", now - 1_000).await;
     support::point_repo_checkpoint(&f.pool, 1, "hunt", Some(10)).await;
 
-    workspace::sweep(&support::admin(&f.store), &f.cfg.work_root, now)
+    workspace::sweep(&support::admin(&f.store), &f.cfg.work_root, now, None)
         .await
         .unwrap();
     assert!(ws.tree.is_dir(), "a checkpoint's tree is its resume");
@@ -473,7 +474,7 @@ async fn the_sweep_releases_only_finished_chains_and_ages_out_their_sessions() {
     // The work item lets go of it: given up, superseded, or the repo's
     // work started over. The row stays `suspended`, as it ended.
     support::point_repo_checkpoint(&f.pool, 1, "hunt", None).await;
-    let report = workspace::sweep(&support::admin(&f.store), &f.cfg.work_root, now)
+    let report = workspace::sweep(&support::admin(&f.store), &f.cfg.work_root, now, None)
         .await
         .unwrap();
     assert_eq!(report.trees_released, 1);
@@ -492,6 +493,7 @@ async fn the_sweep_releases_only_finished_chains_and_ages_out_their_sessions() {
         &support::admin(&f.store),
         &f.cfg.work_root,
         now + SESSION_RETENTION_MS - 10_000,
+        None,
     )
     .await
     .unwrap();
@@ -500,6 +502,7 @@ async fn the_sweep_releases_only_finished_chains_and_ages_out_their_sessions() {
         &support::admin(&f.store),
         &f.cfg.work_root,
         now + SESSION_RETENTION_MS,
+        None,
     )
     .await
     .unwrap();
@@ -576,7 +579,7 @@ async fn the_sweep_ages_a_resumed_chain_by_its_newest_attempt() {
     let ws = made_workspace(&f, 10, "suspended", origin_finished).await;
     resumed_link(&f, 11, 10, "running", None).await;
 
-    let report = workspace::sweep(&support::admin(&f.store), &f.cfg.work_root, now)
+    let report = workspace::sweep(&support::admin(&f.store), &f.cfg.work_root, now, None)
         .await
         .unwrap();
     assert_eq!(report.trees_released, 0);
@@ -595,7 +598,7 @@ async fn the_sweep_ages_a_resumed_chain_by_its_newest_attempt() {
         "the newest attempt's finish"
     );
 
-    let report = workspace::sweep(&support::admin(&f.store), &f.cfg.work_root, now)
+    let report = workspace::sweep(&support::admin(&f.store), &f.cfg.work_root, now, None)
         .await
         .unwrap();
     assert_eq!(report.trees_released, 1);
@@ -612,6 +615,7 @@ async fn the_sweep_ages_a_resumed_chain_by_its_newest_attempt() {
         &support::admin(&f.store),
         &f.cfg.work_root,
         now + SESSION_RETENTION_MS + 1,
+        None,
     )
     .await
     .unwrap();
@@ -633,7 +637,7 @@ async fn a_chain_given_up_after_several_attempts_releases_its_tree() {
     resumed_link(&f, 13, 12, "suspended", Some(now - 1_000)).await;
     support::point_repo_checkpoint(&f.pool, 1, "hunt", Some(13)).await;
 
-    let report = workspace::sweep(&support::admin(&f.store), &f.cfg.work_root, now)
+    let report = workspace::sweep(&support::admin(&f.store), &f.cfg.work_root, now, None)
         .await
         .unwrap();
     assert_eq!(report.trees_released, 0);
@@ -682,6 +686,7 @@ async fn the_sweep_prunes_a_locked_registration_whose_tree_is_gone() {
         &support::admin(&f.store),
         &f.cfg.work_root,
         hunter::util::now_ms(),
+        None,
     )
     .await
     .unwrap();
@@ -718,14 +723,14 @@ async fn the_sweep_keeps_a_finished_chains_tree_while_a_runner_leases_it() {
     )
     .unwrap();
 
-    let report = workspace::sweep(&support::admin(&f.store), &f.cfg.work_root, now)
+    let report = workspace::sweep(&support::admin(&f.store), &f.cfg.work_root, now, None)
         .await
         .unwrap();
     assert_eq!(report.trees_released, 0);
     assert!(ws.tree.is_dir(), "a leased tree is kept");
 
     drop(lease);
-    let report = workspace::sweep(&support::admin(&f.store), &f.cfg.work_root, now)
+    let report = workspace::sweep(&support::admin(&f.store), &f.cfg.work_root, now, None)
         .await
         .unwrap();
     assert_eq!(report.trees_released, 1, "and released once the lease ends");
@@ -755,6 +760,260 @@ async fn a_release_with_no_lease_of_its_own_keeps_a_leased_tree() {
     assert!(released && !ws.tree.exists(), "and released once unleased");
 }
 
+// -- build caches: everything in a clone git does not track ------------------
+
+/// [`fixture`] with the work root whose `repos/repo-1` its clone is, so the
+/// clone is the daemon's own.
+async fn own_clone_fixture(label: &str) -> Fixture {
+    let mut f = fixture(label, "main").await;
+    f.cfg.work_root = f.dir.path().to_owned();
+    f
+}
+
+/// Build output in `clone`: an ignored `target/` binary and an untracked
+/// file no ignore rule names.
+fn add_build_caches(clone: &Path) -> [PathBuf; 2] {
+    std::fs::create_dir_all(clone.join(".git/info")).unwrap();
+    std::fs::write(clone.join(".git/info/exclude"), "target/\n").unwrap();
+    let ignored = clone.join("target/debug/app");
+    std::fs::create_dir_all(ignored.parent().unwrap()).unwrap();
+    std::fs::write(&ignored, vec![7u8; 64 << 10]).unwrap();
+    let untracked = clone.join("scratch.log");
+    std::fs::write(&untracked, "notes\n").unwrap();
+    [ignored, untracked]
+}
+
+async fn sweep_with_cap(f: &Fixture, cap_bytes: u64) -> workspace::SweepReport {
+    let (_running, shutdown) = tokio::sync::watch::channel(false);
+    workspace::sweep(
+        &support::admin(&f.store),
+        &f.cfg.work_root,
+        hunter::util::now_ms(),
+        Some(workspace::CacheCap {
+            bytes: cap_bytes,
+            shutdown: &shutdown,
+        }),
+    )
+    .await
+    .unwrap()
+}
+
+/// Over the cap, everything git does not track in the clone goes, ignored
+/// or not; what it tracks stays.
+#[tokio::test]
+async fn the_sweep_clears_a_clones_build_caches_over_the_cap() {
+    let f = own_clone_fixture("ws-cache-over").await;
+    let caches = add_build_caches(&f.clone);
+
+    let report = sweep_with_cap(&f, 1).await;
+    assert_eq!(report.caches_cleared, 1);
+    assert!(
+        report.cache_bytes_cleared >= 64 << 10,
+        "counts what the caches took: {report:?}"
+    );
+    for cache in &caches {
+        assert!(!cache.exists(), "{} is cleared", cache.display());
+    }
+    assert!(!f.clone.join("target").exists());
+    assert_eq!(
+        std::fs::read_to_string(f.clone.join("README.md")).unwrap(),
+        "seed\n",
+        "a tracked file is kept"
+    );
+}
+
+/// Within the cap, the caches stay warm.
+#[tokio::test]
+async fn the_sweep_keeps_a_clones_build_caches_within_the_cap() {
+    let f = own_clone_fixture("ws-cache-under").await;
+    let caches = add_build_caches(&f.clone);
+
+    let report = sweep_with_cap(&f, 1 << 30).await;
+    assert_eq!(report.caches_cleared, 0);
+    for cache in &caches {
+        assert!(cache.exists(), "{} is kept", cache.display());
+    }
+}
+
+/// Cargo hard-links each binary from `deps/` into the profile directory:
+/// the file takes its blocks once, so it counts once against the cap.
+#[tokio::test]
+async fn the_sweep_counts_a_hard_linked_file_once() {
+    let f = own_clone_fixture("ws-cache-linked").await;
+    std::fs::create_dir_all(f.clone.join(".git/info")).unwrap();
+    std::fs::write(f.clone.join(".git/info/exclude"), "target/\n").unwrap();
+    let deps = f.clone.join("target/debug/deps/app-0123");
+    std::fs::create_dir_all(deps.parent().unwrap()).unwrap();
+    std::fs::write(&deps, vec![7u8; 256 << 10]).unwrap();
+    let linked = f.clone.join("target/debug/app");
+    std::fs::hard_link(&deps, &linked).unwrap();
+
+    let report = sweep_with_cap(&f, 384 << 10).await;
+    assert_eq!(report.caches_cleared, 0, "256 KiB, not twice that");
+    assert!(linked.exists());
+
+    let report = sweep_with_cap(&f, 128 << 10).await;
+    assert_eq!(report.caches_cleared, 1);
+    assert!(
+        (256 << 10..384 << 10).contains(&report.cache_bytes_cleared),
+        "the file counted once: {report:?}"
+    );
+    assert!(!deps.exists() && !linked.exists());
+}
+
+/// A legacy `NOTES.md` the notes migration could not move out is the
+/// operator's only copy: never cleared, and not cache that counts toward
+/// the cap. A `NOTES.md` deeper in the tree is ordinary untracked output.
+#[tokio::test]
+async fn the_sweep_keeps_a_legacy_notes_file_in_the_clone() {
+    let f = own_clone_fixture("ws-cache-notes").await;
+    let notes = f.clone.join("NOTES.md");
+    std::fs::write(&notes, vec![b'n'; 64 << 10]).unwrap();
+
+    let report = sweep_with_cap(&f, 1).await;
+    assert_eq!(
+        report.caches_cleared, 0,
+        "the notes alone are not over the cap"
+    );
+    assert!(notes.exists());
+
+    let caches = add_build_caches(&f.clone);
+    let nested = f.clone.join("target/NOTES.md");
+    std::fs::write(&nested, "build output\n").unwrap();
+    let report = sweep_with_cap(&f, 1).await;
+    assert_eq!(report.caches_cleared, 1);
+    for cache in caches.iter().chain([&nested]) {
+        assert!(!cache.exists(), "{} is cleared", cache.display());
+    }
+    assert_eq!(
+        std::fs::read(&notes).unwrap(),
+        vec![b'n'; 64 << 10],
+        "the legacy notes are kept"
+    );
+}
+
+/// A runner leasing a tree of the repo may be building into the clone's
+/// caches, so they stay over the cap until no chain of the repo holds one.
+/// The job row is finished, so only the lease keeps them.
+#[tokio::test]
+async fn the_sweep_keeps_build_caches_while_a_chain_of_the_repo_holds_a_lease() {
+    let f = own_clone_fixture("ws-cache-leased").await;
+    sqlx::query(
+        "INSERT INTO jobs (id, kind, repo_id, state, started_at, finished_at) \
+         VALUES (10, 'fix', 1, 'done', 1000, 2000)",
+    )
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    let lease = permit(&f).await.lease(&chain(&f, 10).await).unwrap();
+    let caches = add_build_caches(&f.clone);
+
+    let report = sweep_with_cap(&f, 1).await;
+    assert_eq!(report.caches_cleared, 0);
+    for cache in &caches {
+        assert!(cache.exists(), "{} is kept while leased", cache.display());
+    }
+
+    drop(lease);
+    let report = sweep_with_cap(&f, 1).await;
+    assert_eq!(report.caches_cleared, 1, "and cleared once the lease ends");
+    assert!(caches.iter().all(|c| !c.exists()));
+}
+
+/// A repo row may name a checkout that is not the daemon's own clone
+/// under `<work_root>/repos/`, such as the operator's: its untracked files
+/// are the operator's, never cache.
+#[tokio::test]
+async fn the_sweep_never_clears_a_clone_outside_the_work_roots_repos() {
+    let f = fixture("ws-cache-foreign", "main").await;
+    assert!(!f.clone.starts_with(&f.cfg.work_root));
+    let caches = add_build_caches(&f.clone);
+
+    let report = sweep_with_cap(&f, 1).await;
+    assert_eq!(report.caches_cleared, 0);
+    for cache in &caches {
+        assert!(cache.exists(), "{} is kept", cache.display());
+    }
+}
+
+/// The daemon waits for the sweep duty's run before it stops, and each
+/// clone's caches may take minutes to measure and clear: once a stop is
+/// set, the run leaves the clones it has not reached. Here the stop comes
+/// while the first clone's caches are measured, which goes on to clear
+/// them; the second keeps its own.
+#[tokio::test]
+async fn a_stop_during_the_sweep_leaves_the_clones_it_has_not_reached() {
+    let mut f = own_clone_fixture("ws-cache-stop").await;
+    f.cfg.repo_cache_cap_bytes = 1;
+    let second = f.dir.subdir("repos").join("repo-2");
+    std::fs::create_dir_all(&second).unwrap();
+    git(&second, &["init", "-q"]);
+    sqlx::query(
+        "INSERT INTO repos (id, name, url, path, forge, default_branch, enabled, added_at) \
+         VALUES (2, 'beta', 'https://example.com/b.git', ?1, 'github', 'main', 1, 1000)",
+    )
+    .bind(second.to_string_lossy().to_string())
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    let caches = [add_build_caches(&f.clone), add_build_caches(&second)];
+    let real_git = std::process::Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    let real_git = String::from_utf8(real_git.stdout).unwrap();
+    let (measuring, release) = (f.dir.join("measuring"), f.dir.join("release"));
+    let bins = FakeBins::acquire("ws-cache-stop");
+    // Bounded, so a failing test's sweep does not wait on forever.
+    bins.script(
+        "git",
+        &format!(
+            "case \" $* \" in *' --others '*) touch '{}'; for _ in $(seq 1 900); do [ -f '{}' ] && break; sleep 0.05; done ;; esac\nexec '{}' \"$@\"",
+            measuring.display(),
+            release.display(),
+            real_git.trim()
+        ),
+    );
+
+    let (stop, shutdown) = tokio::sync::watch::channel(false);
+    let (admin, notes_lock) = (support::admin(&f.store), tokio::sync::Mutex::new(()));
+    let status = hunter::activity::AdminStatus::default();
+    let duty = hunter::daemon::admin_duty(
+        &admin,
+        &f.cfg,
+        &notes_lock,
+        &status,
+        hunter::types::AdminTask::Sweep,
+        &shutdown,
+    );
+    let stopper = async {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !measuring.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the sweep never measured a clone's caches"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        stop.send_replace(true);
+        std::fs::write(&release, "").unwrap();
+    };
+    tokio::join!(duty, stopper);
+
+    // Per clone: whether its caches are all gone, or all kept.
+    let cleared: Vec<Option<bool>> = caches
+        .iter()
+        .map(|clone| {
+            let gone = clone.iter().filter(|cache| !cache.exists()).count();
+            (gone == 0 || gone == clone.len()).then_some(gone > 0)
+        })
+        .collect();
+    assert!(
+        cleared == [Some(true), Some(false)] || cleared == [Some(false), Some(true)],
+        "the clone in progress is cleared and the other keeps its caches: {cleared:?}"
+    );
+}
+
 /// A Renovate scan interrupted before its repo was deleted leaves a scan
 /// tree no listed repo's pass removes. The sweep removes it anyway, as a
 /// tree whose clone only git can name.
@@ -768,6 +1027,7 @@ async fn the_sweep_removes_the_scan_tree_of_a_repo_no_longer_listed() {
         &support::admin(&f.store),
         &f.cfg.work_root,
         hunter::util::now_ms(),
+        None,
     )
     .await
     .unwrap();
@@ -1042,7 +1302,9 @@ async fn the_sweep_waits_for_the_clones_holder_before_pruning() {
     let held = permit(&f).await;
     let sweep = tokio::spawn({
         let (store, root) = (f.store.clone(), f.cfg.work_root.clone());
-        async move { workspace::sweep(&support::admin(&store), &root, hunter::util::now_ms()).await }
+        async move {
+            workspace::sweep(&support::admin(&store), &root, hunter::util::now_ms(), None).await
+        }
     });
     support::until_waiting(&f.store, 1, 1).await;
     assert!(!sweep.is_finished(), "the sweep waits for the clone");
@@ -1079,7 +1341,9 @@ async fn the_sweep_waits_for_a_deleted_repos_clone_before_its_scan_tree() {
     let held = f.store.test_lane().lock_clone(2).await.unwrap();
     let sweep = tokio::spawn({
         let (store, root) = (f.store.clone(), f.cfg.work_root.clone());
-        async move { workspace::sweep(&support::admin(&store), &root, hunter::util::now_ms()).await }
+        async move {
+            workspace::sweep(&support::admin(&store), &root, hunter::util::now_ms(), None).await
+        }
     });
     support::until_waiting(&f.store, 2, 1).await;
     assert!(scan.is_dir(), "the scan tree stays while its clone is held");
@@ -1132,6 +1396,7 @@ async fn the_sweep_keeps_the_live_scan_tree_of_a_reaped_repo() {
             &support::admin(&f.store),
             &f.cfg.work_root,
             hunter::util::now_ms(),
+            None,
         )
         .await
         .unwrap();
@@ -1172,6 +1437,7 @@ async fn the_sweep_changes_no_clone_it_holds_no_permit_for() {
         &support::admin(&f.store),
         &f.cfg.work_root,
         hunter::util::now_ms(),
+        None,
     )
     .await
     .unwrap();
@@ -1314,6 +1580,7 @@ async fn the_sweep_removes_legacy_trees_no_live_job_uses() {
         &support::admin(&f.store),
         &f.cfg.work_root,
         hunter::util::now_ms(),
+        None,
     )
     .await
     .unwrap();
@@ -1375,7 +1642,9 @@ async fn a_sweep_that_keeps_every_legacy_tree_holds_no_clone_while_it_waits() {
     let held = f.store.test_lane().lock_clone(2).await.unwrap();
     let sweep = tokio::spawn({
         let (store, root) = (f.store.clone(), f.cfg.work_root.clone());
-        async move { workspace::sweep(&support::admin(&store), &root, hunter::util::now_ms()).await }
+        async move {
+            workspace::sweep(&support::admin(&store), &root, hunter::util::now_ms(), None).await
+        }
     });
     support::until_waiting(&f.store, 2, 1).await;
     let other = tokio::time::timeout(
@@ -1419,7 +1688,7 @@ async fn a_sweep_never_holds_one_clone_while_waiting_for_another() {
     let leftover = f.cfg.work_root.join("wt").join("f57");
     std::fs::create_dir_all(leftover.join("src")).unwrap();
     let sweep = |store: hunter::store::Store, root: std::path::PathBuf| async move {
-        workspace::sweep(&support::admin(&store), &root, hunter::util::now_ms()).await
+        workspace::sweep(&support::admin(&store), &root, hunter::util::now_ms(), None).await
     };
 
     let held = f.store.test_lane().lock_clone(2).await.unwrap();
@@ -1739,7 +2008,7 @@ async fn the_sweep_ages_out_legacy_session_dirs_no_live_job_recorded() {
         .unwrap();
     }
 
-    let report = workspace::sweep(&support::admin(&f.store), &f.cfg.work_root, now)
+    let report = workspace::sweep(&support::admin(&f.store), &f.cfg.work_root, now, None)
         .await
         .unwrap();
 
@@ -1850,6 +2119,7 @@ async fn renovate_runs_holding_no_clone_and_the_sweep_keeps_its_tree() {
             &support::admin(&f.store),
             &f.cfg.work_root,
             hunter::util::now_ms(),
+            None,
         )
         .await
         .unwrap();

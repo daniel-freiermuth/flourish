@@ -1974,6 +1974,12 @@ impl Store {
         repos_dir.join(format!("repo-{repo_id}"))
     }
 
+    /// The file name notes had in the clone's root under the old layout
+    /// ([`Self::notes_path`]). One may still be there when
+    /// `server::migrate_repo_notes` could not move it out, and then it is
+    /// the operator's only copy, so whatever clears a clone keeps it.
+    pub const LEGACY_NOTES: &str = "NOTES.md";
+
     /// Where a repo's notes live: `<work_root>/notes/repo-<id>.md`.
     ///
     /// Outside the clone, and deliberately so. Notes used to be written
