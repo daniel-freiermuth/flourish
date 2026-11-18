@@ -2330,6 +2330,7 @@ async fn a_checkpoint_whose_finding_moved_on_is_dropped_and_its_tree_released() 
             &support::admin(&store),
             &cfg.work_root,
             hunter::util::now_ms(),
+            None,
         )
         .await
         .unwrap();
@@ -2347,6 +2348,7 @@ async fn a_checkpoint_whose_finding_moved_on_is_dropped_and_its_tree_released() 
             &support::admin(&store),
             &cfg.work_root,
             hunter::util::now_ms(),
+            None,
         )
         .await
         .unwrap();

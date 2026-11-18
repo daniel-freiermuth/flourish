@@ -108,8 +108,11 @@ pub enum FetchOutcome {
 /// What a [`TreeLease`] keeps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Leased {
-    /// Chain `origin_id`'s tree, `jobs/<origin>/tree`.
-    Chain(i64),
+    /// Chain `origin_id`'s tree, `jobs/<origin>/tree`, a tree of repo
+    /// `repo_id`'s clone. The repo is part of the key so the sweep can tell
+    /// whether any runner is using that clone's build caches
+    /// ([`Clones::repo_chain_leases`]).
+    Chain { origin_id: i64, repo_id: i64 },
     /// Repo `repo_id`'s Renovate scan tree, `scan/repo-<id>`.
     Scan(i64),
 }
@@ -320,7 +323,13 @@ fn permit_of<'l>(clones: Clones, clone: CloneRef, guard: OwnedMutexGuard<()>) ->
 impl Clones {
     /// How many leases chain `origin_id`'s tree has.
     pub(crate) fn chain_leases(&self, origin_id: i64) -> usize {
-        self.count(Leased::Chain(origin_id))
+        self.sum(|what| matches!(what, Leased::Chain { origin_id: o, .. } if o == origin_id))
+    }
+
+    /// How many leases the chains of repo `repo_id` hold, together: while
+    /// any is held, a runner may be building in that repo's clone.
+    pub(crate) fn repo_chain_leases(&self, repo_id: i64) -> usize {
+        self.sum(|what| matches!(what, Leased::Chain { repo_id: r, .. } if r == repo_id))
     }
 
     /// Whether a running scan holds repo `repo_id`'s scan tree.
@@ -330,6 +339,16 @@ impl Clones {
 
     fn count(&self, what: Leased) -> usize {
         lock(&self.0.leases).get(&what).copied().unwrap_or(0)
+    }
+
+    /// The leases of every key `pick` accepts. A scan over the live
+    /// leases, of which there are a handful at most.
+    fn sum(&self, pick: impl Fn(Leased) -> bool) -> usize {
+        lock(&self.0.leases)
+            .iter()
+            .filter(|&(&what, _)| pick(what))
+            .map(|(_, n)| n)
+            .sum()
     }
 
     fn take(&self, what: Leased) -> TreeLease {
@@ -428,7 +447,10 @@ impl ClonePermit<'_> {
     /// right after they looked.
     pub fn lease(&self, chain: &ChainRef) -> Result<TreeLease, ForeignChain> {
         self.holds_chain(chain)?;
-        Ok(self.clones.take(Leased::Chain(chain.origin_id())))
+        Ok(self.clones.take(Leased::Chain {
+            origin_id: chain.origin_id(),
+            repo_id: chain.repo_id(),
+        }))
     }
 
     /// Take the lease on this repo's scan tree, for a Renovate scan: one

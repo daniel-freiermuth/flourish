@@ -34,6 +34,8 @@ struct RawConfig {
     poll_s: Option<f64>,
     #[serde(rename = "sessionGraceS")]
     session_grace_s: Option<u64>,
+    #[serde(rename = "repoCacheCapGiB")]
+    repo_cache_cap_gib: Option<f64>,
     serve: RawServe,
     budget: RawBudget,
     models: RawModels,
@@ -250,6 +252,10 @@ pub struct Config {
     /// [`MIN_FREE_DISK_BYTES`]; a field only so the gate is testable
     /// without filling a disk.
     pub min_free_disk_bytes: u64,
+    /// repoCacheCapGiB — how much a repo clone's untracked files (its
+    /// build caches: cargo's `target/`, Gradle's `build/`, …) may take on
+    /// disk before the sweep clears them all (`workspace::sweep` step f).
+    pub repo_cache_cap_bytes: u64,
     pub model_default: Option<String>,
     pub model_smol: Option<String>,
     pub model_hunt: Option<String>,
@@ -368,6 +374,14 @@ impl Config {
             "{}: sessionGraceS must be greater than 0",
             cfg_path.display()
         );
+        let repo_cache_cap_gib = raw.repo_cache_cap_gib.unwrap_or(10.0);
+        anyhow::ensure!(
+            repo_cache_cap_gib.is_finite() && repo_cache_cap_gib > 0.0,
+            "{}: repoCacheCapGiB must be a finite number greater than 0 (got {repo_cache_cap_gib})",
+            cfg_path.display()
+        );
+        // Saturates: a cap past u64::MAX bytes is no cap.
+        let repo_cache_cap_bytes = (repo_cache_cap_gib * f64::from(1u32 << 30)) as u64;
         // A zero or negative wall-clock limit trips `elapsed >= max_wall_s`
         // on the worker's first meter tick, so the run is killed before it
         // does anything. Zero is not a way to disable the limit, it is the
@@ -577,6 +591,7 @@ impl Config {
             poll_s,
             session_grace_s,
             min_free_disk_bytes: MIN_FREE_DISK_BYTES,
+            repo_cache_cap_bytes,
             model_default: raw.models.default,
             model_smol: raw.models.smol,
             model_hunt: raw.models.hunt,

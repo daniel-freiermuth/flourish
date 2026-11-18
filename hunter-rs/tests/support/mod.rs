@@ -130,6 +130,7 @@ pub fn test_config(root: &Path) -> hunter::config::Config {
         poll_s: 2.0,
         session_grace_s: 120,
         min_free_disk_bytes: 0,
+        repo_cache_cap_bytes: 10 << 30,
         model_default: None,
         model_smol: None,
         model_hunt: None,

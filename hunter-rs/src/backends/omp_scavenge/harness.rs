@@ -582,6 +582,9 @@ pub fn run_worker(
     // start every chain with a full cold compile inside its wall-clock
     // limit, and cost up to a gigabyte of disk per live chain. Point cargo
     // at the clone's own warm `target/` instead (`Workspace::build_cache`).
+    // It grows with every build of every chain; the sweep clears it, with
+    // the clone's other untracked files, once they pass `repoCacheCapGiB`
+    // (`workspace::sweep` step f).
     // Set for every repo: an unused variable costs a non-Rust worker
     // nothing, and detecting the language would be a second guess at what
     // the worker will build. An operator who exported their own for the

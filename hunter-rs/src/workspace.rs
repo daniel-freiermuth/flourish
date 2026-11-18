@@ -51,6 +51,10 @@ pub const SESSION_RETENTION_MS: i64 = 30 * 86_400_000;
 /// Seconds allowed for a local git plumbing command.
 const GIT_TIMEOUT_S: u64 = 60;
 
+/// Seconds allowed for `git clean` to delete a clone's build caches: tens
+/// of gigabytes of small files take minutes, not the seconds plumbing does.
+const CLEAN_TIMEOUT_S: u64 = 1800;
+
 /// One chain's workspace. Plain paths; nothing here exists until
 /// [`create`] makes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,7 +102,9 @@ impl Workspace {
     /// a time (`recovery::JobAuthority`) and cargo locks the directory anyway.
     /// With several job workers, builds of one repo would wait on each
     /// other here: a cache per chain is part of that change (`crate::daemon`
-    /// module docs).
+    /// module docs). Nothing ever trims what cargo leaves here, so the
+    /// sweep caps it, with the clone's other untracked files ([`sweep`]
+    /// step f).
     pub fn build_cache(&self) -> PathBuf {
         self.clone.join("target")
     }
@@ -278,12 +284,7 @@ pub async fn quiet_clones(lane: &mut Lane, work_root: &Path) -> sqlx::Result<()>
             Err(CloneLockError::NoRepo(_)) => continue,
             Err(CloneLockError::Db(e)) => return Err(e),
         };
-        // Ours when the row's path is `<work_root>/repos/repo-<id>`, as
-        // the filesystem resolves both. A clone not made yet fails to
-        // resolve too: the sync that makes it sets the config.
-        let ours = std::fs::canonicalize(Store::repo_dir(&repos_dir, repo_id))
-            .is_ok_and(|own| std::fs::canonicalize(permit.clone_dir()).is_ok_and(|dir| dir == own));
-        if !ours {
+        if !own_clone(&repos_dir, repo_id, permit.clone_dir()) {
             continue;
         }
         let (rc, out) = permit
@@ -299,6 +300,15 @@ pub async fn quiet_clones(lane: &mut Lane, work_root: &Path) -> sqlx::Result<()>
         }
     }
     Ok(())
+}
+
+/// Whether `dir`, the directory repo `repo_id`'s row names, is the
+/// daemon's own clone `<repos_dir>/repo-<id>`, as the filesystem resolves
+/// both. A repo row whose path names the operator's own checkout (kept by
+/// migration 007) is not, and neither is a clone not made yet.
+fn own_clone(repos_dir: &Path, repo_id: i64, dir: &Path) -> bool {
+    std::fs::canonicalize(Store::repo_dir(repos_dir, repo_id))
+        .is_ok_and(|own| std::fs::canonicalize(dir).is_ok_and(|dir| dir == own))
 }
 
 /// The commit `rev` names in `clone` (or one of its trees), or `None`.
@@ -676,6 +686,10 @@ pub struct SweepReport {
     pub legacy_trees_removed: usize,
     pub legacy_trees_kept: usize,
     pub legacy_sessions_removed: usize,
+    /// Clones whose build caches went over the cap and were cleared.
+    pub caches_cleared: usize,
+    /// What those caches took on disk, in allocated bytes.
+    pub cache_bytes_cleared: u64,
 }
 
 /// Reclaim what finished chains, and the layouts before this one, left on
@@ -711,12 +725,34 @@ pub struct SweepReport {
 ///     its clone stays on disk until it is reaped.
 /// (e) `<work_root>/scan/*`: leftovers of an interrupted Renovate scan. A
 ///     live scan holds its repo's permit, so one is never removed.
+/// (f) Each clone's build caches, capped at `caches`' bytes; skipped
+///     when that is `None`, as in the startup sweep, which the daemon
+///     awaits before it serves: measuring every clone and clearing tens
+///     of gigabytes there would hold up every start, while the admin
+///     lane's periodic sweep does it beside the lanes. Once `caches`'
+///     shutdown is set, the clones not reached yet are left as they are
+///     (a clean already running finishes): the daemon waits for the
+///     sweep before it stops, and each clone may take minutes. Everything
+///     in a clone that git does not track is cache: cargo's `target/`
+///     (every worker compiles into it, see [`Workspace::build_cache`]),
+///     Gradle's `.gradle/` and `build/`, whatever the next tool leaves.
+///     When it takes more than the cap on disk, `git clean -ffdx` removes
+///     all of it (tracked files are untouched, and so is a legacy
+///     `NOTES.md` the notes migration left behind), and the next build starts
+///     cold. Only the daemon's own clones (`<work_root>/repos/repo-<id>`),
+///     never a repo row's path naming the operator's checkout; and never
+///     while a chain of the repo holds a [`TreeLease`], since its worker
+///     may be building into the clone. The lease is taken under the same
+///     permit, so none appears while the step runs, and no worker runs
+///     without one: a worker's cgroup ends with its run, and a starting
+///     daemon refuses while anything an earlier one started still runs
+///     (`crate::child`). Best effort: a clone that cannot be measured or
+///     cleaned is logged and kept.
 ///
 /// Kept, always, whatever the job table says: the clones under
-/// `<work_root>/repos/`, including each clone's `target/`, which is the
-/// per-repo cargo build cache every worker compiles into (see
-/// [`Workspace::build_cache`]); `<work_root>/out/`; and a chain's
-/// `session/` while its workspace is inside retention.
+/// `<work_root>/repos/` with their tracked files, and their build caches
+/// while within the cap; `<work_root>/out/`; and a chain's `session/`
+/// while its workspace is inside retention.
 ///
 /// The admin lane's alone: it takes the [`AdminAuthority`], and runs in a
 /// lane of its own.
@@ -724,20 +760,35 @@ pub async fn sweep(
     admin: &AdminAuthority,
     work_root: &Path,
     now_ms: i64,
+    caches: Option<CacheCap<'_>>,
 ) -> anyhow::Result<SweepReport> {
     admin
         .store()
-        .lane(async |lane| sweep_in(lane, work_root, now_ms).await)
+        .lane(async |lane| sweep_in(lane, work_root, now_ms, caches).await)
         .await?
 }
 
+/// What step (f) of [`sweep`] goes by.
+#[derive(Debug, Clone, Copy)]
+pub struct CacheCap<'a> {
+    /// How much a clone's untracked files may take on disk, in bytes.
+    pub bytes: u64,
+    /// The daemon's stop: once set, the step reaches no further clone.
+    pub shutdown: &'a tokio::sync::watch::Receiver<bool>,
+}
+
 /// [`sweep`] in its lane.
-async fn sweep_in(lane: &mut Lane, work_root: &Path, now_ms: i64) -> anyhow::Result<SweepReport> {
+async fn sweep_in(
+    lane: &mut Lane,
+    work_root: &Path,
+    now_ms: i64,
+    caches: Option<CacheCap<'_>>,
+) -> anyhow::Result<SweepReport> {
     let mut report = SweepReport::default();
     sweep_chains(lane, work_root, now_ms, &mut report).await?;
     sweep_legacy_trees(lane, work_root, &mut report).await?;
     sweep_legacy_sessions(lane.store(), work_root, now_ms, &mut report).await?;
-    prune_clones_and_scans(lane, work_root).await?;
+    prune_clones_and_scans(lane, work_root, caches, &mut report).await?;
     Ok(report)
 }
 
@@ -901,13 +952,19 @@ async fn sweep_legacy_sessions(
     Ok(())
 }
 
-/// Steps (d) and (e) of [`sweep`], one clone at a time under its permit.
-/// A scan tree of a repo no longer listed is removed with every clone
-/// held, as its clone is only known to git, and only once every clone is
-/// free ([`Lane::try_lock_every`]). A scan tree a running scan leases is
-/// kept: the lease is taken under the same permit.
-async fn prune_clones_and_scans(lane: &mut Lane, work_root: &Path) -> anyhow::Result<()> {
+/// Steps (d), (e) and (f) of [`sweep`], one clone at a time under its
+/// permit. A scan tree of a repo no longer listed is removed with every
+/// clone held, as its clone is only known to git, and only once every
+/// clone is free ([`Lane::try_lock_every`]). A scan tree a running scan
+/// leases is kept: the lease is taken under the same permit.
+async fn prune_clones_and_scans(
+    lane: &mut Lane,
+    work_root: &Path,
+    caches: Option<CacheCap<'_>>,
+    report: &mut SweepReport,
+) -> anyhow::Result<()> {
     let store = lane.store().clone();
+    let repos_dir = work_root.join("repos");
     let mut scans: BTreeSet<PathBuf> = child_dirs(&scan_root(work_root)).into_iter().collect();
     for repo_id in store.clone_ids().await? {
         let permit = match lane.lock_clone(repo_id).await {
@@ -919,16 +976,30 @@ async fn prune_clones_and_scans(lane: &mut Lane, work_root: &Path) -> anyhow::Re
         let scan = scan_tree_path(work_root, repo_id);
         scans.remove(&scan);
         let leased = store.clones().scan_leased(repo_id);
-        permit
+        // Under the permit, as every chain lease is taken.
+        let cap = caches
+            .filter(|caches| {
+                !*caches.shutdown.borrow()
+                    && own_clone(&repos_dir, repo_id, permit.clone_dir())
+                    && store.clones().repo_chain_leases(repo_id) == 0
+            })
+            .map(|caches| caches.bytes);
+        let cleared = permit
             .blocking(move |hold| {
                 if !leased {
                     discard_scan_tree(hold, &scan);
                 }
-                if hold.clone_dir().is_dir() {
-                    prune_worktrees(hold);
+                if !hold.clone_dir().is_dir() {
+                    return None;
                 }
+                prune_worktrees(hold);
+                cap.and_then(|cap| clear_build_caches(hold, cap))
             })
             .await?;
+        if let Some(bytes) = cleared {
+            report.caches_cleared += 1;
+            report.cache_bytes_cleared += bytes;
+        }
     }
     scans.retain(|scan| {
         scan_tree_repo(scan).is_none_or(|repo_id| !store.clones().scan_leased(repo_id))
@@ -947,6 +1018,91 @@ async fn prune_clones_and_scans(lane: &mut Lane, work_root: &Path) -> anyhow::Re
             .await?;
     }
     Ok(())
+}
+
+/// Step (f) of [`sweep`] in the held clone: when what git does not track
+/// there takes more than `cap_bytes` on disk, `git clean -ffdx` it all.
+/// The bytes cleared, or `None` when the clone was within the cap or the
+/// step failed (logged).
+///
+/// `ls-files --others` without `--exclude-standard` lists ignored files
+/// too, and `--directory` names a wholly untracked directory once instead
+/// of every file in it. Two `f`s, so a nested repository a build fetched
+/// (a Go module, a cargo git dependency checked out in place) goes too.
+///
+/// The one untracked file that is not cache is a legacy notes file in the
+/// clone's root ([`Store::LEGACY_NOTES`]): the operator's writing, which
+/// `server::migrate_repo_notes` leaves in place whenever it cannot move it
+/// safely. It is neither counted nor cleared: the same anchored pattern
+/// goes to `ls-files --exclude` and to `clean -e`, which `-x` still obeys.
+fn clear_build_caches(hold: &CloneHold, cap_bytes: u64) -> Option<u64> {
+    let clone = hold.clone_dir();
+    let keep = format!("/{}", Store::LEGACY_NOTES);
+    let (rc, out) = hold.git(
+        &[
+            "ls-files",
+            "-z",
+            "--others",
+            "--directory",
+            &format!("--exclude={keep}"),
+        ],
+        GIT_TIMEOUT_S,
+    );
+    if rc != 0 {
+        tracing::warn!(
+            "sweep: {}: listing untracked files: {}",
+            clone.display(),
+            crate::util::tail(&out, 300)
+        );
+        return None;
+    }
+    // Every entry ends in a NUL; what follows the last one is stderr,
+    // which the output carries after stdout.
+    let mut entries: Vec<&str> = out.split('\0').collect();
+    entries.pop();
+    let size = allocated_bytes(entries.iter().map(|e| clone.join(e)));
+    if size <= cap_bytes {
+        return None;
+    }
+    let (rc, out) = hold.git(&["clean", "-ffdxq", "-e", &keep], CLEAN_TIMEOUT_S);
+    if rc != 0 {
+        tracing::warn!(
+            "sweep: {}: clearing {size} bytes of build caches: {}",
+            clone.display(),
+            crate::util::tail(&out, 300)
+        );
+        return None;
+    }
+    tracing::info!(
+        "sweep: repo {}: cleared {size} bytes of untracked build caches (cap {cap_bytes} bytes)",
+        hold.repo_id()
+    );
+    Some(size)
+}
+
+/// What `roots` and everything under them take on disk: allocated blocks,
+/// not apparent sizes, so a sparse file counts what it holds. Symlinks are
+/// counted as themselves and never followed, and each file counts once
+/// however many hard links name it (cargo links each binary from `deps/`).
+fn allocated_bytes(roots: impl Iterator<Item = PathBuf>) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    let mut counted = std::collections::HashSet::new();
+    let mut total = 0;
+    let mut stack: Vec<PathBuf> = roots.collect();
+    while let Some(path) = stack.pop() {
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&path) {
+                stack.extend(entries.flatten().map(|e| e.path()));
+            }
+        } else if !counted.insert((meta.dev(), meta.ino())) {
+            continue;
+        }
+        total += meta.blocks() * 512;
+    }
+    total
 }
 
 /// The repo id a `scan/repo-<id>` directory is named for.

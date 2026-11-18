@@ -1867,13 +1867,16 @@ pub fn migrate_repo_notes(work_root: &Path) -> usize {
         else {
             continue;
         };
-        let old = entry.path().join("NOTES.md");
+        let old = entry.path().join(Store::LEGACY_NOTES);
         if !old.is_file() {
             continue;
         }
         // `--error-unmatch` exits 0 when tracked, 1 when not; anything
         // else (128: not a repository) means git could not tell.
-        let (rc, _) = Unheld::IsTracked { path: "NOTES.md" }.run(&entry.path(), 30);
+        let (rc, _) = Unheld::IsTracked {
+            path: Store::LEGACY_NOTES,
+        }
+        .run(&entry.path(), 30);
         if rc != 1 {
             if rc == 0 {
                 tracing::info!(
