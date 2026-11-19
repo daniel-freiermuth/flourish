@@ -1705,17 +1705,9 @@ async fn add_repo(
         },
         _ => crate::forge::detect_forge(&url),
     };
-    // Dupe check ports Python's get_repo(name) key routing: an all-digit
-    // name looks up BY ID (`Store.get_repo`), so a repo named "123" dupe-checks
-    // against repo id 123 — preexisting oddity, ported as-is (contract §7).
-    let existing = if name.bytes().all(|b| b.is_ascii_digit()) {
-        match name.parse::<i64>() {
-            Ok(id) => state.store.get_repo_by_id(id).await?,
-            Err(_) => None,
-        }
-    } else {
-        state.store.get_repo_by_name(&name).await?
-    };
+    // Dupe check by name only, whatever its shape: `repos.name` is the
+    // UNIQUE column, and a repo id is no claim on an all-digit name.
+    let existing = state.store.get_repo_by_name(&name).await?;
     if existing.is_some() {
         return Err(ApiError::Conflict(format!("repo '{name}' already exists")));
     }
