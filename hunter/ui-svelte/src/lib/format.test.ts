@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { clock, datetime, isHttpUrl, issuesAwaitingJudgment, ktok, reviewIssueStatusLabel, reviewStateLabel, roundPostTally, roundWait, ts } from "./format";
+import { checksTone, clock, datetime, isHttpUrl, issuesAwaitingJudgment, ktok, reviewIssueStatusLabel, reviewStateLabel, roundPostTally, roundWait, ts } from "./format";
 import type { PrReviewIssueOut, PrReviewOut, PrReviewRoundOut } from "./types";
 
 describe("reviewStateLabel", () => {
@@ -173,5 +173,20 @@ describe("ktok", () => {
     [1_000_000, "1.0M"],
   ])("formats %d as %s", (n, want) => {
     expect(ktok(n)).toBe(want);
+  });
+});
+
+/** The daemon stores `"N pass[ / M fail][ / K pending]"` (attention.rs checks_summary). */
+describe("checksTone", () => {
+  it.each(["1 pass / 2 fail", "0 pass / 1 fail", "3 pass / 1 fail / 2 pending"])("is bad when %s", (s) => {
+    expect(checksTone(s)).toBe("bad");
+  });
+
+  it("is ok when every check passed", () => {
+    expect(checksTone("4 pass")).toBe("ok");
+  });
+
+  it.each(["2 pass / 1 pending", "0 pass / 3 pending", null])("is dim when %s", (s) => {
+    expect(checksTone(s)).toBe("dim");
   });
 });

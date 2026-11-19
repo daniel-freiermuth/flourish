@@ -283,3 +283,16 @@ export function isHttpUrl(url: string): boolean {
     return false; // not absolute (scp-like ssh URL, bare path)
   }
 }
+
+/**
+ * Colour of the PR checks cell. The daemon stores a summary, not a GitHub
+ * rollup state: `"N pass[ / M fail][ / K pending]"` (hunter-rs attention.rs
+ * `checks_summary`), the fail part only when something failed. Red on any
+ * failure, green when nothing is failing or pending, dim otherwise.
+ */
+export function checksTone(checks: string | null): "ok" | "bad" | "dim" {
+  if (!checks) return "dim";
+  const parts = checks.split(" / ");
+  if (parts.some((p) => p.endsWith(" fail"))) return "bad";
+  return parts.length === 1 && checks.endsWith(" pass") ? "ok" : "dim";
+}
