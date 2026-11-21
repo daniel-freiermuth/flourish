@@ -346,6 +346,10 @@ struct GlMergeRequest {
     detailed_merge_status: Option<String>,
     #[serde(default)]
     merge_status: Option<String>,
+    /// Whether the MR conflicts with its target: true exactly when
+    /// `merge_status` is `cannot_be_merged` ([`gitlab_norm_mergeable`]).
+    #[serde(default, deserialize_with = "nullable")]
+    has_conflicts: bool,
     #[serde(default, deserialize_with = "nullable")]
     source_branch: String,
     #[serde(default, deserialize_with = "nullable")]
@@ -1853,7 +1857,16 @@ fn gitlab_norm_state(raw: &str) -> PrState {
     }
 }
 
+/// Whether the MR merges into its target without conflicts, as GitHub's
+/// `mergeable` says it. `has_conflicts` decides a conflict first:
+/// `detailed_merge_status` names only the first check that blocks the
+/// merge, and a draft (every MR hunter opens) reads `draft_status` there
+/// over a conflict, which left every conflicting draft `Unknown` and so
+/// never flagged for engage.
 fn gitlab_norm_mergeable(mr: &GlMergeRequest) -> Mergeable {
+    if mr.has_conflicts {
+        return Mergeable::Conflicting;
+    }
     let status = mr
         .detailed_merge_status
         .as_deref()
