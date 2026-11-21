@@ -894,6 +894,29 @@ fn gitlab_view_survives_a_failing_notes_endpoint() {
     assert_eq!(bins.calls_to("glab").len(), 2, "both endpoints were tried");
 }
 
+/// A conflict is a conflict on a draft too, and every MR hunter opens is
+/// one. GitLab's `detailed_merge_status` names only the first check that
+/// blocks the merge, `draft_status` for a draft, so read alone it hid the
+/// conflict and engage was never asked to resolve it. Shaped like a real
+/// GitLab 19.2 answer for such an MR.
+#[test]
+fn gitlab_view_reads_a_conflicting_draft_as_conflicting() {
+    let bins = FakeBins::acquire("forge-gl-view-draft-conflict");
+    bins.script(
+        "glab",
+        "case \"$*\" in\n  *notes*) echo '[]'; exit 0 ;;\nesac\n\
+         echo '{\"state\":\"opened\",\"draft\":true,\"detailed_merge_status\":\"draft_status\",\
+         \"merge_status\":\"cannot_be_merged\",\"has_conflicts\":true,\"source_branch\":\"fix/x\",\
+         \"sha\":\"cafe\"}'\nexit 0",
+    );
+
+    let view = forge_for(ForgeName::Gitlab)
+        .view_pr_sync(GL_REPO, PR, &ReviewBots::default())
+        .expect("draft MR view");
+
+    assert_eq!(view.mergeable, Mergeable::Conflicting);
+}
+
 /// The view a caller reads to check whether hunter's own post already
 /// landed must see every note or fail: an MR whose notes could not be read
 /// is not one without notes, and taking it for one posts the same comment
