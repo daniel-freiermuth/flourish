@@ -254,7 +254,7 @@
   .stat-value {
     font-size: 1.5rem;
     font-weight: 700;
-    font-family: ui-monospace, "SF Mono", "Cascadia Code", monospace;
+    font-family: var(--font-mono);
     letter-spacing: -0.02em;
   }
   .stat-value.ok { color: var(--ok); }
@@ -333,7 +333,7 @@
   }
   .data-table td.right { text-align: right; }
   .data-table td.mono,
-  .mono { font-family: ui-monospace, "SF Mono", "Cascadia Code", monospace; }
+  .mono { font-family: var(--font-mono); }
   .data-table td.accent,
   .accent { color: var(--accent); }
   .ok { color: var(--ok); }
@@ -345,13 +345,13 @@
   /* ── Finding link ───────────────────────────────────────────── */
   .finding-link {
     color: var(--accent);
-    font-family: ui-monospace, "SF Mono", "Cascadia Code", monospace;
+    font-family: var(--font-mono);
   }
   .finding-link:hover { color: var(--accent-hover); }
 
   /* ── Fingerprint cell ───────────────────────────────────────── */
   .fingerprint {
-    font-family: ui-monospace, "SF Mono", "Cascadia Code", monospace;
+    font-family: var(--font-mono);
     font-size: 0.6875rem;
     color: var(--text-dim);
     overflow: hidden;
