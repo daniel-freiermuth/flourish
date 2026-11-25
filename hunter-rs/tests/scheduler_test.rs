@@ -13,7 +13,7 @@ use std::sync::atomic::Ordering;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use hunter::config::Config;
+use hunter::config::{Config, ScanIntervals};
 use hunter::domain::{FindingJobKind, RepoJobKind};
 use hunter::scheduler::{anticipated_tokens, pick_next};
 use hunter::server::{AppState, router};
@@ -439,6 +439,7 @@ const DAY_MS: i64 = 86_400_000;
 struct Ran {
     hunt: f64,
     test_gap: f64,
+    refactor: f64,
     modernization: f64,
     standards: f64,
     simplification: f64,
@@ -448,13 +449,14 @@ struct Ran {
 const FRESH: Ran = Ran {
     hunt: 0.0,
     test_gap: 0.0,
+    refactor: 0.0,
     modernization: 0.0,
     standards: 0.0,
     simplification: 0.0,
 };
 
 /// An enabled, cloned repo (its path exists) whose scans last ran as
-/// `ran` says; `dep_update` and `refactor` ran just now.
+/// `ran` says; `dep_update` ran just now.
 async fn seed_scanned_repo(pool: &SqlitePool, id: i64, name: &str, path: &Path, ran: Ran) {
     let now = now_ms();
     #[allow(clippy::cast_possible_truncation, reason = "whole milliseconds")]
@@ -464,7 +466,7 @@ async fn seed_scanned_repo(pool: &SqlitePool, id: i64, name: &str, path: &Path, 
          last_hunt_at, last_test_gap_at, last_dep_update_at, last_refactor_at, \
          last_modernization_at, last_standards_at, last_simplification_at) \
          VALUES (?1, ?2, 'https://example.com/r.git', ?3, 'github', 'main', 1, 1000, \
-                 ?4, ?5, ?6, ?6, ?7, ?8, ?9)",
+                 ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
     )
     .bind(id)
     .bind(name)
@@ -472,6 +474,7 @@ async fn seed_scanned_repo(pool: &SqlitePool, id: i64, name: &str, path: &Path, 
     .bind(ago(ran.hunt))
     .bind(ago(ran.test_gap))
     .bind(now)
+    .bind(ago(ran.refactor))
     .bind(ago(ran.modernization))
     .bind(ago(ran.standards))
     .bind(ago(ran.simplification))
@@ -480,15 +483,23 @@ async fn seed_scanned_repo(pool: &SqlitePool, id: i64, name: &str, path: &Path, 
     .unwrap();
 }
 
-/// What `pick_next` selects for one repo that last ran as `ran`, under a
-/// 2-day scan interval and 30-day modernization, standards and
-/// simplification intervals.
+/// What `pick_next` selects for one repo that last ran as `ran`, under
+/// intervals of 2 days for hunts, 5 for test gaps, 9 for refactors, 14
+/// for standards, 30 for modernization and 60 for simplification.
 async fn rotation_pick(ran: Ran) -> Option<RepoJobKind> {
     let (dir, path, pool) = fresh_db().await;
     seed_scanned_repo(&pool, 1, "alpha", dir.path(), ran).await;
     let store = open_store(pool, &path).await;
     let mut cfg = test_config(3600.0);
-    cfg.scan_interval_days = 2.0;
+    cfg.scan_intervals = ScanIntervals {
+        hunt: 2 * DAY_MS,
+        test_gap: 5 * DAY_MS,
+        refactor: 9 * DAY_MS,
+        standards: 14 * DAY_MS,
+        modernization: 30 * DAY_MS,
+        simplification: 60 * DAY_MS,
+        ..cfg.scan_intervals
+    };
     match pick_next(&support::scope(&store), &cfg, None)
         .await
         .unwrap()
@@ -499,60 +510,74 @@ async fn rotation_pick(ran: Ran) -> Option<RepoJobKind> {
     }
 }
 
+/// Each scan kind waits out its own interval, not another kind's.
 #[tokio::test]
-async fn a_scan_is_due_only_once_its_interval_has_passed() {
-    let within = Ran {
-        test_gap: 1.5,
-        ..FRESH
-    };
-    assert_eq!(rotation_pick(within).await, None);
-    let past = Ran {
-        test_gap: 3.0,
-        ..FRESH
-    };
-    assert_eq!(rotation_pick(past).await, Some(RepoJobKind::TestGap));
-}
-
-#[tokio::test]
-async fn modernization_is_due_only_once_its_interval_has_passed() {
-    let within = Ran {
-        modernization: 20.0,
-        ..FRESH
-    };
-    assert_eq!(rotation_pick(within).await, None);
-    let past = Ran {
-        modernization: 40.0,
-        ..FRESH
-    };
-    assert_eq!(rotation_pick(past).await, Some(RepoJobKind::Modernization));
-}
-
-#[tokio::test]
-async fn standards_is_due_only_once_its_interval_has_passed() {
-    let within = Ran {
-        standards: 20.0,
-        ..FRESH
-    };
-    assert_eq!(rotation_pick(within).await, None);
-    let past = Ran {
-        standards: 40.0,
-        ..FRESH
-    };
-    assert_eq!(rotation_pick(past).await, Some(RepoJobKind::Standards));
-}
-
-#[tokio::test]
-async fn simplification_is_due_only_once_its_interval_has_passed() {
-    let within = Ran {
-        simplification: 20.0,
-        ..FRESH
-    };
-    assert_eq!(rotation_pick(within).await, None);
-    let past = Ran {
-        simplification: 40.0,
-        ..FRESH
-    };
-    assert_eq!(rotation_pick(past).await, Some(RepoJobKind::Simplification));
+async fn a_scan_is_due_only_once_its_own_interval_has_passed() {
+    for (kind, within, past) in [
+        (
+            RepoJobKind::Hunt,
+            Ran { hunt: 1.5, ..FRESH },
+            Ran { hunt: 2.5, ..FRESH },
+        ),
+        (
+            RepoJobKind::TestGap,
+            Ran {
+                test_gap: 4.5,
+                ..FRESH
+            },
+            Ran {
+                test_gap: 5.5,
+                ..FRESH
+            },
+        ),
+        (
+            RepoJobKind::Refactor,
+            Ran {
+                refactor: 8.5,
+                ..FRESH
+            },
+            Ran {
+                refactor: 9.5,
+                ..FRESH
+            },
+        ),
+        (
+            RepoJobKind::Standards,
+            Ran {
+                standards: 13.5,
+                ..FRESH
+            },
+            Ran {
+                standards: 14.5,
+                ..FRESH
+            },
+        ),
+        (
+            RepoJobKind::Modernization,
+            Ran {
+                modernization: 29.5,
+                ..FRESH
+            },
+            Ran {
+                modernization: 30.5,
+                ..FRESH
+            },
+        ),
+        (
+            RepoJobKind::Simplification,
+            Ran {
+                simplification: 59.5,
+                ..FRESH
+            },
+            Ran {
+                simplification: 60.5,
+                ..FRESH
+            },
+        ),
+    ] {
+        assert_eq!(rotation_pick(within).await, None, "{kind} within");
+        assert_eq!(rotation_pick(past).await, Some(kind), "{kind} past");
+    }
 }
 
 /// A forced cycle picks the named repo's work, though another repo's is

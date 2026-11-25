@@ -424,10 +424,9 @@ fn engage_held_back(mode: Pick<'_>, fid: i64) -> bool {
 /// ([`Store::list_pending_harvest`]) -> oldest
 /// rechecking -> oldest queued fix -> resumable suspended work -> the
 /// most stale-of-rotation job type for the least-recently-hunted enabled
-/// repo (hunt if never cloned, else whichever of
-/// `hunt/test_gap/dep_update/refactor` is oldest/never-run subject to
-/// `cfg.scan_interval_days`; modernization, standards and simplification
-/// gated by their own `cfg.*_interval_days`). All types gated for one repo ->
+/// repo (hunt if never cloned, else whichever kind is oldest/never-run
+/// among those whose own interval, `cfg.scan_intervals`, has passed since
+/// it last ran on the repo). All types gated for one repo ->
 /// the next-stalest repo is tried. None = nothing to do.
 ///
 /// Each finding tier continues a suspended attempt at its own
@@ -784,49 +783,20 @@ fn rotation_kind(
     now: i64,
     held: impl Fn(RepoJobKind) -> bool,
 ) -> Option<RepoJobKind> {
-    let scan_interval_ms = (cfg.scan_interval_days * 86_400_000.0) as i64;
-    let mod_interval_ms = cfg.modernization_interval_days * 86_400_000;
-    let std_interval_ms = cfg.standards_interval_days * 86_400_000;
-    let simp_interval_ms = cfg.simplification_interval_days * 86_400_000;
-
     // Eligible job types with their last-run timestamps, in
     // RepoJobKind::ALL insertion order (mirrors Python's dict).
     let mut job_times: Vec<(RepoJobKind, i64)> = Vec::with_capacity(RepoJobKind::ALL.len());
-    for (kind, last, interval_ms) in [
-        (RepoJobKind::Hunt, target.last_hunt_at, scan_interval_ms),
-        (
-            RepoJobKind::TestGap,
-            target.last_test_gap_at,
-            scan_interval_ms,
-        ),
-        (
-            RepoJobKind::DepUpdate,
-            target.last_dep_update_at,
-            scan_interval_ms,
-        ),
-        (
-            RepoJobKind::Refactor,
-            target.last_refactor_at,
-            scan_interval_ms,
-        ),
-        (
-            RepoJobKind::Modernization,
-            target.last_modernization_at,
-            mod_interval_ms,
-        ),
-        (
-            RepoJobKind::Standards,
-            target.last_standards_at,
-            std_interval_ms,
-        ),
-        (
-            RepoJobKind::Simplification,
-            target.last_simplification_at,
-            simp_interval_ms,
-        ),
+    for (kind, last) in [
+        (RepoJobKind::Hunt, target.last_hunt_at),
+        (RepoJobKind::TestGap, target.last_test_gap_at),
+        (RepoJobKind::DepUpdate, target.last_dep_update_at),
+        (RepoJobKind::Refactor, target.last_refactor_at),
+        (RepoJobKind::Modernization, target.last_modernization_at),
+        (RepoJobKind::Standards, target.last_standards_at),
+        (RepoJobKind::Simplification, target.last_simplification_at),
     ] {
         let last = last.unwrap_or(0);
-        if !held(kind) && (last == 0 || (now - last) >= interval_ms) {
+        if !held(kind) && (last == 0 || (now - last) >= cfg.scan_intervals.ms(kind)) {
             job_times.push((kind, last));
         }
     }
@@ -5005,7 +4975,7 @@ impl DepScanGate {
             held: store.held_work().await?,
             running: store.running_places().await?,
             fallbacks: store.dep_update_fallbacks().await?,
-            interval_ms: (cfg.scan_interval_days * 86_400_000.0) as i64,
+            interval_ms: cfg.scan_intervals.dep_update,
             now: now_ms(),
         })
     }

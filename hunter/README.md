@@ -335,17 +335,18 @@ The order:
    PR. Restarting costs a flat ~37k-token session floor and then redoes
    the work; continuing costs re-caching the context the worker was
    already carrying.
-7. Otherwise, **hunt/test_gap/dep_update/refactor** — whichever is most
-   overdue for the least-recently-scanned enabled repo (a never-cloned repo
-   always hunts first). **Modernization**, **standards** and
-   **simplification** join this rotation too, but each only once its own
-   `modernization.intervalDays` / `standards.intervalDays` /
-   `simplification.intervalDays` (config, default 30) has passed since it
-   last ran for that repo — periodic strategic checks, not tight-loop scans
-   competing for every cycle. A repo with a **full re-hunt** queued from the Repos page
-   goes first, and its hunt runs ahead of its other scans and of the scan
-   interval — until a hunt has attempted that request, so a failing hunt
-   is not retried back to back.
+7. Otherwise, the **rotation**: hunt, test\_gap, dep\_update, refactor,
+   modernization, standards and simplification — whichever is most
+   overdue for the least-recently-scanned enabled repo (a never-cloned
+   repo always hunts first), among the kinds whose own interval
+   (`<kind>.intervalDays`, § Configuration) has passed since they last
+   ran for that repo. By default hunts and dependency scans are daily,
+   test-gap and refactor scans weekly, and modernization, standards and
+   simplification monthly — periodic strategic checks, not tight-loop
+   scans competing for every cycle. A repo with a **full re-hunt** queued
+   from the Repos page goes first, and its hunt runs ahead of its other
+   scans and of the hunt interval — until a hunt has attempted that
+   request, so a failing hunt is not retried back to back.
 
 Each of 1-5 picks a (finding, kind). When that finding has a suspended
 attempt of that same kind that can still be continued, the tier continues
@@ -1231,7 +1232,16 @@ quota source for one installation.
   A repo whose path is your own checkout is never cleaned.
 - `hunt`/`fix` settings apply to their whole job family (hunt also covers
   test\_gap/dep\_update/refactor/modernization/recheck; fix also covers
-  engage/harvest/apply\_\*).
+  engage/harvest/apply\_\*), except `hunt.intervalDays` and
+  `hunt.rehuntDays`, which are the hunt's own.
+- `<kind>.intervalDays` — how many days (fractions allowed) the rotation
+  waits after a repo's scan of that kind last succeeded before it offers
+  the kind for the repo again: `hunt` (default 1), `testGap` (7),
+  `depUpdate` (1; also paces the zero-token Renovate pass), `refactor`
+  (7), `modernization`, `standards` and `simplification` (30 each). A
+  value that rounds to under a millisecond is a load error. The former
+  shared `scan.intervalDays` is retired: a config that still sets it
+  loads with a warning in the log, and the value is ignored.
 - `budget.deny5hAbove` / `staleAfterS` — see § Budget policy.
 - `models` — fuzzy names, anything omp's `--model` flag accepts. `default`
   applies to all workers; `smol` is for lightweight helper tasks; `hunt`/

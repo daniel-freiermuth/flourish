@@ -417,8 +417,8 @@ async fn the_dependency_pass_scans_due_repos_and_leaves_the_ai_scans_alone() {
     assert_eq!(rig.bins.calls_to("renovate").len(), 1);
 }
 
-/// A pass scans a repo whose last scan is older than the scan interval and
-/// leaves one scanned within it alone.
+/// A pass scans a repo whose last scan is older than its `dep_update`
+/// interval and leaves one scanned within it alone.
 #[tokio::test]
 async fn the_dependency_pass_waits_out_the_scan_interval() {
     const DAY_MS: i64 = 86_400_000;
@@ -427,7 +427,7 @@ async fn the_dependency_pass_waits_out_the_scan_interval() {
     let (_keep, running_on) = tokio::sync::watch::channel(false);
     let admin = support::admin(&rig.store);
     let mut cfg = rig.cfg.clone();
-    cfg.scan_interval_days = 7.0;
+    cfg.scan_intervals.dep_update = 7 * DAY_MS;
     let scanned_ago = |ago_ms: i64| {
         sqlx::query("UPDATE repos SET last_dep_update_at = ?1 WHERE id = ?2")
             .bind(hunter::util::now_ms() - ago_ms)
