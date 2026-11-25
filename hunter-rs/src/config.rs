@@ -5,9 +5,12 @@
 use std::path::{Path, PathBuf};
 
 use crate::backends::omp_scavenge::LlmProvider;
+use crate::domain::RepoJobKind;
 use crate::forge::ReviewBots;
 use anyhow::Context;
 use serde::Deserialize;
+
+const MS_PER_DAY: i64 = 86_400_000;
 
 /// Free space `work_root` must have for the scheduler to start a job.
 ///
@@ -43,7 +46,13 @@ struct RawConfig {
     hunt: RawCaps,
     fix: RawCaps,
     review: RawReview,
+    /// Retired `scan.intervalDays`, read only to warn that it is ignored.
     scan: RawScan,
+    #[serde(rename = "testGap")]
+    test_gap: RawScan,
+    #[serde(rename = "depUpdate")]
+    dep_update: RawScan,
+    refactor: RawScan,
     modernization: RawScan,
     standards: RawScan,
     simplification: RawScan,
@@ -101,6 +110,8 @@ struct RawCaps {
     max_findings: Option<i64>,
     #[serde(rename = "rehuntDays")]
     rehunt_days: Option<i64>,
+    #[serde(rename = "intervalDays")]
+    interval_days: Option<f64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -163,6 +174,53 @@ impl Default for AuthGatewayConfig {
         Self {
             broker_port: 8765,
             gateway_port: 4000,
+        }
+    }
+}
+
+/// How long the rotation waits, after a repo's scan of a kind last
+/// succeeded, before it offers that kind for the repo again
+/// (`<kind>.intervalDays`: `hunt`, `testGap`, `depUpdate`, `refactor`,
+/// `modernization`, `standards`, `simplification`), in milliseconds.
+/// `dep_update`'s also paces the admin lane's Renovate pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanIntervals {
+    pub hunt: i64,
+    pub test_gap: i64,
+    pub dep_update: i64,
+    pub refactor: i64,
+    pub modernization: i64,
+    pub standards: i64,
+    pub simplification: i64,
+}
+
+impl ScanIntervals {
+    /// `kind`'s interval in milliseconds.
+    pub const fn ms(&self, kind: RepoJobKind) -> i64 {
+        match kind {
+            RepoJobKind::Hunt => self.hunt,
+            RepoJobKind::TestGap => self.test_gap,
+            RepoJobKind::DepUpdate => self.dep_update,
+            RepoJobKind::Refactor => self.refactor,
+            RepoJobKind::Modernization => self.modernization,
+            RepoJobKind::Standards => self.standards,
+            RepoJobKind::Simplification => self.simplification,
+        }
+    }
+}
+
+/// Hunts and dependency scans daily, test-gap and refactor scans weekly,
+/// the modernization, standards and simplification audits monthly.
+impl Default for ScanIntervals {
+    fn default() -> Self {
+        Self {
+            hunt: MS_PER_DAY,
+            test_gap: 7 * MS_PER_DAY,
+            dep_update: MS_PER_DAY,
+            refactor: 7 * MS_PER_DAY,
+            modernization: 30 * MS_PER_DAY,
+            standards: 30 * MS_PER_DAY,
+            simplification: 30 * MS_PER_DAY,
         }
     }
 }
@@ -291,16 +349,9 @@ pub struct Config {
     /// commit, the fixer rewrites them into a few logical ones of the same
     /// tree before the push (`scheduler::review`). Default on.
     pub review_curate: bool,
-    /// scan.intervalDays — per-repo hunt cadence gate
-    /// (`types.Config.scan_interval_days`, read in `Config.load`).
-    pub scan_interval_days: f64,
-    /// modernization.intervalDays (`types.Config.modernization_interval_days`, read in
-    /// `Config.load`).
-    pub modernization_interval_days: i64,
-    /// standards.intervalDays — per-repo standards audit cadence gate.
-    pub standards_interval_days: i64,
-    /// simplification.intervalDays — per-repo simplification scan cadence gate.
-    pub simplification_interval_days: i64,
+    /// `<kind>.intervalDays` — per-repo cadence gate of each rotation
+    /// scan kind.
+    pub scan_intervals: ScanIntervals,
     /// renovate.githubToken — the token Renovate's github.com lookups use
     /// for GitHub-hosted repos, in place of the operator's `gh` login
     /// (see `dep_scan::github_token`).
@@ -336,7 +387,6 @@ impl Config {
                   across functions that are each called exactly once"
     )]
     pub fn load(root: &Path) -> anyhow::Result<Self> {
-        const MS_PER_DAY: i64 = 86_400_000;
         // Git resolves worktree destinations from its clone, while workers
         // resolve their cwd from the daemon. Both must receive absolute paths.
         let root = std::path::absolute(root)
@@ -406,48 +456,75 @@ impl Config {
             "{}: budget.staleAfterS must be a finite number greater than or equal to 0 (got {stale_after_s})",
             cfg_path.display()
         );
-        // Cadences are validated at the precision the scheduler actually
-        // uses: it converts days to milliseconds and compares against
-        // elapsed time, so a value that rounds to a non-positive interval
-        // makes its job eligible on every single cycle rather than "never"
-        // or "rarely", which is the opposite of what an operator typing a
-        // small number intends.
-        #[allow(clippy::cast_precision_loss)]
-        let max_days = (i64::MAX / MS_PER_DAY) as f64;
-        let scan_interval_days = raw.scan.interval_days.unwrap_or(1.0);
-        anyhow::ensure!(
-            scan_interval_days.is_finite()
-                && scan_interval_days > 0.0
-                && scan_interval_days <= max_days
-                && (scan_interval_days * MS_PER_DAY as f64) >= 1.0,
-            "{}: scan.intervalDays must be a finite number greater than 0 and at most {max_days} \
-             (got {scan_interval_days})",
-            cfg_path.display()
-        );
-        // These three are whole days by the time the scheduler sees them, so
-        // a fraction is truncated — 0.5 silently becomes 0, i.e. every
-        // cycle. Reject it rather than reinterpret it.
-        let whole_days = |field: &str, raw_days: Option<f64>| -> anyhow::Result<i64> {
-            let d = raw_days.unwrap_or(30.0);
-            anyhow::ensure!(
-                d.is_finite() && d >= 1.0 && d <= max_days && d.fract() == 0.0,
-                "{}: {field} must be a whole number of days, at least 1 and at most {max_days} \
-                 (got {d})",
+        // Cadences are validated at the precision the scheduler uses: it
+        // compares elapsed milliseconds against them, so a value that
+        // rounds to no interval makes its job eligible on every single
+        // cycle rather than "never" or "rarely", which is the opposite of
+        // what an operator typing a small number intends. A huge value
+        // saturates at `i64::MAX` ms: once run, the kind is never due again.
+        let interval =
+            |field: &str, raw_days: Option<f64>, default_ms: i64| -> anyhow::Result<i64> {
+                let Some(days) = raw_days else {
+                    return Ok(default_ms);
+                };
+                #[allow(clippy::cast_precision_loss)]
+                let ms = days * MS_PER_DAY as f64;
+                anyhow::ensure!(
+                    ms >= 1.0,
+                    "{}: {field} must be greater than 0, and at least a millisecond (got {days})",
+                    cfg_path.display()
+                );
+                #[allow(clippy::cast_possible_truncation)]
+                Ok(ms as i64)
+            };
+        let default_intervals = ScanIntervals::default();
+        let scan_intervals = ScanIntervals {
+            hunt: interval(
+                "hunt.intervalDays",
+                raw.hunt.interval_days,
+                default_intervals.hunt,
+            )?,
+            test_gap: interval(
+                "testGap.intervalDays",
+                raw.test_gap.interval_days,
+                default_intervals.test_gap,
+            )?,
+            dep_update: interval(
+                "depUpdate.intervalDays",
+                raw.dep_update.interval_days,
+                default_intervals.dep_update,
+            )?,
+            refactor: interval(
+                "refactor.intervalDays",
+                raw.refactor.interval_days,
+                default_intervals.refactor,
+            )?,
+            modernization: interval(
+                "modernization.intervalDays",
+                raw.modernization.interval_days,
+                default_intervals.modernization,
+            )?,
+            standards: interval(
+                "standards.intervalDays",
+                raw.standards.interval_days,
+                default_intervals.standards,
+            )?,
+            simplification: interval(
+                "simplification.intervalDays",
+                raw.simplification.interval_days,
+                default_intervals.simplification,
+            )?,
+        };
+        // Its intervals moved to the kinds' own keys. Dropping it changes
+        // how often the rotation scans, so ignoring it is said, not silent.
+        if let Some(days) = raw.scan.interval_days {
+            tracing::warn!(
+                "{}: scan.intervalDays ({days}) is retired and ignored; set \
+                 hunt.intervalDays, testGap.intervalDays, depUpdate.intervalDays \
+                 and refactor.intervalDays instead",
                 cfg_path.display()
             );
-            #[allow(clippy::cast_possible_truncation)]
-            Ok(d as i64)
-        };
-        let modernization_interval_days = whole_days(
-            "modernization.intervalDays",
-            raw.modernization.interval_days,
-        )?;
-        let standards_interval_days =
-            whole_days("standards.intervalDays", raw.standards.interval_days)?;
-        let simplification_interval_days = whole_days(
-            "simplification.intervalDays",
-            raw.simplification.interval_days,
-        )?;
+        }
         // An empty token would win over the `gh` login and then fail every
         // lookup, which is worse than not setting it.
         let renovate_github_token = match raw.renovate.github_token {
@@ -610,10 +687,7 @@ impl Config {
             fix_max_wall_s,
             review_max_rounds: raw.review.max_rounds.unwrap_or(7),
             review_curate: raw.review.curate.unwrap_or(true),
-            scan_interval_days,
-            modernization_interval_days,
-            standards_interval_days,
-            simplification_interval_days,
+            scan_intervals,
             renovate_github_token,
             review_bots,
         })

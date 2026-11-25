@@ -11,7 +11,7 @@
 
 use std::path::Path;
 
-use hunter::config::{Config, HostAllowList};
+use hunter::config::{Config, HostAllowList, ScanIntervals};
 
 mod support;
 use support::TempDir;
@@ -228,29 +228,22 @@ fn models_are_required_for_anthropic() {
 
 /// Cadences are validated at the precision the scheduler uses.
 ///
-/// `scan.intervalDays` is multiplied by `86_400_000` and cast to `i64`;
-/// the modernization, standards and simplification cadences are cast to `i64` days
-/// first. So a value that rounds to a non-positive interval does not
-/// mean "never" or "rarely" — it makes that job eligible on every cycle,
-/// the opposite of what a small number is meant to express.
+/// Each `<kind>.intervalDays` is multiplied by `86_400_000` and cast to
+/// `i64` milliseconds. So a value that rounds to a non-positive interval
+/// does not mean "never" or "rarely" — it makes that job eligible on
+/// every cycle, the opposite of what a small number is meant to express.
 #[test]
 fn cadences_that_round_to_no_interval_are_rejected() {
     for (field, value) in [
-        // Truncates to 0 days -> eligible every cycle.
-        ("modernization", "0.5"),
-        ("standards", "0.5"),
-        ("simplification", "0.5"),
-        ("modernization", "-0.5"),
         // Zero and negative outright.
-        ("modernization", "0"),
-        ("standards", "-1"),
-        ("scan", "0"),
-        ("scan", "-1"),
+        ("hunt", "0"),
+        ("testGap", "-1"),
+        ("depUpdate", "-2"),
+        ("modernization", "-0.5"),
+        ("standards", "0"),
+        ("simplification", "0"),
         // Sub-millisecond: * 86_400_000 still floors to 0 ms.
-        ("scan", "0.00000000001"),
-        // Would overflow the millisecond conversion.
-        ("modernization", "1e300"),
-        ("scan", "1e300"),
+        ("refactor", "0.00000000001"),
     ] {
         let dir = TempDir::new("cfg-cadence");
         let err = load(
@@ -265,24 +258,56 @@ fn cadences_that_round_to_no_interval_are_rejected() {
     }
 }
 
-/// The values an operator actually writes still load.
+/// Every scan kind waits on its own `<kind>.intervalDays`, in days,
+/// fractions included; one too large for milliseconds is never due again.
 #[test]
-fn ordinary_cadences_load() {
+fn each_scan_kind_has_its_own_interval() {
+    const DAY: i64 = 86_400_000;
     let dir = TempDir::new("cfg-cadence-ok");
     let cfg = load(
         &dir,
-        r#"{"scan": {"intervalDays": 0.5},
-            "modernization": {"intervalDays": 30},
-            "standards": {"intervalDays": 14},
-            "simplification": {"intervalDays": 60}}"#,
+        r#"{"hunt": {"intervalDays": 0.5},
+            "testGap": {"intervalDays": 2},
+            "depUpdate": {"intervalDays": 3},
+            "refactor": {"intervalDays": 4},
+            "modernization": {"intervalDays": 5},
+            "standards": {"intervalDays": 1e300},
+            "simplification": {"intervalDays": 1.5}}"#,
     )
     .expect("valid cadences");
-    // Half a day is meaningful for the scan scheduler: it keeps a
-    // sub-day interval because that one is not truncated to whole days.
-    assert!((cfg.scan_interval_days - 0.5).abs() < f64::EPSILON);
-    assert_eq!(cfg.modernization_interval_days, 30);
-    assert_eq!(cfg.standards_interval_days, 14);
-    assert_eq!(cfg.simplification_interval_days, 60);
+    assert_eq!(
+        cfg.scan_intervals,
+        ScanIntervals {
+            hunt: DAY / 2,
+            test_gap: 2 * DAY,
+            dep_update: 3 * DAY,
+            refactor: 4 * DAY,
+            modernization: 5 * DAY,
+            standards: i64::MAX,
+            simplification: 3 * DAY / 2,
+        }
+    );
+}
+
+/// Unless configured, hunts and dependency scans run daily, test-gap and
+/// refactor scans weekly, and the strategic audits monthly.
+#[test]
+fn scan_intervals_default_by_kind() {
+    const DAY: i64 = 86_400_000;
+    let dir = TempDir::new("cfg-cadence-default");
+    let cfg = load(&dir, "{}").unwrap();
+    assert_eq!(
+        cfg.scan_intervals,
+        ScanIntervals {
+            hunt: DAY,
+            test_gap: 7 * DAY,
+            dep_update: DAY,
+            refactor: 7 * DAY,
+            modernization: 30 * DAY,
+            standards: 30 * DAY,
+            simplification: 30 * DAY,
+        }
+    );
 }
 
 /// A clone's build caches are capped at 10 GiB unless the operator says

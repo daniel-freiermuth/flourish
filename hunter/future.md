@@ -732,14 +732,12 @@ interface at exactly the joints the Rust trait must get right:
 Worth doing as a spike *during* port step 3 (even a stub impl), so the trait
 is shaped by two consumers before it hardens.
 
-### 8.4 Scheduler: per-repo and per-kind scan intervals
-**Status:** `scan_interval_days` done; extension idea.
+### 8.4 Scheduler: per-repo scan intervals
+**Status:** per-kind intervals done (`<kind>.intervalDays`); per-repo
+overrides are an extension idea.
 
 Per-repo overrides in the repos table ("scan this repo every 6h, that one
-weekly"; config default as floor). Per-kind intervals generalize the existing
-`modernization_interval_days` into `scan_intervals: {hunt: 1, dep_update: 7,
-...}`. Cheap to include in the Rust store/scheduler port; becomes a user
-story in Phase 3 (§2).
+weekly"; config default as floor). Becomes a user story in Phase 3 (§2).
 
 ### 8.5 UI: finding detail page
 **Status:** idea; folded into the Svelte rewrite scope (§2 triage stories).

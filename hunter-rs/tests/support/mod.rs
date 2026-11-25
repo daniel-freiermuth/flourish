@@ -146,10 +146,7 @@ pub fn test_config(root: &Path) -> hunter::config::Config {
         fix_max_wall_s: 2700,
         review_max_rounds: 0,
         review_curate: false,
-        scan_interval_days: 1.0,
-        modernization_interval_days: 30,
-        standards_interval_days: 30,
-        simplification_interval_days: 30,
+        scan_intervals: hunter::config::ScanIntervals::default(),
         renovate_github_token: None,
         review_bots: hunter::forge::ReviewBots::default(),
     }
