@@ -680,7 +680,7 @@
     font-size: 0.625rem;
     padding: 0.0625rem 0.375rem;
     border-radius: 99px;
-    font-family: ui-monospace, "SF Mono", "Cascadia Code", monospace;
+    font-family: var(--font-mono);
     font-weight: 500;
   }
   .forge-badge.github {
@@ -722,7 +722,7 @@
   .meta-sep { margin: 0 0.25rem; opacity: 0.4; }
 
   .branch {
-    font-family: ui-monospace, "SF Mono", "Cascadia Code", monospace;
+    font-family: var(--font-mono);
   }
 
   .repo-actions {
@@ -801,7 +801,7 @@
     font-size: 0.75rem;
     color: var(--text-dim);
     white-space: pre-wrap;
-    font-family: ui-monospace, "SF Mono", "Cascadia Code", monospace;
+    font-family: var(--font-mono);
     margin-bottom: 0.75rem;
     max-height: 12rem;
     overflow: auto;

@@ -249,7 +249,7 @@
   }
 
   .mono {
-    font-family: ui-monospace, "SF Mono", "Cascadia Code", monospace;
+    font-family: var(--font-mono);
   }
 
   .dim,

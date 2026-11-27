@@ -553,7 +553,7 @@
   .fid {
     color: var(--text-dim);
     font-size: 0.6875rem;
-    font-family: ui-monospace, "SF Mono", "Cascadia Code", monospace;
+    font-family: var(--font-mono);
     user-select: all;
   }
   .fid:hover, .fid:focus-visible {
@@ -664,7 +664,7 @@
     gap: 0.75rem;
     font-size: 0.6875rem;
     color: var(--text-dim);
-    font-family: ui-monospace, "SF Mono", "Cascadia Code", monospace;
+    font-family: var(--font-mono);
     min-width: 0;
     overflow: hidden;
   }
@@ -686,7 +686,7 @@
     color: var(--text-dim);
   }
   .lineage a {
-    font-family: ui-monospace, "SF Mono", "Cascadia Code", monospace;
+    font-family: var(--font-mono);
     color: var(--accent);
     text-decoration: none;
     margin-left: 0.25rem;

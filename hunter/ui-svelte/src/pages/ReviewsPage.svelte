@@ -638,7 +638,7 @@
   .dim { color: var(--text-dim); }
 
   code {
-    font-family: ui-monospace, "SF Mono", "Cascadia Code", monospace;
+    font-family: var(--font-mono);
   }
 
   /* ── Request form ────────────────────────────────────────────── */
@@ -750,7 +750,7 @@
   .pr-option:disabled { opacity: 0.5; cursor: default; }
 
   .pr-num {
-    font-family: ui-monospace, "SF Mono", "Cascadia Code", monospace;
+    font-family: var(--font-mono);
     color: var(--accent);
   }
   .pr-title {
@@ -841,7 +841,7 @@
   }
 
   .pr-link {
-    font-family: ui-monospace, "SF Mono", "Cascadia Code", monospace;
+    font-family: var(--font-mono);
     font-size: 0.8125rem;
   }
 
@@ -1105,7 +1105,7 @@
     color: var(--text-dim);
     white-space: pre-wrap;
     overflow-wrap: anywhere;
-    font-family: ui-monospace, "SF Mono", "Cascadia Code", monospace;
+    font-family: var(--font-mono);
     line-height: 1.5;
   }
 

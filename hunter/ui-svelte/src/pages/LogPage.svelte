@@ -288,7 +288,7 @@
   .cell-ts {
     color: var(--text-dim);
     font-size: 0.6875rem;
-    font-family: ui-monospace, "SF Mono", "Cascadia Code", monospace;
+    font-family: var(--font-mono);
     white-space: nowrap;
     width: 7rem;
   }
@@ -302,7 +302,7 @@
 
   .cell-kind {
     color: var(--accent);
-    font-family: ui-monospace, "SF Mono", "Cascadia Code", monospace;
+    font-family: var(--font-mono);
     font-size: 0.6875rem;
   }
   .th-kind { width: 6rem; }
@@ -328,7 +328,7 @@
   }
 
   .mono {
-    font-family: ui-monospace, "SF Mono", "Cascadia Code", monospace;
+    font-family: var(--font-mono);
     font-size: 0.6875rem;
   }
 
