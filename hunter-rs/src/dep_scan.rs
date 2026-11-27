@@ -215,53 +215,46 @@ pub fn scan_repo(
     let so = drain_pipe(child.take_stdout());
     let se = drain_pipe(child.take_stderr());
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_s);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                // renovate is a node script that spawns helpers: the direct
-                // child can exit while a descendant still holds the pipes, which
-                // would make this read unbounded (see util::run_cmd).
-                child.kill_tree();
-                let output = join_pipes(so, se);
-                // A non-zero exit means the lookup is untrustworthy even when
-                // it logged plenty: fall back to the AI job.
-                if !status.success() {
-                    tracing::warn!(
-                        "dep_scan: renovate failed (rc={:?}) for {repo_name}",
-                        status.code()
-                    );
-                    return None;
-                }
-                let (scan, looked_up) = parse_renovate_output(&output, repo_name);
-                if looked_up == 0 {
-                    tracing::info!("dep_scan: renovate looked up no dependencies for {repo_name}");
-                    return None;
-                }
-                tracing::info!(
-                    "dep_scan: {repo_name} — {} update candidates from renovate \
-                     ({looked_up} dependencies looked up, {} unchecked)",
-                    scan.candidates.len(),
-                    scan.unchecked.len()
-                );
-                return Some(scan);
-            }
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    child.kill_tree();
-                    let _ = join_pipes(so, se);
-                    tracing::warn!("dep_scan: renovate timeout for {repo_name}");
-                    return None;
-                }
-                std::thread::sleep(Duration::from_millis(200));
-            }
-            Err(_) => {
-                child.kill_tree();
-                let _ = join_pipes(so, se);
-                return None;
-            }
+    let status = match child.wait_timeout(Duration::from_secs(timeout_s)) {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            child.kill_tree();
+            let _ = join_pipes(so, se);
+            tracing::warn!("dep_scan: renovate timeout for {repo_name}");
+            return None;
         }
+        Err(_) => {
+            child.kill_tree();
+            let _ = join_pipes(so, se);
+            return None;
+        }
+    };
+    // renovate is a node script that spawns helpers: the direct child can
+    // exit while a descendant still holds the pipes, which would make this
+    // read unbounded (see util::run_cmd).
+    child.kill_tree();
+    let output = join_pipes(so, se);
+    // A non-zero exit means the lookup is untrustworthy even when it logged
+    // plenty: fall back to the AI job.
+    if !status.success() {
+        tracing::warn!(
+            "dep_scan: renovate failed (rc={:?}) for {repo_name}",
+            status.code()
+        );
+        return None;
     }
+    let (scan, looked_up) = parse_renovate_output(&output, repo_name);
+    if looked_up == 0 {
+        tracing::info!("dep_scan: renovate looked up no dependencies for {repo_name}");
+        return None;
+    }
+    tracing::info!(
+        "dep_scan: {repo_name} — {} update candidates from renovate \
+         ({looked_up} dependencies looked up, {} unchecked)",
+        scan.candidates.len(),
+        scan.unchecked.len()
+    );
+    Some(scan)
 }
 
 /// One dependency move on a Renovate branch.

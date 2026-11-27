@@ -159,24 +159,18 @@ fn run_cmd_fed(
         bytes.extend(written(err));
         String::from_utf8_lossy(&bytes).into_owned()
     };
-    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_s);
-    loop {
-        match child.try_wait() {
-            // What the command left is its unit's to end (module docs).
-            Ok(Some(status)) => return (status.code().unwrap_or(-1), merged(&mut out, &mut err)),
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    child.kill_tree();
-                    let out = merged(&mut out, &mut err);
-                    return (124, format!("timeout after {timeout_s}s\n{out}"));
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => {
-                child.kill_tree();
-                let out = merged(&mut out, &mut err);
-                return (127, format!("{e}\n{out}"));
-            }
+    match child.wait_timeout(Duration::from_secs(timeout_s)) {
+        // What the command left is its unit's to end (module docs).
+        Ok(Some(status)) => (status.code().unwrap_or(-1), merged(&mut out, &mut err)),
+        Ok(None) => {
+            child.kill_tree();
+            let out = merged(&mut out, &mut err);
+            (124, format!("timeout after {timeout_s}s\n{out}"))
+        }
+        Err(e) => {
+            child.kill_tree();
+            let out = merged(&mut out, &mut err);
+            (127, format!("{e}\n{out}"))
         }
     }
 }
