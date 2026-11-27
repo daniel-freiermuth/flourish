@@ -564,6 +564,42 @@ async fn repo_add_happy_then_duplicate_409() {
     assert_eq!(body["error"], "repo 'newrepo' already exists");
 }
 
+/// A repo name is a free-form label, so an all-digit one (a year, a ticket
+/// number) dupe-checks against other names, never against a repo id.
+#[tokio::test]
+async fn repo_add_all_digit_name_dupe_checks_by_name() {
+    let state = test_state().await;
+    let (status, body) = post(
+        &state,
+        "/api/repos",
+        json!({ "name": "2024", "url": "https://github.com/x/y2024.git" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let first_id = body["repo"]["id"].as_i64().expect("new repo id");
+    assert_ne!(first_id, 2024);
+
+    let (status, body) = post(
+        &state,
+        "/api/repos",
+        json!({ "name": "2024", "url": "https://github.com/x/other.git" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "repo '2024' already exists");
+
+    // The id of an existing repo is no claim on that number as a name.
+    let name = first_id.to_string();
+    let (status, body) = post(
+        &state,
+        "/api/repos",
+        json!({ "name": name, "url": "https://github.com/x/byid.git" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["repo"]["name"], name.as_str());
+}
+
 #[tokio::test]
 async fn repo_add_bad_name_and_missing_url() {
     let state = test_state().await;
