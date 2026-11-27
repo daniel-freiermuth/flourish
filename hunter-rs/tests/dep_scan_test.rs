@@ -318,6 +318,31 @@ fn single_candidate(
     got.into_iter().next().unwrap_or_else(|| unreachable!())
 }
 
+/// One docker dep whose tag stays `20` while its digest moves `from -> to`.
+fn digest_line(from: &str, to: &str) -> String {
+    format!(
+        r#"{{"name":"renovate","level":20,"msg":"packageFiles with updates","config":{{"dockerfile":[{{"packageFile":"Dockerfile","deps":[{{"depName":"node","currentValue":"20","currentDigest":"{from}","datasource":"docker","updates":[{{"updateType":"digest","newValue":"20","newDigest":"{to}","branchName":"renovate/node-20.x"}}]}}]}}]}}}}"#
+    )
+}
+
+/// A digest-only update keeps the tag, so the digest is where the dep
+/// stands: after the first bump merges, the next one must not share its
+/// fingerprint (it would be swallowed as a duplicate of the merged row),
+/// and the target must name the new digest, not `20 -> 20`.
+#[test]
+fn digest_only_update_is_fingerprinted_by_digest() {
+    let first = scan_printing("depscan-digest-1", &digest_line("sha256:aaa", "sha256:bbb"))
+        .expect("renovate succeeded")
+        .candidates;
+    let second = scan_printing("depscan-digest-2", &digest_line("sha256:bbb", "sha256:ccc"))
+        .expect("renovate succeeded")
+        .candidates;
+    assert_eq!((first.len(), second.len()), (1, 1));
+    assert_ne!(first[0].fingerprint, second[0].fingerprint);
+    assert!(first[0].latest_version.contains("sha256:bbb"), "{first:?}");
+    assert!(first[0].current_version.contains("sha256:aaa"), "{first:?}");
+}
+
 /// The triage table: `updateType` and `isVulnerabilityAlert` decide the
 /// severity and confidence every dep finding is ranked by.
 ///

@@ -364,19 +364,34 @@ fn collect_dep_updates(
     // The resolved version (lockfile, digest-pinned tag) before the
     // manifest's range: `^24.0.0` and `^24.13.3` are both 24.13.3 when
     // that is what is installed, and the fingerprint must agree.
-    let current = str_of(dep, &["currentVersion", "currentValue"]).map_or_else(
-        || "?".to_owned(),
-        |c| {
-            c.trim_start_matches(|c: char| "^~>=<".contains(c))
-                .to_owned()
-        },
+    // A digest-pinned dep stands at its digest too: a digest-only update
+    // keeps the tag, and without the digest every later bump would share
+    // the merged finding's fingerprint and never be filed.
+    let with_digest = |v: String, src: &serde_json::Value, key: &str| match str_of(src, &[key]) {
+        Some(d) => format!("{v}@{d}"),
+        None => v,
+    };
+    let current = with_digest(
+        str_of(dep, &["currentVersion", "currentValue"]).map_or_else(
+            || "?".to_owned(),
+            |c| {
+                c.trim_start_matches(|c: char| "^~>=<".contains(c))
+                    .to_owned()
+            },
+        ),
+        dep,
+        "currentDigest",
     );
     let datasource = str_of(dep, &["datasource"]).unwrap_or_else(|| manager.to_owned());
     let Some(updates) = dep.get("updates").and_then(|v| v.as_array()) else {
         return;
     };
     for u in updates {
-        let new_version = str_of(u, &["newVersion", "newValue"]).unwrap_or_else(|| "?".to_owned());
+        let new_version = with_digest(
+            str_of(u, &["newVersion", "newValue"]).unwrap_or_else(|| "?".to_owned()),
+            u,
+            "newDigest",
+        );
         // Normalise BEFORE grading. Renovate's housekeeping types mean
         // "this is a patch", and the record says so — grading them off the
         // raw value gave two findings both labelled `patch` different
