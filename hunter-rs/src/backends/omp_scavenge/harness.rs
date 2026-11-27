@@ -723,7 +723,13 @@ pub fn run_worker(
             proc.kill_tree();
             break;
         }
-        std::thread::sleep(Duration::from_secs_f64(cfg.poll_s));
+        // The next tick, or sooner once omp ends: the tick after its exit
+        // meters it and ends the loop. A wait that fails still keeps the
+        // tick, rather than re-reading the ledger in a tight loop.
+        let tick = Duration::from_secs_f64(cfg.poll_s);
+        if proc.wait_timeout(tick).is_err() {
+            std::thread::sleep(tick);
+        }
     }
 
     let exit_code = proc.wait().ok().and_then(|s| s.code());

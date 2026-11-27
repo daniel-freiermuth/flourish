@@ -1078,11 +1078,12 @@ impl Drop for Cgroup {
 
 /// A process started by [`Command::spawn`], in its cgroup.
 ///
-/// Its status ([`Self::try_wait`], [`Self::wait`]) is the program's own,
-/// the moment it ends; what it started may still run, in its cgroup,
-/// until [`Self::kill_tree`] or the end of its unit. Dropped while the
-/// program runs, everything in its cgroup is killed (SIGKILL): whatever
-/// returns early or unwinds past a child cannot leave it running.
+/// Its status ([`Self::try_wait`], [`Self::wait`], [`Self::wait_timeout`])
+/// is the program's own, the moment it ends; what it started may still
+/// run, in its cgroup, until [`Self::kill_tree`] or the end of its unit.
+/// Dropped while the program runs, everything in its cgroup is killed
+/// (SIGKILL): whatever returns early or unwinds past a child cannot leave
+/// it running.
 pub struct Child {
     inner: std::process::Child,
     /// Until [`Self::kill_tree`] or the drop.
@@ -1117,6 +1118,42 @@ impl Child {
     /// until [`Self::kill_tree`] or the end of its unit.
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
         self.inner.wait()
+    }
+
+    /// Wait for the program to end, at most `within`: its status, or `None`
+    /// while it still runs. Woken by the exit itself, not by a poll: the
+    /// program's pidfd turns readable the moment it ends (Linux 5.3, below
+    /// the 5.14 `cgroup.kill` already needs). What it left keeps running
+    /// as after [`Self::wait`].
+    pub fn wait_timeout(&mut self, within: Duration) -> io::Result<Option<ExitStatus>> {
+        let until = Instant::now() + within;
+        // Checked first: once reaped, its pid may already name another
+        // process. Until then it is the program's, ended or not.
+        if let Some(status) = self.inner.try_wait()? {
+            return Ok(Some(status));
+        }
+        let pidfd = rustix::process::pidfd_open(
+            rustix::process::Pid::from_child(&self.inner),
+            rustix::process::PidfdFlags::empty(),
+        )?;
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            let timeout = rustix::event::Timespec::try_from(left).map_err(io::Error::other)?;
+            let mut ended = [rustix::event::PollFd::new(
+                &pidfd,
+                rustix::event::PollFlags::IN,
+            )];
+            match rustix::event::poll(&mut ended, Some(&timeout)) {
+                Ok(_) | Err(rustix::io::Errno::INTR) => {}
+                Err(e) => return Err(e.into()),
+            }
+            if let Some(status) = self.inner.try_wait()? {
+                return Ok(Some(status));
+            }
+            if left.is_zero() {
+                return Ok(None);
+            }
+        }
     }
 
     /// End the program and everything in its cgroup, then reap it and

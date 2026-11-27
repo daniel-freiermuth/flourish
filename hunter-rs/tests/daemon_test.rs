@@ -737,7 +737,12 @@ async fn the_job_lane_holds_engages_back_until_the_first_pr_sync_ends() {
 #[tokio::test]
 async fn an_engage_whose_pr_end_the_sync_never_records_is_held_without_a_hot_loop() {
     let bins = daemon_bins("daemon-engage-unrecorded");
-    bins.omp("exit 0");
+    // A worker run takes longer than a PR sync pass, as a real one does.
+    // alpha's test_gap fails every run (the worker writes nothing) and is
+    // held at its streak limit, so its runs must not all fit in the wait
+    // for the first pass: the lane needs work left to run while the
+    // engage waits for the later ones.
+    bins.omp("[ \"$1\" = -p ] && sleep 1\nexit 0");
     gh_disagreeing(&bins, "");
     let f = EngageFixture::new(&bins, "daemon-engage-unrecorded-root").await;
     // The first pass waits for the lane's first cycle, which it holds
@@ -878,13 +883,12 @@ async fn a_starting_daemon_reclaims_leftover_trees() {
     std::fs::create_dir_all(leftover.join("src")).unwrap();
     std::fs::write(leftover.join("src").join("lib.rs"), "half removed\n").unwrap();
 
-    let daemon = tokio::spawn(hunter::daemon::run_daemon(cfg));
+    let daemon = spawn_daemon(cfg);
     let deadline = Instant::now() + Duration::from_secs(30);
     while leftover.exists() {
         assert!(
             !daemon.is_finished(),
-            "the daemon exited instead of running: {:?}",
-            daemon.await
+            "the daemon exited instead of running"
         );
         assert!(
             Instant::now() < deadline,
@@ -893,7 +897,7 @@ async fn a_starting_daemon_reclaims_leftover_trees() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    daemon.abort();
+    stop_daemon(daemon).await;
 }
 
 /// A starting daemon turns git's automatic maintenance off in its own
@@ -940,13 +944,12 @@ async fn a_starting_daemon_turns_automatic_maintenance_off_in_its_clones() {
     pool.close().await;
     cfg.db_path = db;
 
-    let daemon = tokio::spawn(hunter::daemon::run_daemon(cfg));
+    let daemon = spawn_daemon(cfg);
     let deadline = Instant::now() + Duration::from_secs(30);
     while String::from_utf8_lossy(&git_config(&clone).stdout).trim() != "false" {
         assert!(
             !daemon.is_finished(),
-            "the daemon exited instead of running: {:?}",
-            daemon.await
+            "the daemon exited instead of running"
         );
         assert!(
             Instant::now() < deadline,
@@ -955,7 +958,7 @@ async fn a_starting_daemon_turns_automatic_maintenance_off_in_its_clones() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    daemon.abort();
+    stop_daemon(daemon).await;
 }
 
 /// The startup sweep, which the daemon awaits before it serves, leaves the
@@ -1010,13 +1013,12 @@ async fn a_starting_daemon_serves_before_its_sweep_caps_build_caches() {
     cfg.db_path = db;
     let port = cfg.serve_port;
 
-    let daemon = tokio::spawn(hunter::daemon::run_daemon(cfg));
+    let daemon = spawn_daemon(cfg);
     let deadline = Instant::now() + Duration::from_secs(30);
     while http(port, "GET", "/api/summary", "", "").await.is_none() {
         assert!(
             !daemon.is_finished(),
-            "the daemon exited instead of running: {:?}",
-            daemon.await
+            "the daemon exited instead of running"
         );
         assert!(
             Instant::now() < deadline,
@@ -1038,7 +1040,7 @@ async fn a_starting_daemon_serves_before_its_sweep_caps_build_caches() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    daemon.abort();
+    stop_daemon(daemon).await;
 }
 
 /// A skipped cycle did no work: its pick was stale (the finding left
