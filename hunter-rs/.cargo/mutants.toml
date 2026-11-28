@@ -68,10 +68,6 @@ minimum_test_timeout = 120
 exclude_globs = [
     # Generated at build time; not hand-written logic.
     "build.rs",
-    # Argument parsing with a single caller (the systemd unit). Mutants
-    # here are all "accepts a flag it should reject", which the usage
-    # string already documents and no test should be pinned to.
-    "src/main.rs",
 ]
 
 # Trait method bodies that only forward, and Display impls, generate
@@ -83,6 +79,12 @@ exclude_globs = [
 # before matched no mutant at all (`cargo mutants --list` showed them).
 exclude_re = [
     "<impl (std::)?(fmt::)?Display for [^>]+>::fmt ",
+    # `src/main.rs`'s argv parsing: its mutants are all "accepts a flag it
+    # should reject", which the usage string already documents and no
+    # test should be pinned to. The rest of the file -- `main`, `run`, the
+    # `hunter user` dispatch, `read_password`, `prompt_hidden` -- is
+    # mutated (`daemon_test`, `cli_user_test`).
+    "replace parse_args -> ",
     # The match guard in `sweep_workspaces` only decides whether a pass
     # is worth a log line: both arms have already swept, so forcing the
     # guard either way or inverting it changes what is logged and
